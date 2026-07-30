@@ -14,7 +14,11 @@
 //! fixups — those appear only at macOS 12 and above. So classic it is.
 
 pub mod commands;
+pub mod dyld_info;
 pub mod format;
+pub mod symtab;
 
 pub use commands::{LinkEditLayout, SymbolGroups};
+pub use dyld_info::{Bind, Rebase};
 pub use format::{MachHeader, Writer};
+pub use symtab::{OutputSymbol, SymbolGroup, SymbolTable, SymbolTableBuilder};

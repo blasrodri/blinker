@@ -1,0 +1,499 @@
+//! The symbol table and its string table.
+//!
+//! # Sorting is load-bearing
+//!
+//! `LC_DYSYMTAB` does not list which symbols are local, external, or undefined
+//! — it records three *index ranges* into the symbol table. dyld and the
+//! debugger then index by range. So the table must be sorted into those three
+//! groups, in that order, or consumers silently read the wrong entries rather
+//! than rejecting the file.
+//!
+//! A real Rust executable:
+//!
+//! ```text
+//! ilocalsym    0     nlocalsym   2646
+//! iextdefsym   2646  nextdefsym   262
+//! iundefsym    2908  nundefsym     70
+//! ```
+//!
+//! Contiguous, in order, covering every symbol. [`SymbolTableBuilder`]
+//! guarantees that shape by construction rather than trusting callers to
+//! insert in the right sequence.
+
+use crate::commands::SymbolGroups;
+use crate::format::Writer;
+
+/// `n_type` bit fields from `<mach-o/nlist.h>`.
+pub mod n_type {
+    /// Mask selecting the debug-symbol bits. Any of these set means a stab.
+    pub const N_STAB: u8 = 0xe0;
+    /// Private external: visible to the link but not exported.
+    pub const N_PEXT: u8 = 0x10;
+    /// Mask selecting the type field.
+    pub const N_TYPE: u8 = 0x0e;
+    /// External — participates in dynamic linking.
+    pub const N_EXT: u8 = 0x01;
+
+    /// Undefined; no section.
+    pub const N_UNDF: u8 = 0x0;
+    /// Absolute; no section.
+    pub const N_ABS: u8 = 0x2;
+    /// Defined in the section given by `n_sect`.
+    pub const N_SECT: u8 = 0xe;
+}
+
+/// `n_sect` value meaning "no section".
+pub const NO_SECT: u8 = 0;
+
+/// Which of the three groups a symbol belongs to.
+///
+/// The order of these variants *is* the required table order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SymbolGroup {
+    /// Not visible outside the image.
+    Local,
+    /// Defined here and exported.
+    ExternalDefined,
+    /// Referenced here, defined elsewhere.
+    Undefined,
+}
+
+/// One symbol to place in the table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputSymbol {
+    pub name: String,
+    pub group: SymbolGroup,
+    /// One-based output section number; `None` for undefined symbols.
+    pub section: Option<u8>,
+    /// Virtual address for a definition, zero for a reference.
+    pub value: u64,
+    /// Index of the dylib providing an undefined symbol.
+    ///
+    /// Under the two-level namespace this is not optional: dyld records *which*
+    /// library a symbol came from, and an ordinal of zero would mean
+    /// flat-namespace lookup instead.
+    pub library_ordinal: u8,
+    /// Private external — external to the link, not exported from the image.
+    pub private_external: bool,
+}
+
+impl OutputSymbol {
+    /// A local definition.
+    pub fn local(name: impl Into<String>, section: u8, value: u64) -> Self {
+        OutputSymbol {
+            name: name.into(),
+            group: SymbolGroup::Local,
+            section: Some(section),
+            value,
+            library_ordinal: 0,
+            private_external: false,
+        }
+    }
+
+    /// An exported definition.
+    pub fn exported(name: impl Into<String>, section: u8, value: u64) -> Self {
+        OutputSymbol {
+            name: name.into(),
+            group: SymbolGroup::ExternalDefined,
+            section: Some(section),
+            value,
+            library_ordinal: 0,
+            private_external: false,
+        }
+    }
+
+    /// A reference satisfied by `library_ordinal`.
+    pub fn undefined(name: impl Into<String>, library_ordinal: u8) -> Self {
+        OutputSymbol {
+            name: name.into(),
+            group: SymbolGroup::Undefined,
+            section: None,
+            value: 0,
+            library_ordinal,
+            private_external: false,
+        }
+    }
+
+    /// The `n_type` byte for this symbol.
+    fn type_byte(&self) -> u8 {
+        let mut byte = match self.group {
+            SymbolGroup::Undefined => n_type::N_UNDF,
+            _ => n_type::N_SECT,
+        };
+        if self.group != SymbolGroup::Local {
+            byte |= n_type::N_EXT;
+        }
+        if self.private_external {
+            byte |= n_type::N_PEXT;
+        }
+        byte
+    }
+
+    /// The `n_desc` field.
+    ///
+    /// For an undefined symbol the library ordinal lives in the high byte,
+    /// which is how the two-level namespace records the providing library.
+    fn desc(&self) -> u16 {
+        match self.group {
+            SymbolGroup::Undefined => (self.library_ordinal as u16) << 8,
+            _ => 0,
+        }
+    }
+}
+
+/// Builds a correctly grouped symbol table and its string table.
+#[derive(Debug, Default)]
+pub struct SymbolTableBuilder {
+    symbols: Vec<OutputSymbol>,
+}
+
+impl SymbolTableBuilder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn add(&mut self, symbol: OutputSymbol) -> &mut Self {
+        self.symbols.push(symbol);
+        self
+    }
+
+    pub fn len(&self) -> usize {
+        self.symbols.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.symbols.is_empty()
+    }
+
+    /// Produce the symbol table, string table, and the group ranges.
+    ///
+    /// Sorting happens here rather than being the caller's responsibility,
+    /// because a caller that inserted out of order would produce a file that
+    /// loads and then misbehaves.
+    pub fn build(mut self) -> SymbolTable {
+        // Stable sort by group: within a group, insertion order is preserved,
+        // which keeps the output deterministic.
+        self.symbols.sort_by_key(|s| s.group);
+
+        // The string table opens with a NUL so index 0 is the empty string,
+        // which is what an unnamed symbol points at.
+        let mut strings = vec![0u8];
+        let mut entries = Vec::with_capacity(self.symbols.len());
+
+        for symbol in &self.symbols {
+            let name_offset = if symbol.name.is_empty() {
+                0
+            } else {
+                let offset = strings.len() as u32;
+                strings.extend_from_slice(symbol.name.as_bytes());
+                strings.push(0);
+                offset
+            };
+
+            entries.push(NlistEntry {
+                name_offset,
+                type_byte: symbol.type_byte(),
+                section: symbol.section.unwrap_or(NO_SECT),
+                desc: symbol.desc(),
+                value: symbol.value,
+            });
+        }
+
+        let count =
+            |group: SymbolGroup| self.symbols.iter().filter(|s| s.group == group).count() as u32;
+        let locals = count(SymbolGroup::Local);
+        let externals = count(SymbolGroup::ExternalDefined);
+        let undefined = count(SymbolGroup::Undefined);
+
+        SymbolTable {
+            entries,
+            strings,
+            groups: SymbolGroups {
+                local_index: 0,
+                local_count: locals,
+                external_index: locals,
+                external_count: externals,
+                undefined_index: locals + externals,
+                undefined_count: undefined,
+                indirect_offset: 0,
+                indirect_count: 0,
+            },
+        }
+    }
+}
+
+/// One `nlist_64` entry: 16 bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NlistEntry {
+    pub name_offset: u32,
+    pub type_byte: u8,
+    pub section: u8,
+    pub desc: u16,
+    pub value: u64,
+}
+
+impl NlistEntry {
+    /// Size on disk.
+    pub const SIZE: usize = 16;
+
+    pub fn write(&self, writer: &mut Writer) {
+        writer
+            .u32(self.name_offset)
+            .bytes(&[self.type_byte, self.section])
+            .bytes(&self.desc.to_le_bytes())
+            .u64(self.value);
+    }
+}
+
+/// A built symbol table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolTable {
+    pub entries: Vec<NlistEntry>,
+    pub strings: Vec<u8>,
+    pub groups: SymbolGroups,
+}
+
+impl SymbolTable {
+    /// Serialize the `nlist_64` array.
+    pub fn write_entries(&self, writer: &mut Writer) {
+        for entry in &self.entries {
+            entry.write(writer);
+        }
+    }
+
+    /// Total size of the symbol table on disk.
+    pub fn entries_size(&self) -> usize {
+        self.entries.len() * NlistEntry::SIZE
+    }
+
+    pub fn strings_size(&self) -> usize {
+        self.strings.len()
+    }
+
+    /// Read a name back out of the string table, for tests and diagnostics.
+    pub fn name_at(&self, offset: u32) -> Option<&str> {
+        let start = offset as usize;
+        let bytes = self.strings.get(start..)?;
+        let end = bytes.iter().position(|&b| b == 0)?;
+        std::str::from_utf8(&bytes[..end]).ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn built() -> SymbolTable {
+        let mut builder = SymbolTableBuilder::new();
+        // Deliberately inserted out of order: the builder must sort.
+        builder
+            .add(OutputSymbol::undefined("_malloc", 1))
+            .add(OutputSymbol::local("ltmp0", 1, 0x1_0000_1000))
+            .add(OutputSymbol::exported("_main", 1, 0x1_0000_2000))
+            .add(OutputSymbol::local("ltmp1", 1, 0x1_0000_1100))
+            .add(OutputSymbol::undefined("_free", 1));
+        builder.build()
+    }
+
+    /// The property `LC_DYSYMTAB` depends on: three contiguous ranges, in
+    /// order, covering every symbol.
+    #[test]
+    fn symbols_are_sorted_into_three_contiguous_groups() {
+        let table = built();
+        let groups = table.groups;
+
+        assert_eq!(groups.local_index, 0);
+        assert_eq!(groups.local_count, 2);
+        assert_eq!(groups.external_index, 2);
+        assert_eq!(groups.external_count, 1);
+        assert_eq!(groups.undefined_index, 3);
+        assert_eq!(groups.undefined_count, 2);
+
+        // Contiguous and complete.
+        assert_eq!(
+            groups.undefined_index + groups.undefined_count,
+            table.entries.len() as u32
+        );
+    }
+
+    #[test]
+    fn the_groups_appear_in_the_required_order() {
+        let table = built();
+        let names: Vec<&str> = table
+            .entries
+            .iter()
+            .map(|e| table.name_at(e.name_offset).expect("named"))
+            .collect();
+        assert_eq!(names, vec!["ltmp0", "ltmp1", "_main", "_malloc", "_free"]);
+    }
+
+    #[test]
+    fn insertion_order_is_preserved_within_a_group() {
+        // A stable sort keeps the output deterministic run to run.
+        let table = built();
+        assert_eq!(table.name_at(table.entries[0].name_offset), Some("ltmp0"));
+        assert_eq!(table.name_at(table.entries[1].name_offset), Some("ltmp1"));
+    }
+
+    #[test]
+    fn locals_are_not_marked_external() {
+        let table = built();
+        let local = &table.entries[0];
+        assert_eq!(local.type_byte & n_type::N_EXT, 0);
+        assert_eq!(local.type_byte & n_type::N_TYPE, n_type::N_SECT);
+    }
+
+    #[test]
+    fn exported_definitions_are_marked_external_and_in_a_section() {
+        let table = built();
+        let exported = &table.entries[2];
+        assert_eq!(exported.type_byte & n_type::N_EXT, n_type::N_EXT);
+        assert_eq!(exported.type_byte & n_type::N_TYPE, n_type::N_SECT);
+        assert_eq!(exported.section, 1);
+        assert_eq!(exported.value, 0x1_0000_2000);
+    }
+
+    #[test]
+    fn undefined_symbols_have_no_section_and_no_value() {
+        let table = built();
+        let undefined = &table.entries[3];
+        assert_eq!(undefined.type_byte & n_type::N_TYPE, n_type::N_UNDF);
+        assert_eq!(undefined.section, NO_SECT);
+        assert_eq!(undefined.value, 0);
+    }
+
+    /// Under the two-level namespace dyld records which library provides each
+    /// import. An ordinal of zero would mean flat-namespace lookup instead.
+    #[test]
+    fn the_library_ordinal_is_carried_in_the_high_byte_of_desc() {
+        let mut builder = SymbolTableBuilder::new();
+        builder.add(OutputSymbol::undefined("_printf", 3));
+        let table = builder.build();
+        assert_eq!(table.entries[0].desc >> 8, 3);
+    }
+
+    #[test]
+    fn private_external_symbols_carry_the_pext_bit() {
+        let mut builder = SymbolTableBuilder::new();
+        let mut symbol = OutputSymbol::exported("_hidden", 1, 0x1000);
+        symbol.private_external = true;
+        builder.add(symbol);
+        let table = builder.build();
+        assert_eq!(table.entries[0].type_byte & n_type::N_PEXT, n_type::N_PEXT);
+    }
+
+    #[test]
+    fn the_string_table_starts_with_a_nul_so_offset_zero_is_empty() {
+        let table = built();
+        assert_eq!(table.strings[0], 0);
+        assert_eq!(table.name_at(0), Some(""));
+    }
+
+    #[test]
+    fn every_name_round_trips_through_the_string_table() {
+        let table = built();
+        for entry in &table.entries {
+            let name = table.name_at(entry.name_offset).expect("resolvable");
+            assert!(!name.is_empty(), "name lost from the string table");
+        }
+    }
+
+    #[test]
+    fn an_unnamed_symbol_points_at_the_empty_string() {
+        let mut builder = SymbolTableBuilder::new();
+        builder.add(OutputSymbol::local("", 1, 0));
+        let table = builder.build();
+        assert_eq!(table.entries[0].name_offset, 0);
+        // And the table is not grown by an empty name.
+        assert_eq!(table.strings.len(), 1);
+    }
+
+    #[test]
+    fn names_are_not_deduplicated_but_each_resolves_correctly() {
+        // Two symbols may legitimately share a name across groups.
+        let mut builder = SymbolTableBuilder::new();
+        builder
+            .add(OutputSymbol::local("shared", 1, 0x1000))
+            .add(OutputSymbol::exported("shared", 1, 0x2000));
+        let table = builder.build();
+        for entry in &table.entries {
+            assert_eq!(table.name_at(entry.name_offset), Some("shared"));
+        }
+    }
+
+    #[test]
+    fn an_nlist_entry_is_exactly_sixteen_bytes() {
+        let mut writer = Writer::new();
+        NlistEntry {
+            name_offset: 1,
+            type_byte: n_type::N_SECT | n_type::N_EXT,
+            section: 1,
+            desc: 0,
+            value: 0x1_0000_0000,
+        }
+        .write(&mut writer);
+        assert_eq!(writer.len(), NlistEntry::SIZE);
+    }
+
+    #[test]
+    fn nlist_fields_are_written_in_the_documented_order() {
+        let mut writer = Writer::new();
+        NlistEntry {
+            name_offset: 0x0102_0304,
+            type_byte: 0x0e,
+            section: 0x02,
+            desc: 0x0300,
+            value: 0x0A0B_0C0D_0E0F_1011,
+        }
+        .write(&mut writer);
+
+        let bytes = writer.as_slice();
+        assert_eq!(&bytes[0..4], &0x0102_0304u32.to_le_bytes(), "n_strx");
+        assert_eq!(bytes[4], 0x0e, "n_type");
+        assert_eq!(bytes[5], 0x02, "n_sect");
+        assert_eq!(&bytes[6..8], &0x0300u16.to_le_bytes(), "n_desc");
+        assert_eq!(&bytes[8..16], &0x0A0B_0C0D_0E0F_1011u64.to_le_bytes());
+    }
+
+    #[test]
+    fn sizes_match_what_was_written() {
+        let table = built();
+        let mut writer = Writer::new();
+        table.write_entries(&mut writer);
+        assert_eq!(writer.len(), table.entries_size());
+        assert_eq!(table.strings_size(), table.strings.len());
+    }
+
+    #[test]
+    fn an_empty_table_is_valid() {
+        let table = SymbolTableBuilder::new().build();
+        assert!(table.entries.is_empty());
+        assert_eq!(table.groups.local_count, 0);
+        assert_eq!(table.groups.undefined_count, 0);
+        // The leading NUL is still present.
+        assert_eq!(table.strings, vec![0]);
+    }
+
+    #[test]
+    fn handles_the_scale_of_a_real_binary() {
+        // 2646 locals, 262 exported, 70 undefined — the real proportions.
+        let mut builder = SymbolTableBuilder::new();
+        for i in 0..70 {
+            builder.add(OutputSymbol::undefined(format!("_undef{i}"), 1));
+        }
+        for i in 0..2646 {
+            builder.add(OutputSymbol::local(format!("_local{i}"), 1, i as u64));
+        }
+        for i in 0..262 {
+            builder.add(OutputSymbol::exported(format!("_ext{i}"), 1, i as u64));
+        }
+        let table = builder.build();
+
+        assert_eq!(table.groups.local_count, 2646);
+        assert_eq!(table.groups.external_count, 262);
+        assert_eq!(table.groups.undefined_count, 70);
+        assert_eq!(table.entries.len(), 2978);
+        assert_eq!(table.groups.external_index, 2646);
+        assert_eq!(table.groups.undefined_index, 2908);
+    }
+}
