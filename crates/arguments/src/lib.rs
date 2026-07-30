@@ -34,6 +34,7 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod reference;
 mod response_file;
 pub use response_file::{expand_response_files, ResponseFileError};
 
@@ -193,11 +194,10 @@ impl ParsedInvocation {
     }
 }
 
-/// Flags that take their value as the *following* argument.
-const SEPARATE_VALUE_FLAGS: &[&str] =
-    &["-o", "-arch", "-framework", "-install_name", "-syslibroot"];
-
 /// Driver flags we see from rustc, recognize, and forward without modelling.
+///
+/// These are *compiler driver* spellings, not `ld64` options — the `ld64` set
+/// lives in [`reference::LD64_OPTIONS`] with its arity.
 const KNOWN_UNMODELLED: &[&str] = &[
     "-dynamiclib",
     "-shared",
@@ -206,8 +206,47 @@ const KNOWN_UNMODELLED: &[&str] = &[
     "-fPIC",
     "-pie",
     "-no-pie",
-    "-v",
 ];
+
+/// Classify one option and the `values` it consumes.
+///
+/// Options blinker models semantically get a typed variant; the rest are
+/// recorded as recognized-but-unmodelled along with the arguments they ate, so
+/// nothing is silently dropped and the arity is visible in the inventory.
+fn classify_option(name: &str, values: &[String]) -> LinkerArg {
+    match (name, values) {
+        ("-o", [v]) => LinkerArg::Output(PathBuf::from(v)),
+        ("-arch", [v]) => LinkerArg::Arch(v.clone()),
+        ("-framework", [v]) => LinkerArg::Framework(v.clone()),
+        ("-L", [v]) => LinkerArg::LibrarySearchPath(PathBuf::from(v)),
+        ("-F", [v]) => LinkerArg::FrameworkSearchPath(PathBuf::from(v)),
+        (_, []) => LinkerArg::KnownUnmodelled(name.to_string()),
+        _ => LinkerArg::KnownUnmodelled(format!("{name} {}", values.join(" "))),
+    }
+}
+
+/// Classify an attached-value flag such as `-L/usr/lib` or `-lSystem`.
+fn classify_joined(arg: &str) -> Option<LinkerArg> {
+    for prefix in reference::JOINED_PREFIXES {
+        // Longest-match order is guaranteed by JOINED_PREFIXES' ordering, so
+        // `-weak-lfoo` is not mistaken for `-l` with value `weak-lfoo`.
+        let Some(rest) = arg.strip_prefix(prefix) else {
+            continue;
+        };
+        if rest.is_empty() {
+            // Bare flag: the separate-argument spelling, handled by the table.
+            return None;
+        }
+        return Some(match *prefix {
+            "-L" => LinkerArg::LibrarySearchPath(PathBuf::from(rest)),
+            "-F" => LinkerArg::FrameworkSearchPath(PathBuf::from(rest)),
+            "-l" => LinkerArg::Library(rest.to_string()),
+            // `-weak-l…`, `-O…` and friends: recognized, not yet modelled.
+            _ => LinkerArg::KnownUnmodelled(arg.to_string()),
+        });
+    }
+    None
+}
 
 fn classify(argv: &[String]) -> Vec<(usize, LinkerArg)> {
     let mut out = Vec::with_capacity(argv.len());
@@ -215,59 +254,28 @@ fn classify(argv: &[String]) -> Vec<(usize, LinkerArg)> {
     while i < argv.len() {
         let arg = &argv[i];
 
-        // Two-token flags: consume the value that follows.
-        if SEPARATE_VALUE_FLAGS.contains(&arg.as_str()) {
-            let Some(value) = argv.get(i + 1) else {
-                // A value-taking flag with nothing after it is malformed, not
-                // unknown — record it verbatim so the inventory shows it.
-                out.push((i, LinkerArg::Unrecognized(arg.clone())));
-                i += 1;
-                continue;
-            };
-            let parsed = match arg.as_str() {
-                "-o" => LinkerArg::Output(PathBuf::from(value)),
-                "-arch" => LinkerArg::Arch(value.clone()),
-                "-framework" => LinkerArg::Framework(value.clone()),
-                // Recognized, value-taking, not yet semantically modelled.
-                _ => LinkerArg::KnownUnmodelled(format!("{arg} {value}")),
-            };
-            out.push((i, parsed));
-            i += 2;
-            continue;
-        }
-
-        // `-Wl,a,b,c` — driver tunnel for ld64 options. Split so each ld64
-        // option is classified on its own, matching how the driver forwards it.
+        // `-Wl,a,b,c` — the driver's tunnel for ld64 options.
+        //
+        // Arity applies *within* the payload: `-Wl,-exported_symbol,_main` is
+        // one option consuming one value, not two independent flags. Splitting
+        // blindly on commas would classify `_main` as its own option.
         if let Some(payload) = arg.strip_prefix("-Wl,") {
-            for flag in payload.split(',') {
-                if !flag.is_empty() {
-                    out.push((i, LinkerArg::LinkerFlag(flag.to_string())));
-                }
+            let elements: Vec<String> = payload
+                .split(',')
+                .filter(|e| !e.is_empty())
+                .map(str::to_string)
+                .collect();
+            for arg in classify_ld64_sequence(&elements) {
+                out.push((i, arg));
             }
             i += 1;
             continue;
         }
 
-        // `-m<platform>-version-min=<version>`
+        // `-m<platform>-version-min=<version>` — a driver spelling with no
+        // ld64 equivalent, so it is checked before the table.
         if let Some(parsed) = parse_version_min(arg) {
             out.push((i, parsed));
-            i += 1;
-            continue;
-        }
-
-        // Attached-value flags: `-L<dir>`, `-F<dir>`, `-l<name>`.
-        if let Some(rest) = strip_attached(arg, "-L") {
-            out.push((i, LinkerArg::LibrarySearchPath(PathBuf::from(rest))));
-            i += 1;
-            continue;
-        }
-        if let Some(rest) = strip_attached(arg, "-F") {
-            out.push((i, LinkerArg::FrameworkSearchPath(PathBuf::from(rest))));
-            i += 1;
-            continue;
-        }
-        if let Some(rest) = strip_attached(arg, "-l") {
-            out.push((i, LinkerArg::Library(rest.to_string())));
             i += 1;
             continue;
         }
@@ -284,6 +292,31 @@ fn classify(argv: &[String]) -> Vec<(usize, LinkerArg)> {
             continue;
         }
 
+        // Table lookup drives arity. This is what stops a value-taking option
+        // from letting its values be misread as input files.
+        if let Some(arity) = reference::arity_of(arg) {
+            let arity = arity as usize;
+            let available = argv.len() - i - 1;
+            if available < arity {
+                // Declared arity cannot be satisfied: malformed, not unknown.
+                out.push((i, LinkerArg::Unrecognized(arg.clone())));
+                i += 1;
+                continue;
+            }
+            let values = &argv[i + 1..=i + arity];
+            out.push((i, classify_option(arg, values)));
+            i += 1 + arity;
+            continue;
+        }
+
+        // Attached-value flags, after the table so bare `-L` takes the
+        // separate-argument path above.
+        if let Some(parsed) = classify_joined(arg) {
+            out.push((i, parsed));
+            i += 1;
+            continue;
+        }
+
         // Anything else starting with `-` is a flag we do not know.
         if arg.starts_with('-') {
             out.push((i, LinkerArg::Unrecognized(arg.clone())));
@@ -294,6 +327,32 @@ fn classify(argv: &[String]) -> Vec<(usize, LinkerArg)> {
         // Positional: classify by extension.
         out.push((i, classify_positional(arg)));
         i += 1;
+    }
+    out
+}
+
+/// Classify a sequence of `ld64` options, honouring arity.
+///
+/// Used for `-Wl,` payloads, where the elements form their own little argument
+/// vector with the same value-consuming rules as the top level.
+fn classify_ld64_sequence(elements: &[String]) -> Vec<LinkerArg> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < elements.len() {
+        let element = &elements[i];
+        let arity = reference::arity_of(element).unwrap_or(0) as usize;
+
+        if arity > 0 && i + arity < elements.len() {
+            let values = &elements[i + 1..=i + arity];
+            out.push(LinkerArg::LinkerFlag(format!(
+                "{element} {}",
+                values.join(" ")
+            )));
+            i += 1 + arity;
+        } else {
+            out.push(LinkerArg::LinkerFlag(element.clone()));
+            i += 1;
+        }
     }
     out
 }
@@ -324,16 +383,6 @@ fn parse_version_min(arg: &str) -> Option<LinkerArg> {
         platform: platform.to_string(),
         version: version.to_string(),
     })
-}
-
-/// Strip a flag prefix, returning the attached value if non-empty.
-///
-/// Returns `None` for the bare flag (e.g. `-L` alone), which is a
-/// separate-value spelling we do not currently see from rustc; leaving it
-/// unrecognized surfaces it in the inventory rather than guessing.
-fn strip_attached<'a>(arg: &'a str, prefix: &str) -> Option<&'a str> {
-    let rest = arg.strip_prefix(prefix)?;
-    (!rest.is_empty()).then_some(rest)
 }
 
 #[cfg(test)]
@@ -521,8 +570,141 @@ mod tests {
 
     #[test]
     fn bare_dash_l_is_unrecognized_rather_than_an_empty_library() {
+        // Lowercase `-l` takes no separate value, so a bare one is malformed.
         let parsed = ParsedInvocation::parse(argv(&["-l"]));
         assert_eq!(parsed.unrecognized(), vec!["-l"]);
+    }
+
+    /// Observed from a real build: a `cargo:rustc-link-search=` directive in a
+    /// build script reaches the linker as `-L` followed by the path as a
+    /// separate argument, not as an attached `-L<dir>`. Handling only the
+    /// attached form silently drops the search path, and the native library
+    /// the build script just compiled fails to resolve.
+    #[test]
+    fn search_path_flags_accept_both_attached_and_separate_spellings() {
+        for (input, expected) in [
+            (
+                vec!["-L", "/build/out"],
+                LinkerArg::LibrarySearchPath(PathBuf::from("/build/out")),
+            ),
+            (
+                vec!["-L/build/out"],
+                LinkerArg::LibrarySearchPath(PathBuf::from("/build/out")),
+            ),
+            (
+                vec!["-F", "/Frameworks"],
+                LinkerArg::FrameworkSearchPath(PathBuf::from("/Frameworks")),
+            ),
+            (
+                vec!["-F/Frameworks"],
+                LinkerArg::FrameworkSearchPath(PathBuf::from("/Frameworks")),
+            ),
+        ] {
+            let parsed = ParsedInvocation::parse(argv(&input));
+            assert_eq!(
+                parsed.args.iter().map(|(_, a)| a).collect::<Vec<_>>(),
+                vec![&expected],
+                "failed for {input:?}"
+            );
+            assert!(parsed.unrecognized().is_empty(), "failed for {input:?}");
+        }
+    }
+
+    #[test]
+    fn separate_form_search_path_does_not_leak_its_value_as_a_positional() {
+        // The regression this guards: consuming `-L` but not its value leaves
+        // the path to be misclassified as an input file.
+        let parsed = ParsedInvocation::parse(argv(&["-L", "/build/out", "a.o"]));
+        assert_eq!(parsed.input_paths(), vec![Path::new("a.o")]);
+    }
+
+    /// The bug class the option table exists to prevent. `-sectcreate` takes
+    /// three arguments; without arity knowledge its three values are read as
+    /// input files and the link silently gains three phantom inputs.
+    ///
+    /// No fixture we could plausibly write would have surfaced this — it comes
+    /// from the table, which is the point.
+    #[test]
+    fn multi_argument_options_consume_all_their_values() {
+        let parsed = ParsedInvocation::parse(argv(&[
+            "-sectcreate",
+            "__TEXT",
+            "__info_plist",
+            "plist.xml",
+            "real.o",
+        ]));
+        assert_eq!(
+            parsed.input_paths(),
+            vec![Path::new("real.o")],
+            "option values were misread as inputs"
+        );
+        assert!(parsed.unrecognized().is_empty());
+    }
+
+    #[test]
+    fn four_argument_options_consume_all_their_values() {
+        let parsed = ParsedInvocation::parse(argv(&[
+            "-rename_section",
+            "__OLD",
+            "__old",
+            "__NEW",
+            "__new",
+            "real.o",
+        ]));
+        assert_eq!(parsed.input_paths(), vec![Path::new("real.o")]);
+    }
+
+    /// `-platform_version macos 11.0 14.0` is the modern replacement for
+    /// `-macosx_version_min`, and takes three arguments.
+    #[test]
+    fn platform_version_consumes_its_three_values() {
+        let parsed =
+            ParsedInvocation::parse(argv(&["-platform_version", "macos", "11.0", "14.0", "a.o"]));
+        assert_eq!(parsed.input_paths(), vec![Path::new("a.o")]);
+    }
+
+    #[test]
+    fn an_option_whose_declared_arity_cannot_be_satisfied_is_reported() {
+        // Truncated input is malformed, not unknown. Both the option and its
+        // orphaned value are surfaced, and neither is silently consumed or
+        // read past the end of the vector.
+        let parsed = ParsedInvocation::parse(argv(&["-sectcreate", "__TEXT"]));
+        assert!(parsed.unrecognized().contains(&"-sectcreate"));
+        assert!(parsed.input_paths().is_empty());
+    }
+
+    /// Inside a `-Wl,` payload the same arity rules apply, but the values are
+    /// the following *comma elements*. Splitting blindly on commas would make
+    /// `_main` look like its own ld64 option.
+    #[test]
+    fn wl_payload_honours_option_arity() {
+        let parsed = ParsedInvocation::parse(argv(&["-Wl,-exported_symbol,_main"]));
+        let flags: Vec<&str> = parsed
+            .args
+            .iter()
+            .filter_map(|(_, a)| match a {
+                LinkerArg::LinkerFlag(f) => Some(f.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(flags, vec!["-exported_symbol _main"]);
+    }
+
+    #[test]
+    fn wl_payload_still_splits_independent_flags() {
+        let parsed = ParsedInvocation::parse(argv(&["-Wl,-dead_strip,-no_pie"]));
+        assert_eq!(parsed.args.len(), 2);
+    }
+
+    #[test]
+    fn longest_joined_prefix_wins() {
+        // `-weak-lfoo` is a weak library request, not `-l` with the value
+        // `weak-lfoo`.
+        let parsed = ParsedInvocation::parse(argv(&["-weak-lfoo"]));
+        assert!(matches!(
+            parsed.args[0].1,
+            LinkerArg::KnownUnmodelled(ref s) if s == "-weak-lfoo"
+        ));
     }
 
     #[test]

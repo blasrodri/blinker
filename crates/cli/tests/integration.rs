@@ -1,15 +1,15 @@
 //! End-to-end tests: real `cargo build` invocations driven through the real
 //! blinker binary.
 //!
-//! These are the tests that actually establish the M0 acceptance criteria.
-//! Unit tests over synthetic argv can only confirm we handle the arguments we
-//! *imagined*; only a genuine build confirms we handle the ones rustc emits.
+//! These establish the M0 acceptance criteria. Unit tests over synthetic argv
+//! can only confirm we handle the arguments we *imagined*; only a genuine build
+//! confirms we handle the ones rustc emits.
 //!
-//! They are correspondingly slow (each spawns a full `cargo build`), so the
-//! set is kept small and each test earns its place by checking something no
-//! unit test can.
+//! The project-shape tests are driven by [`blinker_test_support::catalog`], so
+//! adding a shape there gets it built, recorded, and checked here without a new
+//! test being written by hand.
 
-use blinker_test_support::{workspace_binary, RustFixture, MINIMAL_MAIN, MULTI_MODULE_MAIN};
+use blinker_test_support::{catalog, workspace_binary, Network, RustFixture, MULTI_MODULE_MAIN};
 use std::path::Path;
 
 fn blinker() -> std::path::PathBuf {
@@ -23,150 +23,189 @@ fn record_into(dir: &Path) -> Vec<String> {
     vec![format!("--blinker-record-invocation={}", dir.display())]
 }
 
-#[test]
-fn minimal_rust_binary_builds_and_runs_through_blinker() {
-    let fixture = RustFixture::binary("minimal", MINIMAL_MAIN).unwrap();
-    let build = fixture
-        .build_with_linker(&blinker(), &record_into(&fixture.recording_dir()))
-        .unwrap();
-
-    assert!(
-        build.success,
-        "build failed through blinker\nstderr:\n{}",
-        build.stderr
-    );
-
-    // Building is necessary but not sufficient — the produced executable must
-    // actually run. A linker that emits a well-formed but non-functional
-    // binary would pass a build-only check.
-    let exe = fixture
-        .path()
-        .join("target/aarch64-apple-darwin/debug")
-        .join(fixture.name());
-    let output = std::process::Command::new(&exe).output().unwrap();
-    assert!(output.status.success(), "produced binary did not run");
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "fixture ok");
+/// Whether crates.io is reachable, so network-dependent fixtures can be skipped
+/// rather than reported as failures on an offline machine.
+fn network_available() -> bool {
+    std::net::TcpStream::connect_timeout(
+        &"3.33.220.204:443".parse().expect("literal address parses"),
+        std::time::Duration::from_secs(3),
+    )
+    .is_ok()
+        || std::net::TcpStream::connect_timeout(
+            &"151.101.64.223:443"
+                .parse()
+                .expect("literal address parses"),
+            std::time::Duration::from_secs(3),
+        )
+        .is_ok()
 }
 
+/// Every project shape in the catalog must build through blinker, and every
+/// argument rustc emits for it must classify.
+///
+/// This is the M0 acceptance bar. It is one test rather than nine because the
+/// catalog is the source of truth — a new shape should not need a new test.
 #[test]
-fn multi_module_binary_with_tls_and_panic_path_builds_and_runs() {
-    let fixture = RustFixture::binary("multimod", MULTI_MODULE_MAIN).unwrap();
-    let build = fixture.build_with_linker(&blinker(), &[]).unwrap();
+fn every_project_shape_builds_and_fully_classifies() {
+    let online = network_available();
+    let mut checked = 0;
+
+    for kind in catalog() {
+        if kind.network == Network::Required && !online {
+            eprintln!("skipping {}: needs crates.io", kind.tag);
+            continue;
+        }
+
+        let fixture = kind.build().expect("fixture is creatable");
+        let build = fixture
+            .build_with_linker(&blinker(), &record_into(&fixture.recording_dir()))
+            .expect("cargo runs");
+
+        assert!(
+            build.success,
+            "fixture `{}` ({}) failed to build through blinker\nstderr:\n{}",
+            kind.tag, kind.exercises, build.stderr
+        );
+
+        for record in build.all_recordings() {
+            let unrecognized = record["unrecognized_arguments"]
+                .as_array()
+                .expect("records always carry the field");
+            assert!(
+                unrecognized.is_empty(),
+                "fixture `{}` produced arguments blinker does not model: {unrecognized:?}\n\
+                 Add them to the `arguments` crate — check `reference.rs` for the \
+                 option's arity before assuming it takes no value.",
+                kind.tag
+            );
+            assert_eq!(record["mode"], "delegated");
+            assert_eq!(record["exit_code"], 0);
+            assert_eq!(record["arch"], "arm64");
+
+            // A `missing: true` input means an argument was misparsed into a
+            // path that was never a path — the signature of an arity bug.
+            for input in record["inputs"].as_array().expect("inputs is an array") {
+                assert_eq!(
+                    input["missing"], false,
+                    "fixture `{}` classified a non-existent input: {}\n\
+                     This usually means a value-taking option's value was read \
+                     as an input file.",
+                    kind.tag, input["path"]
+                );
+            }
+        }
+        checked += 1;
+    }
+
     assert!(
-        build.success,
-        "build failed through blinker\nstderr:\n{}",
-        build.stderr
+        checked >= 8,
+        "expected at least 8 shapes, checked {checked}"
     );
+}
 
-    let exe = fixture
-        .path()
-        .join("target/aarch64-apple-darwin/debug")
-        .join(fixture.name());
+/// Building is necessary but not sufficient — the produced executable has to
+/// run, and its panic path has to reach the runtime's handler.
+#[test]
+fn produced_binaries_run_and_unwind() {
+    let fixture = RustFixture::new("runcheck")
+        .and_then(|f| {
+            let name = f.name();
+            f.file(
+                "Cargo.toml",
+                &format!(
+                    "[package]\nname = \"{name}\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n"
+                ),
+            )
+        })
+        .and_then(|f| f.file("src/main.rs", MULTI_MODULE_MAIN))
+        .expect("fixture is creatable");
 
-    let ok = std::process::Command::new(&exe).output().unwrap();
+    let build = fixture
+        .build_with_linker(&blinker(), &[])
+        .expect("cargo runs");
+    assert!(build.success, "stderr:\n{}", build.stderr);
+
+    let exe = fixture.built_binary();
+    let ok = std::process::Command::new(&exe)
+        .output()
+        .expect("binary runs");
     assert!(ok.status.success());
     assert!(String::from_utf8_lossy(&ok.stdout).starts_with("alpha beta:"));
 
-    // Panic unwinding must reach the runtime's handler and produce the usual
-    // message — this is the M0 smoke test for the unwind path that M3 will
-    // properly validate.
     let panicked = std::process::Command::new(&exe)
         .env("FIXTURE_SHOULD_PANIC", "1")
         .output()
-        .unwrap();
+        .expect("binary runs");
     assert!(!panicked.status.success());
     assert!(String::from_utf8_lossy(&panicked.stderr).contains("requested panic"));
 }
 
-/// The central M0 deliverable: a recorded corpus entry describing a real link.
+/// The central M0 deliverable: a recording that describes a real link
+/// completely enough to be useful.
 #[test]
 fn recorded_invocation_captures_the_real_link_configuration() {
-    let fixture = RustFixture::binary("record", MINIMAL_MAIN).unwrap();
+    let fixture = catalog()
+        .into_iter()
+        .find(|k| k.tag == "multimod")
+        .expect("multimod fixture exists")
+        .build()
+        .expect("fixture is creatable");
+
     let build = fixture
         .build_with_linker(&blinker(), &record_into(&fixture.recording_dir()))
-        .unwrap();
+        .expect("cargo runs");
     assert!(build.success, "stderr:\n{}", build.stderr);
 
     let record = build.single_recording();
-
-    assert_eq!(record["mode"], "delegated");
-    assert_eq!(record["exit_code"], 0);
-    assert_eq!(record["arch"], "arm64");
-    assert!(
-        record["deployment_target"]
-            .as_str()
-            .is_some_and(|s| s.starts_with("macosx")),
-        "unexpected deployment target: {:?}",
-        record["deployment_target"]
-    );
+    assert!(record["deployment_target"]
+        .as_str()
+        .is_some_and(|s| s.starts_with("macosx")));
     assert!(record["output_path"]
         .as_str()
-        .is_some_and(|s| s.contains(fixture.name())));
+        .is_some_and(|s| s.contains(fixture.name().as_str())));
 
-    // A real link reads many inputs; zero would mean classification silently
-    // failed to recognize the positional arguments.
-    let inputs = record["inputs"].as_array().unwrap();
+    let inputs = record["inputs"].as_array().expect("inputs is an array");
     assert!(
         inputs.len() > 5,
-        "expected several inputs, found {}",
+        "expected several inputs, got {}",
         inputs.len()
     );
-    assert!(record["counters"]["bytes_read"].as_u64().unwrap() > 0);
+    assert!(record["counters"]["bytes_read"].as_u64().expect("counter") > 0);
 
-    // Every input rustc named must exist on disk. A `missing: true` entry means
-    // we misparsed an argument into a path that was never a path.
-    for input in inputs {
-        assert_eq!(
-            input["missing"], false,
-            "classified a non-existent input: {}",
-            input["path"]
-        );
-    }
-}
-
-/// If rustc emits an argument we do not model, this test is how we find out —
-/// it is the mechanism behind the "unknown arguments are inventoried" bar.
-#[test]
-fn real_rustc_invocation_contains_no_unrecognized_arguments() {
-    let fixture = RustFixture::binary("unknownargs", MULTI_MODULE_MAIN).unwrap();
-    let build = fixture
-        .build_with_linker(&blinker(), &record_into(&fixture.recording_dir()))
-        .unwrap();
-    assert!(build.success, "stderr:\n{}", build.stderr);
-
-    let record = build.single_recording();
-    let unrecognized = record["unrecognized_arguments"].as_array().unwrap();
+    // Archiving is what makes the recording replayable at all: rustc deletes
+    // the temp directory holding the object files as soon as the link returns.
     assert!(
-        unrecognized.is_empty(),
-        "rustc emitted arguments blinker does not model: {unrecognized:?}\n\
-         This is expected to happen as the corpus grows — add them to the \
-         `arguments` crate's classifier rather than relaxing this assertion."
+        inputs.iter().all(|i| i["archived_path"].is_string()),
+        "every input should have been archived"
     );
+    assert!(record["replay_argv"].is_array());
 }
 
 #[test]
 fn recorded_invocation_can_be_replayed() {
-    let fixture = RustFixture::binary("replay", MINIMAL_MAIN).unwrap();
+    let fixture = catalog()
+        .into_iter()
+        .find(|k| k.tag == "minimal")
+        .expect("minimal fixture exists")
+        .build()
+        .expect("fixture is creatable");
+
     let build = fixture
         .build_with_linker(&blinker(), &record_into(&fixture.recording_dir()))
-        .unwrap();
+        .expect("cargo runs");
     assert!(build.success, "stderr:\n{}", build.stderr);
 
-    let recording = &build.recordings[0];
-
-    // Replaying re-runs the exact recorded argument vector. This is what makes
-    // the corpus a regression suite rather than just an archive.
-    let status = std::process::Command::new(blinker())
+    let out = std::process::Command::new(blinker())
         .arg(format!(
             "--blinker-replay-invocation={}",
-            recording.display()
+            build.recordings[0].display()
         ))
         .output()
-        .unwrap();
+        .expect("blinker runs");
     assert!(
-        status.status.success(),
+        out.status.success(),
         "replay failed:\n{}",
-        String::from_utf8_lossy(&status.stderr)
+        String::from_utf8_lossy(&out.stderr)
     );
 }
 
@@ -176,7 +215,7 @@ fn version_and_help_work_without_a_link_configuration() {
         let out = std::process::Command::new(blinker())
             .arg(flag)
             .output()
-            .unwrap();
+            .expect("blinker runs");
         assert!(out.status.success(), "{flag} failed");
         assert!(!out.stdout.is_empty(), "{flag} printed nothing");
     }
@@ -187,21 +226,19 @@ fn unknown_blinker_option_fails_loudly_rather_than_being_forwarded() {
     let out = std::process::Command::new(blinker())
         .arg("--blinker-not-a-real-option")
         .output()
-        .unwrap();
+        .expect("blinker runs");
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("unknown blinker option"));
 }
 
 #[test]
 fn fallback_linker_failure_propagates_its_exit_code() {
-    // A link that cannot succeed must surface the underlying linker's status,
-    // not a status blinker invented.
     let out = std::process::Command::new(blinker())
         .arg("/nonexistent/blinker/input.o")
         .arg("-o")
         .arg("/nonexistent/blinker/output")
         .output()
-        .unwrap();
+        .expect("blinker runs");
     assert!(
         !out.status.success(),
         "linking a nonexistent input unexpectedly succeeded"

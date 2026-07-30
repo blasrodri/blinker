@@ -110,7 +110,71 @@ overlooked.
 
 ---
 
-## 4. Argument classification is complete for the observed corpus
+## 4. Arity, not existence, is the dangerous unknown — so the option table is generated, not discovered
+
+**How this was found.** The `-L` bug below (finding 4a) was found by building a
+build-script fixture and watching classification fail. That works, but it scales
+terribly: each such bug waits for a project that happens to trigger it, and the
+failure mode is silent.
+
+The realisation: knowing an option *exists* is the easy half. The half that
+corrupts a link is knowing how many arguments it **consumes**. Get that wrong
+and the linker's own arguments are read as input files — nothing errors, the
+link is just wrong.
+
+**What replaced the guessing.** Two authoritative sources encode arity directly:
+
+- **Apple's `man ld`** on the host toolchain documents each option with its
+  argument names (`-alias symbol_name alternate_symbol_name`), so arity is
+  mechanically extractable — 209 options.
+- **LLD's `lld/MachO/Options.td`** declares `Flag` / `Separate` / `Joined` /
+  `MultiArg`, covering options Apple's page omits and disambiguating the
+  dual-spelling ones.
+
+Merged, that is **238 options with known arity**, now in
+`crates/arguments/src/reference.rs` and driving classification.
+
+**What this caught that fixtures never would have.** 16 options take *more than
+one* argument:
+
+```
+-rename_section(4)
+-platform_version(3)  -sectcreate(3)  -sectalign(3)  -segprot(3)  -sectorder(3)  -segcreate(3)
+-alias(2)  -add_empty_section(2)  -rename_segment(2)  -section_order(2)  -segaddr(2)
+-move_to_ro_segment(2)  -move_to_rw_segment(2)  -seg_page_size(2)  -sectobjectsymbols(2)
+```
+
+`-sectcreate __TEXT __info_plist plist.xml` would have contributed three phantom
+input files. `-platform_version` is the modern replacement for
+`-macosx_version_min` and takes three. None of these appear in any fixture we
+would have thought to write.
+
+**A second arity bug the table exposed.** Inside a `-Wl,` payload the same rules
+apply, but values are the following *comma elements*:
+`-Wl,-exported_symbol,_main` is one option consuming one value, not two flags.
+The original code split blindly on commas.
+
+**The corpus's real job, corrected.** After all nine fixture shapes, the corpus
+exercises **3 of 238** options (`-arch`, `-dead_strip`, `-framework`). Iterative
+discovery would have modelled 3. The table models 238, so an option appearing
+for the first time in someone else's project is already parsed correctly. The
+corpus now answers *which options matter in practice*, not *which exist* —
+which is what it is actually good for.
+
+Regenerate after a toolchain update with `scripts/extract-ld-options.sh`.
+
+### 4a. `-L` arrives in two spellings
+
+`man ld` documents only the attached form (`-Ldir`), so the separate form is not
+derivable from it — LLD's table is the source that declares both. rustc emits
+both: a build script's `cargo:rustc-link-search=` arrives as `-L` followed by
+the path as a separate argument, everything else arrives attached. Handling only
+the attached form silently drops the search path, and the native library the
+build script just compiled fails to resolve. Same applies to `-F` and `-l`.
+
+---
+
+## 5. Argument classification is complete for the observed corpus
 
 All arguments in the observed invocations classify without falling through to
 `Unrecognized`. An integration test asserts this and is designed to fail loudly
@@ -122,14 +186,29 @@ This is expected to happen as the corpus grows — add them to the
 `arguments` crate's classifier rather than relaxing this assertion.
 ```
 
-**Caveat on breadth.** The current corpus is narrow: single-crate binaries with
-no build scripts, no C dependencies, no proc macros, no framework linkage, and
-no `cargo test` harness. The classifier being complete says little until the
-corpus covers those. Expanding it is the first task remaining in M0.
+**Corpus breadth.** Nine project shapes are covered, driven by a catalog in
+`blinker_test_support::catalog` that both the integration tests and the corpus
+tool iterate — adding a shape gets it built, recorded, and checked without
+writing a new test:
+
+| Shape | Exercises |
+|---|---|
+| `minimal` | smallest linkable binary |
+| `multimod` | several modules, TLS, statics, panic path |
+| `workspace` | multi-crate workspace, cross-crate rlib linkage |
+| `buildscript` | build script emitting link arguments |
+| `cdep` | C static library built and linked via build script |
+| `procmacro` | proc macro at compile time, normal link of the user |
+| `testharness` | `cargo test --no-run` harness binary |
+| `generics` | heavy generic instantiation, many codegen units |
+| `deps` | real crates.io dependency graph (serde, serde_json, regex) |
+
+All nine build through blinker with zero unmodelled arguments. Scale: 371 inputs
+and 202 MB read across the nine links.
 
 ---
 
-## 5. Anything the linker prints makes rustc emit a warning
+## 6. Anything the linker prints makes rustc emit a warning
 
 **Spec assumption.** §7 shows a concise human-readable summary printed on every
 link ("mode: incremental / elapsed: 82 ms / …"), with §31's `--print-stats`
@@ -160,21 +239,64 @@ results a developer will actually want to watch.
 
 ---
 
-## Remaining M0 work
+## 7. Whole-build wall time cannot measure linker overhead
 
-The scaffolding, recorder, and harness are done and the gate is green
-(90 tests). Not yet done:
+**What was tried.** Time a full clean `cargo build` with the system linker and
+with blinker, and compare. Median of repeated runs, per fixture:
 
-1. **Corpus breadth.** Run the recorder over ≥5 representative real projects —
-   including a build-script crate, a C dependency, a proc-macro user, and a
-   `cargo test --no-run` harness binary — and inventory whatever new arguments
-   appear. This is the actual M0 acceptance bar and the input to M1's scope.
-2. **Baseline timing report.** Record system-linker latency across those
-   projects, so every later performance claim has a same-machine baseline to
-   compare against. blinker already measures and records the delegation time; it
-   needs to be run over real workloads and written up.
+```
+FIXTURE         SYSTEM (ms) BLINKER (ms)     OVERHEAD
+minimal                 543          476       -12.3%
+multimod                280          317        13.3%
+workspace               421          382         -9.1%
+buildscript             569          534         -6.1%
+cdep                    737          745          1.0%
+procmacro               589          624          6.1%
+testharness             219          241          9.8%
+generics                264          218        -17.3%
+deps                   4004         3619         -9.6%
+```
+
+**Why it says nothing.** The spread runs from −17% to +13%, including
+impossible negatives — blinker cannot make a link faster while delegating to the
+same linker. Compile time is an order of magnitude larger than link time, and
+its variance alone exceeds the entire linker step. The instrument cannot resolve
+the quantity.
+
+**The instrument that works.** blinker's own recorded timings isolate the link
+step. Across the corpus:
+
+```
+Median link time:  67 ms   (delegated to the system linker)
+blinker overhead:   8.9 ms per link (13.2% of the link step)
+  argument parsing  0.12 ms
+  fingerprinting    0.30 ms
+  remainder         ~8.5 ms — input archiving (27 files, 17 MB copied)
+```
+
+Archiving only happens when `--blinker-record-invocation` is set. Steady-state
+overhead without recording is under a millisecond.
+
+**Consequence for M4.** Benchmarking must measure the link step, not the build.
+The implementation plan's scenario suite should be built on blinker's recorded
+per-link timings, with whole-build wall time reported only as context. A
+plan that compares `cargo build` durations will not be able to detect the effect
+it is trying to measure.
 
 ---
+
+## Remaining M0 work
+
+Scaffolding, recorder, corpus, and baseline are done; the gate is green.
+Remaining:
+
+1. **External projects.** The nine fixtures are synthetic. Running the recorder
+   over a handful of real third-party repositories would confirm the argument
+   inventory holds outside our own constructions — particularly anything using
+   frameworks, `-sectcreate`, or a `build.rs` that emits unusual link args.
+2. **Response files.** Still unit-tested only; no fixture is large enough to
+   make rustc use one (finding 3). Worth confirming against a genuinely large
+   external project.
 
 ## Decisions taken during M0
 
