@@ -6,6 +6,7 @@ members = [
     "crates/archive",
     "crates/layout",
     "crates/macho",
+    "crates/relocations",
     "crates/symbols",
     "crates/tbd",
     "crates/arguments",
@@ -24,6 +25,7 @@ blinker-diagnostics = { path = "crates/diagnostics" }
 blinker-archive = { path = "crates/archive" }
 blinker-layout = { path = "crates/layout" }
 blinker-macho = { path = "crates/macho" }
+blinker-relocations = { path = "crates/relocations" }
 blinker-symbols = { path = "crates/symbols" }
 blinker-tbd = { path = "crates/tbd" }
 blinker-test-support = { path = "crates/test-support" }

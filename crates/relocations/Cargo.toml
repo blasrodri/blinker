@@ -1,0 +1,8 @@
+[package]
+name = "blinker-relocations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blinker-macho = { workspace = true }
