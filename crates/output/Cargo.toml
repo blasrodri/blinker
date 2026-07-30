@@ -1,0 +1,9 @@
+[package]
+name = "blinker-output"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blinker-layout = { workspace = true }
+blinker-macho = { workspace = true }

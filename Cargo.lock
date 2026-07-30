@@ -118,6 +118,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "blinker-output"
+version = "0.1.0"
+dependencies = [
+ "blinker-layout",
+ "blinker-macho",
+]
+
+[[package]]
 name = "blinker-relocations"
 version = "0.1.0"
 dependencies = [
