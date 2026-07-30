@@ -1,0 +1,23 @@
+[package]
+name = "blinker-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+blinker-macho = { path = "../crates/macho" }
+
+[[bin]]
+name = "parse_macho"
+path = "fuzz_targets/parse_macho.rs"
+test = false
+doc = false
+bench = false
+
+# Keep the fuzz crate out of the workspace: it needs nightly, and building it
+# with the normal `cargo test` would force the whole workspace onto nightly.
+[workspace]

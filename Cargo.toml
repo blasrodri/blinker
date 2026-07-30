@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/cli",
     "crates/corpus",
+    "crates/macho",
     "crates/arguments",
     "crates/diagnostics",
     "crates/test-support",
@@ -16,8 +17,10 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 blinker-arguments = { path = "crates/arguments" }
 blinker-diagnostics = { path = "crates/diagnostics" }
+blinker-macho = { path = "crates/macho" }
 blinker-test-support = { path = "crates/test-support" }
 
 blake3 = "1"
+object = { version = "0.36", default-features = false, features = ["read_core", "macho", "archive", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

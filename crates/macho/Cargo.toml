@@ -1,0 +1,17 @@
+[package]
+name = "blinker-macho"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+object = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+blinker-test-support = { workspace = true }
+
+[[bin]]
+name = "blinker-inspect"
+path = "src/bin/inspect.rs"

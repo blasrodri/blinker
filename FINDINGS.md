@@ -1,9 +1,12 @@
-# M0 Findings
+# Findings
 
-What building the workload recorder actually taught us, recorded against the
-assumptions in [PRODUCT_SPEC.md](PRODUCT_SPEC.md). The point of Milestone 0 is
-to replace guesses about rustc's behaviour with observations, so the findings
-that *contradict* the spec are the valuable output.
+What building this actually taught us, recorded against the assumptions in
+[PRODUCT_SPEC.md](PRODUCT_SPEC.md). The findings that *contradict* the spec are
+the valuable output. Design choices and their evidence live in
+[DECISIONS.md](DECISIONS.md).
+
+Findings 1–7 are from M0 (the workload recorder); 8 onward are from M1 (object
+parsing).
 
 Environment these were observed on:
 
@@ -326,3 +329,37 @@ Carried into M1 rather than left open:
 | Logic in `blinker_cli` lib, thin `main.rs` | Lets the driver be tested directly rather than only through process spawning. |
 | JSON key set is fixed; unpopulated fields are `null` | Consumers index these directly; a stable key set means no defensive guards, and a test asserts the contract. |
 | Fingerprint fast path only (no hashing by default) | Spec §13's verification-path *policy* belongs to M4, where reuse decisions actually depend on it. The recorded shape already carries the fields M4 will need. |
+
+---
+
+## 8. The robustness harness found a real bug within minutes of existing
+
+**Context.** Spec §14 requires malformed input to produce a structured error
+rather than a panic. The obvious reading is "add bounds checks", and wrapping
+`object` (D1) appeared to satisfy that for free — its parser is bounds-checked
+and fuzzed upstream.
+
+**What the mutation tests found.** Not an out-of-bounds read. A *successful
+parse that produced an unusable structure*: a corrupted symbol whose section
+reference named a section that did not exist.
+
+Mach-O numbers sections from one, so the parser subtracts one to get an index.
+A corrupted `n_sect` naming section 200 in a 14-section object subtracts
+cleanly to 199 and was stored as a `SectionId(199)`. Nothing overflowed and
+nothing read out of bounds — `object`'s checks were never going to catch it,
+because the value is structurally valid and only semantically wrong.
+
+Downstream, every ID is treated as an index. A dangling one is a latent panic
+sitting inside a `ParsedObject` that claims to be fine.
+
+**The general lesson.** Inheriting a bounds-checked parser buys memory safety,
+not *semantic* validity. The invariants that matter here — every ID resolves —
+belong to our representation, so they must be enforced at our conversion
+boundary. Every index now passes through a range check against the table it
+refers into, and the fuzz target asserts the same invariant.
+
+**On the harness itself.** This was found by a deterministic mutation test that
+runs on stable in the normal gate, not by a fuzzing session. That split is
+deliberate: a regression here should fail in the gate rather than only in a
+session nobody has run recently. `fuzz/` exists for depth, and drives the same
+entry point with the same invariant assertion.
