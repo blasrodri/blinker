@@ -46,6 +46,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "blinker-corpus"
+version = "0.1.0"
+dependencies = [
+ "blinker-arguments",
+ "blinker-test-support",
+ "serde_json",
+]
+
+[[package]]
 name = "blinker-diagnostics"
 version = "0.1.0"
 dependencies = [

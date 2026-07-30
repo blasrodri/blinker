@@ -8,7 +8,10 @@
 use std::path::{Path, PathBuf};
 
 pub mod fixture;
-pub use fixture::{FixtureBuild, RustFixture, MINIMAL_MAIN, MULTI_MODULE_MAIN};
+pub use fixture::{
+    catalog, BuildCommand, FixtureBuild, FixtureKind, Network, RustFixture, HEAVY_GENERICS_MAIN,
+    MINIMAL_MAIN, MULTI_MODULE_MAIN,
+};
 
 /// A scratch directory that removes itself on drop.
 pub struct TempDir(PathBuf);

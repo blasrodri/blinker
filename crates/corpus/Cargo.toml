@@ -1,0 +1,14 @@
+[package]
+name = "blinker-corpus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "blinker-corpus"
+path = "src/main.rs"
+
+[dependencies]
+blinker-arguments = { workspace = true }
+blinker-test-support = { workspace = true }
+serde_json = { workspace = true }
