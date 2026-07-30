@@ -403,3 +403,77 @@ classification by sniffing content would silently start linking metadata.
 member but is not a member in the structural sense — it is an index. The reader
 surfaces it as such, so member lists must be compared against `ar` minus that
 entry.
+
+---
+
+## 10. A `.tbd` is a multi-document file, and reading one document finds 3 of 9,264 symbols
+
+**Spec assumption.** §21 describes `.tbd` handling as extracting "install names,
+exports, re-exports, architecture constraints, and platform constraints" — a
+list of fields, implying one stub describes one library.
+
+**Observed.** `libSystem.B.tbd` is 3,760 lines containing **40 YAML documents**:
+libSystem itself, then every library it re-exports, inline in the same file.
+Measured against the real SDK stub:
+
+```
+documents in the file:              40
+symbols in the primary document:     3
+symbols after following re-exports: 9,264
+```
+
+libSystem's own `exports` block lists three symbols
+(`___crashreporter_info__`, `_libSystem_init_after_boot_tasks_4launchd`,
+`_mach_init_routine`). `_malloc` lives in the re-exported
+`/usr/lib/system/libsystem_malloc.dylib` document at line 2,822 of the same
+file.
+
+A reader that took the first document and stopped would report that libSystem
+exports three symbols, and every link would fail with thousands of undefined
+symbols.
+
+**Consequence.** Resolution walks `reexported-libraries` breadth-first,
+resolving each install name against the other documents in the same file. The
+walk guards against cycles — the graph is declared data and nothing guarantees
+it is acyclic — and skips names that live in other files, which is the library
+resolver's job in M3.
+
+---
+
+## 11. Architecture matching cannot be exact, or every link fails
+
+**Spec assumption.** §21 lists "architecture filtering" among the `.tbd`
+resolver's jobs, which reads as: match the target, discard the rest.
+
+**Observed.** `libSystem.B.tbd` declares:
+
+```yaml
+targets: [ x86_64-macos, x86_64-maccatalyst, arm64e-macos, arm64e-maccatalyst ]
+```
+
+**There is no `arm64-macos`.** Our target is `aarch64-apple-darwin` — plain
+arm64. Exact filtering discards libSystem entirely.
+
+Yet arm64 binaries link against it constantly. Confirmed empirically rather
+than assumed:
+
+```
+$ cc -arch arm64 -o t t.c && lipo -archs t
+arm64
+$ otool -L t
+	/usr/lib/libSystem.B.dylib
+```
+
+`arm64e` is arm64 plus pointer authentication; the two share a symbol set, and
+the toolchain accepts an arm64e stub for an arm64 link.
+
+**Consequence.** Architecture matching treats arm64 and arm64e as compatible,
+and **nothing else** — the rule is deliberately narrow, since widening it would
+begin accepting stubs that genuinely do not match. Platform still matches
+exactly, so `maccatalyst` never satisfies a `macos` link even at the same
+architecture. Both halves are pinned by tests, including one asserting that
+libSystem's real declared target list yields exactly `arm64e-macos` for an
+arm64 macOS link.
+
+Of the 330 stubs in the SDK, 330 mention `arm64e-macos` and only 32 mention
+`arm64-macos` — so this is the common case, not an edge case.

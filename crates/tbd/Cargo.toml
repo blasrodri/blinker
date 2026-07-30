@@ -1,0 +1,12 @@
+[package]
+name = "blinker-tbd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+yaml-rust2 = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
