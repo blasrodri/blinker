@@ -1,0 +1,13 @@
+[package]
+name = "blinker-symbols"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blinker-archive = { workspace = true }
+blinker-macho = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }

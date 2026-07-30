@@ -109,6 +109,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "blinker-symbols"
+version = "0.1.0"
+dependencies = [
+ "blinker-archive",
+ "blinker-macho",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "blinker-tbd"
 version = "0.1.0"
 dependencies = [

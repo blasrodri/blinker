@@ -114,3 +114,69 @@ That gap is the whole argument for the plan's ordering. Spec §35 asks for ≥80
 of unchanged object parsing to be avoided; these numbers say what that is worth
 in absolute terms, and confirm that input parsing — not output generation — is
 where a repeated-link win comes from.
+
+---
+
+## D4: blinker emulates the compiler driver rather than replacing `ld64`
+
+**Date:** M2 kickoff. **Status:** adopted.
+
+### The question
+
+FINDINGS 1 established that rustc invokes the *C compiler driver*, not `ld`, so
+blinker receives driver-shaped arguments. That leaves two ways to link
+internally:
+
+- **(a) Emulate the driver** — interpret `-arch`, `-mmacosx-version-min=`,
+  `-lSystem`, `-Wl,…` ourselves and perform the link.
+- **(b) Become an `ld64` replacement** invoked *by* a driver, with the user
+  configuring `-fuse-ld=` instead of `linker=`.
+
+(b) is tempting because it narrows the surface to real `ld64` options. But it
+changes the product: the spec's user experience (§7) is a single `linker=` line
+in `.cargo/config.toml`, and `-fuse-ld` would mean a different, more fragile
+setup that also keeps a driver process in the hot path we are trying to make
+fast.
+
+### What decided it
+
+Asking `cc -###` what `ld` invocation it builds from rustc's exact argument
+vector. The delta is the entire job (a) requires:
+
+```text
+-syslibroot   <SDK path>              # driver discovers the SDK
+-platform_version macos 11.0.0 26.5   # translated from -mmacosx-version-min=,
+                                      # SDK version supplied by the driver
+-L/usr/local/lib                      # default search path
+-dynamic                              # output kind
+-demangle, -lto_library, -mllvm …     # diagnostics and LTO; not needed here
+```
+
+Two things make this tractable:
+
+1. **With `-nodefaultlibs`, the driver adds no startup object.** There is no
+   `crt1.o` to synthesise — macOS dynamic executables use `LC_MAIN`, and dyld
+   calls `main` directly. rustc always passes `-nodefaultlibs`, so the default
+   library injection that makes driver emulation hard elsewhere does not apply.
+2. **The rest is four values**, three of which are discovery rather than logic.
+
+### Decision
+
+Emulate the driver. blinker keeps the `linker=` installation the spec
+describes, and internally performs what `cc` would have asked `ld` to do.
+
+### Consequences
+
+- **blinker must discover the SDK itself.** `-syslibroot` and the SDK version in
+  `-platform_version` come from the driver, not from rustc — a requirement §12
+  gestures at ("macOS SDK identity") without saying where it comes from. This is
+  now an explicit input, discovered via `xcrun --show-sdk-path` /
+  `--show-sdk-version` with the results cached, since SDK metadata changes far
+  less often than workspace objects (§21).
+- **`-mmacosx-version-min=` must be translated**, not passed through: `ld64`
+  spells it `-platform_version <platform> <min> <sdk>`, and the SDK half is not
+  in the input at all.
+- `/usr/local/lib` joins the default search paths.
+- The fallback path is unaffected — it delegates to `cc` and gets all of this
+  for free, which is why fallback stays correct while the internal path is
+  being built.
