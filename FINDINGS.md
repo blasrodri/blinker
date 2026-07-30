@@ -91,22 +91,31 @@ cache will need content addressing anyway.
 
 ---
 
-## 3. Response files do not appear at small scale
+## 3. Response files do not appear in practice — and now we know why
 
 **Spec assumption.** §41 item 3 lists safe response-file expansion as an M0
 deliverable, implying they are routinely present.
 
-**Observed.** A minimal build passed all 37 arguments directly; no `@file`
-appeared. Response files are an argument-length-limit mitigation and only show
-up once the input set is large.
+**Observed.** Not one `@file` argument appeared across 13 recorded links,
+including four real third-party projects. The reason is measurable:
 
-**Consequence.** Expansion is implemented and unit-tested anyway (nested files,
-cycles, quoting, escapes) because a workspace of real size will use them — but
-the *integration* fixtures do not currently exercise that path. The large
-fixture that M4 benchmarking needs should be checked for response-file use, and
-if it triggers them, an end-to-end test should cover it. Until then, response
-file handling is unit-tested only, and that gap is deliberate rather than
-overlooked.
+```
+longest command line observed:  71,306 bytes  (tokei, 353 arguments, 342 inputs)
+macOS ARG_MAX:               1,048,576 bytes
+headroom:                              15x
+```
+
+A response file is an argument-length mitigation. rustc only reaches for one
+when the command would exceed the limit, and a typical Rust link is 15x below
+it. Triggering one needs a project roughly fifteen times larger than ripgrep or
+tokei — plausible for a very large monorepo, not for ordinary work.
+
+**Consequence.** Expansion stays implemented and unit-tested (nested files,
+cycles, quoting, escapes) because the failure mode if we are wrong is a link
+that cannot start at all. But it is now understood as a rare path rather than a
+routine one, and the absence of an integration test for it is a measured
+judgement rather than an untested gap. If M4's large benchmark project ever
+produces one, that is the moment to add the end-to-end test.
 
 ---
 
@@ -174,37 +183,37 @@ build script just compiled fails to resolve. Same applies to `-F` and `-l`.
 
 ---
 
-## 5. Argument classification is complete for the observed corpus
+## 5. The argument inventory holds on real third-party projects
 
-All arguments in the observed invocations classify without falling through to
-`Unrecognized`. An integration test asserts this and is designed to fail loudly
-as the corpus grows:
+The nine built-in fixtures are synthetic — they contain the shapes we thought to
+construct. Four real projects were recorded as the check on that:
+
+| Project | Inputs | argv | Command line | Link | Frameworks |
+|---|---:|---:|---:|---:|---|
+| tokei | 342 | 353 | 71 KB | 135 ms | |
+| fd | 327 | 343 | 67 KB | 142 ms | Foundation |
+| hyperfine | 319 | 332 | 69 KB | 80 ms | Security |
+| ripgrep | 310 | 321 | 65 KB | 114 ms | |
+
+**Zero unmodelled arguments.** Real projects added `-liconv`, `-lobjc`, and
+`-framework Foundation` / `-framework Security` — all already handled.
+
+Across the whole corpus of 13 links: 1,669 inputs, 672 MB read, median link
+81 ms.
+
+**Scale gap worth noting.** Real projects link ~320 inputs; the synthetic
+fixtures link 27–82. Anything sensitive to input count — the M4 cache, the M5
+graph — should be exercised against the real projects rather than the fixtures,
+which are an order of magnitude too small to be representative.
+
+An integration test asserts the inventory stays clean and is designed to fail
+loudly as the corpus grows:
 
 ```
 rustc emitted arguments blinker does not model: [...]
-This is expected to happen as the corpus grows — add them to the
-`arguments` crate's classifier rather than relaxing this assertion.
+Add them to the `arguments` crate — check `reference.rs` for the option's
+arity before assuming it takes no value.
 ```
-
-**Corpus breadth.** Nine project shapes are covered, driven by a catalog in
-`blinker_test_support::catalog` that both the integration tests and the corpus
-tool iterate — adding a shape gets it built, recorded, and checked without
-writing a new test:
-
-| Shape | Exercises |
-|---|---|
-| `minimal` | smallest linkable binary |
-| `multimod` | several modules, TLS, statics, panic path |
-| `workspace` | multi-crate workspace, cross-crate rlib linkage |
-| `buildscript` | build script emitting link arguments |
-| `cdep` | C static library built and linked via build script |
-| `procmacro` | proc macro at compile time, normal link of the user |
-| `testharness` | `cargo test --no-run` harness binary |
-| `generics` | heavy generic instantiation, many codegen units |
-| `deps` | real crates.io dependency graph (serde, serde_json, regex) |
-
-All nine build through blinker with zero unmodelled arguments. Scale: 371 inputs
-and 202 MB read across the nine links.
 
 ---
 
@@ -287,16 +296,24 @@ it is trying to measure.
 
 ## Remaining M0 work
 
-Scaffolding, recorder, corpus, and baseline are done; the gate is green.
-Remaining:
+None blocking. The milestone's deliverables are met:
 
-1. **External projects.** The nine fixtures are synthetic. Running the recorder
-   over a handful of real third-party repositories would confirm the argument
-   inventory holds outside our own constructions — particularly anything using
-   frameworks, `-sectcreate`, or a `build.rs` that emits unusual link args.
-2. **Response files.** Still unit-tested only; no fixture is large enough to
-   make rustc use one (finding 3). Worth confirming against a genuinely large
-   external project.
+- Cargo-compatible delegating linker, with argument parsing and normalization.
+- Invocation recording with archived inputs, and working replay.
+- JSON metrics on every link.
+- Fixture corpus: nine synthetic shapes plus four real third-party projects.
+- Baseline timing report (finding 7), with the caveat that whole-build wall
+  time is the wrong instrument.
+- Argument inventory: clean across all 13 links, with 238 ld64 options modelled
+  by arity ahead of ever being seen.
+
+Carried into M1 rather than left open:
+
+1. **The driver-vs-ld64 scope question** (finding 1) — whether blinker emulates
+   the compiler driver or replaces `ld64` under one. The corpus is now large
+   enough to settle it.
+2. **Response files** (finding 3) — rare, measured at 15x headroom, unit-tested
+   only. Revisit if M4's large benchmark project produces one.
 
 ## Decisions taken during M0
 

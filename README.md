@@ -43,6 +43,26 @@ cargo test
 section (or just the `linker` key). Nothing else is left behind — blinker keeps
 no global state, and at M0 every link is performed by the system linker anyway.
 
+## Corpus tooling
+
+`blinker-corpus` builds projects through blinker with recording on, then reports
+what the links actually contained:
+
+```bash
+cargo build
+./target/debug/blinker-corpus gather --out corpus          # nine built-in fixture shapes
+./target/debug/blinker-corpus external --project ~/src/ripgrep --out corpus
+./target/debug/blinker-corpus report --records corpus      # argument inventory
+./target/debug/blinker-corpus baseline --repeat 3          # timing comparison
+```
+
+The inventory's most important line is the unmodelled-argument list: anything
+there is a spelling the classifier does not understand yet. Before adding one,
+check its arity in `crates/arguments/src/reference.rs` — assuming a value-taking
+option takes none causes its values to be silently read as input files.
+
+See [FINDINGS.md](FINDINGS.md) for what the corpus has established so far.
+
 ## Recording a corpus
 
 The point of M0 is to gather real linker invocations from real projects:

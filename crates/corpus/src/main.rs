@@ -15,6 +15,7 @@
 //!
 //! ```text
 //! blinker-corpus gather [--out DIR] [--offline] [--keep]
+//! blinker-corpus external --project DIR [--out DIR] [--tag NAME]
 //! blinker-corpus report --records DIR
 //! blinker-corpus baseline [--repeat N] [--offline]
 //! ```
@@ -33,6 +34,7 @@ fn main() -> std::process::ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("gather") => cmd_gather(&args[1..]),
+        Some("external") => cmd_external(&args[1..]),
         Some("report") => cmd_report(&args[1..]),
         Some("baseline") => cmd_baseline(&args[1..]),
         Some("--help") | Some("-h") | None => {
@@ -56,18 +58,24 @@ blinker-corpus — gather and analyse real linker invocations
 
 USAGE:
     blinker-corpus gather [--out DIR] [--offline] [--keep]
+    blinker-corpus external --project DIR [--out DIR] [--tag NAME]
     blinker-corpus report --records DIR
     blinker-corpus baseline [--repeat N] [--offline]
 
 COMMANDS:
     gather     Build every fixture through blinker, recording each invocation,
                then print the argument inventory.
+    external   Build a real third-party project through blinker and record it.
+               The built-in fixtures are synthetic; this is what confirms the
+               argument inventory holds outside our own constructions.
     report     Re-print the inventory from an existing directory of records.
     baseline   Time each fixture's link through the system linker and through
                blinker, on this machine.
 
 OPTIONS:
     --out DIR      Where to write records (default: ./corpus)
+    --project DIR  Cargo project to build (external only)
+    --tag NAME     Label for the recorded links (external only)
     --records DIR  Directory of records to analyse
     --repeat N     Timed builds per fixture (default: 3)
     --offline      Skip fixtures that need crates.io
@@ -199,6 +207,82 @@ fn cmd_gather(args: &[String]) -> Result<(), String> {
     if !failures.is_empty() {
         return Err(format!("{} fixture(s) failed", failures.len()));
     }
+    Ok(())
+}
+
+/// Build a real third-party project through blinker, recording every link.
+///
+/// The built-in fixtures are synthetic — they contain the shapes we thought to
+/// construct. A real project is the check on that: it exercises dependency
+/// graphs, build scripts, and link configurations nobody designed for our
+/// convenience, and it is where a response file is most likely to appear.
+fn cmd_external(args: &[String]) -> Result<(), String> {
+    let flags = Flags::parse(args);
+    let project = PathBuf::from(
+        flags
+            .value("project")
+            .ok_or("external requires --project DIR")?,
+    );
+    let out = PathBuf::from(flags.value("out").unwrap_or("corpus"));
+    let tag = flags.value("tag").map(str::to_string).unwrap_or_else(|| {
+        project
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "external".to_string())
+    });
+
+    if !project.join("Cargo.toml").exists() {
+        return Err(format!("{} has no Cargo.toml", project.display()));
+    }
+    let blinker = blinker_binary()?;
+    std::fs::create_dir_all(&out).map_err(|e| format!("cannot create {}: {e}", out.display()))?;
+
+    // Record into a directory inside the project so a relative path in the
+    // linker argument cannot be resolved against the wrong working directory.
+    let records = project.join("blinker-records");
+    let _ = std::fs::remove_dir_all(&records);
+    std::fs::create_dir_all(&records).map_err(|e| e.to_string())?;
+
+    println!("Building {} through blinker…", project.display());
+
+    let rustflags = format!(
+        "-C linker={} -C link-arg=--blinker-record-invocation={}",
+        blinker.display(),
+        records.display()
+    );
+    let output = std::process::Command::new("cargo")
+        .args(["build", "--target", "aarch64-apple-darwin"])
+        .current_dir(&project)
+        .env("RUSTFLAGS", rustflags)
+        .env_remove("CARGO_BUILD_RUSTFLAGS")
+        .env_remove("CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER")
+        .output()
+        .map_err(|e| format!("cannot run cargo: {e}"))?;
+
+    let mut copied = 0;
+    if let Ok(entries) = std::fs::read_dir(&records) {
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let name = path.file_name().expect("entry has a name");
+            let dest = out.join(format!("{tag}-{}", name.to_string_lossy()));
+            std::fs::copy(&path, &dest).map_err(|e| format!("cannot copy record: {e}"))?;
+            copied += 1;
+        }
+    }
+    let _ = std::fs::remove_dir_all(&records);
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for line in stderr.lines().filter(|l| l.contains("error")).take(8) {
+            println!("  {line}");
+        }
+        return Err(format!("{tag} failed to build"));
+    }
+
+    println!("  recorded {copied} link(s) as `{tag}`");
     Ok(())
 }
 
