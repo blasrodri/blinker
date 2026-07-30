@@ -99,6 +99,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "blinker-layout"
+version = "0.1.0"
+dependencies = [
+ "blinker-macho",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "blinker-macho"
 version = "0.1.0"
 dependencies = [

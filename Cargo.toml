@@ -4,6 +4,7 @@ members = [
     "crates/cli",
     "crates/corpus",
     "crates/archive",
+    "crates/layout",
     "crates/macho",
     "crates/symbols",
     "crates/tbd",
@@ -21,6 +22,7 @@ license = "MIT OR Apache-2.0"
 blinker-arguments = { path = "crates/arguments" }
 blinker-diagnostics = { path = "crates/diagnostics" }
 blinker-archive = { path = "crates/archive" }
+blinker-layout = { path = "crates/layout" }
 blinker-macho = { path = "crates/macho" }
 blinker-symbols = { path = "crates/symbols" }
 blinker-tbd = { path = "crates/tbd" }
