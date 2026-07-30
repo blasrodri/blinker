@@ -140,7 +140,7 @@ fn adrp_targets_in_a_real_binary_land_inside_the_image() {
         // The image is mapped from 0x100000000 upward. A decode error puts the
         // target far outside that window.
         assert!(
-            target_page >= 0x1_0000_0000 && target_page < 0x2_0000_0000,
+            (0x1_0000_0000..0x2_0000_0000).contains(&target_page),
             "ADRP at {place:#x} decoded to page {target_page:#x}, outside the image"
         );
         checked += 1;
@@ -201,9 +201,9 @@ fn branches_in_a_real_binary_round_trip_and_stay_in_range() {
         // an exact bound.
         let place = *text_address + (index as u64 * 4);
         let target = (place as i64 + displacement) as u64;
+        let window = text_address.saturating_sub(0x10_0000)..(text_address + size + 0x10_0000);
         assert!(
-            target >= text_address.saturating_sub(0x10_0000)
-                && target < text_address + size + 0x10_0000,
+            window.contains(&target),
             "branch at {place:#x} targets {target:#x}, far outside __TEXT"
         );
         checked += 1;

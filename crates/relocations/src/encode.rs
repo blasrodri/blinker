@@ -135,7 +135,7 @@ pub fn imm12_scale(instruction: u32) -> u64 {
 /// Encode a 12-bit immediate at bits [21:10], scaled per the instruction.
 pub fn encode_imm12(instruction: u32, byte_offset: u64) -> Result<u32, EncodeError> {
     let scale = imm12_scale(instruction);
-    if scale > 1 && byte_offset % scale != 0 {
+    if scale > 1 && !byte_offset.is_multiple_of(scale) {
         return Err(EncodeError::Misaligned {
             value: byte_offset as i64,
             alignment: scale,
