@@ -1,0 +1,128 @@
+# blinker
+
+An incremental Mach-O linker for repeated Rust development builds on Apple
+Silicon, aimed at cutting the link latency in edit–build–test loops run by
+humans, IDEs, and coding agents.
+
+**Status: Milestone 0 — workload recorder.** blinker currently records what
+`rustc` asks a linker to do and delegates the actual link to the system linker.
+It does not yet produce Mach-O output. See [PRODUCT_SPEC.md](PRODUCT_SPEC.md)
+for the full product definition and [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md)
+for the milestone sequence.
+
+## Requirements
+
+- Apple Silicon Mac (`aarch64-apple-darwin` is the only supported target)
+- Rust stable toolchain
+- Xcode command line tools (`/usr/bin/cc` must exist)
+
+## Build
+
+```bash
+cargo build --release
+```
+
+The binary lands at `target/release/blinker`.
+
+## Use it as your linker
+
+```toml
+# .cargo/config.toml
+[target.aarch64-apple-darwin]
+linker = "/absolute/path/to/blinker"
+```
+
+Then build as normal:
+
+```bash
+cargo build
+cargo test
+```
+
+**To restore the default linker**, delete that `[target.aarch64-apple-darwin]`
+section (or just the `linker` key). Nothing else is left behind — blinker keeps
+no global state, and at M0 every link is performed by the system linker anyway.
+
+## Recording a corpus
+
+The point of M0 is to gather real linker invocations from real projects:
+
+```bash
+cargo build --config 'target.aarch64-apple-darwin.rustflags = ["-C", "link-arg=--blinker-record-invocation=/tmp/corpus"]'
+```
+
+Each link writes `/tmp/corpus/<output-name>-<pid>.json` plus a
+`<output-name>-<pid>.inputs/` directory holding a copy of every input file.
+
+The archived inputs are what make a recording **replayable**. `rustc` writes the
+object files for a link into a temporary directory it deletes the moment the
+linker returns, so a recording that stored only paths would be dangling by the
+time you opened it. Replay a recorded link with:
+
+```bash
+blinker --blinker-replay-invocation=/tmp/corpus/mycrate-12345.json
+```
+
+Replay rewrites the output path into a scratch directory, so it can never
+overwrite a real build artifact.
+
+## Options
+
+blinker occupies the position `rustc` invokes as the C compiler driver, so its
+argument vector is full of driver flags (`-o`, `-L`, `-l`, `-arch`, `-Wl,…`).
+Every blinker option therefore carries a `--blinker-` prefix that cannot collide
+with a driver or `ld64` flag, and is stripped before the remaining arguments are
+forwarded.
+
+| Option | Meaning |
+|---|---|
+| `--blinker-fallback-linker <PATH>` | Linker to delegate to (default: discovered) |
+| `--blinker-record-invocation <DIR>` | Record this invocation, with inputs, into `DIR` |
+| `--blinker-replay-invocation <FILE>` | Replay a recorded invocation |
+| `--blinker-json-diagnostics <PATH>` | Write the machine-readable record to `PATH` |
+| `--blinker-diagnostics <LEVEL>` | `quiet` \| `normal` \| `verbose` |
+| `--blinker-print-stats` | Print the human-readable summary |
+| `--blinker-strict-fingerprints` | BLAKE3-hash every input rather than trusting metadata |
+| `--blinker-version`, `--blinker-help` | Version / help |
+
+Because these must travel through `rustc` to reach the linker, pass them as
+`-C link-arg=--blinker-…`. Use the inline `=` form so `rustc` cannot separate an
+option from its value.
+
+### Fallback linker discovery
+
+Highest precedence first:
+
+1. `--blinker-fallback-linker <PATH>`
+2. the `BLINKER_FALLBACK_LINKER` environment variable
+3. `/usr/bin/cc`, then `/usr/bin/clang`
+
+An explicitly configured path that does not exist is an error rather than a
+silent fall-through to a default — quietly substituting a different linker would
+change link semantics without saying so.
+
+The default is `cc` rather than `ld` because that is what `rustc` itself invokes;
+see [FINDINGS.md](FINDINGS.md).
+
+## Development
+
+```bash
+./scripts/check.sh          # full gate: fmt, clippy, unit + end-to-end tests
+./scripts/check.sh --fast   # skip the slow real-cargo-build tests
+```
+
+There is no hosted CI. blinker is developed on the same Apple Silicon hardware
+it targets, so the gate script runs locally and is the merge bar for every
+milestone deliverable.
+
+### Layout
+
+| Crate | Role |
+|---|---|
+| `crates/cli` | Entry point, driver, fallback execution, record/replay |
+| `crates/arguments` | Argument classification and response-file expansion |
+| `crates/diagnostics` | JSON record schema, timings, input fingerprints |
+| `crates/test-support` | Fixture generation and the end-to-end harness |
+
+Crates are introduced as milestones need them rather than scaffolded up front;
+the full target layout is in the implementation plan.
