@@ -29,6 +29,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "blinker-archive"
+version = "0.1.0"
+dependencies = [
+ "blinker-macho",
+ "blinker-test-support",
+ "object",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "blinker-arguments"
 version = "0.1.0"
 dependencies = [

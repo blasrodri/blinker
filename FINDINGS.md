@@ -363,3 +363,43 @@ runs on stable in the normal gate, not by a fuzzing session. That split is
 deliberate: a regression here should fail in the gate rather than only in a
 session nobody has run recently. `fuzz/` exists for depth, and drives the same
 entry point with the same invariant assertion.
+
+---
+
+## 9. `lib.rmeta` is a real Mach-O object, so skipping it must be name-based
+
+**Spec assumption.** §15 asks for "deliberate skipping of Rust metadata members
+that are not linker inputs" — which reads as tidiness, an optimisation to avoid
+handing a non-object to an object parser.
+
+**Observed.** It is not tidiness. It is required for correctness.
+
+`lib.rmeta` inside a Rust `.rlib` is a **genuine Mach-O 64-bit arm64 object**:
+
+```
+$ file lib.rmeta
+lib.rmeta: Mach-O 64-bit object arm64
+
+$ otool -l lib.rmeta | grep -A1 sectname
+  sectname .rmeta
+   segname __DWARF
+```
+
+rustc wraps crate metadata in an object container so `ar` and linkers handle it
+like any other member. It parses cleanly. Worse, its single section is
+`__DWARF,.rmeta`, which our own classifier files as `SectionKind::Debug` — so a
+content-based filter would not merely accept it, it would accept it as
+*plausible debug data* and link the entire metadata blob into the output.
+
+The toolchain also ships a second such member, `lib.rmeta-link`, which older
+descriptions of the rlib format do not mention.
+
+**Consequence.** Member classification is by **name**, and the test that pins
+this asserts the surprising half explicitly: metadata *does* parse as Mach-O,
+carries no code, and must be excluded anyway. A future refactor that "improves"
+classification by sniffing content would silently start linking metadata.
+
+**Related.** The archive symbol table (`__.SYMDEF`) is listed by `ar t` as a
+member but is not a member in the structural sense — it is an index. The reader
+surfaces it as such, so member lists must be compared against `ar` minus that
+entry.
