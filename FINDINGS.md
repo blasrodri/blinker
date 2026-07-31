@@ -1949,3 +1949,49 @@ A driver that applies edits from separate files rather than inline `sed`, over
 a longer and more varied sequence, on a project with real dependencies. Then
 the last of the cache's four numbers — how often an edit exceeds its slop — has
 a distribution behind it instead of a single reassuring sample.
+
+## 46. The unwinding fault is in `__eh_frame`'s contents, located precisely
+
+`panic=unwind` still faults, but the crash report now names the exact code:
+
+```
+  libunwind  LocalAddressSpace::getEncodedP
+  libunwind  CFI_Parser::parseCIE
+  libunwind  CFI_Parser::findFDE
+  libunwind  UnwindCursor::setInfoBasedOnIPRegister
+  libunwind  _Unwind_RaiseException
+```
+
+This is progress worth stating plainly. The unwinder **finds the FDE** — which
+means `__unwind_info`, its DWARF-mode offsets, and the two-level index are all
+being consumed correctly (findings 30, 32). It then follows the FDE to its CIE
+and segfaults reading the CIE's encoded pointers.
+
+So the fault is in `__eh_frame`'s **bytes**, not in the table that indexes them.
+Everything above `__eh_frame` in the stack has now been verified against
+ld-prime and works.
+
+### The leading hypothesis, labelled as one
+
+blinker **concatenates** each object's `__eh_frame` and aligns each contribution
+to its declared alignment. CFI records are self-delimiting — each begins with
+its own length, and **a zero length terminates the section**. Alignment padding
+inserted *between* two objects' contributions is a run of zero bytes, which a
+CFI walker reads as a terminator or, worse, as a record with a nonsense length.
+
+ld-prime does not concatenate. It parses `__eh_frame`, deduplicates CIEs, and
+rewrites every FDE's CIE back-pointer — which is why its `__eh_frame` is a
+single coherent chain and blinker's is several chains with gaps.
+
+This is a hypothesis. This project has recorded five that survived reasoning
+and died to measurement (13, 33, 35, 36, 41), so it is written down as
+something to test, not to act on. The test is cheap: dump blinker's
+`__eh_frame` and walk the records by length, checking whether the chain reaches
+the end of the section or hits a zero-length record partway.
+
+### Why this matters for sequencing
+
+`panic=unwind` is the default for `cargo build`. Until it works, blinker cannot
+link a normal Rust project, and the incremental work — however fast — has
+nothing usable to be fast *on*. This should be finished before step 2 of the
+incremental design.
