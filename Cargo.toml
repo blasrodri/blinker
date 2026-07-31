@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/cli",
+    "crates/cache",
     "crates/differential",
     "crates/corpus",
     "crates/archive",
@@ -24,6 +25,7 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 blinker-arguments = { path = "crates/arguments" }
+blinker-cache = { path = "crates/cache" }
 blinker-diagnostics = { path = "crates/diagnostics" }
 blinker-differential = { path = "crates/differential" }
 blinker-archive = { path = "crates/archive" }

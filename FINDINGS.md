@@ -2583,3 +2583,78 @@ the same symbolized backtrace frame for frame:
 - `RUST_BACKTRACE=1` walking the full stack through `catch_unwind`
 
 Two regression tests cover it, and both were confirmed to fail without the fix.
+
+## 59. The output cache passes the test the parse cache failed
+
+Finding 41 killed the parse cache by measuring its premise: deserialising a
+`ParsedObject` is 1.7–3.5× *slower* than parsing the object, because it must
+allocate every `String` and `Vec` the borrowing parser merely pointed at.
+
+The replacement design caches **relocated section bytes**. Same test, opposite
+answer:
+
+```
+  recompute (the relocate stage)   7.3   ms
+  load 1.03 MB from a warm cache   0.065 ms      112x
+```
+
+The reason is the reason finding 41 gave, inverted. Patched bytes have no
+structure to rebuild: they deserialise into a `Vec<u8>` — one allocation and a
+copy. The property that made parsing cheap is the same property that makes
+*this* artifact cheap to reload, and it is the presence or absence of interior
+structure that decides which way the comparison goes.
+
+Worth stating as the general rule, since this project has now measured it in
+both directions: **a cache is worth building only when the artifact is flatter
+than the computation that produced it.**
+
+## 60. Content-hashing every input costs exactly what the cache saves
+
+The cache's validity rests on content hashes, never paths (finding 15). So the
+next premise to test, before wiring anything: what does hashing cost?
+
+```
+  blake3 over all 56 inputs, 17.2 MB:   7.28 ms   (2.48 GB/s)
+  the relocate stage it would replace:  7.3  ms
+```
+
+Net zero. Not marginal — the same number to two significant figures. A cache
+validated this way would have been built, measured, and found to be exactly as
+fast as no cache at all.
+
+That is the third time in this project that a cache design has been killed or
+reshaped by one measurement taken before the code (findings 41, 43, and this),
+and the first where the fatal cost was in the *validation* rather than in the
+storage.
+
+## 61. Two input classes need two keys, and that makes the cache viable
+
+Finding 60 does not kill the cache; it says the key is wrong for most inputs.
+Finding 15's argument — that rustc's object filenames carry a per-build session
+component, so a path-keyed cache has a 0% hit rate — is true of rustc's *own*
+codegen output and of nothing else. Splitting the inputs by that property:
+
+```
+  37 .o    rustc per-build codegen units    0.31 MB    1.8% of bytes
+  19 .rlib toolchain libraries             16.87 MB   98.2% of bytes
+```
+
+The bytes are almost entirely toolchain rlibs, whose paths are not merely
+stable but *already content-addressed*: rustup names them
+`libstd-4f24f0876fd27385.rlib`, hash included. They cannot change under a fixed
+path. Path, mtime and size are a sound key for them.
+
+Only the 1.8% that rustc rewrites every build needs hashing:
+
+```
+  blake3 over the 37 .o files only:  0.16 ms
+```
+
+**0.16 ms to validate, against 7.3 ms saved.** 45×, where the single-key design
+was 1.0×. The whole difference is in noticing that "inputs" is not one
+population.
+
+This also explains why finding 60's number looked so much like a coincidence.
+It is not one: both quantities scale with the same 17 MB, so hashing everything
+was always going to land near the cost of relocating everything. The ratio only
+moves once the key stops touching bytes that cannot have changed.

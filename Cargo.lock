@@ -72,6 +72,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "blinker-cache"
+version = "0.1.0"
+dependencies = [
+ "blake3",
+ "blinker-test-support",
+]
+
+[[package]]
 name = "blinker-cli"
 version = "0.1.0"
 dependencies = [
