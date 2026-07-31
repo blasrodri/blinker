@@ -2943,9 +2943,32 @@ assigned by position before anything is read, so results are collected
 positionally rather than as they finish. A link whose layout depends on thread
 scheduling is not a link.
 
+### The scan was allocation, not scanning
+
+The 1.8 ms spent finding undefined symbols was not the search. Both sets were
+keyed by `String`, so every round cloned the *entire symbol table of every
+object* — tens of thousands of allocations — to answer a question about set
+membership. Borrowing instead, and copying only the handful of names actually
+returned:
+
+```
+  cloning     5.7  5.7  5.6 ms
+  borrowing   5.0  5.1  5.0 ms      (sd 0.1-0.2, 20 iterations each)
+```
+
+0.6 ms, clean against the noise. `read+parse` is 6.9 ms to 5.0 across both
+changes.
+
+Worth naming because it is the same shape as finding 41, one level down: the
+expensive part of a data structure is rarely the operation it is named for. A
+`HashSet<String>` used only for `contains` is a copy of the data wearing a
+lookup's clothes.
+
 ### What this says to do next
 
-Not more parallelism. The remaining 4.1 ms is an algorithm — maintain the
-undefined set incrementally instead of recomputing it — and beyond that, the
-only way to stop paying for unchanged inputs is not to process them at all,
-which is the partial fast path finding 67 points at.
+Not more parallelism, and not more of this. Cold-link work is now within a few
+milliseconds of its floor for this structure, and the remaining stages —
+`resolve` at 6.4 ms and `relocate` at 7.3 — are doing work that a changed
+input genuinely requires. The only way to stop paying for *unchanged* inputs is
+not to process them at all, which is the partial fast path finding 67 points
+at.

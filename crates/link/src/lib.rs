@@ -839,24 +839,33 @@ fn needs_got(kind: Arm64RelocationKind) -> bool {
 /// `libSystem` rather than assumed: an unresolved symbol that libSystem does
 /// not export is a typo or a missing input, and silently binding it would turn
 /// a link error into a crash at first call.
+/// Every symbol referenced by the loaded objects and defined by none of them.
+///
+/// Called once per extraction round, so it is on the hot path of a cold link:
+/// four rounds over tens of thousands of symbols was 1.8 ms of a 6.9 ms stage
+/// (finding 68). Almost all of that was allocation — a first version cloned
+/// every symbol name into the `defined` set, which copies the entire symbol
+/// table of every object, four times, to answer a question about set
+/// membership. The sets borrow now, and only the handful of names actually
+/// returned are copied.
 fn undefined_references(objects: &[LoadedObject]) -> Vec<String> {
-    let mut defined = std::collections::HashSet::new();
+    let mut defined: HashSet<&str> = HashSet::new();
     for object in objects {
         for symbol in &object.parsed.symbols {
             if symbol.strength.is_definition() {
-                defined.insert(symbol.name.clone());
+                defined.insert(symbol.name.as_str());
             }
         }
     }
 
     let mut names = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen: HashSet<&str> = HashSet::new();
     for object in objects {
         for symbol in &object.parsed.symbols {
-            if symbol.strength.is_definition() || defined.contains(&symbol.name) {
+            if symbol.strength.is_definition() || defined.contains(symbol.name.as_str()) {
                 continue;
             }
-            if seen.insert(symbol.name.clone()) {
+            if seen.insert(symbol.name.as_str()) {
                 names.push(symbol.name.clone());
             }
         }
