@@ -4,11 +4,49 @@ An incremental Mach-O linker for repeated Rust development builds on Apple
 Silicon, aimed at cutting the link latency in edit–build–test loops run by
 humans, IDEs, and coding agents.
 
-**Status: Milestone 0 — workload recorder.** blinker currently records what
-`rustc` asks a linker to do and delegates the actual link to the system linker.
-It does not yet produce Mach-O output. See [PRODUCT_SPEC.md](PRODUCT_SPEC.md)
-for the full product definition and [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md)
-for the milestone sequence.
+**Status: it links.** blinker produces Mach-O executables from real object
+files and archives, signs them itself, and the results run.
+
+| | |
+|---|---|
+| C programs | work, results match the system linker |
+| Rust, `-C panic=abort` | works, including panic messages and `SIGABRT` |
+| Rust, default (`panic=unwind`) | links and runs until something panics |
+| Speed | ~1.2× `ld-prime`, Apple's default linker |
+| Output size | 2.25× larger — no dead-stripping yet |
+
+Delegation to the system linker remains the default; pass `--blinker-internal`
+to link internally.
+
+See [PRODUCT_SPEC.md](PRODUCT_SPEC.md) for the product definition,
+[IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for the milestone sequence,
+and **[FINDINGS.md](FINDINGS.md)** for the 41 places reality contradicted the
+plan — several of them contradicting earlier entries in the same file.
+
+## What is not done
+
+- **Unwinding.** `panic=unwind` faults after printing the panic message. The
+  `__unwind_info` table is built and matches the system linker's values; the
+  fault is elsewhere and has not been located.
+- **Dead-stripping.** Every archive member pulled in is emitted whole, which is
+  where the 2.25× size comes from.
+- **The cache.** The whole point of the project, and not started. The parse
+  cache originally planned was measured and struck (finding 41): parsing is
+  faster than any deserialiser. The addressable cost is `resolve` and
+  `relocate`, so the cache must store relocated output keyed by codegen unit.
+
+## Measuring it
+
+```bash
+# capture a real link's arguments with a shim linker, then:
+scripts/bench.py <captured-args>            # blinker vs the system linker
+scripts/bench.py <captured-args> --profile  # blinker's own stage breakdown
+```
+
+The harness interleaves both linkers, discards warmup, verifies every run
+succeeded, and reports spread. Each of those exists because an earlier version
+without it produced a wrong number that was believed — see the header of
+`scripts/bench.py`.
 
 ## Requirements
 
