@@ -3923,11 +3923,23 @@ results are collected positionally — so no thread's timing can reach the
 output. Verified byte-identical.
 
 2.3 ms, where an earlier split had attributed ~8 ms to parsing. The difference
-is that the earlier measurement was taken before findings 78's fixes; what is
-left in the pull is not parsing at all. `Frontier::absorb` clones every symbol
-name of every arriving object into an owned `HashSet<String>` — 937 objects'
-worth — and that is now the cost. It is the same owned-`String` representation
-that finding 82 names as the structural problem, showing up in a third place.
+is that the earlier measurement was taken before findings 78's fixes; three
+quarters of what parallelism looked worth had already been removed by making
+the surrounding loop cheaper.
+
+Where the rest of `read+parse` goes, measured rather than inferred:
+
+```
+  read+parse          24.8 ms
+    Frontier::absorb   5.9 ms      cloning every symbol name into a HashSet
+    member parse       ~2 ms       now concurrent
+    the rest          ~17 ms       reading 89 MB, parsing 21 objects, probing
+```
+
+`absorb` is a quarter of the stage, not the bulk — the inference was right in
+kind and wrong in size, which is why it was then measured. It is the same
+owned-`String` representation finding 82 names as the structural problem,
+showing up in a third place.
 
 **Parallelism moves a cost; it does not remove one.** Three quarters of what
 this looked worth had already been fixed by making the surrounding loop
