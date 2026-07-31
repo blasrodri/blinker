@@ -1518,6 +1518,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
             rebases: &rebases,
             binds: &binds,
             entry_offset,
+            final_pass: true,
         },
     );
     timings.emit_ms = elapsed_ms(step);
@@ -2454,6 +2455,9 @@ fn placements_for(objects: &[LoadedObject], strip: &Strip) -> Vec<InputPlacement
 /// of *decisions* rather than of accumulated arguments.
 #[derive(Default)]
 struct Assembly<'a> {
+    /// Whether this pass produces the real image. The layout probe does not,
+    /// and signing what it produces hashes megabytes that are then dropped.
+    final_pass: bool,
     placements: &'a [InputPlacement],
     symbols: &'a [OutputSymbol],
     contents: Option<&'a HashMap<usize, Vec<u8>>>,
@@ -2470,8 +2474,12 @@ fn assemble(request: &LinkRequest, assembly: &Assembly<'_>) -> Result<Image, Lin
         rebases,
         binds,
         entry_offset,
+        final_pass: _,
     } = *assembly;
     let mut builder = ImageBuilder::new();
+    if !assembly.final_pass {
+        builder.unsigned();
+    }
     // Padding is for the next link, not this one: it costs image size and buys
     // the property that an edit which grows one contribution does not move
     // every contribution after it — which is what keeps the cache's placement

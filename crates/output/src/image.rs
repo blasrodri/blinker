@@ -72,6 +72,8 @@ pub struct ImageBuilder {
     /// Padding left after each contribution so a later edit can grow it in
     /// place. `Slop::NONE` unless asked for.
     slop: Slop,
+    /// Whether to compute the ad-hoc signature. See [`ImageBuilder::unsigned`].
+    sign: bool,
     /// The identifier embedded in the ad-hoc signature.
     ///
     /// `codesign` derives this from the output file's name. blinker does not
@@ -153,6 +155,7 @@ impl ImageBuilder {
     pub fn new() -> Self {
         ImageBuilder {
             slop: Slop::NONE,
+            sign: true,
             inputs: Vec::new(),
             contents: Vec::new(),
             symbols: SymbolTableBuilder::new(),
@@ -209,6 +212,23 @@ impl ImageBuilder {
     /// Entry point, as a **file offset** — see `LC_MAIN`.
     pub fn entry_offset(&mut self, offset: u64) -> &mut Self {
         self.entry_offset = offset;
+        self
+    }
+
+    /// Skip the ad-hoc signature.
+    ///
+    /// The linker assembles the image twice: once to discover where everything
+    /// lands, and once with real content. The first pass reads only
+    /// `Image::layout` — and signing it means SHA-256 over every page of a
+    /// megabytes-large buffer that is then dropped. On blinker's own binary
+    /// that was **6.2 ms per link**, cold and warm alike, hashing bytes nobody
+    /// looks at.
+    ///
+    /// The reservation is unaffected: `signature_size` is derived from the
+    /// image's length, not from the hashes, so the layout the probe reports is
+    /// the same either way.
+    pub fn unsigned(&mut self) -> &mut Self {
+        self.sign = false;
         self
     }
 
@@ -359,9 +379,15 @@ impl ImageBuilder {
             });
         }
         bytes.truncate(signature_start as usize);
-        let blob = sign(&bytes, &request);
-        debug_assert_eq!(blob.len(), signature_len);
-        bytes.extend_from_slice(&blob);
+        if self.sign {
+            let blob = sign(&bytes, &request);
+            debug_assert_eq!(blob.len(), signature_len);
+            bytes.extend_from_slice(&blob);
+        } else {
+            // The space is still reserved, so the layout and every offset in
+            // the load commands are the ones the signed image will have.
+            bytes.resize(bytes.len() + signature_len, 0);
+        }
 
         Ok(Image {
             bytes,
