@@ -1,0 +1,15 @@
+[package]
+name = "blinker-link"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+blinker-layout = { workspace = true }
+blinker-macho = { workspace = true }
+blinker-output = { workspace = true }
+blinker-relocations = { workspace = true }
+blinker-symbols = { workspace = true }
+
+[dev-dependencies]
+blinker-test-support = { workspace = true }

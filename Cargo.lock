@@ -121,6 +121,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "blinker-link"
+version = "0.1.0"
+dependencies = [
+ "blinker-layout",
+ "blinker-macho",
+ "blinker-output",
+ "blinker-relocations",
+ "blinker-symbols",
+ "blinker-test-support",
+]
+
+[[package]]
 name = "blinker-macho"
 version = "0.1.0"
 dependencies = [

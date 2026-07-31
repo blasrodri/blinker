@@ -236,6 +236,7 @@ fn parse_sections<'d>(
             name: name.to_string(),
             kind: classify_section(segment, name),
             size: section.size(),
+            vm_address: section.address(),
             // `object` reports alignment as a byte count already.
             alignment: section.align().max(1),
             file_offset: section.file_range().map(|(offset, _)| offset),

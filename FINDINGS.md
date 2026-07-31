@@ -782,3 +782,63 @@ wrong is a file too corrupt to diagnose from.
 
 The empty-image test that caught this looked like completeness padding when it
 was written. It was the only test that ran the degenerate shape end to end.
+
+## 21. Cross-object *data* is the case a test suite quietly misses
+
+The first end-to-end link tests all passed: a single object ran, a cross-object
+call ran, a global read ran. Linking two objects by hand, outside the harness,
+failed immediately:
+
+```
+link failed: object 1: cannot apply GotLoadPageOff12:
+  ARM64_RELOC_GOT_LOAD_PAGEOFF12 needs an indirect address that was not supplied
+```
+
+Three shapes look similar and are not:
+
+| reference | relocation | needs a GOT |
+|---|---|---|
+| global read, same object | `PAGE21` + `PAGEOFF12` | no |
+| call to another object | `BRANCH26` | no |
+| **data in another object** | `GOT_LOAD_PAGE21` + `GOT_LOAD_PAGEOFF12` | **yes** |
+
+The compiler cannot know whether an `extern` definition will end up in this
+image or in a dylib, so it emits the indirect form unconditionally and leaves
+the choice to the linker. Every test in the suite had picked one of the two
+shapes that avoid it.
+
+The lesson is not "write more tests" — the suite was reasonable. It is that a
+passing suite says nothing about the cases it does not contain, and running the
+thing by hand is how you find out which those are. This project has now had two
+such catches: the differential harness's deployment target (finding 13) and
+this one, both from doing the obvious thing manually and looking at the result.
+
+### What synthesising `__got` requires
+
+Four things, none of which the relocation engine can do alone:
+
+1. Scan every relocation for GOT-needing kinds and collect the target symbols.
+2. Place a synthesised section *before* layout runs, so it is addressed like
+   any other rather than appended afterwards. Layout keys contributions by
+   `(object, section)`, so the linker needs an object id that cannot collide
+   with a real input's.
+3. Patch the GOT-based relocations with the address of the **slot**, not of the
+   symbol — the symbol's address is what the slot *contains*.
+4. Emit a rebase entry per slot. The slots hold absolute addresses and the
+   image is position independent, so dyld has to relocate every one at load.
+
+Step 3 is the one that reads wrong until it clicks: `Context.target` and
+`Context.got` are different addresses and the instruction needs the latter.
+
+### Also found: the same-object assumption
+
+The cross-object *call* test failed first for an unrelated reason. Symbol
+addresses were resolved by searching the object holding the relocation, which
+is correct for locals and for self-contained files, and wrong the moment one
+object refers to another — the definition is elsewhere, so the lookup reported
+a symbol undefined that resolution had already found. Two coordinate systems
+that coincide in the single-object case.
+
+`blinker-link`'s module documentation had predicted exactly this class of bug
+("a symbol whose address is computed in one coordinate system and consumed in
+another") before the code was written. Predicting it did not prevent writing it.

@@ -176,6 +176,14 @@ pub struct InputSection {
     pub name: String,
     pub kind: SectionKind,
     pub size: u64,
+    /// Address of this section *within its own object file*.
+    ///
+    /// Relocatable objects are not laid out at a final address, but their
+    /// sections still carry addresses in a per-object coordinate space, and
+    /// symbol values are absolute in that space. Recovering a symbol's offset
+    /// within its section needs this — assuming zero is right only for the
+    /// first section, and silently misplaces every symbol after it.
+    pub vm_address: u64,
     /// Required alignment in bytes; always a power of two.
     pub alignment: u64,
     /// Offset of this section's bytes within the object file.
@@ -374,6 +382,7 @@ mod tests {
     fn qualified_name_uses_toolchain_spelling() {
         let section = InputSection {
             id: SectionId(0),
+            vm_address: 0,
             segment: "__TEXT".into(),
             name: "__text".into(),
             kind: SectionKind::Code,
@@ -389,6 +398,7 @@ mod tests {
     fn zero_filled_sections_have_no_file_bytes() {
         let bss = InputSection {
             id: SectionId(1),
+            vm_address: 0,
             segment: "__DATA".into(),
             name: "__bss".into(),
             kind: SectionKind::Bss,
@@ -447,6 +457,7 @@ mod tests {
             architecture: Architecture::Arm64,
             sections: vec![InputSection {
                 id: SectionId(0),
+                vm_address: 0,
                 segment: "__TEXT".into(),
                 name: "__text".into(),
                 kind: SectionKind::Code,

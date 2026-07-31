@@ -275,6 +275,14 @@ impl SymbolTable {
         );
     }
 
+    /// The text of an interned symbol name.
+    ///
+    /// Diagnostics carry `SymbolNameId`s to stay small; anything that reports
+    /// to a human needs to turn them back into strings.
+    pub fn name_of(&self, id: SymbolNameId) -> Option<&str> {
+        self.names.resolve(id)
+    }
+
     pub fn lookup(&self, name: &str) -> Option<&ResolvedSymbol> {
         let id = self.names.get(name)?;
         self.resolved.get(&id)
