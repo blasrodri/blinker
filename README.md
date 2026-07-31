@@ -79,7 +79,8 @@ cargo test
 
 **To restore the default linker**, delete that `[target.aarch64-apple-darwin]`
 section (or just the `linker` key). Nothing else is left behind — blinker keeps
-no global state, and at M0 every link is performed by the system linker anyway.
+no global state, and without `--blinker-internal` every link is performed by
+the system linker anyway.
 
 ## Corpus tooling
 
@@ -103,7 +104,8 @@ See [FINDINGS.md](FINDINGS.md) for what the corpus has established so far.
 
 ## Recording a corpus
 
-The point of M0 is to gather real linker invocations from real projects:
+Recording captures real linker invocations from real projects, which is how
+the arity table in `blinker-arguments` and most of FINDINGS were derived:
 
 ```bash
 cargo build --config 'target.aarch64-apple-darwin.rustflags = ["-C", "link-arg=--blinker-record-invocation=/tmp/corpus"]'
