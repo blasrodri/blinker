@@ -211,14 +211,18 @@ pub fn write_dysymtab(writer: &mut Writer, groups: &SymbolGroups) {
 
 /// Emit `LC_LOAD_DYLINKER`.
 pub fn write_load_dylinker(writer: &mut Writer, path: &str) {
-    // 12 bytes of fixed fields, then the padded path.
-    let command_size = 12 + padded_string_length(path);
+    // 12 bytes of fixed fields, then the path padded so the whole command is
+    // 8-byte aligned.
+    let command_size = command_size_with_path(12, path);
+    let start = writer.len();
     writer
         .u32(LC_LOAD_DYLINKER)
         .u32(command_size as u32)
         // Offset of the path within the command.
         .u32(12)
-        .c_string_padded(path);
+        .bytes(path.as_bytes())
+        .bytes(&[0]);
+    writer.pad_to(start + command_size);
 }
 
 /// Emit `LC_LOAD_DYLIB`.
@@ -229,7 +233,8 @@ pub fn write_load_dylib(
     current_version: u32,
     compatibility_version: u32,
 ) {
-    let command_size = 24 + padded_string_length(path);
+    let command_size = command_size_with_path(24, path);
+    let start = writer.len();
     writer
         .u32(LC_LOAD_DYLIB)
         .u32(command_size as u32)
@@ -237,13 +242,26 @@ pub fn write_load_dylib(
         .u32(timestamp)
         .u32(current_version)
         .u32(compatibility_version)
-        .c_string_padded(path);
+        .bytes(path.as_bytes())
+        .bytes(&[0]);
+    writer.pad_to(start + command_size);
 }
 
-/// Length of a NUL-terminated string padded to a 4-byte boundary.
-fn padded_string_length(value: &str) -> usize {
-    let raw = value.len() + 1;
-    raw.div_ceil(4) * 4
+/// Size of a path-carrying load command, rounded to the alignment 64-bit
+/// Mach-O requires.
+///
+/// **Load commands in a 64-bit image must be 8-byte aligned, not 4.** Emitting
+/// a 4-aligned `LC_LOAD_DYLINKER` produces a file `otool -l` walks happily but
+/// `nm` rejects outright:
+///
+/// ```text
+/// truncated or malformed object (load command 7 cmdsize not a multiple of 8)
+/// ```
+///
+/// The real toolchain agrees: its `LC_LOAD_DYLINKER` for `/usr/lib/dyld`
+/// (13 characters) is `cmdsize 32`, not the 28 a 4-byte rounding would give.
+pub fn command_size_with_path(fixed: usize, path: &str) -> usize {
+    (fixed + path.len() + 1).div_ceil(8) * 8
 }
 
 /// Emit `LC_UUID`.
@@ -313,7 +331,11 @@ pub fn write_linkedit_data(writer: &mut Writer, command: u32, offset: u32, size:
 ///
 /// Layout needs this before the commands exist, so it is computed from shape
 /// rather than by emitting and measuring.
-pub fn command_size_for(layout: &Layout, dylib_count: usize, dylib_path_bytes: usize) -> usize {
+///
+/// `dylib_command_bytes` is the summed size of every `LC_LOAD_DYLIB`, fixed
+/// fields included — use [`command_size_with_path`] to compute each, so the
+/// prediction and the emission cannot disagree about the alignment rule.
+pub fn command_size_for(layout: &Layout, dylib_command_bytes: usize) -> usize {
     let segment_bytes: usize = layout
         .segments
         .iter()
@@ -324,13 +346,12 @@ pub fn command_size_for(layout: &Layout, dylib_count: usize, dylib_path_bytes: u
         + sizes::DYLD_INFO
         + sizes::SYMTAB
         + sizes::DYSYMTAB
-        + 12
-        + padded_string_length(DYLD_PATH)
+        + command_size_with_path(12, DYLD_PATH)
         + sizes::UUID
         + sizes::BUILD_VERSION_WITH_TOOL
         + sizes::SOURCE_VERSION
         + sizes::MAIN
-        + (dylib_count * 24 + dylib_path_bytes)
+        + dylib_command_bytes
         // LC_FUNCTION_STARTS, LC_DATA_IN_CODE, LC_CODE_SIGNATURE.
         + sizes::LINKEDIT_DATA * 3
 }
@@ -429,8 +450,10 @@ mod tests {
         write_load_dylinker(&mut w, DYLD_PATH);
         let declared = u32::from_le_bytes(w.as_slice()[4..8].try_into().expect("4 bytes"));
         assert_eq!(declared as usize, w.len());
-        // 12 fixed + 13 chars + NUL, padded to 16 → 28.
-        assert_eq!(w.len(), 28);
+        // 12 fixed + 13 chars + NUL = 26, rounded up to the 8-byte alignment
+        // a 64-bit image requires → 32. This is the value the real toolchain
+        // emits, and a 4-byte rounding to 28 makes `nm` reject the file.
+        assert_eq!(w.len(), 32);
 
         let mut w = writer();
         write_load_dylib(
@@ -444,14 +467,30 @@ mod tests {
         assert_eq!(declared as usize, w.len());
     }
 
+    /// 64-bit Mach-O requires 8-byte-aligned load commands. `otool -l` walks a
+    /// 4-aligned file happily; `nm` rejects it outright with "cmdsize not a
+    /// multiple of 8". Checking against only one tool would have missed this.
     #[test]
-    fn command_sizes_are_always_four_byte_aligned() {
-        // dyld's walk assumes it; an unaligned command would misalign the rest.
-        for path in ["/a", "/ab", "/abc", "/abcd", DYLD_PATH] {
+    fn command_sizes_are_always_eight_byte_aligned() {
+        for path in ["/a", "/ab", "/abc", "/abcd", "/abcde", "/abcdef", DYLD_PATH] {
             let mut w = writer();
             write_load_dylinker(&mut w, path);
-            assert_eq!(w.len() % 4, 0, "{path} produced an unaligned command");
+            assert_eq!(w.len() % 8, 0, "{path} produced an unaligned command");
+
+            let mut w = writer();
+            write_load_dylib(&mut w, path, 2, 0, 0);
+            assert_eq!(w.len() % 8, 0, "{path} produced an unaligned dylib command");
         }
+    }
+
+    #[test]
+    fn a_path_carrying_command_is_nul_terminated_within_its_padding() {
+        let mut w = writer();
+        write_load_dylinker(&mut w, DYLD_PATH);
+        let offset = u32::from_le_bytes(w.as_slice()[8..12].try_into().expect("4 bytes")) as usize;
+        let bytes = &w.as_slice()[offset..];
+        assert_eq!(&bytes[..DYLD_PATH.len()], DYLD_PATH.as_bytes());
+        assert_eq!(bytes[DYLD_PATH.len()], 0, "path must be NUL-terminated");
     }
 
     #[test]
@@ -588,7 +627,7 @@ mod tests {
         ];
         let layout = compute_layout(&inputs, 0x1000);
         let dylib = "/usr/lib/libSystem.B.dylib";
-        let predicted = command_size_for(&layout, 1, padded_string_length(dylib));
+        let predicted = command_size_for(&layout, command_size_with_path(24, dylib));
 
         // Emit everything the prediction accounts for and compare.
         let mut w = writer();

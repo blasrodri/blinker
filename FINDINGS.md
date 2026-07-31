@@ -477,3 +477,58 @@ arm64 macOS link.
 
 Of the 330 stubs in the SDK, 330 mention `arm64e-macos` and only 32 mention
 `arm64-macos` — so this is the common case, not an edge case.
+
+---
+
+## 12. 64-bit load commands must be 8-byte aligned, and only some tools say so
+
+**How it surfaced.** The first assembled image passed `otool -h` and `otool -l`
+cleanly — the header was right, and `otool` walked every load command without
+complaint. `nm` on the same file:
+
+```
+truncated or malformed object (load command 7 cmdsize not a multiple of 8)
+```
+
+Load command 7 was `LC_LOAD_DYLINKER`. I had emitted `cmdsize` 28: twelve fixed
+bytes plus `/usr/lib/dyld` (13 characters) plus a NUL, rounded up to a 4-byte
+boundary. **64-bit Mach-O requires 8.**
+
+The real toolchain agrees, and the evidence was already in the capture taken
+before any of this was written — its `LC_LOAD_DYLINKER` is `cmdsize 32`, not 28.
+I had read that number and not noticed what it implied.
+
+**Why one tool caught it and the other did not.** `otool` walks the command
+list permissively; `nm` validates alignment before reading. Both are Apple
+tools, on the same file, disagreeing about whether it is well formed. Checking
+against a single tool would have shipped this, and the eventual symptom would
+have been dyld refusing the binary with no useful message.
+
+**Consequence.** Path-carrying command sizes go through one function that
+applies the 8-byte rule, used by both the emitter and the size predictor so the
+two cannot drift apart. A test asserts the alignment across a range of path
+lengths, and the `LC_LOAD_DYLINKER` test now pins 32 explicitly with a note
+about why 28 is wrong.
+
+**The general lesson**, and the reason the differential suite is worth the
+effort: *our* assertions only check the format we believe in. Validation has to
+come from the programs that were right first — and from more than one of them,
+because they do not agree on what to check.
+
+### Status
+
+blinker now emits an image `file(1)` reports as `Mach-O 64-bit executable
+arm64`, whose segments, sections, symbols and linked library `otool` and `nm`
+read back correctly:
+
+```
+$ file /tmp/blinker-out
+/tmp/blinker-out: Mach-O 64-bit executable arm64
+
+$ nm -a /tmp/blinker-out
+                 U _exit
+0000000100004000 T _main
+```
+
+It is structurally valid, not yet runnable — the export trie, lazy binding and
+synthesised stubs are still missing, and nothing has been through dyld.

@@ -16,9 +16,11 @@
 pub mod commands;
 pub mod dyld_info;
 pub mod format;
+pub mod image;
 pub mod symtab;
 
 pub use commands::{LinkEditLayout, SymbolGroups};
 pub use dyld_info::{Bind, Rebase};
 pub use format::{MachHeader, Writer};
+pub use image::{Dylib, Image, ImageBuilder, ImageError};
 pub use symtab::{OutputSymbol, SymbolGroup, SymbolTable, SymbolTableBuilder};
