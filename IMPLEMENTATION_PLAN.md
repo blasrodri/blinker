@@ -740,6 +740,13 @@ objects and skips **100%** of the relocations:
 
 Per-object reuse covers it. What remained to win was part of 3.1 ms out of 16.1.
 
+### Superseded: the workload was too small (77)
+
+Everything below was measured on a 47-object fixture. On a real link — blinker
+linking itself, 921 objects — the same code was **7.44x** the system linker,
+because address lookup was quadratic. Fixed; now 3.77x. The section that
+follows described a link that had stopped being representative.
+
 ### Performance work here is done, on this workload
 
 Every remaining item in the profile is ~1 ms on a ~25 ms link whose run-to-run
@@ -784,6 +791,9 @@ pass that must stay. Nothing left is worth its risk at this size.
 - A harness that controls for a variable by removing it manufactures the
   configuration it then reports. Check what the environment *is*, from inside
   the harness, before controlling for it (75).
+- A benchmark fixture is a claim about scale, and it expires. Five findings of
+  carefully controlled measurement were taken on a workload too small to show
+  the system's dominant behaviour (77).
 - A profile says where time is spent; only an interleaved A/B says what
   removing it is worth. Two changes built on 1.2 ms and 1.0 ms profile lines
   bought no measurable time between them (76).

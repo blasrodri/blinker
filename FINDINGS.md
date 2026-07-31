@@ -3579,3 +3579,73 @@ floor.** The link is at parity with the system linker, and every remaining item
 is ~1 ms on a ~25 ms job with a run-to-run spread wider than that. Further
 work here needs either a different workload to measure against, or a
 structural change rather than another line of the profile.
+
+## 77. The fixture was too small to show that the linker was quadratic
+
+Every performance number in findings 72–76 came from one 47-object link. The
+spec asks for "at least one large real Rust project" and there was none, so
+blinker was pointed at the largest one to hand: **itself**.
+
+```
+                  fixture      blinker's own binary
+  inputs           27 files     79 files, 89.3 MB
+  objects          47           921
+  blinker/ld64     0.92x        7.44x
+```
+
+**7.44x.** Not a regression — it had always been there, and a fixture five
+times too small never asked the question. Relocation alone went from 3.1 ms to
+**187 ms**, sixty times worse for five times the input.
+
+### One line, called once per relocation
+
+```rust
+image.layout.sections.iter().enumerate()
+    .find(|(_, s)| s.address_of(object.parsed.id, relocation.section).is_some())
+```
+
+`address_of` scans every output section, and within each one every
+contribution. At 27 inputs that is a few hundred comparisons per relocation and
+invisible. At 79 inputs it is ~900 contributions × 15 sections × 200 000
+relocations.
+
+Nothing was wrong with the lookup. It was asked once per relocation when the
+answer changes once per *input section*, so it is now built once into a
+`HashMap<(object, section), (index, address)>` and read.
+
+```
+  relocate      187.0 ms  ->  26.9 ms
+  whole link    345 ms    ->  156 ms      7.44x -> 3.77x
+```
+
+The same pattern was in `address_map`, `output_symbols`, `entry_offset` and
+`target_address` — each doing a linear scan per *symbol*.
+
+### What the real workload actually costs
+
+```
+  read+parse   56.9 ms   38%      921 objects, 89 MB
+  dead-strip   30.6 ms   21%
+  relocate     25.9 ms   18%
+  emit+sign    11.3 ms    8%
+  resolve       7.7 ms    5%      layout 6.9 ms
+                                  ld64: 41.5 ms total
+```
+
+Nothing here is quadratic any more — every stage grew sublinearly in object
+count between the two workloads. blinker is 3.6x the system linker on a real
+binary, which is an honest starting number rather than a bug.
+
+`read+parse` is now the largest stage and the reason is structural: blinker
+materialises every symbol and relocation of every object into owned `Vec`s and
+`String`s, because `ParsedObject` was designed to be serialisable for a parse
+cache — a cache that was then measured and abandoned (41). The representation
+outlived its reason and is now the single largest cost in the link.
+
+### The rule
+
+**A benchmark fixture is a claim about scale, and it expires.** Five findings'
+worth of measurements, every one of them carefully interleaved and
+negative-controlled, were all taken on a workload too small to exhibit the
+dominant behaviour of the system. The methodology was sound and the sample was
+not, and no amount of care inside the harness could have shown that.
