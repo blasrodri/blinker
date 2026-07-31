@@ -156,6 +156,18 @@ pub fn link_timed(request: &LinkRequest) -> Result<(Image, LinkTimings), LinkErr
     Ok((image, timings))
 }
 
+pub mod reachability;
+
+/// Analyse how much `__text` the program can reach, without linking.
+///
+/// Reports what dead-stripping would remove. Separate from [`link`] because it
+/// changes no output: the model is checked against a linker that already
+/// strips correctly before anything is rebuilt around it (finding 70).
+pub fn reachability_report(request: &LinkRequest) -> Result<reachability::Report, LinkError> {
+    let objects = load_objects(&request.objects)?;
+    Ok(reachability::analyse(&objects, &request.entry_symbol))
+}
+
 /// What to link.
 #[derive(Debug, Clone)]
 pub struct LinkRequest {

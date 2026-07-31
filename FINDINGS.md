@@ -3093,3 +3093,56 @@ correctness-adjacent feature blinker is missing.
 The reachability itself is the easy half: roots are the entry symbol, the
 exported symbols, and any section flagged no-dead-strip; edges are the
 relocations, which the link already surveys.
+
+## 71. Dead-stripping's analysis half, measured against the linker that does it
+
+The reachability graph is built and reports what *would* be stripped, changing
+no output. Built first, and separately, so the model could be checked against a
+linker that already strips correctly before any layout is rebuilt around it.
+
+On the 47-object Rust link:
+
+```
+  atoms live          938 of 2274
+  __text live         255K of 574K
+  ld-prime actual     222K
+```
+
+**255K predicted against 222K achieved.** A 15% over-estimate, and in the safe
+direction: the analysis keeps things it cannot prove dead, so a stripper built
+on it removes less than ld does rather than removing something needed. That
+closes 319K of the 352K gap finding 70 measured, and confirms the atom model is
+right before the expensive part is written.
+
+### The first version reported 2274 of 2274
+
+Everything live, which is an analysis saying nothing. The cause is worth
+recording because it is not obvious: **unwind and exception tables name every
+function in their object**, so rooting from any section outside `__text` made
+every function reachable from its own `__compact_unwind` entry.
+
+Metadata *describes* code rather than using it, and is dropped alongside the
+function it describes. Excluding `__eh_frame`, `__compact_unwind`,
+`__gcc_except_tab` and the debug sections from the root set took it from
+2274/2274 to 938/2274 in one change.
+
+The general form: in a reachability analysis, an edge from *B describes A* must
+not be treated as *B uses A*. Both are relocations, and the format does not
+distinguish them — only the section they live in does.
+
+### One of the six tests cannot fail, again
+
+Restoring metadata as a root leaves the test written for it passing. The reason
+is specific and worth keeping: `__compact_unwind` refers to its function
+through a **section** relocation with an inline addend, so symbol-based rooting
+never sees it. `__eh_frame` uses symbol-named `SUBTRACTOR` pairs (finding 56)
+and does trigger it — and macOS clang emits `__eh_frame` only where compact
+unwind cannot describe a frame, which no small C fixture reaches.
+
+So the guard for this one is the real Rust link and the numbers above. The test
+is labelled as not reproducing it rather than left to imply it does.
+
+Two of the six *are* verified by their controls, including the one that
+matters most: dropping the data-pointer root makes
+`a_function_referenced_only_from_data_is_live` fail. That is the direction that
+would produce a binary that jumps into deleted code.
