@@ -842,3 +842,69 @@ that coincide in the single-object case.
 `blinker-link`'s module documentation had predicted exactly this class of bug
 ("a symbol whose address is computed in one coordinate system and consumed in
 another") before the code was written. Predicting it did not prevent writing it.
+
+## 22. Imports must be resolved before undefined symbols are an error
+
+Adding libSystem support, the first attempt reported:
+
+```
+link failed: undefined symbols:
+  _printf
+```
+
+for a program that links against libSystem, whose `.tbd` stub blinker had just
+successfully read 9,264 symbols from — `_printf` among them. The check simply
+ran in the wrong order: symbol resolution validated completeness *before* the
+dylibs were given their chance at the leftovers. An undefined reference is only
+an error once every provider has declined it.
+
+The same mistake has a second form, found immediately after. A GOT-based
+relocation to an *imported* symbol asked for that symbol's own address — which
+an import does not have, and never will; that is what importing means. The
+instruction is patched from the **slot's** address, and the symbol's address is
+what dyld writes into the slot at load time. The lookup was not merely
+redundant, it was a category error, and it failed the link with the same
+misleading "undefined symbol" wording.
+
+Both are the same shape: a stage asking a question that is only meaningful for
+symbols the image defines itself.
+
+## 23. Non-lazy stubs are three instructions, and enough
+
+ld64's default stubs jump through `__la_symbol_ptr` into `__stub_helper`, which
+calls `dyld_stub_binder` on first use. Reproducing that means three more
+synthesised sections and a second opcode stream, all to defer work.
+
+Binding eagerly needs one section and this:
+
+```asm
+adrp x16, <got page>          ; page containing the slot
+ldr  x16, [x16, <page off>]   ; the address dyld bound
+br   x16
+```
+
+Twelve bytes, matching the shape ld64 emits for its non-lazy stubs — confirmed
+against a real Rust binary's `__TEXT,__stubs`, where every entry decodes to
+`ADRP x16` / `LDR x16,[x16,#n]` / `BR x16` (`0xd61f0200`).
+
+A `BRANCH26` needs a stub only because it cannot reach an address that does not
+exist until load time. Data references already go through the GOT and need
+nothing extra — which is why only *called* imports get one.
+
+Lazy binding is an optimisation to add when there is something to measure it
+against. For a short-lived process it defers work that is never saved.
+
+### What a realistic program actually needs
+
+```
+$ blinker-link real.o -o real && ./real
+sorted: 1 3 7 19 42 88
+strlen=22
+$ echo $?                       # identical to ld64's output and status
+89
+```
+
+`qsort`, `malloc`, `strcpy`, `strcat`, `snprintf`, `printf`, `strlen`, `free` —
+all imported functions through stubs — plus `___stack_chk_guard`, an imported
+*data* symbol through the GOT. The stack protector is what pulls in that last
+case, and no smaller test reaches it.

@@ -129,6 +129,7 @@ dependencies = [
  "blinker-output",
  "blinker-relocations",
  "blinker-symbols",
+ "blinker-tbd",
  "blinker-test-support",
 ]
 

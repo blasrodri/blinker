@@ -216,6 +216,114 @@ fn blinker_and_ld64_agree_on_the_result() {
     );
 }
 
+/// A program that calls into libSystem.
+///
+/// The first link that needs anything blinker cannot supply itself: `printf`
+/// is resolved against the SDK's `.tbd` stub, given a GOT slot dyld fills at
+/// load time, and reached through a synthesised 12-instruction-free stub
+/// (`adrp`/`ldr`/`br`) because a `BRANCH26` cannot reach an address that does
+/// not exist until then.
+#[test]
+fn a_program_that_calls_libsystem_runs() {
+    let scratch = Scratch::dir("link-libsystem").expect("scratch");
+    let objects = compile(
+        &scratch,
+        &[(
+            "hello.c",
+            "#include <stdio.h>\nint main(void) { printf(\"hi\\n\"); return 7; }\n",
+        )],
+    );
+
+    let output = scratch.join("program");
+    let request = LinkRequest::new(objects).identifier("program");
+    let image = link_to_file(&request, &output).expect("blinker links against libSystem");
+
+    assert!(
+        image.layout.sections.iter().any(|s| s.name == "__stubs"),
+        "no __stubs section was synthesised"
+    );
+
+    let (status, stdout, stderr) = run(&output);
+    assert_eq!(status, Some(7), "stderr: {stderr}");
+    assert_eq!(stdout, "hi\n", "the program printed the wrong thing");
+}
+
+/// A substantial program, checked against ld64's output for the same objects.
+///
+/// Exercises imported *functions* (through stubs) and imported *data*
+/// (`___stack_chk_guard`, through the GOT) in one link — the stack protector
+/// pulls in a data import that no smaller test reaches.
+#[test]
+fn a_realistic_program_matches_ld64_exactly() {
+    let scratch = Scratch::dir("link-real").expect("scratch");
+    let source = r#"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+static int compare(const void *a, const void *b) { return *(const int*)a - *(const int*)b; }
+int main(void) {
+    int data[] = {42, 7, 19, 3, 88, 1};
+    int n = sizeof(data)/sizeof(data[0]);
+    qsort(data, n, sizeof(int), compare);
+    char *buf = malloc(128);
+    strcpy(buf, "sorted:");
+    for (int i = 0; i < n; i++) { char t[8]; snprintf(t, sizeof t, " %d", data[i]); strcat(buf, t); }
+    printf("%s\n", buf);
+    printf("strlen=%zu\n", strlen(buf));
+    free(buf);
+    return data[0] + data[n-1];
+}
+"#;
+    let objects = compile(&scratch, &[("real.c", source)]);
+
+    let ours = scratch.join("ours");
+    link_to_file(&LinkRequest::new(objects.clone()).identifier("ours"), &ours)
+        .expect("blinker links");
+
+    let theirs = scratch.join("theirs");
+    let status = Command::new("cc")
+        .args(["-arch", "arm64", DEPLOYMENT_TARGET, "-o"])
+        .arg(&theirs)
+        .args(&objects)
+        .status()
+        .expect("cc runs");
+    assert!(status.success(), "ld64 failed on the same objects");
+
+    let (our_status, our_stdout, our_stderr) = run(&ours);
+    let (their_status, their_stdout, _) = run(&theirs);
+
+    assert_eq!(
+        our_stdout, their_stdout,
+        "blinker's program printed something different from ld64's\nstderr: {our_stderr}"
+    );
+    assert_eq!(our_status, their_status, "different exit statuses");
+}
+
+/// A symbol no object and no dylib provides is still an error.
+///
+/// Imports must not become a way for typos to link successfully and crash on
+/// first call.
+#[test]
+fn a_symbol_libsystem_does_not_export_is_still_undefined() {
+    let scratch = Scratch::dir("link-bogus").expect("scratch");
+    let objects = compile(
+        &scratch,
+        &[(
+            "main.c",
+            "int definitely_not_in_libsystem_xyz(void);\n\
+             int main(void) { return definitely_not_in_libsystem_xyz(); }\n",
+        )],
+    );
+
+    let error = blinker_link::link(&LinkRequest::new(objects)).expect_err("link should fail");
+    assert!(
+        error
+            .to_string()
+            .contains("definitely_not_in_libsystem_xyz"),
+        "the error should name the missing symbol: {error}"
+    );
+}
+
 /// An undefined symbol must be an error, not a program that crashes later.
 #[test]
 fn an_undefined_symbol_is_reported_rather_than_linked() {

@@ -10,6 +10,7 @@ blinker-macho = { workspace = true }
 blinker-output = { workspace = true }
 blinker-relocations = { workspace = true }
 blinker-symbols = { workspace = true }
+blinker-tbd = { workspace = true }
 
 [dev-dependencies]
 blinker-test-support = { workspace = true }
