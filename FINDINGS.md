@@ -3907,3 +3907,29 @@ design work. Finding 41 already ruled out the obvious answer for the first
 (deserialising a parsed object is slower than parsing it), which points at the
 daemon the spec's Stage G was always for: the only way not to re-read 89 MB is
 to still have it.
+
+## 83. Parallel member parsing bought 2 ms of the 7 it looked worth
+
+900 archive members were parsed one after another on one thread. Restructuring
+each extraction round to choose its members first and parse them concurrently:
+
+```
+  read+parse   26.8 ms -> 24.5 ms      whole link 107 -> 100 ms, byte-identical
+```
+
+Determinism is kept by construction rather than by luck: the round's members
+are chosen before any of them is parsed, ids are assigned by position, and
+results are collected positionally — so no thread's timing can reach the
+output. Verified byte-identical.
+
+2.3 ms, where an earlier split had attributed ~8 ms to parsing. The difference
+is that the earlier measurement was taken before findings 78's fixes; what is
+left in the pull is not parsing at all. `Frontier::absorb` clones every symbol
+name of every arriving object into an owned `HashSet<String>` — 937 objects'
+worth — and that is now the cost. It is the same owned-`String` representation
+that finding 82 names as the structural problem, showing up in a third place.
+
+**Parallelism moves a cost; it does not remove one.** Three quarters of what
+this looked worth had already been fixed by making the surrounding loop
+cheaper, and the remainder is an allocation problem that no number of threads
+addresses.
