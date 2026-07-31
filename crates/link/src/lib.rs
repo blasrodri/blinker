@@ -1182,16 +1182,42 @@ impl Frontier {
     /// Definitions first: a symbol defined later in the same object satisfies a
     /// reference made earlier in it, and one pass would leave the name wanted
     /// and pull a member to define what had just arrived.
+    /// # Why the membership test comes before the clone
+    ///
+    /// `insert(name.clone())` reads naturally and allocates a `String` for
+    /// every symbol of every object, then drops most of them on the floor: a
+    /// Rust link resolves the same names out of object after object, so the
+    /// set already holds the great majority of what is offered to it. Probing
+    /// first costs a hash the insert was going to compute anyway, and turns
+    /// the common case from allocate-and-discard into a lookup.
+    ///
+    /// The two loops must stay in this order — a symbol defined later in an
+    /// object satisfies a reference made earlier in it — and neither loop's
+    /// result depends on how many allocations it performed, so this is a
+    /// change of cost and not of meaning.
+    ///
+    /// **It measures zero on the 60-input link this repository benchmarks**:
+    /// two interleaved runs gave -0.6 ms and +0.7 ms, disagreeing in sign. The
+    /// 5.9 ms it targets was measured on a 921-object link (finding 83), which
+    /// is not the workload set up here. Kept because it is a reordering with
+    /// no new machinery rather than because a number says it helps — and said
+    /// plainly so nobody later reads a win into it.
     fn absorb(&mut self, object: &LoadedObject) {
         for symbol in &object.parsed.symbols {
-            if symbol.strength.is_definition() && self.defined.insert(symbol.name.clone()) {
-                self.wanted.remove(&symbol.name);
+            if !symbol.strength.is_definition() || self.defined.contains(symbol.name.as_str()) {
+                continue;
             }
+            self.defined.insert(symbol.name.clone());
+            self.wanted.remove(&symbol.name);
         }
         for symbol in &object.parsed.symbols {
-            if !symbol.strength.is_definition() && !self.defined.contains(&symbol.name) {
-                self.wanted.insert(symbol.name.clone());
+            if symbol.strength.is_definition()
+                || self.defined.contains(symbol.name.as_str())
+                || self.wanted.contains(symbol.name.as_str())
+            {
+                continue;
             }
+            self.wanted.insert(symbol.name.clone());
         }
     }
 }

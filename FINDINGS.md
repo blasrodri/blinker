@@ -4362,3 +4362,36 @@ Two things worth keeping from it:
   change** — repeated links in a single process, where the cache hits every
   time after the first. It still showed nothing. A null result under
   favourable conditions is worth more than a positive one under vague ones.
+
+## 92. Two null results in a row, and what separates them
+
+`Frontier::absorb` cloned every symbol name before testing whether the set
+already held it, which in a Rust link means allocating and discarding for the
+great majority of symbols. Probing first:
+
+```
+  run 1   -0.6 ms
+  run 2   +0.7 ms
+```
+
+Two interleaved runs disagreeing in sign. Zero, on this workload.
+
+Kept, where finding 91's stub cache was reverted, and the difference is worth
+being explicit about because "it measured nothing" is true of both:
+
+- The stub cache **added machinery** — a global, a `Mutex`, a lock ordering to
+  reason about — to buy nothing. That is a net loss even at zero.
+- This is a **reordering of two lines** with nothing new to go wrong, targeting
+  a cost that *was* measured at 5.9 ms, on a 921-object link (finding 83) that
+  is not the one set up here.
+
+Neither is kept because a number says it helps. One is reverted because it
+costs something and the other is not because it does not, and both say so in
+the code rather than leaving a future reader to infer a win.
+
+**The workload is now the limiting instrument.** Three of this session's last
+four changes landed at or under its noise floor of roughly ±1 ms on 41 ms. The
+next performance question worth asking is not which micro-cost to attack but
+whether the 60-input benchmark can still see the answer — finding 77 recorded
+the same failure one scale down, when a twelve-object fixture could not show a
+quadratic linker.
