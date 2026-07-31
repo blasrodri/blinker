@@ -690,10 +690,13 @@ blinker links C and Rust on Apple Silicon, signs its own output, handles
 `panic=unwind` identically to the system linker, and caches across links.
 
 ```
-  ld-prime                     28.4 ms   1.00x
-  blinker, cold                31.3 ms   1.10x
+  ld-prime                     25.9 ms   1.00x
+  blinker, cold                28.3 ms   1.09x
   blinker, unchanged relink    10.4 ms   0.37x
 ```
+
+Output is 0.79x ld-prime's, with `__text` 4.4% larger — blinker keeps a little
+code ld drops and drops none ld keeps.
 
 Cold-link profile, 20 iterations, sd < 0.3 ms per stage:
 
@@ -702,9 +705,25 @@ Cold-link profile, 20 iterations, sd < 0.3 ms per stage:
   relocate     7.3 ms   emit+sign 2.2 ms
 ```
 
-### The two things left, both milestones rather than tasks
+### Dead-stripping: done
 
-**1. The partial fast path** — the edit-compile case.
+Landed. `-dead_strip` on the command line — which rustc passes on every macOS
+link — discards code and data nothing reaches.
+
+```
+  section            blinker   ld-prime
+  __TEXT,__text       224516     215028    +4.4%
+  whole image         368531     468856     0.79x
+```
+
+Atoms are the unit of *liveness*; sections stay the unit of layout and are
+compacted in place, with one `Strip::remap` answering "where did this input
+byte go" for every consumer. See finding 72, and in particular the one field
+in Mach-O that no relocation covers.
+
+### The one thing left, a milestone rather than a task
+
+**The partial fast path** — the edit-compile case.
 
 The whole-image path (finding 67) fires only when *nothing* changed. When one
 codegen unit changed, the link falls all the way back to the full pipeline at
@@ -722,15 +741,6 @@ The check is already cheap enough — 0.18 ms proves which inputs changed — so
 the payoff is the difference between 22 ms and something near the 10.4 ms the
 unchanged case gets.
 
-**2. Dead-stripping** — finding 70.
-
-The output is 2.02x ld-prime's, and all of it is unreachable code plus the
-unwind, exception and literal data that serves it. Every input object sets
-`MH_SUBSECTIONS_VIA_SYMBOLS`, so cutting sections at symbol boundaries is
-legal; the work is that atoms, not sections, become the unit of layout, which
-touches placement, `AddressMap`, relocation, and the tables that index by
-function address.
-
 ### Rules this project runs on, earned rather than assumed
 
 - Measure the premise before writing the code. Three cache designs were killed
@@ -742,4 +752,9 @@ function address.
 - An instrument needs its own negative control; a counter that reports success
   while nothing happens is the failure it was added to detect (66).
 - A test proves something only when the failure would produce a different
-  observable value, not merely a different internal state (63, 66, 69).
+  observable value, not merely a different internal state (63, 66, 69, 72) —
+  and a toolchain default can quietly remove the difference (72).
+- A transformation that preserves order can be landed as a coordinate remap
+  rather than a restructuring (72).
+- A debugger's static parse is a linter for the output format, and costs one
+  command; reach for it before reasoning about a crash in generated code (72).

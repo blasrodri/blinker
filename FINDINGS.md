@@ -3167,3 +3167,131 @@ Two of the six *are* verified by their controls, including the one that
 matters most: dropping the data-pointer root makes
 `a_function_referenced_only_from_data_is_live` fail. That is the direction that
 would produce a binary that jumps into deleted code.
+
+## 72. Dead-stripping, executed: atoms without making atoms the unit of layout
+
+The analysis half (finding 71) predicted 255K of `__text` would survive against
+ld-prime's 222K. Executing it produced:
+
+```
+  section            blinker   ld-prime    delta
+  __TEXT,__text       224516     215028      +9K
+  __TEXT,__const       11996      11652    +0.3K
+  __TEXT,__cstring      7566       5889    +1.7K
+  __TEXT,__eh_frame    28036      26912    +1.1K
+  __TEXT,__gcc_except   4680       4504    +0.2K
+  __TEXT,__unwind_info 10140       4888      +5K
+
+  whole image         368531     468856    0.79x
+```
+
+`__text` within 4.4% of the linker that has done this for twenty years, and in
+the safe direction: blinker keeps 9K of code ld drops, and drops none ld keeps.
+The image is *smaller* than ld's overall, which is not a win — it is ld emitting
+a fuller symbol table, a `__stub_helper` and a lazy pointer section that blinker
+does not.
+
+Cost: 2.8 ms on a 28 ms link, and roughly free in the total, because everything
+downstream then relocates and emits a third less content.
+
+```
+  ld-prime    25.9 ms
+  blinker     28.3 ms   1.09x     (1.10x before this)
+```
+
+### Atoms are the unit of *liveness*, not of layout
+
+The milestone was scoped as "atoms replace sections as the unit of layout",
+which would have split every input section into one placement per atom and
+rewritten `Contribution`, placement, `AddressMap` and the relocation pass
+around it.
+
+That was more than the problem required. The survivors of a section keep their
+original relative order, so the same image comes from leaving the section as
+one contribution and **compacting** it — closing the gaps and recording where
+each surviving byte moved. One `Strip::remap(object, section, offset)` then
+serves every consumer of "where did this input byte end up", and none of them
+has to learn what an atom is.
+
+Six call sites changed by one line each; the relocation pass gained a guard.
+The general shape: when a transformation preserves order, a coordinate
+remapping is equivalent to a restructuring, and much cheaper to land.
+
+### The one field in Mach-O that stripping cannot move
+
+Everything in a relocatable object that points somewhere is a relocation —
+with one exception, and it is in the section that matters most.
+
+An `__eh_frame` FDE's second word is the distance **backwards** to the CIE
+describing it. The assembler computed it; no relocation covers it. Compacting
+the section moves records apart, so every one of those distances becomes the
+distance they used to be.
+
+The failure is a bad one to debug from behaviour: the binary links, starts,
+prints, and dies of SIGSEGV the moment it unwinds — after `stack backtrace:`
+has already been printed. What named it in one step was pointing `lldb` at the
+file, which parses `__eh_frame` statically before running anything:
+
+```
+error: unable to find CIE at 0x1a8 for cie_id = 0xfc for entry at 0x2a0
+error: Invalid cie offset of 0xffffffffffffffc0 found in cie/fde at 0x718
+```
+
+The general form: **a debugger's static parse is a linter for your output
+format**, and it costs one command. Reach for it before reasoning about a
+crash in generated code.
+
+The related case that *is* a relocation, and was already handled: a `SUBTRACTOR`
+pair whose subtrahend is the section's own `ltmpN` anchor stores the distance
+from the anchor to the field, so that the result comes out field-relative.
+Compaction moves both ends, and the addend is re-measured from where they
+landed rather than where they were.
+
+### Two premises, measured before the code depended on them
+
+Both took minutes and both changed the design.
+
+**Every reference lands exactly on a symbol.** Across the 47-object link, all
+1832 pointer relocations in `__const` and every one elsewhere carry an inline
+addend of zero. That is `MH_SUBSECTIONS_VIA_SYMBOLS` being true rather than
+merely asserted, and it is what makes symbol-address remapping sufficient — no
+reference needs resolving by offset. Sections that break the rule are kept
+whole, so the guarantee is enforced rather than assumed.
+
+The first version of that measurement was **wrong in the direction that would
+have caused work**: it reported 1819 of 1832 relocations carrying an addend up
+to 361120, which would have forced a full offset-based resolution path. The
+model was wrong, not the data — for an *external* relocation Mach-O stores the
+addend alone, and for a *section* one it stores the whole target address. I had
+subtracted the symbol value from both. A null result needs proof of provenance
+(finding 58); so does a positive one.
+
+**Only `__compact_unwind` and the debug sections use section-relative targets.**
+Which means exactly one place in the link reads a meaningful inline offset and
+has to undo stripping by hand, and it is a place that already existed.
+
+### The verification pass is the load-bearing part
+
+The propagation is supposed to guarantee that no live atom refers to a dead
+one. Guaranteed-by-argument is not guaranteed, so a final pass walks every live
+atom's references and revives anything dead, counting what it had to fix.
+
+That count is the model's own negative control. It is zero on a real Rust link,
+and removing any single propagation rule makes it non-zero — which is what
+makes asserting it worth anything. Without the assertion the pass would be a
+liability rather than a safety net: it *repairs* the mistake, so an incomplete
+model would produce a correct binary and no symptom at all. That is finding 64
+in a different costume.
+
+### rustc always passes `-dead_strip`, so building without the flag is no control
+
+The obvious test for "did stripping remove anything" builds the fixture twice,
+once with `-Wl,-dead_strip`. On macOS rustc passes that flag on every link, so
+both builds are stripped and the assertion cannot fail. The first version
+reported `224492 against 224492` and passed.
+
+The control has to come from replaying the recorded argument list with
+`-dead_strip` removed — the only way to reach a Rust link that was not
+stripped. Third time a test in this project has been found unable to fail
+(63, 66, 69), and the first where the cause was a *toolchain default* rather
+than the fixture.
