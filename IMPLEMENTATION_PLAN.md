@@ -740,6 +740,33 @@ objects and skips **100%** of the relocations:
 
 Per-object reuse covers it. What remained to win was part of 3.1 ms out of 16.1.
 
+### The state, measured on a real link (77–80)
+
+blinker linking its own 937-object binary, against `ld-prime`:
+
+```
+  ld-prime, every time        41.8 ms
+  blinker, cold              142 ms    3.4x
+  blinker, unchanged          13.3 ms  0.32x    921/921 objects reused
+  blinker, one crate edited  128 ms    3.1x     728/937, 80% of relocations
+```
+
+The unchanged relink beats the system linker threefold and the architecture
+behind it is sound. The **edit** relink is the product, and it is 10% better
+than cold, because reuse covers one stage of six:
+
+```
+  read+parse   26 ms   re-runs      relocate   28 ms   <- the only stage reused
+  dead-strip   19 ms   re-runs      emit+sign  12 ms   re-runs
+  resolve       8 ms   re-runs      layout      7 ms   re-runs
+```
+
+Reserved layout slack is wired (80) and raised the hit rate from 69% to 80% of
+relocations; that was worth 14 ms and is near the ceiling of what hit rate can
+buy. The remaining work is making the other five stages incremental, in
+descending order of size: `read+parse`, `dead-strip`, `emit+sign` (a Merkle
+tree over pages — only changed pages need rehashing), `resolve`, `layout`.
+
 ### Superseded: the workload was too small (77)
 
 Everything below was measured on a 47-object fixture. On a real link — blinker

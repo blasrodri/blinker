@@ -3731,7 +3731,7 @@ avoid. Measured at real scale, on blinker's own 937-object binary:
   ld-prime, every time              41.8 ms
   blinker, cold                    122 ms      2.92x
   blinker, nothing changed          13.3 ms    0.32x   921/921 objects reused
-  blinker, one crate edited        148 ms      3.5x    691/937 reused, 69% of relocations
+  blinker, one crate edited        128 ms      3.1x    728/937 reused, 80% of relocations
 ```
 
 The unchanged relink is **three times faster than the system linker**. The
@@ -3792,15 +3792,25 @@ machinery already existed, tested and unwired since findings 42–44. Wiring it:
 
 ```
                         reused        relocations   link
-  one crate edited   691/937  ->  728/937   69% -> 80%   148 ms -> 183 ms
+  one crate edited   691/937  ->  728/937   69% -> 80%   142 ms -> 128 ms
 ```
 
-The hit rate went up exactly as designed, and the link got **slower** — the
-padding inflates the image, so `emit+sign` pays for what `relocate` saved, and
+The hit rate went up exactly as designed, and the link went from 142 ms cold
+to 128 ms — **10%**, for 80% of the relocations skipped. The padding inflates
+the image, so `emit+sign` gives back part of what `relocate` saved, and
 `relocate` is only 23% of the link to begin with.
+
+The first version of this measurement said 183 ms, and was wrong: those runs
+had `--blinker-record-invocation` on, which copies all 89 MB of inputs aside
+before linking. Recording is a corpus tool and it has no business inside a
+timing loop — the fourth time in this project that a harness measured itself
+(75).
 
 Which is finding 79 restated as a result rather than an analysis: **improving
 the reuse rate cannot help while the reused stage is a fifth of the work.**
+Going from 69% to 80% of relocations skipped is worth 14 ms on a 142 ms link,
+and no achievable hit rate changes that — even 100% reuse of `relocate` leaves
+115 ms.
 Slack is still the right thing to have — it is what makes a *future*
 incremental layout possible at all, and the hit rate it buys is real — but on
 its own it is a cost, and the honest accounting is that this was the cheap item
