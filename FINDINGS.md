@@ -3382,7 +3382,7 @@ adds a way to be wrong.
 comparable, having been 1.10x. blinker's own spread is the wider of the two,
 which is the next thing to understand rather than a result to claim around.
 
-## 75. A 9 ms process spawn that the real workload never paid, and the benchmark could not see
+## 75. The 9 ms I measured was my own harness deleting an environment variable
 
 With the stub *parse* overlapped (finding 74), the stub *path lookup* was still
 on the critical path — and it spawns `xcrun`:
@@ -3394,56 +3394,88 @@ on the critical path — and it spawns `xcrun`:
 
 `xcode-select` records the active developer directory as a symlink, and `xcrun`
 resolves the SDK beneath it, so reading the link answers the same question
-without a process. `xcrun` remains the fallback: the SDK genuinely moves
-between Xcode versions and the Command Line Tools, and the shortcut has to be
-allowed to miss.
+without a process. The change is right and is kept: `xcrun` remains the
+fallback, the discovered path is asserted to equal the one `xcrun` names, and
+the output is byte-identical.
 
-Interleaved A/B, 20 iterations each, same machine conditions:
+**It speeds up nothing that is actually run.** Establishing that took four
+measurements, three of which I first got wrong, and the sequence is the
+finding.
 
-```
-  old, SDKROOT unset   40.1 ms
-  old, SDKROOT set     31.4 ms      <- the spawn, isolated
-  new, SDKROOT unset   29.9 ms
-```
+### 1. An A/B said 10 ms, the project's own harness said 0.9 ms
 
-Byte-identical output — verified after the first attempt said otherwise,
-because the harness gave each arm its own output path and **the output's base
-name is the ad-hoc signature's identifier**. Two names is two different
-binaries no matter what the linker did. A harness bug, and the fourth in this
-project's benchmarking (see the header of `scripts/bench.py`).
-
-### The part that matters more than the 9 ms
-
-**rustc sets `SDKROOT` when it invokes the linker.** Measured, with a shim:
+Same two binaries, same inputs, both interleaved:
 
 ```
-  SDKROOT=[.../MacOSX26.5.sdk]  DEVELOPER_DIR=[<unset>]
+  standalone A/B      old 40.1 ms   new 29.9 ms
+  scripts/bench.py    old 25.3 ms   new 24.4 ms
 ```
 
-So the old code already took the environment fast path in every cargo build.
-The 9 ms was paid only when blinker was invoked *without* it — by hand, by a
-build system that does not set it, and by `scripts/bench.py`, which inherits a
-shell where it is unset.
+Two reproducible measurements that cannot both describe the same thing. I
+recorded the disagreement rather than the number that flattered the change,
+which was the only part of the first write-up worth keeping.
 
-Which means the benchmark and the workload disagreed about what blinker costs,
-and had done for as long as the benchmark has existed. A harness that
-faithfully replays the recorded argument list still does not reproduce the
-recorded *environment*, and the environment was load-bearing.
+### 2. `SDKROOT` decides it, and both compiler drivers set it
 
-**An argument list is not an invocation.** What the process inherits is part of
-the input, and a replay harness that captures one and not the other measures a
-configuration nobody runs.
+`discover_stub_library` checks `SDKROOT` before spawning anything. Measured
+with a shim linker that prints its environment: **`rustc` sets `SDKROOT`, and
+so does plain `cc`.**
 
-### What does not add up, recorded rather than smoothed over
+```
+  SDKROOT=[.../MacOSX.sdk]  DEVELOPER_DIR=[<unset>]
+```
 
-`scripts/bench.py` should therefore have shown ~9 ms of improvement from this
-change, and it did not: blinker's minimum across runs was 23.9 ms before and
-23.8 ms after, while the standalone A/B above puts the same binaries 10 ms
-apart under the same conditions.
+So no real build ever reached the spawn. That much of the first write-up was
+right, and I concluded from it that the benchmark — which I believed ran
+without `SDKROOT` — had been measuring a configuration nobody uses.
 
-Both measurements are reproducible and they cannot both be describing the same
-thing. The likely candidate is `xcrun`'s own caching interacting with
-bench.py's warmup — but that is a guess, and the honest state is that the two
-harnesses disagree and the disagreement is not yet explained. The change is
-kept because it is correct, tested against `xcrun`'s answer, and strictly
-removes work; not because the benchmark endorsed it.
+### 3. It was my harness that ran without it
+
+The difference between the two harnesses was one line I had written to be
+careful:
+
+```python
+env = {k: v for k, v in os.environ.items() if k != 'SDKROOT'}
+```
+
+I had checked with `printenv SDKROOT` in the shell, seen nothing, and
+"controlled" for it. `bench.py` passes no `env=` at all and inherits.
+
+```
+  old, inherit env      26.5 ms
+  old, explicit env     38.5 ms      <- the same binary, minus one variable
+```
+
+The variable I deleted to be careful was the entire effect I then measured.
+**A harness that controls for a variable by removing it manufactures the
+configuration it goes on to report.**
+
+### 4. Why the shell and the harness disagreed about the environment
+
+```
+  printenv SDKROOT                            unset
+  python3 -c "'SDKROOT' in os.environ"        True
+  env -i /usr/bin/python3 -c "...os.environ"  /Applications/Xcode.app/...
+```
+
+`/usr/bin/python3` is one of the `xcode-select` shim binaries — 78 hard links
+to one stub — and it launches the real interpreter through `xcrun`, which
+**exports `SDKROOT` into the process it starts**. An empty environment does not
+help; `/bin/sh` under `env -i` has nothing, and `python3` under `env -i` has
+the SDK.
+
+So every Python benchmarking harness on macOS runs with `SDKROOT` set, whatever
+the shell says. On this platform `python3` is not a neutral parent, and a
+harness written in it inherits an environment its author never chose.
+
+### What this costs and what it is worth
+
+The change stands on its own terms — it removes a process spawn from the one
+path that still reaches it, and a build system that invokes the linker directly
+(a Makefile calling `ld`, not `cc`) does reach it. It is worth roughly zero on
+every workload measured here, and the honest place for it is a footnote rather
+than a performance claim.
+
+The general form, which cost more to learn than the 9 ms was ever worth:
+**check what the environment *is* before controlling for it, and check it from
+inside the harness rather than from the shell you launched the harness from.**

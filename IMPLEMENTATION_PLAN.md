@@ -772,10 +772,10 @@ yet, and neither should be until measured.
 - Before caching a pure computation, check whether it can just happen at the
   same time as something else. Both remove work from the critical path; only
   caching adds a way to be wrong (74).
-- An argument list is not an invocation: what the process inherits is part of
-  the input, and a replay harness that captures one and not the other measures
-  a configuration nobody runs (75).
 - When two reproducible measurements disagree, record the disagreement rather
-  than the one that flatters the change (75).
+  than the one that flatters the change — then go and explain it (75).
+- A harness that controls for a variable by removing it manufactures the
+  configuration it then reports. Check what the environment *is*, from inside
+  the harness, before controlling for it (75).
 - A debugger's static parse is a linter for the output format, and costs one
   command; reach for it before reasoning about a crash in generated code (72).
