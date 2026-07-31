@@ -44,6 +44,12 @@ Three details that are not incidental:
 - **The linker is a copy.** Building blinker with `target/release/blinker` as
   the linker would have cargo rewrite the binary it is currently executing.
   The copy is taken first and never touched again.
+- **The recording directory is the same string for every capture**, and the
+  results are moved into place afterwards. The path travels in `RUSTFLAGS`, and
+  rustflags feed the crate metadata hash — so recording two builds into
+  differently-named directories renames every rlib and object between them, and
+  two captures of the same project come out looking entirely unrelated. That is
+  what `scripts/relink.py` needs them not to do.
 - **The build uses its own target directory**, so capturing a workload cannot
   invalidate the repository's build or be invalidated by it.
 - **The captured workload is verified to link** by both ld64 and blinker
@@ -236,16 +242,26 @@ def main():
     destination.mkdir(parents=True)
 
     # Copied, not referenced: the capture build rewrites target/release/blinker
-    # when the project being captured is this repository.
-    linker = destination / "linker"
+    # when the project being captured is this repository. One shared path
+    # rather than one per workload, for the same reason the staging directory
+    # is shared — cargo fingerprints the linker it was told to use.
+    linker = Path(options.out) / ".linker"
+    linker.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(BLINKER, linker)
 
-    records = destination / "records"
+    # One path for every capture, then moved: see the header. The linker copy
+    # is per-workload and does not travel in rustflags, so it may stay put.
+    staging = Path(options.out) / ".capture"
+    shutil.rmtree(staging, ignore_errors=True)
     build = destination / "build"
-    capture(Path(options.project).resolve(), records, linker, build, options.profile)
+    capture(Path(options.project).resolve(), staging, linker, build, options.profile)
+
+    records = destination / "records"
+    shutil.move(str(staging), str(records))
 
     record = largest_record(records)
     argv = replay_argv(record, destination / "link-output")
+    argv = [a.replace(str(staging), str(records)) for a in argv]
 
     files, objects, size = count_objects(argv)
     if files == 0:
