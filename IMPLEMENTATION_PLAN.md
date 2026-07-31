@@ -525,6 +525,11 @@ testable against real `rustc` output without the other.
 
 ## M4 design, as of the corrected measurements
 
+> **Struck by finding 41.** The premise below was tested and is false:
+> deserialising a `ParsedObject` is 1.7-3.5x *slower* than parsing the object.
+> Cache the relocated output keyed by CGU instead. Kept for the reasoning, not
+> as a plan.
+
 Recorded here rather than started, because the measurements that justify it are
 now solid and the implementation is a clean unit of work.
 

@@ -1687,3 +1687,65 @@ findings 15–18's CGU-keyed design supports — is worth roughly 4×.
 That is the first time this project has had a defensible estimate of what M4/M5
 is worth, and it rests on an instrument whose failure modes are documented in
 its own header.
+
+## 41. The parse cache is dead: parsing is already faster than deserialising
+
+M4 was specified as a persistent cache of parse results, and finding 40 put its
+value at 27% — enough to make blinker the faster linker. Before building it,
+the premise was tested: is deserialising a `ParsedObject` actually faster than
+parsing the object again?
+
+On a realistic input — a 9.4 MB member of `libstd.rlib`:
+
+```
+  parse Mach-O        0.43 ms
+  deserialise JSON    7.51 ms   (17.4x parse)
+```
+
+JSON is a deliberately pessimistic codec, so the useful figure is the implied
+one: a compact binary format runs 5–10× faster than JSON, which puts
+deserialisation at **0.75–1.50 ms against 0.43 ms to parse**. A parse cache
+would be **1.7–3.5× slower than the thing it replaces.**
+
+### Why parsing is so cheap
+
+blinker's parser is lazy by construction, and the reason is recorded in
+`InputSection`'s own doc comment: section bytes are *addressed by offset, not
+copied*, "so that `ParsedObject` stays small enough to cache". Parsing 9.4 MB
+costs 0.43 ms because it walks load commands and the symbol table structurally,
+over borrowed bytes, and copies almost nothing.
+
+Deserialisation cannot do that. It must **allocate** every `String` and every
+`Vec` the parser merely pointed at. The design decision that made parsing fast
+is exactly the one that makes a parse cache pointless — and it was made, and
+documented, long before anyone measured either.
+
+### What this does to the 27%
+
+`read+parse` is 27% of the link, but that measurement bundles two things.
+Parsing is 0.43 ms per 9.4 MB; the rest is **reading 17 MB off disk**. A cache
+cannot avoid the read unless it stores materially less than the original — and
+a serialised `ParsedObject` is not smaller, it is 5.4 MB of JSON for a 9.4 MB
+object, and a binary encoding would still carry every symbol name.
+
+So the addressable cost is not parsing and not reading. It is `resolve` (28%)
+and `relocate` (25%) — the stages that consume the parse rather than produce
+it, and whose *outputs* are small: resolved addresses and patched section
+bytes, not the inputs they came from.
+
+### The corrected direction
+
+Cache the **relocated output**, keyed by CGU identity per findings 15–18, and
+rebuild only the contributions whose CGU changed. That is what the edit-class
+analysis (bodies patch in place, additions append, cascades relink) was always
+pointing at. M4-as-a-parse-cache should be struck from the plan rather than
+implemented.
+
+### The meta-point
+
+This is the fifth premise in this project to survive reasoning and die to a
+single measurement, and the first one that was tested *before* the code was
+written rather than after. The experiment cost one example binary and two
+commands. Implementing the cache first would have cost a crate, a codec
+decision, a schema-versioning scheme, and a cache-invalidation story — all to
+arrive at a linker that was slower.
