@@ -62,6 +62,18 @@ pub struct PhaseTimings {
     pub argument_parsing_ms: Option<f64>,
     pub input_fingerprinting_ms: Option<f64>,
     pub fallback_exec_ms: Option<f64>,
+    /// Wall time of the internal link, when one was performed.
+    ///
+    /// Separate from `fallback_exec_ms`: an internal link is not a fallback,
+    /// and reporting it in that field made the two indistinguishable in a
+    /// record.
+    pub internal_link_ms: Option<f64>,
+    /// Stages within the internal link.
+    pub link_read_and_parse_ms: Option<f64>,
+    pub link_resolve_ms: Option<f64>,
+    pub link_layout_ms: Option<f64>,
+    pub link_relocate_ms: Option<f64>,
+    pub link_emit_ms: Option<f64>,
     pub total_ms: Option<f64>,
 }
 
@@ -138,6 +150,24 @@ impl LinkRecord {
         self.timings.fallback_exec_ms = Some(as_ms(d));
     }
 
+    /// Record the internal link's total and its per-stage breakdown.
+    pub fn set_timing_internal_link(
+        &mut self,
+        total: Duration,
+        read_and_parse: f64,
+        resolve: f64,
+        layout: f64,
+        relocate: f64,
+        emit: f64,
+    ) {
+        self.timings.internal_link_ms = Some(as_ms(total));
+        self.timings.link_read_and_parse_ms = Some(read_and_parse);
+        self.timings.link_resolve_ms = Some(resolve);
+        self.timings.link_layout_ms = Some(layout);
+        self.timings.link_relocate_ms = Some(relocate);
+        self.timings.link_emit_ms = Some(emit);
+    }
+
     pub fn set_timing_total(&mut self, d: Duration) {
         self.timings.total_ms = Some(as_ms(d));
     }
@@ -164,6 +194,34 @@ impl LinkRecord {
         std::fs::write(path, self.to_json())
     }
 
+    /// Per-stage breakdown of the internal link, when there was one.
+    ///
+    /// Printed alongside the summary because the totals alone cannot say where
+    /// a cache would help — and choosing what to cache from a total is how a
+    /// parse cache came to be planned for a link parsing is not dominating.
+    fn link_breakdown(&self) -> Option<String> {
+        let total = self.timings.internal_link_ms?;
+        let stage = |label: &str, value: Option<f64>| {
+            value.map(|v| {
+                let pct = if total > 0.0 { v / total * 100.0 } else { 0.0 };
+                format!("\n    {label:<12}{v:6.1} ms {pct:5.1}%")
+            })
+        };
+        let mut out = format!("\n  link: {total:.1} ms");
+        for (label, value) in [
+            ("read+parse", self.timings.link_read_and_parse_ms),
+            ("resolve", self.timings.link_resolve_ms),
+            ("layout", self.timings.link_layout_ms),
+            ("relocate", self.timings.link_relocate_ms),
+            ("emit+sign", self.timings.link_emit_ms),
+        ] {
+            if let Some(text) = stage(label, value) {
+                out.push_str(&text);
+            }
+        }
+        Some(out)
+    }
+
     /// The concise human-readable summary shown on a normal successful link.
     pub fn to_summary(&self) -> String {
         let mode = match self.mode {
@@ -183,6 +241,9 @@ impl LinkRecord {
                 "\n  unrecognized_arguments: {}",
                 self.unrecognized_arguments.len()
             ));
+        }
+        if let Some(breakdown) = self.link_breakdown() {
+            s.push_str(&breakdown);
         }
         s
     }

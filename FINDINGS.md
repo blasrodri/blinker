@@ -1437,3 +1437,52 @@ The next step is to time the CLI's phases directly rather than infer them —
 the record already carries `argument_parsing_ms` and `input_fingerprinting_ms`,
 and the internal link is currently lumped under `fallback_exec_ms`, which is
 itself a naming bug now that the link is not a fallback.
+
+## 36. A third of the link was in the gaps between the timers
+
+Instrumenting the CLI's internal link answered the open question from finding
+35, and corrected finding 35 at the same time:
+
+```
+  link: 38.6 ms
+    read+parse     8.5 ms  22.0%
+    resolve        7.3 ms  18.8%
+    layout         1.8 ms   4.7%
+    relocate       6.8 ms  17.7%
+    emit+sign      2.3 ms   6.1%
+```
+
+The named stages sum to **26.7 ms of 38.6 ms**. The other 11.9 ms — 31% of the
+link — is work in the gaps *between* the timers, and it is not small:
+
+- the pre-layout scans that decide what to synthesise (`got_symbols`,
+  `personality_symbols`, `tlv_symbols`, `stub_symbols`, `unwind_table_size`),
+  each of which walks every relocation of every object;
+- `output_symbols`, which walks every symbol of every object and does a layout
+  lookup per definition;
+- the rebase and bind table construction.
+
+Every one of those is a full pass over data the timed stages have already
+walked. The link makes roughly half a dozen separate traversals of the same
+symbol and relocation lists.
+
+### What this does to the earlier conclusion
+
+Finding 35 concluded that no phase dominates, and that a parse cache could save
+at most ~30%. That conclusion survives — it is if anything stronger, since
+read+parse is 22% of the link rather than 29.6%. But the *reason* has shifted:
+the largest single category is not any named phase, it is **repeated traversal**,
+and that is a cost a cache does not address at all. It is addressed by making
+one pass collect what six passes currently collect separately.
+
+That is a cheaper and more certain win than the cache, and it comes first: it
+reduces the work the cache would otherwise have to memoise, and it does not
+depend on any of the open questions about what to store or how to key it.
+
+### On the instrumentation itself
+
+The gap only became visible because the stage timings were reported *next to*
+the total rather than on their own. Percentages that sum to 69% are obvious;
+five numbers in isolation are not. The summary now prints both, so the next
+person to read a profile sees the discrepancy without having to add the column
+up by hand.

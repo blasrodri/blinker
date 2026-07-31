@@ -169,9 +169,17 @@ pub fn run(argv: &[String]) -> Result<Outcome, DriverError> {
         if options.verbosity == Verbosity::Verbose {
             eprintln!("blinker: linking internally");
         }
-        internal_link(&parsed).map_err(|e| DriverError::Link {
+        let phases = internal_link(&parsed).map_err(|e| DriverError::Link {
             detail: e.to_string(),
         })?;
+        record.set_timing_internal_link(
+            exec_started.elapsed(),
+            phases.read_and_parse_ms,
+            phases.resolve_ms,
+            phases.layout_probe_ms,
+            phases.relocate_ms,
+            phases.emit_ms,
+        );
         record.mode = blinker_diagnostics::LinkMode::Cold;
         record.fallback_reason = None;
         0
@@ -211,7 +219,9 @@ pub fn run(argv: &[String]) -> Result<Outcome, DriverError> {
 /// Only object files are accepted so far. An archive or a dylib on the command
 /// line is refused with a message naming it, rather than dropped — a link that
 /// silently ignores an input produces a binary missing whatever was in it.
-fn internal_link(parsed: &ParsedInvocation) -> Result<(), blinker_link::LinkError> {
+fn internal_link(
+    parsed: &ParsedInvocation,
+) -> Result<blinker_link::LinkTimings, blinker_link::LinkError> {
     let output = parsed
         .output_path()
         .map(Path::to_path_buf)
@@ -229,7 +239,23 @@ fn internal_link(parsed: &ParsedInvocation) -> Result<(), blinker_link::LinkErro
         .unwrap_or_else(|| "a.out".to_string());
 
     let request = blinker_link::LinkRequest::new(objects).identifier(&identifier);
-    blinker_link::link_to_file(&request, &output).map(|_| ())
+    let (image, timings) = blinker_link::link_timed(&request)?;
+
+    std::fs::write(&output, &image.bytes).map_err(|source| blinker_link::LinkError::Write {
+        path: output.clone(),
+        source,
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&output, std::fs::Permissions::from_mode(0o755)).map_err(
+            |source| blinker_link::LinkError::Write {
+                path: output.clone(),
+                source,
+            },
+        )?;
+    }
+    Ok(timings)
 }
 
 /// Build a unique filename for a recorded invocation.
