@@ -3130,6 +3130,27 @@ The general form: in a reachability analysis, an edge from *B describes A* must
 not be treated as *B uses A*. Both are relocations, and the format does not
 distinguish them — only the section they live in does.
 
+### There is no cheap version of this
+
+Before writing the hard half, the obvious shortcut was measured: drop input
+sections in which *no* atom is live. That needs no change to the unit of layout
+— a dead section is discarded exactly like a linker-internal one — so if it
+recovered most of the gap it would be worth landing on its own.
+
+```
+  strippable in total                    319K
+  in sections where nothing is live        1K
+```
+
+**1K.** Every `__text` section in the link has at least one live atom, which
+makes sense in hindsight: a section arrives because something in it was
+referenced, so an entirely dead one can only come from an object pulled in for
+a symbol in a *different* section. That is rare enough to be worth nothing.
+
+So the shortcut does not exist, and the 15-line version of this feature would
+have been implemented, measured, and deleted. The number that mattered took one
+extra field on the report to obtain.
+
 ### One of the six tests cannot fail, again
 
 Restoring metadata as a root leaves the test written for it passing. The reason

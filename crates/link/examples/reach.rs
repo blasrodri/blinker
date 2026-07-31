@@ -15,4 +15,8 @@ fn main() {
         report.total_bytes as f64 / 1024.0,
         report.dead_bytes() as f64 / 1024.0,
     );
+    println!(
+        "  of which whole dead sections: {:.0}K  (droppable without atom layout)",
+        report.fully_dead_section_bytes as f64 / 1024.0,
+    );
 }

@@ -51,6 +51,14 @@ pub struct Report {
     pub total_atoms: usize,
     pub live_bytes: u64,
     pub total_bytes: u64,
+    /// Bytes in input sections where *no* atom is live.
+    ///
+    /// A strict subset of `dead_bytes`, and the part reachable without
+    /// changing the unit of layout: a section nothing reaches can be dropped
+    /// from placement whole, exactly like a linker-internal one. Measured
+    /// separately because it decides whether there is a safe increment worth
+    /// landing before atoms replace sections everywhere.
+    pub fully_dead_section_bytes: u64,
 }
 
 impl Report {
@@ -236,10 +244,25 @@ pub(crate) fn analyse(objects: &[LoadedObject], entry: &str) -> Report {
         }
     }
 
+    // Sections with no live atom at all.
+    let mut by_section: HashMap<(u32, u32), (u64, bool)> = HashMap::new();
+    for (index, node) in nodes.iter().enumerate() {
+        let entry = by_section
+            .entry((node.atom.object.0, node.atom.section.0))
+            .or_insert((0, false));
+        entry.0 += node.atom.size;
+        entry.1 |= live.contains(&index);
+    }
+
     Report {
         live_atoms: live.len(),
         total_atoms: nodes.len(),
         live_bytes: live.iter().map(|i| nodes[*i].atom.size).sum(),
         total_bytes: nodes.iter().map(|n| n.atom.size).sum(),
+        fully_dead_section_bytes: by_section
+            .values()
+            .filter(|(_, any_live)| !any_live)
+            .map(|(size, _)| *size)
+            .sum(),
     }
 }
