@@ -4333,3 +4333,32 @@ unchanged linker on the same 60-input link:
 What remains at the top of the profile is the part threading cannot touch:
 file I/O, which is the daemon's problem, and the allocator, which is the
 owned-`String` representation finding 82 named.
+
+## 91. Caching the stub parse: a null result, in the case it was built for
+
+Finding 89's profile put 167 samples in `yaml_rust2`'s scanner — `libSystem.tbd`
+is YAML, it is the same file on every link, and `dynamic_symbols` parsed it
+once per link. Memoising it by path is twenty lines.
+
+The measurement, in the scenario that most favours it — one process linking
+the same inputs repeatedly, so the cache is warm for every link after the
+first:
+
+```
+  before   217 links in 6s
+  after    209 links in 6s
+```
+
+No gain, and if anything a loss. 167 of ~14 000 samples is 1.2%, which is
+under the run-to-run spread of this measurement, and the added `Mutex` is not
+free. Reverted.
+
+Two things worth keeping from it:
+
+- **The profile's smallest entries are not a work queue.** A share of self time
+  that small cannot be distinguished from noise by the only instrument that
+  can confirm it, so acting on it is faith either way.
+- **The scenario chosen to measure in was the one that could only flatter the
+  change** — repeated links in a single process, where the cache hits every
+  time after the first. It still showed nothing. A null result under
+  favourable conditions is worth more than a positive one under vague ones.
