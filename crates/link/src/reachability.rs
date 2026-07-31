@@ -46,12 +46,12 @@
 //!   from live bytes is revived, and the count is reported. A hole in the model
 //!   then shows up as a number rather than as a corrupt binary.
 
+use crate::hashing::{FastMap as HashMap, FastSet as HashSet};
 use crate::LoadedObject;
 use blinker_macho::{
     Arm64RelocationKind, InputRelocation, InputSection, ObjectId, RelocationTarget, SectionId,
     SectionKind, SymbolVisibility,
 };
-use std::collections::{HashMap, HashSet};
 
 /// One symbol's worth of bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -262,8 +262,8 @@ impl Atoms {
         let mut result = Atoms {
             atoms,
             by_section,
-            opaque: HashSet::new(),
-            owners: HashMap::new(),
+            opaque: HashSet::default(),
+            owners: HashMap::default(),
         };
 
         for object in objects {
@@ -298,7 +298,7 @@ impl Atoms {
     /// those are resolved by the code that understands the format, and are
     /// remapped rather than copied.
     fn find_opaque(&self, objects: &[LoadedObject]) -> HashSet<(u32, u32)> {
-        let mut opaque = HashSet::new();
+        let mut opaque = HashSet::default();
         for object in objects {
             for relocation in &object.parsed.relocations {
                 let from_metadata = object
@@ -375,7 +375,7 @@ impl Atoms {
 type ByOffset<'a> = HashMap<u32, Vec<&'a InputRelocation>>;
 
 fn group_relocations(object: &LoadedObject) -> ByOffset<'_> {
-    let mut grouped: ByOffset<'_> = HashMap::new();
+    let mut grouped: ByOffset<'_> = HashMap::default();
     for relocation in &object.parsed.relocations {
         grouped
             .entry(relocation.section.0)
@@ -406,7 +406,7 @@ fn liveness(objects: &[LoadedObject], atoms: &Atoms, entry: &str) -> (HashSet<us
         .collect();
     let by_id: HashMap<u32, &LoadedObject> = objects.iter().map(|o| (o.parsed.id.0, o)).collect();
 
-    let mut live: HashSet<usize> = HashSet::new();
+    let mut live: HashSet<usize> = HashSet::default();
     let mut worklist: Vec<usize> = Vec::new();
     let mark = |index: usize, live: &mut HashSet<usize>, worklist: &mut Vec<usize>| {
         if live.insert(index) {
@@ -630,8 +630,8 @@ fn revive_lsdas(
     let Some(list) = grouped.get(&section.id.0) else {
         return;
     };
-    let mut functions: HashMap<u64, Option<usize>> = HashMap::new();
-    let mut lsdas: HashMap<u64, usize> = HashMap::new();
+    let mut functions: HashMap<u64, Option<usize>> = HashMap::default();
+    let mut lsdas: HashMap<u64, usize> = HashMap::default();
     for relocation in list {
         let record = relocation.offset / COMPACT_UNWIND_RECORD;
         match relocation.offset % COMPACT_UNWIND_RECORD {
@@ -867,7 +867,7 @@ fn report(
         revived,
         ..Report::default()
     };
-    let mut by_section: HashMap<(u32, u32), (u64, bool)> = HashMap::new();
+    let mut by_section: HashMap<(u32, u32), (u64, bool)> = HashMap::default();
     for (index, atom) in atoms.atoms.iter().enumerate() {
         if !is_text.contains(&atom.key()) {
             continue;

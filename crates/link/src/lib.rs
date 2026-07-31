@@ -35,7 +35,10 @@
 // correct, and stray diagnostics are invisible to both.
 #![deny(clippy::print_stderr, clippy::print_stdout)]
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::BTreeSet;
+
+/// Every map in the link uses the fast hasher; see [`hashing`].
+use hashing::{FastMap as HashMap, FastSet as HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
@@ -526,11 +529,8 @@ const DW_EH_PE_INDIRECT: u8 = 0x80;
 ///
 /// Returns the offsets, *within each input section*, of personality fields
 /// that use an indirect encoding — the only ones that must name a GOT slot.
-fn eh_frame_personality_fields(
-    object: &LoadedObject,
-    section: &InputSection,
-) -> std::collections::HashSet<u64> {
-    let mut fields = std::collections::HashSet::new();
+fn eh_frame_personality_fields(object: &LoadedObject, section: &InputSection) -> HashSet<u64> {
+    let mut fields = HashSet::default();
     let Some(file_offset) = section.file_offset else {
         return fields;
     };
@@ -628,7 +628,7 @@ fn eh_frame_fde_offsets(
     addresses: &AddressMap,
     strip: &Strip,
 ) -> HashMap<u64, u32> {
-    let mut offsets = HashMap::new();
+    let mut offsets = HashMap::default();
 
     let Some(output) = image
         .layout
@@ -654,7 +654,7 @@ fn eh_frame_fde_offsets(
             let chunk_offset = chunk - output.vm_address;
 
             // Relocations in this section, by offset.
-            let mut targets: HashMap<u64, u64> = HashMap::new();
+            let mut targets: HashMap<u64, u64> = HashMap::default();
             for relocation in object
                 .parsed
                 .relocations
@@ -730,13 +730,13 @@ fn survey_relocations(
     imports: &[String],
     strip: &Strip,
 ) -> RelocationSurvey {
-    let imported: std::collections::HashSet<&str> = imports.iter().map(String::as_str).collect();
+    let imported: HashSet<&str> = imports.iter().map(String::as_str).collect();
     let mut survey = RelocationSurvey::default();
     let (mut got_seen, mut tlv_seen, mut stub_seen, mut personality_seen) = (
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
-        std::collections::HashSet::new(),
+        HashSet::default(),
+        HashSet::default(),
+        HashSet::default(),
+        HashSet::default(),
     );
 
     for object in objects {
@@ -838,10 +838,10 @@ fn compact_unwind_entries(
             // For a section target the inline value is an address in the
             // object's own coordinate space, so the offset within that section
             // has to be recovered before rebasing onto the output address.
-            let mut targets: HashMap<(u64, u64), u64> = HashMap::new();
+            let mut targets: HashMap<(u64, u64), u64> = HashMap::default();
             // Personalities are recorded by GOT slot rather than by address,
             // so they are collected by name and resolved separately.
-            let mut personality_names: HashMap<u64, String> = HashMap::new();
+            let mut personality_names: HashMap<u64, String> = HashMap::default();
             for relocation in object
                 .parsed
                 .relocations
@@ -1051,7 +1051,7 @@ fn common_symbols(objects: &[LoadedObject]) -> Vec<Common> {
         .map(|s| s.name.as_str())
         .collect();
 
-    let mut wanted: HashMap<&str, Common> = HashMap::new();
+    let mut wanted: HashMap<&str, Common> = HashMap::default();
     for symbol in objects.iter().flat_map(|o| &o.parsed.symbols) {
         if symbol.strength != SymbolStrength::Common || defined.contains(symbol.name.as_str()) {
             continue;
@@ -1168,7 +1168,7 @@ struct Frontier {
 impl Frontier {
     fn new(objects: &[LoadedObject]) -> Frontier {
         let mut frontier = Frontier {
-            defined: HashSet::new(),
+            defined: HashSet::default(),
             wanted: BTreeSet::new(),
         };
         for object in objects {
@@ -1197,7 +1197,7 @@ impl Frontier {
 }
 
 fn undefined_references(objects: &[LoadedObject]) -> Vec<String> {
-    let mut defined: HashSet<&str> = HashSet::new();
+    let mut defined: HashSet<&str> = HashSet::default();
     for object in objects {
         for symbol in &object.parsed.symbols {
             if symbol.strength.is_definition() {
@@ -1207,7 +1207,7 @@ fn undefined_references(objects: &[LoadedObject]) -> Vec<String> {
     }
 
     let mut names = Vec::new();
-    let mut seen: HashSet<&str> = HashSet::new();
+    let mut seen: HashSet<&str> = HashSet::default();
     for object in objects {
         for symbol in &object.parsed.symbols {
             if symbol.strength.is_definition() || defined.contains(symbol.name.as_str()) {
@@ -1302,8 +1302,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     // Personality routines named by CIE augmentation data — the only place they
     // appear in DWARF mode (finding 31), which is why collecting them from
     // `__compact_unwind` found none (finding 49).
-    let mut eh_personality_fields: HashMap<(u32, u32), std::collections::HashSet<u64>> =
-        HashMap::new();
+    let mut eh_personality_fields: HashMap<(u32, u32), HashSet<u64>> = HashMap::default();
     for object in &objects {
         for section in &object.parsed.sections {
             if section.name != "__eh_frame" {
@@ -1628,8 +1627,8 @@ fn plan_reuse<'a>(
 
     // One probe per distinct file: an archive is proven unchanged once, not
     // once per member pulled out of it.
-    let mut keys: HashMap<&Path, Option<blinker_cache::InputKey>> = HashMap::new();
-    let mut entries = HashMap::new();
+    let mut keys: HashMap<&Path, Option<blinker_cache::InputKey>> = HashMap::default();
+    let mut entries = HashMap::default();
     for object in objects {
         let ranges = object_ranges(image, object.parsed.id);
         let Some(first) = ranges.first() else {
@@ -1679,7 +1678,7 @@ fn build_cache(
     // Input keys, one probe per distinct file. Archive members share their
     // archive's path and therefore its key: an rlib is proven unchanged once,
     // not once per member pulled out of it.
-    let mut keys: HashMap<&Path, Option<blinker_cache::InputKey>> = HashMap::new();
+    let mut keys: HashMap<&Path, Option<blinker_cache::InputKey>> = HashMap::default();
     let index_of = ObjectIndex::build(objects);
 
     let entries = patched
@@ -1946,7 +1945,7 @@ fn fill_unwind_info(
 
 /// Address of each stub.
 fn stub_addresses(stubs: &[String], image: &Image) -> HashMap<String, u64> {
-    let mut slots = HashMap::new();
+    let mut slots = HashMap::default();
     let Some(section) = image.layout.sections.iter().find(|s| s.name == "__stubs") else {
         return slots;
     };
@@ -2032,7 +2031,7 @@ fn pointer_slot_addresses(
     image: &Image,
     section_name: &str,
 ) -> HashMap<String, u64> {
-    let mut slots = HashMap::new();
+    let mut slots = HashMap::default();
     let Some(section) = image
         .layout
         .sections
@@ -2339,12 +2338,12 @@ fn load_objects(paths: &[PathBuf]) -> Result<Vec<LoadedObject>, LinkError> {
     }
 
     // Pull members in until nothing new is needed.
-    let mut extracted: std::collections::HashSet<(usize, u32)> = std::collections::HashSet::new();
+    let mut extracted: HashSet<(usize, u32)> = HashSet::default();
     let mut frontier = Frontier::new(&objects);
     // Names already offered to every archive. One that no archive defines will
     // still be wanted next round, and asking again cannot produce a different
     // answer — the archives do not change.
-    let mut probed: HashSet<String> = HashSet::new();
+    let mut probed: HashSet<String> = HashSet::default();
     loop {
         let wanted: Vec<String> = frontier
             .wanted
@@ -2811,7 +2810,7 @@ fn debug_map(objects: &[LoadedObject], placed: &[PlacedSymbol<'_>]) -> Vec<Outpu
 
     // Grouped by object, because the map is per compilation unit, and sorted
     // by address within one so a definition's size is the distance to the next.
-    let mut by_object: HashMap<usize, Vec<&PlacedSymbol<'_>>> = HashMap::new();
+    let mut by_object: HashMap<usize, Vec<&PlacedSymbol<'_>>> = HashMap::default();
     for symbol in placed {
         by_object.entry(symbol.object).or_default().push(symbol);
     }
@@ -2954,7 +2953,7 @@ fn build_contents(
     image: &Image,
     strip: &Strip,
 ) -> Result<HashMap<usize, Vec<u8>>, LinkError> {
-    let mut contents: HashMap<usize, Vec<u8>> = HashMap::new();
+    let mut contents: HashMap<usize, Vec<u8>> = HashMap::default();
     let index_of = ObjectIndex::build(objects);
 
     for (index, section) in image.layout.sections.iter().enumerate() {
@@ -3147,7 +3146,7 @@ struct IndirectTables<'a> {
     /// the routine. Resolving it like any other symbol reference wrote a
     /// function address where libunwind expected a pointer slot, and it
     /// segfaulted dereferencing it (finding 48).
-    personalities: &'a HashMap<(u32, u32), std::collections::HashSet<u64>>,
+    personalities: &'a HashMap<(u32, u32), HashSet<u64>>,
 }
 
 /// Patched content, plus the fixups dyld must apply at load time.
@@ -3374,7 +3373,7 @@ fn apply_relocations(
         // hashing below is proportional to distinct references rather than to
         // relocations — an object typically has several times more of the
         // latter.
-        let mut referenced: HashSet<(u32, u8)> = HashSet::new();
+        let mut referenced: HashSet<(u32, u8)> = HashSet::default();
 
         // The whole point of the cache: this object's bytes were relocated by
         // a previous link, nothing it reads has moved, and it has not moved

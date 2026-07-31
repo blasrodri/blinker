@@ -4280,6 +4280,17 @@ has 105 objects rather than the 900 the shape needs to bite. Kept as an
 asymptotic fix and reported as the zero it measured, not as the win it looked
 like.
 
+**Acting on it.** The first item the profile named — the name-keyed maps the
+comment had excluded on untested reasoning — was five lines. Every map in the
+link crate now uses the fast hasher, name-keyed included:
+
+```
+  (object, section) maps only     -2.5 ms
+  every map, names included       -5.2 ms   (9.7%)
+```
+
+The half the comment had ruled out was worth as much as the half it allowed.
+
 **The rule.** Three findings in a row (87, 88, and this one) corrected a
 priority that had been inferred rather than measured, and each inference was
 reasonable. The stage timer was the best instrument available and it was still

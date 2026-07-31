@@ -12,14 +12,22 @@
 //! be; for dense small integers it is a few instructions and distributes them
 //! well enough that the maps stay flat.
 //!
-//! **Not for names.** Symbol names are attacker-shaped in a different sense —
-//! long, sharing prefixes, and hashed far less often — so those maps keep the
-//! default.
+//! **Names too.** The first version of this said symbol names should keep the
+//! default hasher, on the reasoning that they are long and hashed less often.
+//! Both halves were wrong, and neither had been measured: a profile taken
+//! afterwards still showed 1136 samples in `SipHasher::write` after the
+//! `(object, section)` maps had been converted, because the maps a relocation
+//! actually probes — the GOT, stub and TLV slot tables — are keyed by name and
+//! probed once per relocation. Length does not rescue SipHash here either; it
+//! does more work per eight bytes than this does, at every length.
 
 use std::hash::{BuildHasherDefault, Hasher};
 
 /// A `HashMap` using [`FastHasher`].
 pub type FastMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FastHasher>>;
+
+/// A `HashSet` using [`FastHasher`].
+pub type FastSet<T> = std::collections::HashSet<T, BuildHasherDefault<FastHasher>>;
 
 /// The odd 64-bit constant from `rustc_hash`, close to `2^64 / φ`.
 const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
