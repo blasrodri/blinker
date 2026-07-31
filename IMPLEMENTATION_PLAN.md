@@ -520,3 +520,61 @@ convert `Cargo.toml` to a workspace; add the local gate script (even before any 
 code exists, so it's gating from commit one); then `arguments` (tokenizer + response
 files) and `cli` (delegating wrapper) together, since neither is independently
 testable against real `rustc` output without the other.
+
+---
+
+## M4 design, as of the corrected measurements
+
+Recorded here rather than started, because the measurements that justify it are
+now solid and the implementation is a clean unit of work.
+
+### What it is worth
+
+From finding 40 (25 iterations, warmup discarded, sd < 1 ms per stage), against
+`ld-prime` at 32.3 ms and blinker at 39.7 ms on the same 27-input link:
+
+| cached through | saving | blinker becomes |
+|---|---|---|
+| parse | 27% | ~29 ms — ahead of ld-prime |
+| + resolve | 55% | ~18 ms |
+| + relocate | 80% | ~8 ms |
+
+A parse cache alone is sufficient to make blinker the faster linker. That is
+the M4 target.
+
+### The key
+
+**Content hash, never path.** Finding 15: rustc's object filenames carry a
+per-build session component that changes every build, so a path-keyed cache has
+a 0% hit rate by construction. The CGU component of the name is stable, and the
+file's BLAKE3 hash is stable and self-verifying; blinker already hashes inputs
+when `--blinker-strict-fingerprints` is set.
+
+The key must also include a **schema version**, bumped whenever `ParsedObject`
+or any type it contains changes shape. A cache hit that deserializes a stale
+layout is worse than a miss.
+
+### The open question: is deserialising faster than parsing?
+
+This is the premise the whole design rests on and it is **not yet measured**.
+`ParsedObject` is mostly `Vec<InputSymbol>`, and symbol names are `String`s —
+thousands of allocations either way. Parsing currently costs 8.1 ms for 17 MB
+across 27 files. If deserialisation allocates the same strings, it may not win.
+
+The experiment to run first, before writing a cache: serialise the parsed
+objects, then time deserialisation against re-parsing. If the margin is thin,
+the answer is to change what is stored — string interning with a single shared
+buffer, or offsets into the original file rather than owned `String`s — rather
+than to pick a faster codec.
+
+`bincode` 3 is available (`cargo add bincode@3`, no features needed) and is the
+obvious first codec to try; `ciborium` is already in the local registry cache
+if working offline matters. Neither choice matters until the premise above is
+tested.
+
+### Where it lives
+
+A `blinker-cache` crate between `blinker-macho` and `blinker-link`, with
+`load_objects` consulting it. The cache directory should default under
+`CARGO_TARGET_DIR` when set, so a `cargo clean` clears it and it never outlives
+the build tree it describes.
