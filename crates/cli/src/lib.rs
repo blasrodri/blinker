@@ -180,7 +180,11 @@ pub fn run(argv: &[String]) -> Result<Outcome, DriverError> {
             phases.relocate_ms,
             phases.emit_ms,
         );
-        record.mode = blinker_diagnostics::LinkMode::Cold;
+        if options.incremental_cache {
+            record.set_reuse(phases.reused_objects, phases.total_objects);
+        } else {
+            record.mode = blinker_diagnostics::LinkMode::Cold;
+        }
         record.fallback_reason = None;
         0
     } else {

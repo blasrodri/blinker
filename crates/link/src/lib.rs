@@ -61,6 +61,13 @@ pub struct LinkTimings {
     /// relocating them again. Zero on a cold link, and on every link that did
     /// not ask for a cache.
     pub reused_objects: u64,
+    /// Objects the link resolved, after archive members were extracted.
+    ///
+    /// Reported alongside `reused_objects` because the two must be compared
+    /// against each other and not against the number of input *files*: 19
+    /// rlibs on the command line can become 200 objects in the link, and a
+    /// hit rate computed against the file count is meaningless.
+    pub total_objects: u64,
 }
 
 impl std::fmt::Display for LinkTimings {
@@ -72,8 +79,12 @@ impl std::fmt::Display for LinkTimings {
                 0.0
             }
         };
-        if self.reused_objects > 0 {
-            writeln!(f, "  reused      {:7} objects", self.reused_objects)?;
+        if self.total_objects > 0 {
+            writeln!(
+                f,
+                "  reused      {:7} of {} objects",
+                self.reused_objects, self.total_objects
+            )?;
         }
         writeln!(
             f,
@@ -994,7 +1005,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
         (Some(previous), Some(current)) => Some(plan_reuse(&objects, &probe, previous, current)),
         _ => None,
     };
-    timings.reused_objects = plan.as_ref().map_or(0, |p| p.entries.len() as u64);
+    timings.total_objects = objects.len() as u64;
 
     let patched = apply_relocations(
         &objects,
@@ -1018,6 +1029,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
         let _ = blinker_cache::store(path, &cache);
     }
 
+    timings.reused_objects = patched.reused;
     let contents = patched.contents;
     let entry_offset = entry_offset(request, &objects, &probe)?;
     timings.relocate_ms = elapsed_ms(step);
@@ -2025,6 +2037,15 @@ struct Patched {
     rebases: Vec<Rebase>,
     /// What each object read and produced, for the cache.
     records: Vec<ObjectRecord>,
+    /// Objects whose bytes were **actually copied** from the cache.
+    ///
+    /// Counted here, at the copy, and not from the plan. A first version
+    /// reported the plan's size, which is decided before the copy is
+    /// attempted: when every copy failed and every object fell through to a
+    /// full relocation, it still reported 47 of 47 reused. The counter added to
+    /// make a dead cache visible had the dead cache's own failure mode, and
+    /// only the relocate time — 10.1 ms against 4.7 — gave it away.
+    reused: u64,
 }
 
 /// One object's trace through the relocation pass.
@@ -2148,6 +2169,7 @@ fn apply_relocations(
         };
     let mut extra_binds = Vec::new();
     let mut records: Vec<ObjectRecord> = Vec::new();
+    let mut reused = 0u64;
     for object in objects {
         // Where this object's fixups start. Binds and rebases are produced as
         // a side effect of relocating, so an object whose bytes are later
@@ -2168,6 +2190,7 @@ fn apply_relocations(
         if let Some(entry) = reuse.and_then(|plan| plan.entry(object.parsed.id)) {
             let plan = reuse.expect("just matched");
             if copy_cached_bytes(entry, plan, &mut contents) {
+                reused += 1;
                 extra_binds.extend(entry.binds.iter().map(|bind| Bind {
                     segment: bind.segment,
                     offset: bind.offset,
@@ -2453,6 +2476,7 @@ fn apply_relocations(
         binds: extra_binds,
         rebases: extra_rebases,
         records,
+        reused,
     })
 }
 

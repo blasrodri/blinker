@@ -168,6 +168,26 @@ impl LinkRecord {
         self.timings.link_emit_ms = Some(emit);
     }
 
+    /// Record how much of the link came from the cache.
+    ///
+    /// Surfaced by default rather than on request. A cache that silently stops
+    /// working produces a *correct* binary and a slower link, which no
+    /// correctness test can distinguish from a cache that works — blinker's
+    /// reused nothing at all on a real Rust link while every test passed, and
+    /// the only evidence was a counter nothing printed (finding 64).
+    ///
+    /// The mode follows from the counters rather than being set separately, so
+    /// a record cannot claim to be incremental while reporting no reuse.
+    pub fn set_reuse(&mut self, reused: u64, total: u64) {
+        self.counters.reused_inputs = Some(reused);
+        self.counters.changed_inputs = Some(total.saturating_sub(reused));
+        self.mode = if reused == 0 {
+            LinkMode::Cold
+        } else {
+            LinkMode::Incremental
+        };
+    }
+
     pub fn set_timing_total(&mut self, d: Duration) {
         self.timings.total_ms = Some(as_ms(d));
     }
@@ -236,6 +256,13 @@ impl LinkRecord {
             "blinker:\n  mode: {mode}\n  elapsed: {elapsed:.0} ms\n  inputs: {}\n  bytes_read: {}",
             self.counters.input_count, self.counters.bytes_read
         );
+        if let Some(reused) = self.counters.reused_inputs {
+            s.push_str(&format!(
+                "\n  reused: {reused}/{} objects",
+                self.counters.reused_inputs.unwrap_or(0)
+                    + self.counters.changed_inputs.unwrap_or(0)
+            ));
+        }
         if !self.unrecognized_arguments.is_empty() {
             s.push_str(&format!(
                 "\n  unrecognized_arguments: {}",
@@ -330,5 +357,63 @@ mod tests {
         let path = dir.join("nested/deeper/record.json");
         LinkRecord::delegated().write_json(&path).unwrap();
         assert!(path.exists());
+    }
+}
+
+#[cfg(test)]
+mod reuse_tests {
+    use super::*;
+
+    fn parse(record: &LinkRecord) -> serde_json::Value {
+        serde_json::from_str(&record.to_json()).unwrap()
+    }
+
+    #[test]
+    fn reuse_is_reported_in_the_counters_and_the_summary() {
+        let mut record = LinkRecord::delegated();
+        record.set_inputs(
+            (0..47)
+                .map(|n| InputFingerprint::for_test("o", n))
+                .collect(),
+        );
+        record.set_reuse(47, 47);
+        assert_eq!(record.counters.reused_inputs, Some(47));
+        assert_eq!(record.counters.changed_inputs, Some(0));
+        assert!(record.to_summary().contains("reused: 47/47 objects"));
+    }
+
+    /// The failure this exists to make visible: every input rebuilt, and a
+    /// correct binary produced, so nothing else in the record differs.
+    #[test]
+    fn a_cache_that_reused_nothing_says_so_rather_than_staying_silent() {
+        let mut record = LinkRecord::delegated();
+        record.set_inputs(
+            (0..47)
+                .map(|n| InputFingerprint::for_test("o", n))
+                .collect(),
+        );
+        record.set_reuse(0, 47);
+        assert!(record.to_summary().contains("reused: 0/47 objects"));
+        assert_eq!(parse(&record)["counters"]["reused_inputs"], 0);
+    }
+
+    /// The mode is derived, so a record cannot report `incremental` while
+    /// having reused nothing.
+    #[test]
+    fn the_mode_follows_the_counters() {
+        let mut record = LinkRecord::delegated();
+        record.set_reuse(0, 10);
+        assert_eq!(parse(&record)["mode"], "cold");
+        record.set_reuse(3, 10);
+        assert_eq!(parse(&record)["mode"], "incremental");
+    }
+
+    /// A link with no cache leaves the field null, which is different from a
+    /// cache that reused nothing.
+    #[test]
+    fn a_link_without_a_cache_reports_null_rather_than_zero() {
+        let record = LinkRecord::delegated();
+        assert!(parse(&record)["counters"]["reused_inputs"].is_null());
+        assert!(!record.to_summary().contains("reused"));
     }
 }

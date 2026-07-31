@@ -2734,8 +2734,12 @@ Instrumenting the plan showed every condition passing:
 47 entries matched, no address moved, and no object was reused. The failure was
 past all three conditions, in the byte copy: a **zero-filled section** has
 contributions with a real length and no bytes on either side, and the copy read
-that as the two layouts disagreeing and refused. Rust objects touch `__bss` and
-the thread-local block almost universally, so almost every object failed.
+that as the two layouts disagreeing and refused.
+
+*Corrected by finding 66:* exactly **one** object failed the copy, not most of
+them — and it alone accounted for half the relocate time, because it is the
+libstd codegen unit that holds most of the link's relocations. The "0 of 47"
+above was itself wrong, produced by the miscounting finding 66 describes.
 
 ### The symptom that did not exist
 
@@ -2751,13 +2755,13 @@ correctness tests cannot see the difference between a cache that works and a
 cache that is switched off, and that is precisely the difference it exists to
 make.
 
-### The test for it does not work
+### The test for it
 
-The C fixture written to cover this passes with the fix reverted. It is kept,
-with its doc comment saying so plainly, because a test whose negative control
-passes proves nothing and mislabelling it is worse than not having it. Finding
-a C fixture that reaches the same path — or driving the Rust link from a test —
-is unfinished.
+The C fixture written to cover this passes with the fix reverted, and is kept
+only for the weaker property it does check. The guard is
+`crates/cli/tests/rust_cache.rs`, which replays a captured Rust link twice and
+requires *every* object to be reused. It fails with the fix reverted, but only
+after finding 66 — until the counter was honest, it could not have.
 
 ## 65. Tentative (common) symbols are not resolved
 
@@ -2775,3 +2779,50 @@ UndefinedSymbols { names: ["_big_uninitialised"] }
 Rust never emits these, which is why nothing had hit it before, and C code that
 does is common enough that this is a real gap rather than a curiosity. Recorded
 where it was found rather than fixed in passing.
+
+## 66. The counter added to detect a dead cache reported a dead cache as healthy
+
+Finding 64's conclusion was that a cache needs its hit rate surfaced, because a
+cache that stops working is invisible. The counter was added. It lied.
+
+Reverting the zero-fill fix, to check that the new test could catch it:
+
+```
+  with the fix     reused 47/47 objects   relocate  4.7 ms
+  without the fix  reused 47/47 objects   relocate 10.1 ms
+```
+
+Identical hit rate, and the link doing twice the relocation work. Every test
+asserting on that counter passed, including the one written specifically to
+catch this bug.
+
+The cause is a one-word distinction: `reused_objects` was taken from
+`plan.entries.len()` — the objects the plan *selected* — and the plan is built
+before any copy is attempted. When a copy failed, the object fell through to a
+full relocation and the plan still counted it. The counter measured intent.
+
+Counting at the copy instead:
+
+```
+  with the fix     reused 47/47 objects   relocate  4.8 ms
+  without the fix  reused 46/47 objects   relocate  9.8 ms
+```
+
+One object, and half the relocate time — it is the libstd codegen unit that
+holds most of the link's relocations, which is also why "reuse 46 of 47" is a
+catastrophic result rather than a good one. **A hit rate by object count is the
+wrong unit** when object sizes span three orders of magnitude; weighting by
+relocations would have made this obvious immediately.
+
+### The lesson, which is not the one finding 64 drew
+
+Finding 64 said: surface the hit rate, because correctness tests cannot see a
+dead cache. True, and insufficient. The instrument was added and had **the same
+failure mode as the thing it was built to detect** — reporting success while
+nothing happened — and it took the same evidence to catch it: a timing that
+moved when it should not have.
+
+So: **an instrument needs its own negative control.** Deliberately break the
+thing being measured and confirm the number moves. That is one extra command
+after adding any counter, and without it a metric is an assertion about the
+code that nobody has tested.
