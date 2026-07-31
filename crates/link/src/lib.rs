@@ -1739,30 +1739,106 @@ fn is_archive(path: &Path) -> bool {
 ///
 /// Order matters within a pass and between passes, which is why this is a loop
 /// rather than a single sweep.
-fn load_objects(paths: &[PathBuf]) -> Result<Vec<LoadedObject>, LinkError> {
-    let mut objects: Vec<LoadedObject> = Vec::new();
-    let mut next_id = 0u32;
+/// One input, read and either parsed or indexed.
+enum Loaded {
+    Object(LoadedObject),
+    Archive(PathBuf, blinker_archive::ArchiveIndex, Vec<u8>),
+}
 
-    // Archives are indexed but not extracted; objects go in directly.
-    let mut archives: Vec<(PathBuf, blinker_archive::ArchiveIndex, Vec<u8>)> = Vec::new();
-
-    for path in paths {
-        let data = std::fs::read(path).map_err(|source| LinkError::Read {
-            path: path.clone(),
-            source,
-        })?;
-
-        if is_archive(path) {
+/// Read and parse one input. Pure with respect to the others, which is what
+/// lets [`load_objects`] run them concurrently.
+fn load_one(path: &PathBuf, id: Option<ObjectId>) -> Result<Loaded, LinkError> {
+    let data = std::fs::read(path).map_err(|source| LinkError::Read {
+        path: path.clone(),
+        source,
+    })?;
+    match id {
+        None => {
             let index = blinker_archive::index_archive(&data, path)
                 .map_err(|source| LinkError::Archive(Box::new(source)))?;
-            archives.push((path.clone(), index, data));
-            continue;
+            Ok(Loaded::Archive(path.clone(), index, data))
         }
+        Some(id) => {
+            let parsed = parse_object(&data, path, None, id)
+                .map_err(|source| LinkError::Parse(Box::new(source)))?;
+            Ok(Loaded::Object(LoadedObject { parsed, data }))
+        }
+    }
+}
 
-        let parsed = parse_object(&data, path, None, ObjectId(next_id))
-            .map_err(|source| LinkError::Parse(Box::new(source)))?;
-        next_id += 1;
-        objects.push(LoadedObject { parsed, data });
+fn load_objects(paths: &[PathBuf]) -> Result<Vec<LoadedObject>, LinkError> {
+    // Object ids are assigned by position, before anything is read, so that
+    // running the reads out of order cannot change them. `is_archive` looks
+    // only at the path, so the assignment needs no I/O.
+    let mut next_id = 0u32;
+    let ids: Vec<Option<ObjectId>> = paths
+        .iter()
+        .map(|path| {
+            (!is_archive(path)).then(|| {
+                let id = ObjectId(next_id);
+                next_id += 1;
+                id
+            })
+        })
+        .collect();
+
+    // Reading and parsing an input touches nothing shared, and it is the
+    // largest stage of a cold link. Results are collected positionally rather
+    // than as they finish: the order of `objects` decides the layout, and a
+    // link whose output depends on thread scheduling is not a link.
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(paths.len().max(1));
+    let mut loaded: Vec<Option<Result<Loaded, LinkError>>> =
+        (0..paths.len()).map(|_| None).collect();
+
+    if threads > 1 {
+        // A shared cursor rather than a contiguous slice each. The inputs are
+        // wildly uneven — 37 objects averaging 8 KB, then 19 rlibs averaging
+        // 900 KB, and the rlibs arrive last because that is the order a linker
+        // command line puts them in. Handing each thread a contiguous chunk
+        // gave the last thread every large file and saved 1.2 ms of 6.9;
+        // letting threads take the next unclaimed input balances itself.
+        let cursor = std::sync::atomic::AtomicUsize::new(0);
+        let (paths, ids) = (&paths, &ids);
+        let claimed: Vec<Vec<(usize, Result<Loaded, LinkError>)>> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    let cursor = &cursor;
+                    scope.spawn(move || {
+                        let mut mine = Vec::new();
+                        loop {
+                            let at = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            if at >= paths.len() {
+                                return mine;
+                            }
+                            mine.push((at, load_one(&paths[at], ids[at])));
+                        }
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| worker.join().expect("a loader thread panicked"))
+                .collect()
+        });
+        for (at, result) in claimed.into_iter().flatten() {
+            loaded[at] = Some(result);
+        }
+    } else {
+        for (at, slot) in loaded.iter_mut().enumerate() {
+            *slot = Some(load_one(&paths[at], ids[at]));
+        }
+    }
+
+    let mut objects: Vec<LoadedObject> = Vec::new();
+    let mut archives: Vec<(PathBuf, blinker_archive::ArchiveIndex, Vec<u8>)> = Vec::new();
+    for slot in loaded {
+        match slot.expect("every input was visited")? {
+            Loaded::Object(object) => objects.push(object),
+            Loaded::Archive(path, index, data) => archives.push((path, index, data)),
+        }
     }
 
     if archives.is_empty() {

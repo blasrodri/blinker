@@ -2892,3 +2892,60 @@ happens relative to the expensive work*:
 - this checks before any of it, and saves everything.
 
 The artifact being cached mattered less than the position of the check.
+
+## 68. Reading is not the cost; archive extraction is
+
+`read+parse` was 6.9 ms of a 25 ms cold link and the obvious assumption was
+that 17.2 MB of I/O dominates it. Measured instead:
+
+```
+  read 19 rlibs (16.87 MB)   1.18 ms   (14.95 GB/s, warm)
+  read 37 objects (0.31 MB)  0.78 ms   ( 0.41 GB/s — per-file overhead)
+```
+
+Two megabytes of reading, and the rlibs — 98% of the bytes — cost a fifth of
+what the small files cost, because at these sizes the price is per *file*, not
+per byte. Any plan built on "avoid reading the rlibs" would have been chasing
+1.2 ms.
+
+Splitting the stage properly:
+
+```
+  initial read+parse loop     2.0 ms
+  archive extraction          4.1 ms   (47 objects, 4 rounds,
+                                         1.8 ms scanning for undefined symbols)
+```
+
+**Extraction is two thirds of the stage**, and nearly half of *that* is
+re-scanning every object's symbol table once per round to find what is still
+undefined — an O(rounds x symbols) loop where the rounds are only 4 and the
+symbols are tens of thousands. The rest is parsing the 10 extracted members and
+copying their bytes out of the archive.
+
+### The parallelism, and what it was worth
+
+The initial loop is embarrassingly parallel, and threading it took the stage
+from 6.9 ms to 5.5 ms. Worth keeping, and much less than hoped, because it only
+ever addressed the 2 ms half.
+
+Two things showed up doing it:
+
+- **Contiguous chunks are the wrong split.** A linker command line puts small
+  objects first and large archives last, so slicing the input list by position
+  handed one thread every rlib. A shared cursor balances itself.
+- **Thread spawn is not free at this scale.** With 56 tasks averaging under a
+  millisecond, eight threads spend a measurable fraction of the win starting
+  up; the cursor version and the chunk version came out within noise of each
+  other despite the chunk version being badly balanced.
+
+Output stays byte-identical, which is the property that matters: object ids are
+assigned by position before anything is read, so results are collected
+positionally rather than as they finish. A link whose layout depends on thread
+scheduling is not a link.
+
+### What this says to do next
+
+Not more parallelism. The remaining 4.1 ms is an algorithm — maintain the
+undefined set incrementally instead of recomputing it — and beyond that, the
+only way to stop paying for unchanged inputs is not to process them at all,
+which is the partial fast path finding 67 points at.
