@@ -4048,3 +4048,64 @@ absence was recorded in a code comment as a deliberate deferral. Neither
 comment was wrong about the deferral; both were wrong about the consequence.
 "Not implemented yet" and "produces confidently incorrect output" are not the
 same state, and only one of them is safe to leave alone.
+
+## 86. The debug map's `SO` names do not have to be right
+
+The debug map is how a Mach-O executable says where its debug information
+*is*: the DWARF stays in the `.o` files and the executable carries stabs
+naming the object each function came from and the address it landed at. The
+shape `ld` emits, per compilation unit:
+
+```
+  SO    "<dir>/"      SO "<file>"      opens the unit
+  OSO   "<path.o>"    n_desc 1, n_value the object's mtime
+    BNSYM / FUN "_name" / FUN "" (size) / ENSYM     per function
+    GSYM "_global"                                  global data
+    STSYM "_static"                                 static data
+  SO    ""            closes it
+```
+
+`ld` fills the two `SO` strings from the object's DWARF `DW_AT_comp_dir` and
+`DW_AT_name`, which means a DWARF parser — abbrev tables, form decoding, the
+whole thing — for two strings. Before writing one, the question was whether
+they are load-bearing. They are not, and the check was five lines: overwrite
+`ld`'s own `SO` strings in an already-linked binary with same-length garbage
+and ask `atos` the same question.
+
+```
+  correct SO   helper (in a-ld)       (a.c:2)
+  wrong SO     helper (in a-wrongso)  (a.c:2)
+```
+
+`/nowhere/XXXXXX...` and `z.c`, and the file and line still resolve, because
+they come from the DWARF the `OSO` points at. The `SO` names a compilation
+unit; it does not locate anything. blinker derives both from the object's own
+path and skips the parser entirely.
+
+The rest is mechanical, with one part that has to be computed rather than
+copied: **a Mach-O symbol table does not record function sizes**, so the size
+in the second `FUN` stab is the distance to the next definition in the same
+chunk, or to the chunk's end for the last one. Checked against `ld`'s numbers
+for the same object — same machine code, two linkers, so the addresses differ
+and the sizes must not.
+
+Verified end to end without a debugger, which matters because `lldb` needs an
+attach authorisation this project does not ask for. `atos` and `dsymutil` read
+the debug map and need no permission at all:
+
+```
+  atos -o a-bl 0x100000548     helper (in a-bl) (a.c:2)      identical to ld's
+  Rust backtrace               fixture::deep at ./src/main.rs:1:38
+```
+
+**Cost, measured interleaved:** +1.7 ms and +7.7% output. The size was then
+mostly recovered by interning the string table — the debug map names every
+function a second time, so half the added strings were copies of the other
+half — bringing it to **+1.0 ms and +2.0%**. blinker's output is now 1.05x
+`ld`'s, against 0.94x when it was missing what `ld` emits.
+
+**What this closes.** Spec §23 lists five debug behaviours the MVP must state
+the status of. Four now work and are tested: breakpoint-by-name has the
+symbols to resolve against, and stack traces, source-line display, panic
+backtraces and test-failure backtraces all produce what `ld`'s output does.
+Full `.dSYM` production remains out of scope, as §23 allows.

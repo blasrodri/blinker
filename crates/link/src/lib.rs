@@ -1497,7 +1497,11 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     // The symbol table grows between passes, which changes `LC_SYMTAB`'s
     // contents but not the load commands' *sizes* — so the section addresses
     // the relocations were computed against still hold.
-    let symbols = output_symbols(&objects, &placed, &strip)?;
+    let placed_symbols = placed_symbols(&objects, &placed, &strip);
+    let mut symbols = output_symbols(&placed_symbols);
+    // After the ordinary locals, which is where `ld` puts them and where a
+    // consumer walking the local range expects the debug map to begin.
+    symbols.extend(debug_map(&objects, &placed_symbols));
 
     // Each GOT slot holds an absolute address, and the image is position
     // independent, so dyld must relocate every one of them at load time.
@@ -2633,13 +2637,82 @@ fn is_temporary_label(name: &str) -> bool {
 /// of uncertainty. `crates/cli/tests/backtraces_name_the_right_function.rs`
 /// has the observed output: four frames inside a private recursive function
 /// reported as `core::fmt::rt::Argument::new_display`.
-fn output_symbols(
-    objects: &[LoadedObject],
+fn output_symbols(placed: &[PlacedSymbol<'_>]) -> Vec<OutputSymbol> {
+    let mut out: Vec<OutputSymbol> = placed
+        .iter()
+        .map(|symbol| match symbol.visibility {
+            SymbolVisibility::Local => {
+                OutputSymbol::local(symbol.name, symbol.section_number, symbol.address)
+            }
+            SymbolVisibility::Global => {
+                OutputSymbol::exported(symbol.name, symbol.section_number, symbol.address)
+            }
+            SymbolVisibility::PrivateExternal => {
+                let mut exported =
+                    OutputSymbol::exported(symbol.name, symbol.section_number, symbol.address);
+                exported.private_external = true;
+                exported
+            }
+        })
+        .collect();
+    // Deterministic order regardless of how the objects were traversed. Locals
+    // may share a name across objects, so the name alone no longer orders the
+    // table — address and section break the tie.
+    out.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then(a.value.cmp(&b.value))
+            .then(a.section.cmp(&b.section))
+    });
+    out
+}
+
+/// One definition, with everywhere it ended up.
+///
+/// Computed once because two consumers need the same answer and disagreeing
+/// would be worse than either being wrong: the symbol table says where a name
+/// is, and the debug map says which object's DWARF describes that address. A
+/// symbol present in one and absent from the other is a frame that resolves to
+/// a name with no source, or to a source with the wrong name.
+struct PlacedSymbol<'a> {
+    name: &'a str,
+    visibility: SymbolVisibility,
+    /// Index into the `objects` slice this came from.
+    object: usize,
+    section: SectionId,
+    /// One-based output section number, for `n_sect`.
+    section_number: u8,
+    address: u64,
+    /// Where the containing chunk ends, so the last definition in it can be
+    /// sized without looking at the next chunk.
+    chunk_end: u64,
+    is_code: bool,
+}
+
+/// Every definition that survived to the output, placed.
+///
+/// # Locals are not optional
+///
+/// They were dropped once, on the reasoning that a local is invisible outside
+/// its object and only a debugger would want it. Both halves are wrong, and
+/// the second is the dangerous one. Most Rust functions are local — anything
+/// not `pub`, plus nearly every monomorphisation out of `std` — and the
+/// consumer is not a debugger but the panicking program itself, symbolicating
+/// its own backtrace from its own symbol table.
+///
+/// A symbolicator resolves an address to the nearest symbol at or below it, so
+/// omitting the locals does not omit the answer. It moves the answer to
+/// whatever global happens to precede the frame, and prints that with no mark
+/// of uncertainty. `crates/cli/tests/backtraces_name_the_right_function.rs`
+/// has the observed output: four frames inside a private recursive function
+/// reported as `core::fmt::rt::Argument::new_display`.
+fn placed_symbols<'a>(
+    objects: &'a [LoadedObject],
     placed: &Placed,
     strip: &Strip,
-) -> Result<Vec<OutputSymbol>, LinkError> {
+) -> Vec<PlacedSymbol<'a>> {
     let mut out = Vec::new();
-    for object in objects {
+    for (index, object) in objects.iter().enumerate() {
         for symbol in &object.parsed.symbols {
             if !symbol.strength.is_definition() || is_temporary_label(&symbol.name) {
                 continue;
@@ -2670,28 +2743,169 @@ fn output_symbols(
             let Ok(number) = u8::try_from(output_section + 1) else {
                 continue;
             };
-            let address = chunk + offset_in_section;
-            out.push(match symbol.visibility {
-                SymbolVisibility::Local => OutputSymbol::local(&symbol.name, number, address),
-                SymbolVisibility::Global => OutputSymbol::exported(&symbol.name, number, address),
-                SymbolVisibility::PrivateExternal => {
-                    let mut exported = OutputSymbol::exported(&symbol.name, number, address);
-                    exported.private_external = true;
-                    exported
-                }
+            out.push(PlacedSymbol {
+                name: &symbol.name,
+                visibility: symbol.visibility,
+                object: index,
+                section: section_id,
+                section_number: number,
+                address: chunk + offset_in_section,
+                chunk_end: chunk + strip.size_of(object.parsed.id, section_id, input.size),
+                is_code: input.kind == SectionKind::Code,
             });
         }
     }
-    // Deterministic order regardless of how the objects were traversed. Locals
-    // may share a name across objects, so the name alone no longer orders the
-    // table — address and section break the tie.
-    out.sort_by(|a, b| {
-        a.name
-            .cmp(&b.name)
-            .then(a.value.cmp(&b.value))
-            .then(a.section.cmp(&b.section))
-    });
-    Ok(out)
+    out
+}
+
+/// The debug map: where each function came from, so a debugger can find the
+/// DWARF that describes it.
+///
+/// # What it is
+///
+/// A Mach-O executable does not carry its debug information. The DWARF stays
+/// in the `.o` files, and the executable carries a table of stabs saying which
+/// object each definition came from and what address it ended up at. `lldb`
+/// reads it directly; `dsymutil` reads it to build a `.dSYM`. Without it a
+/// binary has names and no line numbers — `deep` instead of `deep at
+/// hello.rs:1:38` — and no way to break on a source line.
+///
+/// # The shape, copied from what `ld` emits
+///
+/// ```text
+///   SO    "<dir>/"      the compilation unit opens
+///   SO    "<file>"
+///   OSO   "<path.o>"    n_desc 1, n_value the object's mtime
+///     BNSYM              at the function's address
+///     FUN  "_name"       at the function's address
+///     FUN  ""            n_value is the function's *size*
+///     ENSYM              at the function's address
+///     GSYM "_data"       n_value 0: the address is in the symbol table
+///     STSYM "_static"    at its address
+///   SO    ""            and closes
+/// ```
+///
+/// # The `SO` names are approximate, and measured to be harmless
+///
+/// `ld` fills them from the object's DWARF `DW_AT_comp_dir` and `DW_AT_name`,
+/// which needs a DWARF parser. blinker derives them from the object's own
+/// path. That was checked rather than assumed: rewriting `ld`'s own `SO`
+/// strings in a linked binary to `/nowhere/XXX...` and `z.c` left `atos` still
+/// reporting `a.c:2`, because the file and line come from the DWARF the `OSO`
+/// points at, not from the `SO`. The `SO` names a compilation unit; it does
+/// not locate anything.
+///
+/// # What it costs to be wrong here
+///
+/// An `OSO` naming an object that has moved, or whose mtime has changed, makes
+/// a debugger report stale or missing line information rather than fail — so
+/// this is a place where a silent wrong answer is easy. Objects with no debug
+/// sections are skipped entirely rather than given an entry that points at
+/// nothing.
+fn debug_map(objects: &[LoadedObject], placed: &[PlacedSymbol<'_>]) -> Vec<OutputSymbol> {
+    use blinker_output::symtab::stab;
+
+    // Grouped by object, because the map is per compilation unit, and sorted
+    // by address within one so a definition's size is the distance to the next.
+    let mut by_object: HashMap<usize, Vec<&PlacedSymbol<'_>>> = HashMap::new();
+    for symbol in placed {
+        by_object.entry(symbol.object).or_default().push(symbol);
+    }
+
+    let mut out = Vec::new();
+    for (index, object) in objects.iter().enumerate() {
+        if !object.parsed.metadata.has_debug_info {
+            continue;
+        }
+        let Some(symbols) = by_object.get_mut(&index) else {
+            continue;
+        };
+        symbols.sort_by_key(|symbol| (symbol.section.0, symbol.address));
+
+        let path = &object.parsed.metadata.path;
+        let directory = path
+            .parent()
+            .map(|parent| format!("{}/", parent.display()))
+            .unwrap_or_default();
+        let file = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // An archive member is named the way `ld` names it, and carries a
+        // timestamp of zero: the member has no mtime of its own, and the
+        // archive's would go stale for reasons unrelated to this member.
+        let (oso, mtime) = match &object.parsed.metadata.member {
+            Some(member) => (format!("{}({member})", path.display()), 0),
+            None => (path.display().to_string(), object_mtime(path)),
+        };
+
+        out.push(OutputSymbol::stab(stab::SO, directory, NO_SECTION, 0, 0));
+        out.push(OutputSymbol::stab(stab::SO, file, NO_SECTION, 0, 0));
+        out.push(OutputSymbol::stab(stab::OSO, oso, NO_SECTION, 1, mtime));
+
+        for (at, symbol) in symbols.iter().enumerate() {
+            if symbol.is_code {
+                // The distance to the next definition in the same chunk, or to
+                // the end of the chunk for the last one. A function's size is
+                // not recorded in a Mach-O symbol table, so it is the gap.
+                let end = symbols
+                    .get(at + 1)
+                    .filter(|next| next.section == symbol.section)
+                    .map(|next| next.address)
+                    .unwrap_or(symbol.chunk_end);
+                let size = end.saturating_sub(symbol.address);
+                let n = symbol.section_number;
+                out.push(OutputSymbol::stab(stab::BNSYM, "", n, 0, symbol.address));
+                out.push(OutputSymbol::stab(
+                    stab::FUN,
+                    symbol.name,
+                    n,
+                    0,
+                    symbol.address,
+                ));
+                out.push(OutputSymbol::stab(stab::FUN, "", NO_SECTION, 0, size));
+                out.push(OutputSymbol::stab(stab::ENSYM, "", n, 0, symbol.address));
+            } else if symbol.visibility == SymbolVisibility::Local {
+                out.push(OutputSymbol::stab(
+                    stab::STSYM,
+                    symbol.name,
+                    symbol.section_number,
+                    0,
+                    symbol.address,
+                ));
+            } else {
+                // A global's address is already in the symbol table, so the
+                // stab carries the name alone — which is what `ld` emits.
+                out.push(OutputSymbol::stab(
+                    stab::GSYM,
+                    symbol.name,
+                    NO_SECTION,
+                    0,
+                    0,
+                ));
+            }
+        }
+
+        out.push(OutputSymbol::stab(stab::SO, "", 1, 0, 0));
+    }
+    out
+}
+
+/// `n_sect` for a stab that describes no particular section.
+const NO_SECTION: u8 = 0;
+
+/// The object's modification time, as the debug map records it.
+///
+/// Zero where it cannot be read: a debugger treats a mismatch as "the object
+/// changed since the link" and says so, which is the right answer for an
+/// object that has since been deleted, and better than refusing to link.
+fn object_mtime(path: &std::path::Path) -> u64 {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
 }
 
 /// Copy each input section's bytes into its output section's buffer.

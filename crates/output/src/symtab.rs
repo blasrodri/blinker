@@ -75,6 +75,41 @@ pub struct OutputSymbol {
     pub library_ordinal: u8,
     /// Private external — external to the link, not exported from the image.
     pub private_external: bool,
+    /// A debug-map entry, carrying its own `n_type` and `n_desc`.
+    ///
+    /// Stabs do not follow the rules the other three groups do: `n_type` is a
+    /// stab kind rather than a composition of `N_SECT`/`N_EXT`, and `n_desc`
+    /// means something different for each kind. They are set here rather than
+    /// derived. See [`crate::symtab::stab`].
+    pub stab: Option<(u8, u16)>,
+}
+
+/// `n_type` values for the debug-map stabs, from `<mach-o/stab.h>`.
+///
+/// The debug map is how a Mach-O executable says where its debug information
+/// *is* rather than carrying it: the DWARF stays in the `.o` files, and the
+/// executable holds a table saying which object each function came from and
+/// what address it ended up at. `dsymutil` reads it to build a `.dSYM`, and
+/// `lldb` reads it directly.
+pub mod stab {
+    /// Source file. Emitted as a pair — directory then name — to open a
+    /// compilation unit, and once more with an empty name to close it.
+    pub const SO: u8 = 0x64;
+    /// Object file: the path to the `.o` holding this unit's DWARF, with its
+    /// modification time in `n_value` so a consumer can tell it has gone
+    /// stale.
+    pub const OSO: u8 = 0x66;
+    /// Function. Emitted twice: once named, at its address, then once unnamed
+    /// carrying its size.
+    pub const FUN: u8 = 0x24;
+    /// Global data, in the object that defines it.
+    pub const GSYM: u8 = 0x20;
+    /// Static data, at its address.
+    pub const STSYM: u8 = 0x26;
+    /// Begin and end of a function's range. Redundant with the `FUN` pair, and
+    /// emitted because `ld` emits them.
+    pub const BNSYM: u8 = 0x2e;
+    pub const ENSYM: u8 = 0x4e;
 }
 
 impl OutputSymbol {
@@ -87,6 +122,7 @@ impl OutputSymbol {
             value,
             library_ordinal: 0,
             private_external: false,
+            stab: None,
         }
     }
 
@@ -99,6 +135,7 @@ impl OutputSymbol {
             value,
             library_ordinal: 0,
             private_external: false,
+            stab: None,
         }
     }
 
@@ -111,11 +148,37 @@ impl OutputSymbol {
             value: 0,
             library_ordinal,
             private_external: false,
+            stab: None,
+        }
+    }
+
+    /// One debug-map entry.
+    ///
+    /// Grouped with the locals because that is where `LC_DYSYMTAB` expects
+    /// them: a stab is not external and not undefined, so the only range it
+    /// can live in is the first one. `ld` emits them after the ordinary
+    /// locals, and [`SymbolTableBuilder::build`] preserves insertion order
+    /// within a group, so callers control that by when they add them.
+    pub fn stab(kind: u8, name: impl Into<String>, section: u8, desc: u16, value: u64) -> Self {
+        OutputSymbol {
+            name: name.into(),
+            group: SymbolGroup::Local,
+            section: Some(section),
+            value,
+            library_ordinal: 0,
+            private_external: false,
+            stab: Some((kind, desc)),
         }
     }
 
     /// The `n_type` byte for this symbol.
     fn type_byte(&self) -> u8 {
+        // A stab's type is the stab kind itself, not a composition of the
+        // N_SECT/N_EXT bits: the two encodings share the byte and are told
+        // apart by whether any N_STAB bit is set.
+        if let Some((kind, _)) = self.stab {
+            return kind;
+        }
         let mut byte = match self.group {
             SymbolGroup::Undefined => n_type::N_UNDF,
             _ => n_type::N_SECT,
@@ -134,6 +197,9 @@ impl OutputSymbol {
     /// For an undefined symbol the library ordinal lives in the high byte,
     /// which is how the two-level namespace records the providing library.
     fn desc(&self) -> u16 {
+        if let Some((_, desc)) = self.stab {
+            return desc;
+        }
         match self.group {
             SymbolGroup::Undefined => (self.library_ordinal as u16) << 8,
             _ => 0,
@@ -179,14 +245,22 @@ impl SymbolTableBuilder {
         // which is what an unnamed symbol points at.
         let mut strings = vec![0u8];
         let mut entries = Vec::with_capacity(self.symbols.len());
+        // Names repeat: the debug map names every function a second time, so
+        // half the string table would otherwise be a copy of the other half.
+        // First occurrence wins, and insertion order is already deterministic,
+        // so the offsets are too.
+        let mut interned: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
 
         for symbol in &self.symbols {
             let name_offset = if symbol.name.is_empty() {
                 0
+            } else if let Some(offset) = interned.get(symbol.name.as_str()) {
+                *offset
             } else {
                 let offset = strings.len() as u32;
                 strings.extend_from_slice(symbol.name.as_bytes());
                 strings.push(0);
+                interned.insert(symbol.name.as_str(), offset);
                 offset
             };
 
