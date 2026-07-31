@@ -690,10 +690,14 @@ blinker links C and Rust on Apple Silicon, signs its own output, handles
 `panic=unwind` identically to the system linker, and caches across links.
 
 ```
-  ld-prime                     25.9 ms   1.00x
-  blinker, cold                28.3 ms   1.09x
-  blinker, unchanged relink    10.4 ms   0.37x
+  ld-prime                     26.6 ms   1.00x   (min 24.6, sd 1.4)
+  blinker, cold                25.6 ms   0.96x   (min 23.9, sd 3.1)
+  blinker, one-line edit       16.1 ms   0.61x
+  blinker, unchanged relink    10.4 ms   0.39x
 ```
+
+Cold is now level with the system linker, inside the spread of both. blinker's
+own spread is the wider one, which is the next thing to understand.
 
 Output is 0.79x ld-prime's, with `__text` 4.4% larger — blinker keeps a little
 code ld drops and drops none ld keeps.
@@ -721,25 +725,32 @@ compacted in place, with one `Strip::remap` answering "where did this input
 byte go" for every consumer. See finding 72, and in particular the one field
 in Mach-O that no relocation covers.
 
-### The one thing left, a milestone rather than a task
+### The partial fast path: withdrawn, because it was already built
 
-**The partial fast path** — the edit-compile case.
+This section used to scope "relocate the changed object alone and patch it into
+the cached image", worth "the difference between 22 ms and 10.4 ms". Measured
+before starting (finding 73), the edit-compile case already reuses 24 of 26
+objects and skips **100%** of the relocations:
 
-The whole-image path (finding 67) fires only when *nothing* changed. When one
-codegen unit changed, the link falls all the way back to the full pipeline at
-~22 ms, even though 46 of 47 objects are provably untouched.
+```
+                       reused    relocs   read resolve layout reloc emit | total
+  cold                  0/26        0%     6.0   1.0     0.7   8.5   0.9 | 22.1
+  one-line body edit   24/26      100%     5.4   1.0     0.6   3.1   0.8 | 16.1
+```
 
-Closing that means relocating the changed object alone and patching its bytes
-into the cached image. The blocker is not the relocation — it is that
-`apply_relocations` needs the whole link state to run: the address map, the
-GOT/stub/TLV tables, section addresses, personality fields, thread-local
-offsets. Reaching it from cache means either caching that state (and finding 41
-warns about what happens when the cached form is less flat than the computation)
-or restructuring the pass to take a narrower context.
+Per-object reuse covers it. What remained to win was part of 3.1 ms out of 16.1.
 
-The check is already cheap enough — 0.18 ms proves which inputs changed — so
-the payoff is the difference between 22 ms and something near the 10.4 ms the
-unchanged case gets.
+### Where a link's time goes now
+
+```
+  read+parse   5.4 ms   34%     resolve 1.0    layout 0.6
+  dead-strip   2.8 ms   17%     relocate 3.1   emit 0.8
+```
+
+`read+parse` is the largest stage, and finding 41 already established that
+deserialising a parsed object is not faster than parsing it — so the next win
+there is not a cache. `dead-strip` is new and unoptimised. Neither is scoped
+yet, and neither should be until measured.
 
 ### Rules this project runs on, earned rather than assumed
 
@@ -756,5 +767,10 @@ unchanged case gets.
   and a toolchain default can quietly remove the difference (72).
 - A transformation that preserves order can be landed as a coordinate remap
   rather than a restructuring (72).
+- Re-measure the premise of a *plan* before starting it, not only the premise
+  of a design. A stale plan outlives the measurement behind it (73).
+- Before caching a pure computation, check whether it can just happen at the
+  same time as something else. Both remove work from the critical path; only
+  caching adds a way to be wrong (74).
 - A debugger's static parse is a linter for the output format, and costs one
   command; reach for it before reasoning about a crash in generated code (72).

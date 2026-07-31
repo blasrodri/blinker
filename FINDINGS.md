@@ -3295,3 +3295,89 @@ The control has to come from replaying the recorded argument list with
 stripped. Third time a test in this project has been found unable to fail
 (63, 66, 69), and the first where the cause was a *toolchain default* rather
 than the fixture.
+
+## 73. The partial fast path was already built, and the milestone it was scoped against no longer existed
+
+The plan's last milestone read: *"relocating the changed object alone and
+patching its bytes into the cached image… the payoff is the difference between
+22 ms and something near the 10.4 ms the unchanged case gets."*
+
+Before building it, the premise was measured: a real cargo project, built
+warm, with one constant changed in one function body.
+
+```
+                       reused        relocs   read resolve layout reloc emit | total
+  cold                  0/26           0%      6.0   1.0     0.7   8.5   0.9 | 22.1
+  one-line body edit   24/26         100%      5.4   1.0     0.6   3.1   0.8 | 16.1
+```
+
+**The edit-compile case already reuses 24 of 26 objects and skips 100% of the
+relocations.** Per-object reuse (finding 62) covers it. The thing the milestone
+proposed to build — relocating only the changed object — would remove part of
+the remaining 3.1 ms, out of 16.1.
+
+The milestone was written when relocation was the largest stage of a link. It
+had stopped being that, and the plan still described the old shape. **A stale
+plan is a premise like any other, and it survives longer than the measurement
+that produced it** — there is nothing to notice unless you re-measure before
+starting, which is the same rule as findings 41, 60 and 68 applied to your own
+notes rather than to the code.
+
+## 74. A quarter of every link was spent parsing a file that never changes
+
+With relocation no longer dominant, the same measurement showed where a warm
+link's time had gone instead. Splitting the stages that were left:
+
+```
+  resolve                 6.8 ms
+    undefined_references  0.3
+    stub library          5.6      <- parse libSystem.B.tbd, 334 KB of YAML
+    symbol table          0.6
+```
+
+`resolve_imports` answers one question — which undefined names does the system
+provide? — and to answer it, it parses the whole of `libSystem.B.tbd`: 40 YAML
+documents, 9264 exported symbols, **5.6 ms, a quarter of the link**. On every
+link, cold and warm alike, for a file that changes when Xcode is updated.
+
+### The fix is not a cache
+
+A cache is the obvious answer and it is justified by finding 59 — a sorted list
+of 9264 strings is far flatter than the YAML parse that produced it. It is
+still the wrong answer, because it buys a warm-link win for the price of new
+on-disk state whose staleness could change an output.
+
+The export list depends on **nothing the objects produce**. So it is read
+alongside them instead of after them:
+
+```rust
+let (objects, exported) = std::thread::scope(|scope| {
+    let stub = scope.spawn(|| request.dynamic_symbols());
+    let objects = load_objects(&request.objects);
+    (objects, stub.join().expect("the stub reader did not panic"))
+});
+```
+
+```
+  resolve   6.8 ms  ->  1.0 ms
+  total    22.1 ms  -> 16.1 ms   (warm)
+```
+
+Nine lines, no new state, no invalidation to get wrong, and the whole 5.6 ms
+disappears into the 5.4 ms the object read was already taking.
+
+**Before caching a pure computation, check whether it can simply happen at the
+same time as something else.** Concurrency and caching solve the same problem
+here — work that is on the critical path and need not be — and only one of them
+adds a way to be wrong.
+
+### Which puts blinker level with the system linker
+
+```
+  ld-prime    26.6 ms  (min 24.6, sd 1.4)
+  blinker     25.6 ms  (min 23.9, sd 3.1)
+```
+
+0.91–0.96x across runs, and the difference is inside the spread: they are now
+comparable, having been 1.10x. blinker's own spread is the wider of the two,
+which is the next thing to understand rather than a result to claim around.
