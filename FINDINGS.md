@@ -3721,3 +3721,66 @@ nobody runs.
 need re-deciding when the workload changes, and a rejected optimisation leaves
 no trace in the code to prompt it — which is why the two above are named in the
 comments where they now live.
+
+## 79. The cold number was never the problem. The edit number is.
+
+"blinker is 2.92x the system linker" is a fact about the case blinker exists to
+avoid. Measured at real scale, on blinker's own 937-object binary:
+
+```
+  ld-prime, every time              41.8 ms
+  blinker, cold                    122 ms      2.92x
+  blinker, nothing changed          13.3 ms    0.32x   921/921 objects reused
+  blinker, one crate edited        148 ms      3.5x    691/937 reused, 69% of relocations
+```
+
+The unchanged relink is **three times faster than the system linker**. The
+edit relink — the only one a developer actually experiences — is three and a
+half times *slower*, and barely faster than blinker's own cold link.
+
+### Why reusing 69% of the work saves 6% of the time
+
+The incremental path skips one stage. At fixture scale that was most of the
+link and the total was 16 ms, so it looked like the design worked:
+
+```
+  read+parse   26.1 ms   21%     re-run in full
+  dead-strip   18.7 ms   16%     re-run in full
+  relocate     27.7 ms   23%     <- the only stage reuse touches
+  emit+sign    12.0 ms   10%     re-run in full
+  resolve       7.9 ms    6%     re-run in full
+  layout        6.9 ms    6%     re-run in full
+```
+
+Skipping 69% of 23% is 16% of the link. Everything else runs exactly as it did
+cold, because parsing, reachability, layout, symbol-table generation and
+signing are all whole-image computations with no incremental form.
+
+This is finding 73 arriving in a different costume. There, measuring the
+edit case on a 47-object fixture showed relocation reuse already at 100% and a
+16 ms link, and the conclusion was "the partial fast path is already built".
+It was — and it was built on the only stage that was worth anything *at that
+size*. At 937 objects the same design leaves 84% of the link untouched.
+
+### What this actually costs to fix
+
+Not another optimisation. Every remaining stage needs an incremental form, and
+they are not equally hard:
+
+- **emit+sign** (12 ms) — the signature is a Merkle tree over pages; only
+  changed pages need rehashing. Self-contained.
+- **layout** (7 ms) — the `Slop` machinery already exists and is tested
+  (findings 42–44): reserved slack lets a contribution grow without moving its
+  neighbours. Nothing calls it. Wiring it also stabilises the cache's
+  placement keys, which is a second win.
+- **dead-strip** (19 ms) — reachability is a fixpoint over a graph that barely
+  changes between edits, and nothing about it is incremental yet.
+- **read+parse** (26 ms) — the hardest, and finding 41 already ruled out the
+  obvious answer: deserialising a parsed object is slower than parsing it.
+
+### The rule
+
+**An incremental system is only as incremental as its slowest whole-image
+stage,** and which stage that is depends on scale. Every measurement that
+justified the current design was taken where `relocate` dominated. It does not
+dominate a real link, and no amount of improving it would have mattered.
