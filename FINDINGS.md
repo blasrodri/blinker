@@ -1205,3 +1205,50 @@ relocation through the GOT the way a data reference to an import already is,
 rather than resolving it to an address directly.
 
 Recorded as the precise next step rather than left as "unwinding is broken".
+
+## 31. Most Rust functions use DWARF-mode compact unwind, which is a pointer into `__eh_frame`
+
+With `__unwind_info` built and personalities routed through the GOT, the table
+still had zero personalities and zero LSDAs, and `panic=unwind` still crashed.
+Counting the encoding modes explained why:
+
+| mode | blinker | ld64 |
+|---|---|---|
+| `FRAME` | 160 | 17 |
+| **`DWARF`** | **1408** | **375** |
+| `FRAMELESS` | 618 | 74 |
+
+`UNWIND_ARM64_MODE_DWARF` (`0x03000000`) does not describe the frame at all.
+Its low 24 bits are an **offset into `__eh_frame`** where the function's FDE
+lives, and the unwinder follows it to the real DWARF description. ld64's 375
+DWARF entries all carry a non-zero offset; every one of blinker's 1408 carries
+zero, so the unwinder dereferences the start of `__eh_frame` for every function
+and reads whatever is there.
+
+That also explains the two zero counts. In DWARF mode the personality and the
+LSDA live in the CIE and FDE respectively, not in the compact record — so there
+are no personality or LSDA *relocations* to find in `__compact_unwind`, and
+looking for them was searching for something that was never there. Routing
+personalities through the GOT was correct and is kept, but it was not the
+blocker.
+
+### What is actually required
+
+An `__eh_frame` parser: walk the CIE/FDE records of each input object, map each
+FDE to the function it describes, compute where that FDE lands in the output
+`__eh_frame`, and write that offset into the encoding's low 24 bits. Until
+then, DWARF-mode functions have no usable unwind description.
+
+This is the honest boundary. `-C panic=abort` works completely; `panic=unwind`
+does not, and the remaining work is one well-specified component rather than an
+open question.
+
+### The pattern across findings 21, 25, 29, 30 and 31
+
+Five of the hardest bugs in this project were the same mistake: **an offset
+used as though it were an address, or an address as though it were an offset.**
+Cross-object symbol lookup, unrebased absolute pointers, null pointer-table
+slots, inline compact-unwind addends, and now DWARF-mode encodings. A linker is
+largely a program for translating between coordinate spaces, and every one of
+these was a place where two spaces coincided in the simple case and diverged in
+the real one.

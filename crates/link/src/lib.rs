@@ -149,6 +149,47 @@ const CU_ENCODING: u64 = 12;
 const CU_PERSONALITY: u64 = 16;
 const CU_LSDA: u64 = 24;
 
+/// Symbols used as unwind personality routines.
+///
+/// These need GOT slots like any other indirect reference. `__unwind_info`
+/// records a personality as an image-relative offset to the **slot** holding
+/// its address, not to the function — the unwinder loads through it, exactly
+/// as code does for an imported symbol.
+fn personality_symbols(objects: &[LoadedObject]) -> Vec<TableEntry> {
+    let mut entries = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for object in objects {
+        for section in &object.parsed.sections {
+            if section.name != "__compact_unwind" {
+                continue;
+            }
+            for relocation in object
+                .parsed
+                .relocations
+                .iter()
+                .filter(|r| r.section == section.id)
+            {
+                if relocation.offset % COMPACT_UNWIND_RECORD != CU_PERSONALITY {
+                    continue;
+                }
+                let RelocationTarget::Symbol(id) = relocation.target else {
+                    continue;
+                };
+                let Some(symbol) = object.parsed.symbol(id) else {
+                    continue;
+                };
+                if seen.insert(symbol.name.clone()) {
+                    entries.push(TableEntry {
+                        object: object.parsed.id,
+                        name: symbol.name.clone(),
+                    });
+                }
+            }
+        }
+    }
+    entries
+}
+
 /// Read the compact unwind records the compiler emitted.
 ///
 /// Each record names a function, how long it is, how to restore its frame, and
@@ -159,6 +200,7 @@ fn compact_unwind_entries(
     objects: &[LoadedObject],
     image: &Image,
     addresses: &AddressMap,
+    got_slots: &HashMap<String, u64>,
 ) -> Vec<UnwindEntry> {
     let Some(text) = image.layout.segment("__TEXT") else {
         return Vec::new();
@@ -187,6 +229,9 @@ fn compact_unwind_entries(
             // object's own coordinate space, so the offset within that section
             // has to be recovered before rebasing onto the output address.
             let mut targets: HashMap<(u64, u64), u64> = HashMap::new();
+            // Personalities are recorded by GOT slot rather than by address,
+            // so they are collected by name and resolved separately.
+            let mut personality_names: HashMap<u64, String> = HashMap::new();
             for relocation in object
                 .parsed
                 .relocations
@@ -215,6 +260,14 @@ fn compact_unwind_entries(
 
                 let record = relocation.offset / COMPACT_UNWIND_RECORD;
                 let field = relocation.offset % COMPACT_UNWIND_RECORD;
+
+                if field == CU_PERSONALITY {
+                    if let RelocationTarget::Symbol(id) = relocation.target {
+                        if let Some(symbol) = object.parsed.symbol(id) {
+                            personality_names.insert(record, symbol.name.clone());
+                        }
+                    }
+                }
                 targets.insert((record, field), address);
             }
 
@@ -242,9 +295,10 @@ fn compact_unwind_entries(
                 entries.push(UnwindEntry {
                     function_offset: (function - image_base) as u32,
                     encoding,
-                    personality: targets
-                        .get(&(record, CU_PERSONALITY))
-                        .map(|a| (a - image_base) as u32),
+                    personality: personality_names
+                        .get(&record)
+                        .and_then(|name| got_slots.get(name))
+                        .map(|slot| (slot - image_base) as u32),
                     lsda: targets
                         .get(&(record, CU_LSDA))
                         .map(|a| (a - image_base) as u32),
@@ -505,6 +559,11 @@ pub fn link(request: &LinkRequest) -> Result<Image, LinkError> {
     // imports share one table: the difference is only how each slot gets its
     // value — a rebase for an address we know, a bind for one dyld supplies.
     let mut got = got_symbols(&objects);
+    for entry in personality_symbols(&objects) {
+        if !got.iter().any(|e| e.name == entry.name) {
+            got.push(entry);
+        }
+    }
     for name in &imports {
         if !got.iter().any(|e| &e.name == name) {
             got.push(TableEntry {
@@ -582,7 +641,7 @@ pub fn link(request: &LinkRequest) -> Result<Image, LinkError> {
     fill_got(&mut contents, &probe, &got, &addresses, &imports)?;
     fill_stubs(&mut contents, &probe, &stubs, &got_slots)?;
     fill_pointer_table(&mut contents, &probe, &tlv, &addresses, "__thread_ptrs")?;
-    fill_unwind_info(&mut contents, &probe, &objects, &addresses)?;
+    fill_unwind_info(&mut contents, &probe, &objects, &addresses, &got_slots)?;
     let patched = apply_relocations(
         &objects,
         &probe,
@@ -685,6 +744,7 @@ fn fill_unwind_info(
     image: &Image,
     objects: &[LoadedObject],
     addresses: &AddressMap,
+    got_slots: &HashMap<String, u64>,
 ) -> Result<(), LinkError> {
     let Some((index, section)) = image
         .layout
@@ -696,7 +756,7 @@ fn fill_unwind_info(
         return Ok(());
     };
 
-    let entries = compact_unwind_entries(objects, image, addresses);
+    let entries = compact_unwind_entries(objects, image, addresses, got_slots);
     let mut table = blinker_output::unwind::build(entries);
 
     if table.len() as u64 > section.size {
