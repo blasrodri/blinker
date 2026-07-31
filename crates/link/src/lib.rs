@@ -245,6 +245,139 @@ const UNWIND_MODE_DWARF: u32 = 0x0300_0000;
 /// Low 24 bits of a DWARF-mode encoding hold the FDE offset.
 const UNWIND_DWARF_OFFSET_MASK: u32 = 0x00ff_ffff;
 
+/// Read a ULEB128 value, returning it and the position after it.
+fn uleb128(data: &[u8], mut pos: usize) -> Option<(u64, usize)> {
+    let (mut value, mut shift) = (0u64, 0u32);
+    loop {
+        let byte = *data.get(pos)?;
+        pos += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some((value, pos));
+        }
+        shift += 7;
+        if shift > 63 {
+            return None;
+        }
+    }
+}
+
+/// Skip a SLEB128 value, returning the position after it.
+fn skip_sleb128(data: &[u8], mut pos: usize) -> Option<usize> {
+    loop {
+        let byte = *data.get(pos)?;
+        pos += 1;
+        if byte & 0x80 == 0 {
+            return Some(pos);
+        }
+    }
+}
+
+/// `DW_EH_PE_indirect` — the encoded value addresses a *slot* holding the
+/// real pointer, rather than being the pointer.
+const DW_EH_PE_INDIRECT: u8 = 0x80;
+
+/// Where each CIE stores its personality reference.
+///
+/// # Why this has to parse the augmentation
+///
+/// A CIE names its personality routine only in its augmentation data, and
+/// nothing else in the object says which relocation that is. blinker's first
+/// attempt at this keyed on personality symbols collected from
+/// `__compact_unwind` — which, in DWARF mode, contains none (finding 31), so
+/// the code was inert (finding 49).
+///
+/// The layout being walked, per the DWARF CFI format:
+///
+/// ```text
+/// length, CIE id (0), version, augmentation string,
+/// code alignment (ULEB), data alignment (SLEB), return register,
+/// if augmentation begins with 'z': augmentation length (ULEB), then one
+///   entry per remaining character — 'P' is an encoding byte followed by the
+///   personality pointer, 'L' and 'R' are a single byte each.
+/// ```
+///
+/// Returns the offsets, *within each input section*, of personality fields
+/// that use an indirect encoding — the only ones that must name a GOT slot.
+fn eh_frame_personality_fields(
+    object: &LoadedObject,
+    section: &InputSection,
+) -> std::collections::HashSet<u64> {
+    let mut fields = std::collections::HashSet::new();
+    let Some(file_offset) = section.file_offset else {
+        return fields;
+    };
+    let data = &object.data;
+    let base = file_offset as usize;
+
+    let mut position = 0u64;
+    while position + 8 <= section.size {
+        let at = base + position as usize;
+        let Some(bytes) = data.get(at..at + 8) else {
+            break;
+        };
+        let length = u32::from_le_bytes(bytes[0..4].try_into().expect("4")) as u64;
+        if length == 0 {
+            break;
+        }
+        let id = u32::from_le_bytes(bytes[4..8].try_into().expect("4"));
+
+        // Only CIEs carry an augmentation; an FDE's second word is the
+        // distance back to its CIE.
+        if id == 0 {
+            if let Some(offset) = personality_field_in_cie(data, at + 8, position + 8) {
+                fields.insert(offset);
+            }
+        }
+        position += 4 + length;
+    }
+    fields
+}
+
+/// The section-relative offset of this CIE's indirect personality field.
+fn personality_field_in_cie(data: &[u8], start: usize, start_offset: u64) -> Option<u64> {
+    // `at` indexes the file; `offset` is the same position expressed relative
+    // to the section, which is what a relocation records. They advance
+    // together, so one delta keeps both correct.
+    let mut at = start;
+    let section_delta = start_offset.wrapping_sub(start as u64);
+
+    let _version = *data.get(at)?;
+    at += 1;
+
+    let mut augmentation = Vec::new();
+    while *data.get(at)? != 0 {
+        augmentation.push(*data.get(at)?);
+        at += 1;
+    }
+    at += 1; // the NUL
+
+    if augmentation.first() != Some(&b'z') {
+        return None;
+    }
+
+    (_, at) = uleb128(data, at)?; // code alignment factor
+    at = skip_sleb128(data, at)?; // data alignment factor
+    (_, at) = uleb128(data, at)?; // return address register
+    (_, at) = uleb128(data, at)?; // augmentation data length
+
+    for entry in &augmentation[1..] {
+        match entry {
+            b'P' => {
+                let encoding = *data.get(at)?;
+                at += 1;
+                // The field starts here. Only an indirect encoding needs a GOT
+                // slot; a direct one genuinely wants the symbol's address.
+                return (encoding & DW_EH_PE_INDIRECT != 0)
+                    .then_some((at as u64).wrapping_add(section_delta));
+            }
+            b'L' | b'R' => at += 1,
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// Map each function to the offset of its FDE within the output `__eh_frame`.
 ///
 /// # Why the records are walked but not decoded
@@ -707,11 +840,6 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     // other section rather than appended afterwards. Internal targets and
     // imports share one table: the difference is only how each slot gets its
     // value — a rebase for an address we know, a bind for one dyld supplies.
-    let personality_names: Vec<String> = survey
-        .personalities
-        .iter()
-        .map(|e| e.name.clone())
-        .collect();
     let mut got = survey.got;
     for entry in survey.personalities {
         if !got.iter().any(|e| e.name == entry.name) {
@@ -726,6 +854,38 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
             });
         }
     }
+    // Personality routines named by CIE augmentation data — the only place they
+    // appear in DWARF mode (finding 31), which is why collecting them from
+    // `__compact_unwind` found none (finding 49).
+    let mut eh_personality_fields: HashMap<(u32, u32), std::collections::HashSet<u64>> =
+        HashMap::new();
+    for object in &objects {
+        for section in &object.parsed.sections {
+            if section.name != "__eh_frame" {
+                continue;
+            }
+            let fields = eh_frame_personality_fields(object, section);
+            for relocation in &object.parsed.relocations {
+                if relocation.section != section.id || !fields.contains(&relocation.offset) {
+                    continue;
+                }
+                if let RelocationTarget::Symbol(id) = relocation.target {
+                    if let Some(symbol) = object.parsed.symbol(id) {
+                        if !got.iter().any(|e| e.name == symbol.name) {
+                            got.push(TableEntry {
+                                object: object.parsed.id,
+                                name: symbol.name.clone(),
+                            });
+                        }
+                    }
+                }
+            }
+            if !fields.is_empty() {
+                eh_personality_fields.insert((object.parsed.id.0, section.id.0), fields);
+            }
+        }
+    }
+
     if !stubs.is_empty() {
         placements.push(InputPlacement {
             object: SYNTHETIC_OBJECT,
@@ -809,7 +969,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
             stubs: &stub_slots,
             tlv: &tlv_slots,
             imports: &imports,
-            personalities: &personality_names,
+            personalities: &eh_personality_fields,
         },
         contents,
     )?;
@@ -1539,14 +1699,15 @@ struct IndirectTables<'a> {
     stubs: &'a HashMap<String, u64>,
     tlv: &'a HashMap<String, u64>,
     imports: &'a [String],
-    /// Unwind personality routines, which `__eh_frame` references *indirectly*.
+    /// Offsets, per `(object, section)`, of CIE personality fields that use an
+    /// indirect encoding.
     ///
     /// A CIE's augmentation encodes its personality with `DW_EH_PE_indirect`:
-    /// the stored value is the address of a slot holding the routine's address,
-    /// not the routine. Resolving it to the symbol like any other reference
-    /// wrote a function address where libunwind expected a pointer slot, and it
+    /// the stored value addresses a *slot* holding the routine's address, not
+    /// the routine. Resolving it like any other symbol reference wrote a
+    /// function address where libunwind expected a pointer slot, and it
     /// segfaulted dereferencing it (finding 48).
-    personalities: &'a [String],
+    personalities: &'a HashMap<(u32, u32), std::collections::HashSet<u64>>,
 }
 
 /// Patched content, plus the fixups dyld must apply at load time.
@@ -1583,19 +1744,22 @@ fn apply_relocations(
 
     // A reference from `__eh_frame` to a personality routine must name that
     // routine's GOT slot.
-    let indirect_personality = |object: &LoadedObject, target: RelocationTarget, section: &str| {
-        if section != "__eh_frame" {
-            return None;
-        }
-        let RelocationTarget::Symbol(id) = target else {
-            return None;
+    // A relocation whose field is a CIE's indirect personality reference must
+    // resolve to that symbol's GOT slot. Identified by *offset* — the CIE's
+    // augmentation is the only thing that says which field this is, and it was
+    // parsed before layout.
+    let indirect_personality =
+        |object: &LoadedObject, relocation: &blinker_macho::InputRelocation| {
+            let fields = personalities.get(&(object.parsed.id.0, relocation.section.0))?;
+            if !fields.contains(&relocation.offset) {
+                return None;
+            }
+            let RelocationTarget::Symbol(id) = relocation.target else {
+                return None;
+            };
+            let symbol = object.parsed.symbol(id)?;
+            got_slots.get(&symbol.name).copied()
         };
-        let symbol = object.parsed.symbol(id)?;
-        if !personalities.contains(&symbol.name) {
-            return None;
-        }
-        got_slots.get(&symbol.name).copied()
-    };
     let mut extra_binds = Vec::new();
     for object in objects {
         // Indexed rather than iterated: `SUBTRACTOR` is one half of a pair and
@@ -1642,8 +1806,7 @@ fn apply_relocations(
                 index += 1;
 
                 let subtrahend = target_address(object, image, addresses, relocation.target)?;
-                let minuend = match indirect_personality(object, pair.target, &output_section.name)
-                {
+                let minuend = match indirect_personality(object, pair) {
                     Some(slot) => slot,
                     None => target_address(object, image, addresses, pair.target)?,
                 };
@@ -1751,27 +1914,6 @@ fn apply_relocations(
             } else {
                 None
             };
-
-            if let Some(slot) =
-                indirect_personality(object, relocation.target, &output_section.name)
-            {
-                let Some(buffer) = contents.get_mut(&section_index) else {
-                    continue;
-                };
-                apply(
-                    relocation.kind,
-                    relocation.length,
-                    chunk_offset + relocation.offset,
-                    Context::direct(place, slot, relocation.addend),
-                    buffer,
-                )
-                .map_err(|source| LinkError::Relocation {
-                    object: object.parsed.id,
-                    kind: relocation.kind,
-                    source: Box::new(source),
-                })?;
-                continue;
-            }
 
             let target = match (stub, got.or(tlv)) {
                 (Some(address), _) => address,

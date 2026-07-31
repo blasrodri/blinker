@@ -2122,3 +2122,51 @@ The inert branch is kept rather than reverted: it is the correct handling once
 the set is populated, and removing it would mean writing it again. But it is
 **not a fix**, and the tests do not claim it is — `panic=unwind` still faults,
 and nothing new passes because of this change.
+
+## 50. The object already says the CIE personality is a GOT pointer
+
+Finding 49 concluded that identifying the CIE personality required parsing the
+augmentation string. I wrote that parser — ULEB/SLEB decoding, augmentation
+walking, encoding bytes — wired it in, and the link then failed with:
+
+```
+object 2: cannot apply PointerToGot:
+  ARM64_RELOC_POINTER_TO_GOT at 0x1000aeffb needs an indirect address
+```
+
+The relocation on that field is **`ARM64_RELOC_POINTER_TO_GOT`**. The object
+states outright that the field holds a pointer to a GOT entry. No augmentation
+parsing was ever needed to identify it — the same lesson as finding 32, where
+an FDE's function came from a relocation rather than from decoding a DWARF
+pointer encoding, and I did not apply it here.
+
+The failure was my own new branch bypassing the `got` context that
+`PointerToGot` requires. Removing it restores the previous behaviour: the link
+succeeds and `panic=unwind` still faults.
+
+### Where the bug must now be
+
+blinker already supports `ARM64_RELOC_POINTER_TO_GOT`, and it is reached — the
+link would fail otherwise. So the fault is in *what that relocation produces*,
+not in recognising the field:
+
+- the GOT slot allocated for the personality symbol may be the wrong one, or
+- the encoding is `pcrel|sdata4`, so the field wants
+  `got_slot - field_address` as a 32-bit signed value, and the arithmetic in
+  `apply` for this kind may not match what a CIE expects.
+
+blinker writes `0x10017d873` where ld-prime writes `0x100044000`. The value is
+odd, so whatever is being written is not a slot address at all.
+
+### What is kept and what is not
+
+The augmentation parser is retained but no longer decides patching. It is used
+for one thing that is still correct and still needed: **ensuring a GOT slot
+exists** for symbols referenced as personalities. It is dead weight if the
+`PointerToGot` path turns out to allocate those slots itself, and the next
+session should check that before keeping it.
+
+Two attempts at this fix, both aimed at identifying the field, when the field
+was never the problem. The evidence that it was not — a relocation kind whose
+name is literally `POINTER_TO_GOT` — was in the error message the first attempt
+produced.
