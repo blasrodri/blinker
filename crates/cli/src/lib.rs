@@ -20,7 +20,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use blinker_arguments::{expand_response_files, ParsedInvocation};
+use blinker_arguments::{expand_response_files, LinkerArg, ParsedInvocation};
 use blinker_diagnostics::{fingerprint_input, LinkRecord};
 
 pub mod archive;
@@ -165,7 +165,17 @@ pub fn run(argv: &[String]) -> Result<Outcome, DriverError> {
     // silently delegated: an internal path that quietly falls back looks
     // identical to one that works, and the difference is the whole project.
     let exec_started = Instant::now();
-    let exit_code = if options.internal_link {
+    // `--blinker-internal` asks for an internal link, not for one at any cost.
+    // rustc hands the same linker every crate in a workspace, and a proc-macro
+    // crate is a `-dynamiclib` — so refusing outright makes blinker unusable on
+    // any project that has one, which is most of them.
+    let unsupported = unsupported_output_kind(&parsed);
+    if let Some(flag) = unsupported {
+        if options.internal_link && options.verbosity == Verbosity::Verbose {
+            eprintln!("blinker: {flag} is not an output kind blinker produces; delegating");
+        }
+    }
+    let exit_code = if options.internal_link && unsupported.is_none() {
         if options.verbosity == Verbosity::Verbose {
             eprintln!("blinker: linking internally");
         }
@@ -199,6 +209,9 @@ pub fn run(argv: &[String]) -> Result<Outcome, DriverError> {
         if options.verbosity == Verbosity::Verbose {
             eprintln!("blinker: delegating to {}", linker.display());
         }
+        if unsupported.is_some() {
+            record.fallback_reason = Some(blinker_diagnostics::FallbackReason::UnsupportedArgument);
+        }
         fallback::execute(&linker, &parsed.argv)?
     };
     record.set_timing_fallback_exec(exec_started.elapsed());
@@ -225,15 +238,49 @@ pub fn run(argv: &[String]) -> Result<Outcome, DriverError> {
     Ok(Outcome { exit_code, record })
 }
 
+/// An output kind blinker does not produce, if the invocation asks for one.
+///
+/// blinker emits a `MH_EXECUTE` image with an `LC_MAIN` entry point and nothing
+/// else. Everything here is a different Mach-O file type, and each is named
+/// rather than lumped together so the diagnostic says which one arrived.
+///
+/// Delegating is the correct answer rather than a stopgap: a shim linker that
+/// refuses what it cannot do, loudly and by name, is usable today on projects
+/// whose every crate it cannot yet link. One that fails is not.
+fn unsupported_output_kind(parsed: &ParsedInvocation) -> Option<&'static str> {
+    const KINDS: &[&str] = &[
+        // A dynamic library — what every proc-macro crate is built as.
+        "-dynamiclib",
+        "-shared",
+        // A loadable bundle, e.g. a plugin.
+        "-bundle",
+        // A relocatable partial link: object in, object out.
+        "-r",
+        // A static executable, which has no dyld and therefore no LC_MAIN
+        // bootstrap of the kind blinker emits.
+        "-static",
+    ];
+    parsed.args.iter().find_map(|(_, arg)| {
+        let text = match arg {
+            LinkerArg::KnownUnmodelled(flag)
+            | LinkerArg::Unrecognized(flag)
+            | LinkerArg::LinkerFlag(flag) => flag.as_str(),
+            _ => return None,
+        };
+        KINDS.iter().find(|kind| **kind == text).copied()
+    })
+}
+
 /// Whether the command line asked for unreachable input to be discarded.
 ///
 /// `-dead_strip` is a linker flag rustc already passes on every macOS link;
 /// honouring it is what makes blinker's output comparable to the system
 /// linker's at all.
 fn wants_dead_strip(parsed: &ParsedInvocation) -> bool {
-    parsed.args.iter().any(|(_, arg)| {
-        matches!(arg, blinker_arguments::LinkerArg::LinkerFlag(flag) if flag == "-dead_strip")
-    })
+    parsed
+        .args
+        .iter()
+        .any(|(_, arg)| matches!(arg, LinkerArg::LinkerFlag(flag) if flag == "-dead_strip"))
 }
 
 /// Perform the link with blinker's own linker.
