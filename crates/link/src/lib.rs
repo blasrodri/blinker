@@ -225,6 +225,15 @@ pub struct LinkRequest {
     pub cache_path: Option<PathBuf>,
     /// Whether to discard input nothing reaches.
     pub dead_strip: bool,
+    /// Leave padding after each contribution, so an edit that grows one does
+    /// not move everything after it.
+    ///
+    /// A property of the *request*, not of whether a cache is being written.
+    /// Tying it to the cache made a cold link and a cached one lay out
+    /// differently, which breaks the equivalence the whole design rests on:
+    /// an incremental output must be the output a cold link would have
+    /// produced.
+    pub stable_layout: bool,
 }
 
 impl LinkRequest {
@@ -237,6 +246,7 @@ impl LinkRequest {
             stub_libraries: default_stub_library().into_iter().collect(),
             cache_path: None,
             dead_strip: false,
+            stable_layout: false,
         }
     }
 
@@ -249,6 +259,12 @@ impl LinkRequest {
     /// command line. `-dead_strip` turns it on, which is what rustc passes.
     pub fn dead_stripped(mut self, on: bool) -> Self {
         self.dead_strip = on;
+        self
+    }
+
+    /// Reserve slack after each contribution so later links can reuse more.
+    pub fn with_stable_layout(mut self, on: bool) -> Self {
+        self.stable_layout = on;
         self
     }
 
@@ -2456,6 +2472,14 @@ fn assemble(request: &LinkRequest, assembly: &Assembly<'_>) -> Result<Image, Lin
         entry_offset,
     } = *assembly;
     let mut builder = ImageBuilder::new();
+    // Padding is for the next link, not this one: it costs image size and buys
+    // the property that an edit which grows one contribution does not move
+    // every contribution after it — which is what keeps the cache's placement
+    // keys valid across an edit. A link that is not writing a cache has no
+    // next link to help, so it pays nothing.
+    if request.stable_layout {
+        builder.slop(blinker_layout::Slop::DEFAULT);
+    }
     for placement in placements {
         builder.input(placement.clone());
     }
@@ -3547,7 +3571,26 @@ fn request_hash(request: &LinkRequest) -> [u8; 32] {
     hasher.update(request.entry_symbol.as_bytes());
     hasher.update(&[0]);
     hasher.update(request.identifier.as_bytes());
-    hasher.update(&[request.dead_strip as u8]);
+    hasher.update(&[request.dead_strip as u8, request.stable_layout as u8]);
+    // The linker itself is an input to its own output.
+    //
+    // Without this, changing blinker and relinking replays the binary the
+    // *previous* build produced: the inputs are unchanged and the request is
+    // unchanged, so the whole-image fast path fires and hands back a stale
+    // image. It cost an hour here — a fix was measured as broken because the
+    // cache was serving output from the build before it — and in a release it
+    // would mean upgrading the linker silently changes nothing.
+    if let Ok(exe) = std::env::current_exe() {
+        hasher.update(exe.to_string_lossy().as_bytes());
+        if let Ok(meta) = std::fs::metadata(&exe) {
+            hasher.update(&meta.len().to_le_bytes());
+            if let Ok(modified) = meta.modified() {
+                if let Ok(since) = modified.duration_since(std::time::UNIX_EPOCH) {
+                    hasher.update(&since.as_nanos().to_le_bytes());
+                }
+            }
+        }
+    }
     for dylib in &request.dylibs {
         hasher.update(&[1]);
         hasher.update(dylib.install_name.as_bytes());

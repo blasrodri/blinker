@@ -441,6 +441,12 @@ pub fn compute_layout_with_slop(
 
     for ((_, _, segment, name), members) in groups {
         let kind = members[0].kind;
+        // Only where a gap is known to be inert. See `may_be_padded`.
+        let slop = if may_be_padded(&name) {
+            slop
+        } else {
+            Slop::NONE
+        };
         let zero_filled = kind == SectionKind::Bss;
 
         let mut offset = 0u64;
@@ -494,6 +500,31 @@ pub fn compute_layout_with_slop(
         file_size,
         header_reservation,
     }
+}
+
+/// Whether a section may carry padding between its contributions.
+///
+/// An allow-list, and deliberately so. Padding is invisible to anything
+/// addressed by symbol and fatal to anything whose *shape* means something,
+/// and the second category is larger than it looks:
+///
+/// - `__eh_frame` is a chain walked by the length each record starts with, so
+///   a gap is not padding but a record header made of zeroes. A padded one
+///   links, runs, and dies the moment it unwinds.
+/// - `__thread_vars` is an array of 24-byte descriptors, and dyld checks:
+///   *"size (512) of thread-locals section __thread_vars is not a multiple of
+///   24"*. That one at least refuses to start.
+/// - `__got`, `__stubs`, `__thread_ptrs`, `__la_symbol_ptr` and
+///   `__mod_init_func` are all fixed-stride slot arrays indexed by position.
+///
+/// Guessing which of those tolerate a gap is exactly the kind of judgement a
+/// linker should not be making, so the rule is inverted: padding goes only
+/// where it is known to be inert.
+fn may_be_padded(name: &str) -> bool {
+    matches!(
+        name,
+        "__text" | "__const" | "__cstring" | "__gcc_except_tab" | "__data" | "__bss"
+    )
 }
 
 /// Output section name for an input section.

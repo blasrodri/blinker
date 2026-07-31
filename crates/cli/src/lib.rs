@@ -310,7 +310,11 @@ fn internal_link(
 
     let mut request = blinker_link::LinkRequest::new(objects)
         .identifier(&identifier)
-        .dead_stripped(wants_dead_strip(parsed));
+        .dead_stripped(wants_dead_strip(parsed))
+        // Reserved slack pays for itself only across links, so it is turned on
+        // with the cache — but it is applied to the cold link too, so that the
+        // cached output is the one a cold link with the same options produces.
+        .with_stable_layout(options.incremental_cache);
     // Opt-in for now: the reuse path is new, and a linker that silently
     // depends on state from a previous run is one whose output cannot be
     // reproduced from its inputs alone. `--blinker-cache` turns it on.

@@ -20,7 +20,7 @@
 //! the code signature. Its contents are produced after layout, so the segment
 //! is reserved during layout and filled here.
 
-use blinker_layout::{align_up, compute_layout, InputPlacement, Layout, PAGE_SIZE};
+use blinker_layout::{align_up, compute_layout_with_slop, InputPlacement, Layout, Slop, PAGE_SIZE};
 
 use crate::commands::{self, LinkEditLayout};
 use crate::dyld_info::{encode_bind, encode_rebase, Bind, Rebase};
@@ -69,6 +69,9 @@ pub struct ImageBuilder {
     min_os: (u16, u8, u8),
     sdk: (u16, u8, u8),
     uuid: [u8; 16],
+    /// Padding left after each contribution so a later edit can grow it in
+    /// place. `Slop::NONE` unless asked for.
+    slop: Slop,
     /// The identifier embedded in the ad-hoc signature.
     ///
     /// `codesign` derives this from the output file's name. blinker does not
@@ -149,6 +152,7 @@ pub struct Image {
 impl ImageBuilder {
     pub fn new() -> Self {
         ImageBuilder {
+            slop: Slop::NONE,
             inputs: Vec::new(),
             contents: Vec::new(),
             symbols: SymbolTableBuilder::new(),
@@ -208,6 +212,18 @@ impl ImageBuilder {
         self
     }
 
+    /// Leave `slop` after each contribution, so an edit that grows one does
+    /// not move everything after it.
+    ///
+    /// Costs image size and buys cache stability: without it, adding a byte to
+    /// one function moves every section after `__text` (finding 42), which
+    /// changes the placement every cache entry is keyed by and invalidates all
+    /// of them.
+    pub fn slop(&mut self, slop: Slop) -> &mut Self {
+        self.slop = slop;
+        self
+    }
+
     pub fn versions(&mut self, min_os: (u16, u8, u8), sdk: (u16, u8, u8)) -> &mut Self {
         self.min_os = min_os;
         self.sdk = sdk;
@@ -217,7 +233,7 @@ impl ImageBuilder {
     /// Lay out and emit the image.
     pub fn build(mut self) -> Result<Image, ImageError> {
         // Pass one: discover the shape with a nominal reservation.
-        let probe = compute_layout(&self.inputs, PAGE_SIZE);
+        let probe = compute_layout_with_slop(&self.inputs, PAGE_SIZE, self.slop);
         let dylib_bytes: usize = self
             .dylibs
             .iter()
@@ -230,7 +246,7 @@ impl ImageBuilder {
 
         // Pass two: lay out for real, with room for the header and commands.
         let reservation = align_up((MachHeader::SIZE + command_size) as u64, 16);
-        let layout = compute_layout(&self.inputs, reservation);
+        let layout = compute_layout_with_slop(&self.inputs, reservation, self.slop);
 
         for content in &self.contents {
             let Some(section) = layout.section(content.section) else {
