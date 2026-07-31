@@ -1749,3 +1749,61 @@ written rather than after. The experiment cost one example binary and two
 commands. Implementing the cache first would have cost a crate, a codec
 decision, a schema-versioning scheme, and a cache-invalidation story — all to
 arrive at a linker that was slower.
+
+## 42. Every section after the edit moves, so the cache needs slop or it is worthless
+
+The corrected cache design (finding 41) stores *relocated output* keyed by
+codegen unit and rebuilds only what changed. Its load-bearing premise is that
+cached bytes stay valid — which requires the addresses they were relocated
+against to stay put.
+
+Tested with the smallest possible edit: adding `+ 0` to a function body in a
+two-module Rust binary, changing no signature and no symbol name.
+
+```
+                  before              after
+  __stubs         0x10008d90c    →    0x10008d930
+  __const         0x10008e1e8    →    0x10008e210
+  __gcc_except_tab 0x1000a0504   →    0x1000a052c
+  __cstring       0x1000a2f74    →    0x1000a2f9c
+  __unwind_info   0x1000a66c4    →    0x1000a66ec
+  __eh_frame      0x1000af020    →    0x1000af048
+```
+
+**Every section after `__text` moved, by exactly 0x24 — 36 bytes.** The same
+36 bytes finding 17 measured for this class of edit. `__text` itself did not
+move only because it is first.
+
+So a naive output cache is worth nothing. Any edit that changes a function's
+size shifts every downstream address, and every cached relocated byte that
+referenced one is stale. Finding 17 already established that *most* edits change
+size — including "pure body" edits, which is the class the whole incremental
+premise rests on.
+
+### This is the padding trick, and it is not optional
+
+The fix is to leave slop: pad each contribution so a function that grows by a
+small amount consumes its own padding rather than displacing its neighbours.
+Then a body-only edit rewrites one contribution's bytes in place and every
+cached address downstream stays valid.
+
+That turns the design question into two measurable ones, neither of which has
+been answered:
+
+1. **How much slop?** Finding 17's single data point is +36 bytes for a trivial
+   edit. The distribution across real edits — not one example — decides whether
+   slop costs 5% of image size or 50%.
+2. **What happens when slop runs out?** An edit that outgrows its padding
+   forces a relayout, which invalidates everything after it. The cache needs a
+   defined behaviour there, and the honest one is to fall back to a cold link
+   rather than to emit something subtly wrong.
+
+### Why this had to be measured before the cache and not after
+
+Building the cache first would have produced a correct-looking implementation
+with a near-zero hit rate on exactly the workload it exists for — an agent
+making one-line edits — and the failure would have looked like a tuning problem
+rather than a design one. It cost two builds and a diff to learn instead.
+
+That is the sixth premise in this project tested against reality rather than
+argued about, and the second one tested *before* the code that depends on it.
