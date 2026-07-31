@@ -3381,3 +3381,69 @@ adds a way to be wrong.
 0.91–0.96x across runs, and the difference is inside the spread: they are now
 comparable, having been 1.10x. blinker's own spread is the wider of the two,
 which is the next thing to understand rather than a result to claim around.
+
+## 75. A 9 ms process spawn that the real workload never paid, and the benchmark could not see
+
+With the stub *parse* overlapped (finding 74), the stub *path lookup* was still
+on the critical path — and it spawns `xcrun`:
+
+```
+  default_stub_library()   7.46 ms      spawn xcrun --show-sdk-path
+                           0.06 ms      read /var/db/xcode_select_link
+```
+
+`xcode-select` records the active developer directory as a symlink, and `xcrun`
+resolves the SDK beneath it, so reading the link answers the same question
+without a process. `xcrun` remains the fallback: the SDK genuinely moves
+between Xcode versions and the Command Line Tools, and the shortcut has to be
+allowed to miss.
+
+Interleaved A/B, 20 iterations each, same machine conditions:
+
+```
+  old, SDKROOT unset   40.1 ms
+  old, SDKROOT set     31.4 ms      <- the spawn, isolated
+  new, SDKROOT unset   29.9 ms
+```
+
+Byte-identical output — verified after the first attempt said otherwise,
+because the harness gave each arm its own output path and **the output's base
+name is the ad-hoc signature's identifier**. Two names is two different
+binaries no matter what the linker did. A harness bug, and the fourth in this
+project's benchmarking (see the header of `scripts/bench.py`).
+
+### The part that matters more than the 9 ms
+
+**rustc sets `SDKROOT` when it invokes the linker.** Measured, with a shim:
+
+```
+  SDKROOT=[.../MacOSX26.5.sdk]  DEVELOPER_DIR=[<unset>]
+```
+
+So the old code already took the environment fast path in every cargo build.
+The 9 ms was paid only when blinker was invoked *without* it — by hand, by a
+build system that does not set it, and by `scripts/bench.py`, which inherits a
+shell where it is unset.
+
+Which means the benchmark and the workload disagreed about what blinker costs,
+and had done for as long as the benchmark has existed. A harness that
+faithfully replays the recorded argument list still does not reproduce the
+recorded *environment*, and the environment was load-bearing.
+
+**An argument list is not an invocation.** What the process inherits is part of
+the input, and a replay harness that captures one and not the other measures a
+configuration nobody runs.
+
+### What does not add up, recorded rather than smoothed over
+
+`scripts/bench.py` should therefore have shown ~9 ms of improvement from this
+change, and it did not: blinker's minimum across runs was 23.9 ms before and
+23.8 ms after, while the standalone A/B above puts the same binaries 10 ms
+apart under the same conditions.
+
+Both measurements are reproducible and they cannot both be describing the same
+thing. The likely candidate is `xcrun`'s own caching interacting with
+bench.py's warmup — but that is a guess, and the honest state is that the two
+harnesses disagree and the disagreement is not yet explained. The change is
+kept because it is correct, tested against `xcrun`'s answer, and strictly
+removes work; not because the benchmark endorsed it.
