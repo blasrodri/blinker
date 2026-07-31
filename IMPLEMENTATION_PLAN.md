@@ -777,5 +777,10 @@ yet, and neither should be until measured.
 - A harness that controls for a variable by removing it manufactures the
   configuration it then reports. Check what the environment *is*, from inside
   the harness, before controlling for it (75).
+- A profile says where time is spent; only an interleaved A/B says what
+  removing it is worth. Two changes built on 1.2 ms and 1.0 ms profile lines
+  bought no measurable time between them (76).
+- An incremental version of a cheap computation can cost more than the
+  computation, when what makes it cheap is borrowing (76).
 - A debugger's static parse is a linter for the output format, and costs one
   command; reach for it before reasoning about a crash in generated code (72).
