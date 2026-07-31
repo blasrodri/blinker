@@ -2035,3 +2035,48 @@ the generic relocation path, which resolves symbols to their addresses.
 **Recorded as the next thing to test, not as a conclusion.** The check is to
 decode one CIE's augmentation string, read its personality encoding byte, and
 compare the value blinker wrote against the address of that symbol's GOT slot.
+
+## 48. Confirmed: the CIE's personality points at the function, not its GOT slot
+
+Decoding the first CIE's augmentation data from both linkers' output for the
+same program:
+
+```
+blinker:   aug='zPLR' personality enc=indirect|pcrel|sdata4  ->  0x10017d873
+ld-prime:  aug='zPLR' personality enc=indirect|pcrel|sdata4  ->  0x100044000
+```
+
+Both use `DW_EH_PE_indirect`, which means the value is the address of a **slot
+containing** the personality routine's address. ld-prime's resolves to
+`0x100044000` — eight-byte aligned, in `__DATA_CONST,__got`. blinker's resolves
+to `0x10017d873`, an **odd address**, which cannot be a pointer slot at all.
+
+libunwind dereferences it as a pointer, reads unaligned bytes as an address,
+and segfaults in `getEncodedP` — exactly the crash in finding 46.
+
+This is the same defect fixed once already in `__unwind_info`'s personality
+array, which had to name a GOT slot rather than the function. That side was
+corrected; the CIE's own personality pointer inside `__eh_frame` was not,
+because it is patched by the generic relocation path, and that path resolves a
+symbol to *the symbol's address*. For an indirect encoding, the right answer is
+the address of the symbol's GOT entry.
+
+### A methodology note on how this was nearly missed
+
+The first run of this comparison reported blinker and ld-prime producing
+**identical** values, which would have refuted the hypothesis. They were
+identical because both decodes ran on the same file: an earlier command had
+rebuilt `target/debug/rs2` with the default linker, so the "blinker" decode was
+reading ld-prime's output.
+
+The tell was that both reported `__eh_frame` at the same address, for binaries
+known to differ in size by 2.25×. Two independent measurements agreeing exactly
+is evidence of a harness fault more often than of a real result — the same
+lesson as the benchmark that timed two crashing programs (finding 34).
+
+### The fix
+
+When patching a relocation whose field is a CIE personality reference with an
+indirect encoding, target the symbol's GOT slot rather than its address —
+allocating one if it does not already exist, as is already done for
+`GOT_LOAD_PAGE21` and for `__unwind_info`'s personality array.
