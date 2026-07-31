@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Refuse a commit that would not pass the gate.
+#
+# This exists because lint failures were committed twice, both times because
+# the gate was run by a human who then misread or skipped its result. A hook
+# does not misread exit statuses.
+#
+# Installed by `scripts/install-hooks.sh`, which points `core.hooksPath` at
+# this directory so the hook is version-controlled rather than copied into
+# `.git/hooks` where it would drift.
+#
+# Runs the fast gate: fmt, clippy, and unit tests. The full gate spawns real
+# `cargo build` invocations and takes long enough that it would train the
+# habit of passing `--no-verify`, which defeats the purpose. Run
+# `./scripts/check.sh` in full before pushing a milestone.
+#
+# To bypass deliberately (a WIP commit on a scratch branch):
+#
+#   git commit --no-verify
+
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+
+# The gate checks the whole working tree, not the index. If they differ, what
+# the gate approved is not what is being committed — so say so rather than
+# reporting a pass that does not apply to this commit.
+if ! git diff --quiet; then
+  printf '\033[1;33mnote:\033[0m unstaged changes present — the gate checks the working tree,\n' >&2
+  printf '      so it is validating more (or less) than this commit contains.\n' >&2
+fi
+
+# Capture rather than pipe. Piping into `grep`/`tail` makes the *pipeline*
+# exit status that of the last command, which is how a failing gate was
+# reported as a pass twice already.
+log="$(mktemp -t blinker-precommit)"
+trap 'rm -f "$log"' EXIT
+
+# Record the status on the same line that produces it.
+#
+# The obvious spelling — `if check.sh; then ...; fi` followed by `status=$?` —
+# is wrong, and wrong in the same direction as the bug this hook exists to
+# stop: after an `if` whose condition failed and which has no `else`, `$?` is
+# the status of the *`if` statement* (0), not of the condition. The first
+# version of this hook did exactly that, printed "gate failed", and then
+# exited 0 and let the commit through.
+status=0
+"$root/scripts/check.sh" --fast >"$log" 2>&1 || status=$?
+
+if [[ $status -eq 0 ]]; then
+  printf '\033[1;32mgate passed\033[0m\n'
+  exit 0
+fi
+
+printf '\n\033[1;31m==> gate failed — commit refused\033[0m\n\n' >&2
+tail -40 "$log" >&2
+printf '\nFull output: %s\n' "$log" >&2
+trap - EXIT # keep the log around so it can be read
+exit "$status"
