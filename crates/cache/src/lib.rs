@@ -113,6 +113,85 @@ pub struct CachedRebase {
     pub offset: u64,
 }
 
+/// How an input is proven unchanged.
+///
+/// Two classes of input reach a Rust link, and using one key for both is what
+/// made a first version of this cache exactly break-even (findings 60, 61):
+///
+/// ```text
+///   37 .o     rustc per-build codegen units    0.31 MB    1.8% of bytes
+///   19 .rlib  toolchain libraries             16.87 MB   98.2% of bytes
+/// ```
+///
+/// Hashing all of it costs 7.28 ms — within noise of the 7.3 ms the cache
+/// saves. Hashing only rustc's output costs **0.16 ms**, and the rest is
+/// covered soundly by metadata, because toolchain rlibs live at paths that are
+/// already content-addressed: rustup writes `libstd-4f24f0876fd27385.rlib`,
+/// hash included in the name. That file cannot change without changing path.
+///
+/// rustc's own objects get the opposite treatment for the opposite reason
+/// (finding 15): their names carry a per-build session component, so the path
+/// changes every build even when the bytes do not, and only content can
+/// identify them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputKey {
+    /// BLAKE3 of the file's bytes. For inputs whose path is not evidence.
+    Content([u8; 32]),
+    /// Path, modification time and size. For inputs whose path is evidence.
+    Metadata {
+        path: PathBuf,
+        modified_nanos: u128,
+        size: u64,
+    },
+}
+
+impl InputKey {
+    /// Choose a key for `path`, reading the file only when the path is not
+    /// itself evidence of its content.
+    ///
+    /// Returns `None` when the file cannot be examined at all — a missing
+    /// input is a cold link, not an error to propagate from here.
+    pub fn probe(path: &Path) -> Option<InputKey> {
+        if path_is_content_addressed(path) {
+            let metadata = std::fs::metadata(path).ok()?;
+            return Some(InputKey::Metadata {
+                path: path.to_path_buf(),
+                modified_nanos: metadata
+                    .modified()
+                    .ok()?
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()?
+                    .as_nanos(),
+                size: metadata.len(),
+            });
+        }
+        let bytes = std::fs::read(path).ok()?;
+        Some(InputKey::Content(*blake3::hash(&bytes).as_bytes()))
+    }
+}
+
+/// Whether a path is strong enough evidence of its own content.
+///
+/// True for the toolchain's `.rlib`s, which rustup names with a content hash.
+/// Deliberately conservative: anything not recognised is hashed, because the
+/// cost of hashing an input unnecessarily is microseconds and the cost of
+/// trusting a path that lied is a wrong binary.
+fn path_is_content_addressed(path: &Path) -> bool {
+    if path.extension().and_then(|e| e.to_str()) != Some("rlib") {
+        return false;
+    }
+    // `lib<crate>-<16 hex digits>.rlib`. The hash is what makes the path
+    // evidence; an `.rlib` without one is just a file that happens to be an
+    // archive, and gets hashed like anything else.
+    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    match stem.rsplit_once('-') {
+        Some((_, hash)) => hash.len() == 16 && hash.bytes().all(|b| b.is_ascii_hexdigit()),
+        None => false,
+    }
+}
+
 /// One object's cached contribution to the link.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Entry {
@@ -562,5 +641,100 @@ mod tests {
     fn the_cache_path_is_derived_from_the_output_name() {
         let path = cache_path(Path::new("/tmp/build/myprog"));
         assert!(path.to_string_lossy().ends_with("myprog.blinkcache"));
+    }
+}
+
+#[cfg(test)]
+mod input_key_tests {
+    use super::*;
+
+    /// The 98.2% of bytes that must never be hashed, or the cache breaks even
+    /// with doing nothing (findings 60, 61).
+    #[test]
+    fn a_rustup_rlib_is_keyed_by_its_path() {
+        let scratch = blinker_test_support::Scratch::dir("key-rlib").unwrap();
+        scratch
+            .write("libstd-4f24f0876fd27385.rlib", "archive")
+            .unwrap();
+        let key = InputKey::probe(&scratch.join("libstd-4f24f0876fd27385.rlib"));
+        assert!(matches!(key, Some(InputKey::Metadata { .. })), "{key:?}");
+    }
+
+    /// The 1.8% that must always be hashed: rustc rewrites these every build
+    /// under a new name (finding 15), so nothing about the path is evidence.
+    #[test]
+    fn a_rustc_codegen_object_is_keyed_by_content() {
+        let scratch = blinker_test_support::Scratch::dir("key-obj").unwrap();
+        scratch
+            .write("uw-9277bce136af823e.0f4x6c3m.023ewd0.rcgu.o", "object")
+            .unwrap();
+        let key = InputKey::probe(&scratch.join("uw-9277bce136af823e.0f4x6c3m.023ewd0.rcgu.o"));
+        assert!(matches!(key, Some(InputKey::Content(_))), "{key:?}");
+    }
+
+    /// An `.rlib` without a hash in its name is just an archive. Cargo writes
+    /// these for local crates, and their paths are reused across builds.
+    #[test]
+    fn an_rlib_without_a_hash_in_its_name_is_keyed_by_content() {
+        let scratch = blinker_test_support::Scratch::dir("key-plain").unwrap();
+        scratch.write("libmine.rlib", "archive").unwrap();
+        assert!(matches!(
+            InputKey::probe(&scratch.join("libmine.rlib")),
+            Some(InputKey::Content(_))
+        ));
+    }
+
+    /// A near-miss must fall to the safe side: the cost of hashing when the
+    /// path would have done is microseconds, the cost of the reverse is a
+    /// wrong binary.
+    #[test]
+    fn a_name_that_only_looks_content_addressed_is_still_hashed() {
+        let scratch = blinker_test_support::Scratch::dir("key-near").unwrap();
+        for name in [
+            "libstd-4f24f0876fd2738.rlib",   // 15 digits, not 16
+            "libstd-4f24f0876fd273855.rlib", // 17
+            "libstd-zzzzzzzzzzzzzzzz.rlib",  // not hex
+            "libstd.rlib",                   // no hash at all
+        ] {
+            scratch.write(name, "archive").unwrap();
+            assert!(
+                matches!(
+                    InputKey::probe(&scratch.join(name)),
+                    Some(InputKey::Content(_))
+                ),
+                "{name} was trusted on its path alone"
+            );
+        }
+    }
+
+    #[test]
+    fn changed_content_changes_a_content_key() {
+        let scratch = blinker_test_support::Scratch::dir("key-change").unwrap();
+        scratch.write("a.o", "before").unwrap();
+        let before = InputKey::probe(&scratch.join("a.o"));
+        scratch.write("a.o", "after!").unwrap();
+        assert_ne!(before, InputKey::probe(&scratch.join("a.o")));
+    }
+
+    /// The property the whole design rests on: rustc renames an object every
+    /// build, and identical bytes under a new name must still be a hit.
+    #[test]
+    fn identical_bytes_under_a_different_name_share_a_content_key() {
+        let scratch = blinker_test_support::Scratch::dir("key-rename").unwrap();
+        scratch
+            .write("crate-abc.cgu1.session1.rcgu.o", "same bytes")
+            .unwrap();
+        scratch
+            .write("crate-abc.cgu1.session2.rcgu.o", "same bytes")
+            .unwrap();
+        assert_eq!(
+            InputKey::probe(&scratch.join("crate-abc.cgu1.session1.rcgu.o")),
+            InputKey::probe(&scratch.join("crate-abc.cgu1.session2.rcgu.o")),
+        );
+    }
+
+    #[test]
+    fn a_missing_input_probes_as_none_rather_than_failing() {
+        assert_eq!(InputKey::probe(Path::new("/nonexistent/a.o")), None);
     }
 }
