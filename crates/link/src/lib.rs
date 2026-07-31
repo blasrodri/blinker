@@ -26,6 +26,15 @@
 //! depends only on section sizes and alignments, which the patching does not
 //! change, so the two passes agree by construction.
 
+// This crate is a library: everything it has to say travels through
+// `LinkError`, `LinkTimings` or a return value. Printing is the CLI's job.
+//
+// Denied because it did not stay hypothetical — two `eprintln!` calls added to
+// measure the loader were committed and shipped, printing to stderr on every
+// link. The gate had nothing to say about it: the tests pass, the output is
+// correct, and stray diagnostics are invisible to both.
+#![deny(clippy::print_stderr, clippy::print_stdout)]
+
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -2100,7 +2109,6 @@ fn load_one(path: &PathBuf, id: Option<ObjectId>) -> Result<Loaded, LinkError> {
 }
 
 fn load_objects(paths: &[PathBuf]) -> Result<Vec<LoadedObject>, LinkError> {
-    let t_all = std::time::Instant::now();
     // Object ids are assigned by position, before anything is read, so that
     // running the reads out of order cannot change them. `is_archive` looks
     // only at the path, so the assignment needs no I/O.
@@ -2175,26 +2183,14 @@ fn load_objects(paths: &[PathBuf]) -> Result<Vec<LoadedObject>, LinkError> {
         }
     }
 
-    eprintln!(
-        "LOAD parallel-phase {:.2} ({} objects, {} archives)",
-        elapsed_ms(t_all),
-        objects.len(),
-        archives.len()
-    );
-    let t_pull = std::time::Instant::now();
     if archives.is_empty() {
         return Ok(objects);
     }
 
     // Pull members in until nothing new is needed.
     let mut extracted: std::collections::HashSet<(usize, u32)> = std::collections::HashSet::new();
-    let mut rounds = 0u32;
-    let mut t_undef = 0.0f64;
     loop {
-        rounds += 1;
-        let t_u = std::time::Instant::now();
         let wanted = undefined_references(&objects);
-        t_undef += elapsed_ms(t_u);
         let mut added = false;
 
         for name in &wanted {
@@ -2223,13 +2219,6 @@ fn load_objects(paths: &[PathBuf]) -> Result<Vec<LoadedObject>, LinkError> {
         }
 
         if !added {
-            eprintln!(
-                "LOAD pull {:.2} ({} rounds, {} members, undefined {:.2})",
-                elapsed_ms(t_pull),
-                rounds,
-                extracted.len(),
-                t_undef
-            );
             return Ok(objects);
         }
     }
