@@ -3026,3 +3026,70 @@ milliseconds of its floor for this structure, and the remaining stages —
 input genuinely requires. The only way to stop paying for *unchanged* inputs is
 not to process them at all, which is the partial fast path finding 67 points
 at.
+
+## 70. The size gap is `__text`, and closing it needs atom-level stripping
+
+blinker's output has been described as "2.0x ld-prime's" since finding 34. The
+comparison needed a correction and then a breakdown.
+
+The correction: **2.0x is against ld-prime *with* `-dead_strip`**, which is how
+rustc invokes it. Against the same linker without the flag, blinker is smaller:
+
+```
+  blinker                        1055 KB
+  ld-prime, -dead_strip           521 KB     2.02x
+  ld-prime, no -dead_strip       1409 KB     0.75x
+```
+
+So blinker is not producing bloated output; it is producing *unstripped*
+output, and the entire gap is one feature it does not implement.
+
+Where the 534 KB sits:
+
+```
+  section                    blinker   ld-prime     delta
+  __TEXT,__text                 574K       222K     +352K
+  __TEXT,__eh_frame              96K        32K      +64K
+  __TEXT,__const                 75K        13K      +61K
+  __TEXT,__unwind_info           36K         6K      +30K
+  __DATA_CONST,__const           27K         8K      +19K
+  __TEXT,__cstring               15K         7K       +8K
+  __TEXT,__gcc_except_tab        11K         5K       +6K
+```
+
+`__text` is two thirds of it, and every other line follows from it: unwind
+tables, exception tables and string literals exist to serve code, so dropping
+unreachable functions drops their metadata with them. There is no separate
+problem to solve in those sections.
+
+### Why it cannot be done at section granularity
+
+The gap is *inside* objects that are legitimately needed. Archive members are
+pulled in only to satisfy a referenced symbol, so no whole member is dead —
+what is dead is the other forty functions that came with the one that was
+wanted. Removing them means splitting a section into per-symbol atoms.
+
+Mach-O says when that is legal, and every object in a Rust link says yes:
+
+```
+  subsections_via_symbols=YES   symbols.o
+  subsections_via_symbols=YES   uw-...rcgu.o
+  subsections_via_symbols=YES   std-...cgu.0.rcgu.o
+```
+
+`MH_SUBSECTIONS_VIA_SYMBOLS` is the compiler's assertion that no code in the
+object refers to anything except through a symbol, so a section may be cut at
+symbol boundaries without changing behaviour. Without that flag an object must
+be kept whole; with it, atoms are the unit.
+
+### What the work is
+
+Not a filter over the existing pipeline. It changes the unit of layout from
+"an object's section" to "an atom", which touches placement, `AddressMap`, the
+relocation pass, and the unwind and exception tables that index by function
+address. It is a milestone, not an optimisation, and it is the last large
+correctness-adjacent feature blinker is missing.
+
+The reachability itself is the easy half: roots are the entry symbol, the
+exported symbols, and any section flagged no-dead-strip; edges are the
+relocations, which the link already surveys.
