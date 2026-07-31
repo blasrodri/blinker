@@ -2835,3 +2835,60 @@ So: **an instrument needs its own negative control.** Deliberately break the
 thing being measured and confirm the number moves. That is one extra command
 after adding any counter, and without it a metric is an assertion about the
 code that nobody has tested.
+
+## 67. Proving the inputs unchanged costs 0.18 ms, and that buys the whole link
+
+The cache reuses relocated bytes, which skips one stage of five. The stages it
+cannot skip — `read+parse` at 6.9 ms and `resolve` at 6.2 ms — run *before* the
+cache is consulted, because addresses have to exist before anything can be
+checked against them. That put a floor of about 17 ms under any incremental
+link, and made 58% of the work permanently unreachable.
+
+The floor is an artifact of checking too late. Measuring what it costs to
+decide, from paths alone, that nothing changed:
+
+```
+  blake3 over rustc's 37 objects (0.31 MB)   0.16  ms
+  stat the 19 toolchain rlibs                0.024 ms
+                                             ----
+                                             0.18  ms
+
+  the link it would replace                 22.6   ms
+```
+
+125×. So when every input is unchanged and the request is identical, the right
+answer is the binary already on disk, and reaching it needs no pipeline at all
+— no parse, no resolve, no layout, no relocation, no assembly.
+
+```
+  ld-prime                     32.8 ms
+  blinker, unchanged relink     9.2 ms      0.28x
+```
+
+Byte-identical output, and it still unwinds. This is the first configuration in
+which blinker is *faster* than the system linker rather than close to it.
+
+### What this case is and is not
+
+It is the unchanged relink: `cargo` re-running the linker after a dependency's
+timestamp moved, a build after `cargo test`, an IDE reissuing a build. It is
+not the edit-compile loop, where one codegen unit changed — that still goes
+through the pipeline with per-object reuse, at 22.6 ms.
+
+Quoting the 0.28× as blinker's speed would be dishonest by omission. What it
+establishes is narrower and still worth having: **the checking-before-reading
+structure works**, and the same 0.18 ms proof is what a partial fast path needs
+to identify the one changed object without reading the other 46.
+
+### The general shape
+
+Three caches have now been designed in this project, and the difference between
+the two that worked and the one that did not is *when the validity check
+happens relative to the expensive work*:
+
+- the parse cache checked after reading, and lost to re-parsing (41);
+- the relocation cache checks after parsing and resolving, and saves the one
+  stage below it (59);
+- this checks before any of it, and saves everything.
+
+The artifact being cached mattered less than the position of the check.

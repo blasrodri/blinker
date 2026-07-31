@@ -77,6 +77,13 @@ pub struct LinkTimings {
     /// the files is what makes the number mean what it appears to mean.
     pub reused_relocations: u64,
     pub total_relocations: u64,
+    /// Whether the finished binary was taken from the cache outright.
+    ///
+    /// Distinct from reusing every object: that still resolves, lays out and
+    /// assembles, and only skips relocating. This skips all of it. The two
+    /// report the same hit rate, so without this flag no test could tell them
+    /// apart — and a fast path that silently stops firing is finding 64 again.
+    pub reused_finished_image: bool,
 }
 
 impl std::fmt::Display for LinkTimings {
@@ -96,8 +103,15 @@ impl std::fmt::Display for LinkTimings {
             };
             writeln!(
                 f,
-                "  reused      {:7} of {} objects, {:.0}% of relocations",
-                self.reused_objects, self.total_objects, share
+                "  reused      {:7} of {} objects, {:.0}% of relocations{}",
+                self.reused_objects,
+                self.total_objects,
+                share,
+                if self.reused_finished_image {
+                    " (whole image)"
+                } else {
+                    ""
+                }
             )?;
         }
         writeln!(
@@ -1036,12 +1050,20 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
         request.cache_path.is_some(),
         plan.as_ref(),
     )?;
-    if let (Some(path), Some(addresses)) = (&request.cache_path, current_addresses) {
-        let cache = build_cache(&objects, &probe, addresses, &patched.contents, &patched);
-        // A cache that cannot be written is not an error: the link succeeded,
-        // and the only consequence is that the next one is cold.
-        let _ = blinker_cache::store(path, &cache);
-    }
+    // Built here, while the patched contents still exist, but not written
+    // until the image does — the fast path needs the finished binary, and that
+    // is the last thing produced.
+    let mut cache = match (&request.cache_path, current_addresses) {
+        (Some(_), Some(addresses)) => Some(build_cache(
+            request,
+            &objects,
+            &probe,
+            addresses,
+            &patched.contents,
+            &patched,
+        )),
+        _ => None,
+    };
 
     timings.reused_objects = patched.reused;
     timings.reused_relocations = patched.reused_relocations;
@@ -1082,6 +1104,14 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
         },
     );
     timings.emit_ms = elapsed_ms(step);
+
+    if let (Some(path), Some(cache), Ok(image)) = (&request.cache_path, &mut cache, &image) {
+        cache.image = image.bytes.clone();
+        // A cache that cannot be written is not an error: the link succeeded,
+        // and the only consequence is that the next one is cold.
+        let _ = blinker_cache::store(path, cache);
+    }
+
     timings.total_ms = elapsed_ms(overall);
     image
 }
@@ -1214,6 +1244,7 @@ fn plan_reuse<'a>(
 /// hashing of names, which is why writing a cache costs a fraction of using
 /// one.
 fn build_cache(
+    request: &LinkRequest,
     objects: &[LoadedObject],
     image: &Image,
     addresses: Vec<(blinker_cache::NameHash, u64)>,
@@ -1270,6 +1301,11 @@ fn build_cache(
         entries,
         addresses,
         sections,
+        inputs: input_keys(request).unwrap_or_default(),
+        request: request_hash(request),
+        // Filled in once the image exists; a cache written without it simply
+        // has no fast path, which is a slower link and not a wrong one.
+        image: Vec::new(),
     }
 }
 
@@ -2699,16 +2735,100 @@ fn entry_offset(
 
 /// Convenience: link and write the result.
 pub fn link_to_file(request: &LinkRequest, output: &Path) -> Result<Image, LinkError> {
-    link_to_file_timed(request, output).map(|(image, _)| image)
+    let (image, timings) = link_timed(request)?;
+    write_output(&image.bytes, output)?;
+    let _ = timings;
+    Ok(image)
 }
 
-/// As [`link_to_file`], reporting what the link did.
-pub fn link_to_file_timed(
+/// Link and write, reusing a finished binary outright when nothing changed.
+///
+/// The fast path is the one case where the cache can be certain without doing
+/// any of the work: every input file unchanged and the request identical means
+/// the output is the one already on disk. Proving that costs 0.18 ms on a
+/// 56-input Rust link — 0.16 to hash rustc's own objects, 0.024 to stat the
+/// toolchain rlibs — against 22.6 ms to link (finding 67).
+///
+/// It returns timings rather than an [`Image`], because an `Image` carries the
+/// layout and symbol table, and reconstructing those is most of the work being
+/// skipped. Callers that need them should use [`link_to_file`], which always
+/// performs a full link.
+pub fn link_to_file_timed(request: &LinkRequest, output: &Path) -> Result<LinkTimings, LinkError> {
+    if let Some(timings) = reuse_finished_image(request, output)? {
+        return Ok(timings);
+    }
+    let (image, timings) = link_timed(request)?;
+    write_output(&image.bytes, output)?;
+    Ok(timings)
+}
+
+/// Everything about a request that is not an input file.
+///
+/// Identical objects linked with a different entry point are a different
+/// binary, and the input keys alone would not say so.
+fn request_hash(request: &LinkRequest) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(request.entry_symbol.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(request.identifier.as_bytes());
+    for dylib in &request.dylibs {
+        hasher.update(&[1]);
+        hasher.update(dylib.install_name.as_bytes());
+    }
+    for stub in &request.stub_libraries {
+        hasher.update(&[2]);
+        hasher.update(stub.to_string_lossy().as_bytes());
+    }
+    *hasher.finalize().as_bytes()
+}
+
+/// The input files and the keys that prove them unchanged.
+fn input_keys(request: &LinkRequest) -> Option<Vec<(PathBuf, blinker_cache::InputKey)>> {
+    request
+        .objects
+        .iter()
+        .map(|path| blinker_cache::InputKey::probe(path).map(|key| (path.clone(), key)))
+        .collect()
+}
+
+/// Write the cached binary if it is provably the one this link would produce.
+fn reuse_finished_image(
     request: &LinkRequest,
     output: &Path,
-) -> Result<(Image, LinkTimings), LinkError> {
-    let (image, timings) = link_timed(request)?;
-    std::fs::write(output, &image.bytes).map_err(|source| LinkError::Write {
+) -> Result<Option<LinkTimings>, LinkError> {
+    let overall = std::time::Instant::now();
+    let Some(path) = request.cache_path.as_deref() else {
+        return Ok(None);
+    };
+    let Some(cache) = blinker_cache::load(path) else {
+        return Ok(None);
+    };
+    let Some(inputs) = input_keys(request) else {
+        // An input that cannot be examined is one that may have moved; the
+        // full link will produce the real error.
+        return Ok(None);
+    };
+    if !cache.matches(&inputs, &request_hash(request)) {
+        return Ok(None);
+    }
+
+    write_output(&cache.image, output)?;
+    let relocations = cache.entries.iter().map(|e| e.deps.len() as u64).sum();
+    Ok(Some(LinkTimings {
+        total_ms: elapsed_ms(overall),
+        reused_objects: cache.entries.len() as u64,
+        total_objects: cache.entries.len() as u64,
+        // Nothing was relocated because nothing was linked. Reported as a
+        // complete hit so the number means the same thing on both paths.
+        reused_relocations: relocations,
+        total_relocations: relocations,
+        reused_finished_image: true,
+        ..LinkTimings::default()
+    }))
+}
+
+fn write_output(bytes: &[u8], output: &Path) -> Result<(), LinkError> {
+    std::fs::write(output, bytes).map_err(|source| LinkError::Write {
         path: output.to_path_buf(),
         source,
     })?;
@@ -2722,5 +2842,5 @@ pub fn link_to_file_timed(
             },
         )?;
     }
-    Ok((image, timings))
+    Ok(())
 }

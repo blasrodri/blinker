@@ -262,6 +262,39 @@ pub struct LinkCache {
     pub addresses: Vec<(NameHash, u64)>,
     /// The patched output sections, by output section index.
     pub sections: Vec<(u32, Vec<u8>)>,
+    /// The link's input files, in order, with the key that proves each one.
+    ///
+    /// Kept separately from `entries` because it is checked *before* anything
+    /// is read: proving all 56 inputs of a Rust link unchanged costs 0.18 ms
+    /// (0.16 to hash rustc's output, 0.024 to stat the rlibs), against 22.6 ms
+    /// to link. That ratio is what makes the whole-image path below worth
+    /// having.
+    pub inputs: Vec<(PathBuf, InputKey)>,
+    /// Everything about the request that is not an input file.
+    ///
+    /// The entry symbol, the dylibs, the stub libraries, the signing
+    /// identifier. Identical inputs linked with a different entry point are a
+    /// different binary, and nothing in `inputs` would say so.
+    pub request: [u8; 32],
+    /// The finished, signed binary.
+    ///
+    /// Present so that a link whose inputs are *all* unchanged can skip the
+    /// pipeline outright rather than rebuild a result it already has. This is
+    /// the one case where the cache can be sure without doing any of the work:
+    /// same inputs, same request, same output — no reasoning about which
+    /// contributions moved, because none of them did.
+    pub image: Vec<u8>,
+}
+
+impl LinkCache {
+    /// Whether this cache describes exactly the link about to be performed.
+    ///
+    /// Order matters as much as content: the same objects in a different order
+    /// lay out differently, so the comparison is positional rather than a set
+    /// comparison.
+    pub fn matches(&self, inputs: &[(PathBuf, InputKey)], request: &[u8; 32]) -> bool {
+        !self.image.is_empty() && &self.request == request && self.inputs == inputs
+    }
 }
 
 impl LinkCache {
@@ -375,25 +408,7 @@ fn encode(cache: &LinkCache) -> Vec<u8> {
 
     out.u32(cache.entries.len() as u32);
     for entry in &cache.entries {
-        match &entry.key {
-            InputKey::Content(hash) => {
-                out.u32(0);
-                out.bytes_raw(hash);
-            }
-            InputKey::Metadata {
-                path,
-                modified_nanos,
-                size,
-            } => {
-                out.u32(1);
-                let path = path.to_string_lossy();
-                out.u32(path.len() as u32);
-                out.bytes_raw(path.as_bytes());
-                out.u64((*modified_nanos >> 64) as u64);
-                out.u64(*modified_nanos as u64);
-                out.u64(*size);
-            }
-        }
+        encode_key(&mut out, &entry.key);
         out.u32(entry.ranges.len() as u32);
         for range in &entry.ranges {
             out.u32(range.section);
@@ -432,7 +447,58 @@ fn encode(cache: &LinkCache) -> Vec<u8> {
         out.u32(bytes.len() as u32);
         out.bytes_raw(bytes);
     }
+
+    out.u32(cache.inputs.len() as u32);
+    for (path, key) in &cache.inputs {
+        let path = path.to_string_lossy();
+        out.u32(path.len() as u32);
+        out.bytes_raw(path.as_bytes());
+        encode_key(&mut out, key);
+    }
+    out.bytes_raw(&cache.request);
+    out.u32(cache.image.len() as u32);
+    out.bytes_raw(&cache.image);
     out.finish()
+}
+
+fn encode_key(out: &mut Encoder, key: &InputKey) {
+    match key {
+        InputKey::Content(hash) => {
+            out.u32(0);
+            out.bytes_raw(hash);
+        }
+        InputKey::Metadata {
+            path,
+            modified_nanos,
+            size,
+        } => {
+            out.u32(1);
+            let path = path.to_string_lossy();
+            out.u32(path.len() as u32);
+            out.bytes_raw(path.as_bytes());
+            out.u64((*modified_nanos >> 64) as u64);
+            out.u64(*modified_nanos as u64);
+            out.u64(*size);
+        }
+    }
+}
+
+fn decode_key(input: &mut Decoder<'_>) -> Option<InputKey> {
+    Some(match input.u32()? {
+        0 => InputKey::Content(input.bytes_raw(32)?.try_into().ok()?),
+        1 => {
+            let length = input.u32()? as usize;
+            let path = std::str::from_utf8(input.bytes_raw(length)?).ok()?;
+            let high = input.u64()? as u128;
+            let low = input.u64()? as u128;
+            InputKey::Metadata {
+                path: PathBuf::from(path),
+                modified_nanos: (high << 64) | low,
+                size: input.u64()?,
+            }
+        }
+        _ => return None,
+    })
 }
 
 fn decode(bytes: &[u8]) -> Option<LinkCache> {
@@ -443,21 +509,7 @@ fn decode(bytes: &[u8]) -> Option<LinkCache> {
 
     let mut entries = Vec::new();
     for _ in 0..input.u32()? {
-        let key = match input.u32()? {
-            0 => InputKey::Content(input.bytes_raw(32)?.try_into().ok()?),
-            1 => {
-                let length = input.u32()? as usize;
-                let path = std::str::from_utf8(input.bytes_raw(length)?).ok()?;
-                let high = input.u64()? as u128;
-                let low = input.u64()? as u128;
-                InputKey::Metadata {
-                    path: PathBuf::from(path),
-                    modified_nanos: (high << 64) | low,
-                    size: input.u64()?,
-                }
-            }
-            _ => return None,
-        };
+        let key = decode_key(&mut input)?;
         let mut entry = Entry {
             key,
             ranges: Vec::new(),
@@ -511,11 +563,24 @@ fn decode(bytes: &[u8]) -> Option<LinkCache> {
         sections.push((index, input.bytes_raw(length)?.to_vec()));
     }
 
+    let mut inputs = Vec::new();
+    for _ in 0..input.u32()? {
+        let length = input.u32()? as usize;
+        let path = PathBuf::from(std::str::from_utf8(input.bytes_raw(length)?).ok()?);
+        inputs.push((path, decode_key(&mut input)?));
+    }
+    let request: [u8; 32] = input.bytes_raw(32)?.try_into().ok()?;
+    let length = input.u32()? as usize;
+    let image = input.bytes_raw(length)?.to_vec();
+
     // Trailing bytes mean the file is not what it claims to be.
     input.at_end().then_some(LinkCache {
         entries,
         addresses,
         sections,
+        inputs,
+        request,
+        image,
     })
 }
 
@@ -559,6 +624,9 @@ mod tests {
             }],
             addresses: addresses_from([("_main".to_string(), 0x1000)]),
             sections: vec![(1, vec![0xab; 64])],
+            inputs: vec![(PathBuf::from("/tmp/a.o"), InputKey::Content([1u8; 32]))],
+            request: [2u8; 32],
+            image: vec![0xcd; 128],
         }
     }
 

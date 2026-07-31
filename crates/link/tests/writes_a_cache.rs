@@ -173,14 +173,14 @@ fn a_second_link_reuses_the_cache_and_produces_an_identical_binary() {
     let request = LinkRequest::new(objects).cached_at(cache_path.clone());
 
     let cold = scratch.join("cold");
-    let (_, first) = blinker_link::link_to_file_timed(&request, &cold).expect("cold link");
+    let first = blinker_link::link_to_file_timed(&request, &cold).expect("cold link");
     assert_eq!(
         first.reused_objects, 0,
         "the first link had nothing to reuse"
     );
 
     let warm = scratch.join("warm");
-    let (_, second) = blinker_link::link_to_file_timed(&request, &warm).expect("warm link");
+    let second = blinker_link::link_to_file_timed(&request, &warm).expect("warm link");
     assert_eq!(
         second.reused_objects, 2,
         "both objects should have been reused"
@@ -202,7 +202,7 @@ fn the_binary_from_a_reusing_link_runs_correctly() {
 
     let program = scratch.join("program");
     blinker_link::link_to_file(&request, &program).expect("cold link");
-    let (_, timings) = blinker_link::link_to_file_timed(&request, &program).expect("warm link");
+    let timings = blinker_link::link_to_file_timed(&request, &program).expect("warm link");
     assert!(timings.reused_objects > 0, "nothing was reused");
 
     let run = Command::new(&program).output().expect("the program runs");
@@ -225,7 +225,7 @@ fn editing_one_object_invalidates_only_what_depended_on_it() {
     compile(&scratch, &[("helper.c", &HELPER.replace("n * 6", "n * 9"))]);
 
     let edited = scratch.join("edited");
-    let (_, timings) = blinker_link::link_to_file_timed(&request, &edited).expect("warm link");
+    let timings = blinker_link::link_to_file_timed(&request, &edited).expect("warm link");
     assert_eq!(
         timings.reused_objects, 1,
         "the edited object should have been rebuilt and the other reused"
@@ -321,7 +321,7 @@ int main(void) {
     let cold = scratch.join("cold");
     blinker_link::link_to_file(&request, &cold).expect("cold link");
     let warm = scratch.join("warm");
-    let (_, timings) = blinker_link::link_to_file_timed(&request, &warm).expect("warm link");
+    let timings = blinker_link::link_to_file_timed(&request, &warm).expect("warm link");
 
     assert_eq!(
         timings.reused_objects, 2,
@@ -330,4 +330,74 @@ int main(void) {
     assert_eq!(std::fs::read(&cold).unwrap(), std::fs::read(&warm).unwrap());
     let run = Command::new(&warm).output().expect("the program runs");
     assert_eq!(String::from_utf8_lossy(&run.stdout), "49\n");
+}
+
+/// The fast path: every input unchanged, so the finished binary is the one
+/// already on disk and none of the pipeline needs to run.
+///
+/// Proving the inputs unchanged costs 0.18 ms on a 56-input Rust link against
+/// 22.6 ms to link it (finding 67), which is the whole argument for checking
+/// before reading rather than after.
+#[test]
+fn an_unchanged_relink_reuses_the_finished_binary_outright() {
+    let scratch = Scratch::dir("cache-whole").expect("scratch");
+    let objects = compile(&scratch, &[("main.c", PROGRAM), ("helper.c", HELPER)]);
+    let request = LinkRequest::new(objects).cached_at(scratch.join("link.blinkcache"));
+    let out = scratch.join("program");
+
+    let cold = blinker_link::link_to_file_timed(&request, &out).expect("cold link");
+    assert!(!cold.reused_finished_image, "the first link has no cache");
+    let first = std::fs::read(&out).expect("a binary");
+
+    let warm = blinker_link::link_to_file_timed(&request, &out).expect("warm link");
+    assert!(warm.reused_finished_image, "the fast path did not fire");
+    assert_eq!(warm.read_and_parse_ms, 0.0, "inputs were read anyway");
+    assert_eq!(first, std::fs::read(&out).expect("a binary"));
+
+    let run = Command::new(&out).output().expect("the program runs");
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "49\n");
+}
+
+/// Changing any input must defeat it. The fast path does no reasoning about
+/// what moved, so it has to be certain that nothing did.
+#[test]
+fn editing_an_input_defeats_the_whole_image_path() {
+    let scratch = Scratch::dir("cache-whole-edit").expect("scratch");
+    let objects = compile(&scratch, &[("main.c", PROGRAM), ("helper.c", HELPER)]);
+    let request = LinkRequest::new(objects.clone()).cached_at(scratch.join("link.blinkcache"));
+    let out = scratch.join("program");
+
+    blinker_link::link_to_file_timed(&request, &out).expect("cold link");
+    compile(&scratch, &[("helper.c", &HELPER.replace("n * 6", "n * 9"))]);
+    let after = blinker_link::link_to_file_timed(&request, &out).expect("warm link");
+    assert!(!after.reused_finished_image, "a changed input was reused");
+
+    let reference = scratch.join("reference");
+    blinker_link::link_to_file(&LinkRequest::new(objects), &reference).expect("uncached");
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        std::fs::read(&reference).unwrap()
+    );
+}
+
+/// And so must changing the request. The same objects linked with a different
+/// entry point are a different binary, and no input key would say so.
+#[test]
+fn changing_the_request_defeats_the_whole_image_path() {
+    let scratch = Scratch::dir("cache-whole-request").expect("scratch");
+    let objects = compile(&scratch, &[("main.c", PROGRAM), ("helper.c", HELPER)]);
+    let cache = scratch.join("link.blinkcache");
+    let out = scratch.join("program");
+
+    let first = LinkRequest::new(objects.clone()).cached_at(cache.clone());
+    blinker_link::link_to_file_timed(&first, &out).expect("cold link");
+
+    let renamed = LinkRequest::new(objects)
+        .cached_at(cache)
+        .identifier("something-else");
+    let after = blinker_link::link_to_file_timed(&renamed, &out).expect("second link");
+    assert!(
+        !after.reused_finished_image,
+        "a different request reused the previous binary"
+    );
 }

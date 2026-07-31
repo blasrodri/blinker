@@ -254,12 +254,7 @@ fn internal_link(
     if options.incremental_cache {
         request = request.cached_at(blinker_cache::cache_path(&output));
     }
-    let (image, timings) = blinker_link::link_timed(&request)?;
-
-    std::fs::write(&output, &image.bytes).map_err(|source| blinker_link::LinkError::Write {
-        path: output.clone(),
-        source,
-    })?;
+    let timings = blinker_link::link_to_file_timed(&request, &output)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
