@@ -1995,3 +1995,43 @@ the end of the section or hits a zero-length record partway.
 link a normal Rust project, and the incremental work — however fast — has
 nothing usable to be fast *on*. This should be finished before step 2 of the
 incremental design.
+
+## 47. The `__eh_frame` chain is intact; the fault is inside a CIE's encoded pointers
+
+Finding 46's hypothesis — that alignment padding between concatenated
+`__eh_frame` contributions creates zero-length records that break the CFI
+chain — is **wrong**. Walking both binaries' records by length:
+
+```
+  blinker:  23 CIEs, 1408 FDEs, 0 zero-length, 0 malformed, walked to 0x16cb0/0x16cb0
+  ld-prime: 20 CIEs,  375 FDEs, 0 zero-length,              walked to  0x6920/0x6920
+```
+
+blinker's chain reaches the **exact end** of the section with no gaps and no
+malformed records. Concatenation is not the problem, and rewriting
+`__eh_frame` to deduplicate CIEs would have fixed nothing.
+
+Sixth hypothesis in this project refuted by measurement. It cost one script.
+
+### Where the fault must be
+
+libunwind crashes in `getEncodedP` while parsing a CIE — reading a pointer
+encoded according to that CIE's augmentation string. The chain is intact, so it
+is reading the right CIE; the *pointer inside it* is bad.
+
+A CIE's augmentation data carries the **personality routine**, and DWARF
+pointer encodings include `DW_EH_PE_indirect`, which means the encoded value is
+the address of a slot *containing* the personality address — a GOT entry — not
+the personality function itself. Dereferencing a function address as though it
+were a pointer slot reads instruction bytes as an address and jumps into
+nothing.
+
+That is the same defect already fixed once, in a different place: finding 41's
+neighbour, where `__unwind_info`'s personality array had to point at a GOT slot
+rather than at the function. The `__unwind_info` side was corrected; the CIE's
+own personality pointer inside `__eh_frame` was not, because it is patched by
+the generic relocation path, which resolves symbols to their addresses.
+
+**Recorded as the next thing to test, not as a conclusion.** The check is to
+decode one CIE's augmentation string, read its personality encoding byte, and
+compare the value blinker wrote against the address of that symbol's GOT slot.
