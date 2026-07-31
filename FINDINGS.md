@@ -2449,3 +2449,50 @@ Worth recording for scale: this single `libstd` codegen unit has 264 FDEs
 carrying LSDAs and 2361 relocations in `__eh_frame` alone. The six-correct,
 350-wrong split across the whole link is consistent with one object resolving
 and the rest not.
+
+## 57. The LSDA's operands are same-named local labels in every object
+
+Resolving the two symbols the LSDA relocation names:
+
+```
+symbol   26: 'GCC_except_table5'  (__TEXT,__gcc_except_tab)  value=0x4ea04
+symbol 1788: 'ltmp18'             (__TEXT,__eh_frame)        value=0x828e80
+```
+
+Both are **local labels**, and the LSDA value is `GCC_except_table5 − ltmp18`.
+
+The name is the point. *Every* object in the link defines its own
+`GCC_except_table5`, `GCC_except_table6`, and so on, and its own `ltmpN`
+labels. They are local precisely so that repetition is legal. Resolving one to
+the wrong object's definition gives an address in the right *section* but the
+wrong *contribution* — which is exactly the observed failure: six LSDAs land
+inside `__gcc_except_tab` and 350 land past its end.
+
+`AddressMap` was built for this: locals are keyed `(object, name)` and looked
+up against the object that referenced them, because "two objects may
+legitimately define the same local name". Finding 29 added that after null
+`__thread_ptrs` slots traced to looking locals up under the linker's synthetic
+object id.
+
+So the machinery exists and the failure looks like exactly what it was built to
+prevent. The check is narrow: for one known-bad FDE, resolve
+`GCC_except_table5` through `AddressMap` with that FDE's owning object, and
+compare against both `__gcc_except_tab`'s bounds and the address ld-prime
+produced.
+
+Two candidates worth distinguishing when someone runs it:
+
+- the lookup falls through to the **global** map, where one arbitrary object's
+  `GCC_except_table5` won, or
+- the per-object key is right but the *contribution* offset used to place it is
+  not — `address_map` computes `chunk + value − input.vm_address`, and
+  `saturating_sub` there silently yields zero if the section's recorded address
+  ever exceeds the symbol's.
+
+### State of the unwinding chase
+
+`__unwind_info` (30, 32), the `__eh_frame` chain (47), CIE personalities (52,
+fixed), and FDE ranges (53) are all verified correct against ld-prime. The
+LSDA is wrong, its relocation has been read (56), and its operands are now
+identified. That is as far as this stretch got, and the next move is a lookup,
+not a theory.
