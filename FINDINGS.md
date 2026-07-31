@@ -1332,3 +1332,51 @@ premise was false. This project has now had two hypotheses that survived
 reasoning and died to a single measurement (the other being the dyld strategy
 in finding 13). Both times the measurement was available before the reasoning
 started.
+
+## 34. Cold-link measurement: blinker is 1.6× slower than ld64, and 2.25× larger
+
+The first real benchmark, on the argument vector `rustc` actually handed the
+linker for a small Rust binary (8 objects, 19 rlibs, 17 MB of input):
+
+| linker | time | output size |
+|---|---|---|
+| `ld64` invoked directly | **27.9 ms** | 468 KB |
+| `blinker` (release) | **44.6 ms** | 1056 KB |
+| `cc` → `ld64` (driver spawn included) | 44.6 ms | — |
+
+Three things worth separating.
+
+**blinker is 1.6× slower cold.** Not the order of magnitude that finding D3
+feared, but not parity either, and parity was never the plan — a linker that
+re-reads 17 MB and rebuilds everything cannot beat one that does the same thing
+in optimised C++. This number matters because it is the floor the cache has to
+beat: M4 has to save more than 44.6 ms of work to be worth anything, and it
+starts from a 16.7 ms deficit.
+
+**The `cc` driver costs as much as the link.** Spawning `ld` takes ld64's
+27.9 ms to 44.6 ms. Any comparison that measures `cc` rather than `ld` is
+measuring process creation as though it were linking — which is exactly the
+mistake the first attempt at this benchmark made.
+
+**The output is 2.25× larger** because blinker does not dead-strip. Every
+member pulled out of an archive is emitted whole. That is a correctness-neutral
+gap today and a real one for anything shipping.
+
+### Two failed measurements before this one
+
+The first run reported blinker at 35.8 ms against ld64's 64.9 ms — a win. Both
+numbers were of **failing** linkers: the object list was passed as a single
+quoted argument, both programs rejected it immediately, and output was
+redirected to `/dev/null` so neither said so. A benchmark that does not assert
+its subject succeeded is measuring startup cost.
+
+The second attempt fixed the quoting and still failed, because the objects
+alone do not link — the rlibs carry `rust_panic` and the allocator shims. Both
+linkers agreed exactly on which symbols were missing, which is what made the
+failure obvious.
+
+The rule this leaves: **a benchmark must verify its output before it reports a
+time**, and the verification belongs in the harness rather than in the
+operator's memory. The run above checks exit status and file size for both
+linkers, and it is the reason the third set of numbers can be trusted where the
+first cannot.
