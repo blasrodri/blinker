@@ -137,10 +137,8 @@ fn main() {
 /// thread-local machinery — descriptors, the pointer table, its rebases, and
 /// the block offsets — is all correct.
 ///
-/// `panic=unwind` (the default) is *not* covered here, and does not yet work:
-/// `__TEXT,__unwind_info` is still not synthesised from the input objects'
-/// `__compact_unwind`, so the unwinder has no tables to walk. That is a known
-/// gap, recorded rather than hidden behind a passing test.
+/// `panic=unwind` — the default, and the harder case — is covered by the tests
+/// below it.
 #[test]
 fn a_panicking_program_reports_and_aborts_under_panic_abort() {
     let (status, _, stderr) = build_and_run_with(
@@ -151,6 +149,82 @@ fn a_panicking_program_reports_and_aborts_under_panic_abort() {
 
     // SIGABRT (6), as an aborting panic should — not an exit code.
     assert_eq!(status, RunResult::Signalled(6), "stderr: {stderr}");
+    assert!(
+        stderr.contains("panicked at") && stderr.contains("boom"),
+        "the panic message did not reach stderr: {stderr}"
+    );
+}
+
+/// A caught panic under the **default** `panic=unwind`.
+///
+/// This is the deepest thing the linker is asked to get right, because
+/// unwinding reads four separate structures the linker itself synthesises —
+/// `__unwind_info`'s two-level index, the `__eh_frame` CIE/FDE chain, each
+/// CIE's personality pointer, and each FDE's LSDA — and a single wrong word in
+/// any of them ends the process instead of returning here.
+///
+/// It failed for a long time with `failed to initiate panic, error 3`
+/// (`_URC_FATAL_PHASE1_ERROR`) while all four structures decoded correctly, and
+/// the cause was none of them: `SUBTRACTOR` pairs dropped their addend. Mach-O
+/// stores addends **in the bytes being patched**, not in the relocation, so
+/// every LSDA came out measured from the start of its object's `__eh_frame`
+/// contribution rather than from the field, and landed outside
+/// `__gcc_except_tab`. See FINDINGS.md 58.
+#[test]
+fn a_panic_unwinds_and_is_caught_under_the_default_panic_strategy() {
+    let source = r#"
+struct Noisy(&'static str);
+impl Drop for Noisy {
+    fn drop(&mut self) { println!("drop {}", self.0); }
+}
+
+fn deep(n: u32) {
+    let _guard = Noisy(if n == 0 { "zero" } else { "deep" });
+    if n == 0 { panic!("boom"); }
+    deep(n - 1);
+}
+
+fn main() {
+    let caught = std::panic::catch_unwind(|| deep(3));
+    println!("caught: {}", caught.is_err());
+    let payload = caught.unwrap_err().downcast::<&str>().map(|b| *b).unwrap_or("?");
+    println!("payload: {payload}");
+    std::process::exit(21);
+}
+"#;
+    let (status, stdout, stderr) = build_and_run("rust-panic-unwind", source);
+
+    // Exiting at all is the assertion: a broken LSDA aborts in phase 1.
+    assert_eq!(status, RunResult::Exited(21), "stderr: {stderr}");
+    assert!(
+        !stderr.contains("failed to initiate panic"),
+        "the unwinder could not walk the tables: {stderr}"
+    );
+    assert!(stdout.contains("caught: true"), "stdout: {stdout}");
+    assert!(stdout.contains("payload: boom"), "stdout: {stdout}");
+
+    // Each frame's cleanup runs exactly once, innermost first. A plausible
+    // near-miss — landing pads found but the wrong ones — shows up here and
+    // not in the exit status.
+    let drops: Vec<&str> = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix("drop "))
+        .collect();
+    assert_eq!(drops, ["zero", "deep", "deep", "deep"], "stdout: {stdout}");
+}
+
+/// An *uncaught* panic under `panic=unwind` exits 101 rather than aborting.
+///
+/// The distinction matters: `panic=abort` dies by SIGABRT, and so does an
+/// unwinder that cannot find its tables. Only a complete unwind reaches the
+/// runtime's ordinary exit path.
+#[test]
+fn an_uncaught_panic_exits_101_rather_than_aborting() {
+    let (status, _, stderr) = build_and_run(
+        "rust-panic-unwind-uncaught",
+        "fn main() { println!(\"before\"); panic!(\"boom\"); }\n",
+    );
+    assert_eq!(status, RunResult::Exited(101), "stderr: {stderr}");
     assert!(
         stderr.contains("panicked at") && stderr.contains("boom"),
         "the panic message did not reach stderr: {stderr}"

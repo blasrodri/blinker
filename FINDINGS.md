@@ -2496,3 +2496,90 @@ fixed), and FDE ranges (53) are all verified correct against ld-prime. The
 LSDA is wrong, its relocation has been read (56), and its operands are now
 identified. That is as far as this stretch got, and the next move is a lookup,
 not a theory.
+
+## 58. Fixed: `SUBTRACTOR` pairs dropped their addend, and Mach-O keeps it inline
+
+`panic=unwind` works. The cause was not any of the four structures the unwinder
+reads — all of them decoded correctly all along.
+
+Mach-O relocation entries **have no addend field**. The value is written into
+the bytes being patched, and the linker is expected to read it back out.
+`InputRelocation::addend` comes from the `object` crate's `addend()`, which for
+Mach-O correctly reports `0` on every relocation, because the addend is
+implicit. `apply_pair` was adding that zero.
+
+For an ordinary relocation dropping the addend would be a small error. For a
+pair it is not, because of what the subtrahend is:
+
+```
+obj  17 off 0xebb9  sub ltmp18 = 0x1000afee8  min GCC_except_table1201 = 0x1000a2f1c
+                    place 0x1000beaa1  reloc_addend 0  inline -60345  want -60345
+```
+
+`ltmp18` is the **anchor label at the start of that object's `__eh_frame`
+contribution**, not a per-site label — so `minuend - subtrahend` is a distance
+measured from the start of the contribution, while the field's `DW_EH_PE_pcrel`
+encoding wants it measured from the field. The inline value is exactly that
+gap. Across the whole link, all **1783** pairs agreed:
+
+```
+1783 with reloc_addend == 0, inline != 0, and inline == the needed correction
+```
+
+1783 of 1783. Not a trend — an identity.
+
+### Why finding 55's null result was wrong
+
+Finding 55 implemented this and reported byte-identical output, then reverted
+it and recorded a refutation. The refutation was false. Nothing here contradicts
+finding 55's *reasoning*; the measurement it rested on was simply not measuring
+the build it thought it was — the same failure mode as the two decodes that read
+one file in finding 47. A negative result from an unverified binary is not a
+negative result.
+
+The lesson is narrower than "test your hypotheses", which finding 55 already
+said. It is: **a null result needs the same proof of provenance as a positive
+one.** A change that does nothing and a change that never ran look identical
+from the outside, and only one of them is evidence. The cheap guard is a
+negative control — deliberately break the fix and confirm the test goes red —
+which is what was done here:
+
+```
+with the addend:     6 passed
+without the addend:  4 passed, 2 failed   (the two new unwind tests)
+```
+
+### The gap is only in the pair path
+
+Checked rather than assumed. Counting every non-pair relocation whose patch
+site holds a non-zero value, across a link spanning all of libstd's rlibs:
+
+```
+8112 Branch26   symbol  len=Word
+4507 PageOff12  symbol  len=Word
+4462 Page21     symbol  len=Word
+ 74  GotLoadPage21 / GotLoadPageOff12
+ 46  TlvpLoadPage21 / TlvpLoadPageOff12
+ 17  PointerToGot
+```
+
+Every one is an instruction-word kind, where those bytes are the instruction
+and not an addend at all. `Unsigned` does not appear, and neither does any
+section-targeted relocation: zero occurrences of either. So no non-pair
+relocation in this corpus carries an implicit addend, and the fix stays scoped
+to `apply_pair`.
+
+`ARM64_RELOC_ADDEND` (r_type 10) is still refused with an error rather than
+mis-applied, which is why an explicit addend cannot silently go missing.
+
+### What now works
+
+Both profiles, matching ld-prime exactly — same stdout, same exit status, and
+the same symbolized backtrace frame for frame:
+
+- caught panics, with `Drop` cleanup running innermost-first once per frame
+- payload downcast through `catch_unwind`
+- uncaught panics exiting 101 rather than aborting
+- `RUST_BACKTRACE=1` walking the full stack through `catch_unwind`
+
+Two regression tests cover it, and both were confirmed to fail without the fix.

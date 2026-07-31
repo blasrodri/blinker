@@ -31,8 +31,8 @@ use std::path::{Path, PathBuf};
 
 use blinker_layout::InputPlacement;
 use blinker_macho::{
-    parse_object, Arm64RelocationKind, InputSection, ObjectId, ParsedObject, RelocationTarget,
-    SectionId, SectionKind, SymbolVisibility,
+    parse_object, Arm64RelocationKind, InputRelocation, InputSection, ObjectId, ParsedObject,
+    RelocationLength, RelocationTarget, SectionId, SectionKind, SymbolVisibility,
 };
 use blinker_output::image::Dylib;
 use blinker_output::symtab::OutputSymbol;
@@ -1811,6 +1811,15 @@ fn apply_relocations(
                     None => target_address(object, image, addresses, pair.target)?,
                 };
 
+                // Mach-O relocations carry their addend **in the bytes being
+                // patched**, not in the relocation entry — `addend` is zero on
+                // every one of them. For a pair that difference is not a small
+                // correction: the subtrahend is the section's own anchor label
+                // (`ltmpN`), so `minuend - subtrahend` is measured from the
+                // start of the contribution, while the field wants it measured
+                // from the field. The inline value is exactly that gap.
+                let addend = pair.addend + inline_addend(object, pair);
+
                 let Some(buffer) = contents.get_mut(&section_index) else {
                     continue;
                 };
@@ -1819,7 +1828,7 @@ fn apply_relocations(
                     chunk_offset + pair.offset,
                     subtrahend,
                     minuend,
-                    pair.addend,
+                    addend,
                     place,
                     buffer,
                 )
@@ -1991,6 +2000,44 @@ fn apply_relocations(
         binds: extra_binds,
         rebases: extra_rebases,
     })
+}
+
+/// The addend a Mach-O relocation stores in the bytes it patches.
+///
+/// Mach-O has no addend field: `InputRelocation::addend` is zero on every
+/// relocation an object file actually contains, and the value is written into
+/// the patch site instead. Read from the *input* bytes rather than from the
+/// output buffer being assembled, so applying a relocation twice cannot
+/// accumulate.
+///
+/// Sign-extended from the relocation's own width — these are signed
+/// displacements, and a 4-byte field holding `-125` is `0xffffff83`, not
+/// four billion.
+fn inline_addend(object: &LoadedObject, relocation: &InputRelocation) -> i64 {
+    let Some(file_offset) = object
+        .parsed
+        .section(relocation.section)
+        .and_then(|s| s.file_offset)
+    else {
+        return 0;
+    };
+    let at = (file_offset + relocation.offset) as usize;
+    match relocation.length {
+        RelocationLength::Long => object
+            .data
+            .get(at..at + 8)
+            .map(|b| i64::from_le_bytes(b.try_into().expect("8 bytes"))),
+        RelocationLength::Word => object
+            .data
+            .get(at..at + 4)
+            .map(|b| i32::from_le_bytes(b.try_into().expect("4 bytes")) as i64),
+        RelocationLength::Half => object
+            .data
+            .get(at..at + 2)
+            .map(|b| i16::from_le_bytes(b.try_into().expect("2 bytes")) as i64),
+        RelocationLength::Byte => object.data.get(at).map(|b| *b as i8 as i64),
+    }
+    .unwrap_or(0)
 }
 
 /// The output address a relocation refers to.
