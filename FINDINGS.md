@@ -1335,6 +1335,9 @@ started.
 
 ## 34. Cold-link measurement: blinker is 1.6× slower than ld64, and 2.25× larger
 
+> **Superseded by findings 38 and 39.** The ratio here is wrong (see 38) and
+> the linker called `ld64` throughout is really `ld-prime` (see 39).
+
 The first real benchmark, on the argument vector `rustc` actually handed the
 linker for a small Rust binary (8 objects, 19 rlibs, 17 MB of input):
 
@@ -1532,6 +1535,9 @@ performance improvement.
 
 ## 38. The benchmark was wrong, and blinker is near parity with ld64
 
+> **Naming corrected by finding 39:** the baseline called `ld64` here is
+> Apple's `ld-prime`. The measurements stand; the name does not.
+
 Rebuilding the harness (interleaved runs, controlled warmup, verified output,
 reported spread) changed the headline number of this project.
 
@@ -1579,3 +1585,48 @@ only weakly.
 The remaining honest claim is narrow and worth stating exactly: **blinker links
 this workload in roughly the same time as ld64, while producing an image 2.25×
 larger because it does not dead-strip.**
+
+## 39. The baseline is ld-prime, not ld64, and not lld
+
+Every comparison in findings 34 and 38 was labelled "ld64". That is wrong, and
+the distinction matters because the three names are three different programs.
+
+What `cc` actually invokes on this machine:
+
+```
+$ ld -v
+@(#)PROGRAM:ld  PROJECT:ld-1267
+```
+
+That is **ld-prime**, Apple's linker rewrite shipped since Xcode 15 — parallel,
+and the default for every `cc` and `rustc` link here. The classic `ld64` is
+still installed, as a *separate binary* named `ld-classic`, and is no longer
+what anything uses by default.
+
+**lld is not installed at all** on this machine: `-fuse-ld=lld` is rejected as
+an invalid linker name and neither `lld` nor `ld64.lld` is on `PATH`. No
+measurement in this project has ever involved it.
+
+Measured against all three, same 27-input link, 25 interleaved iterations:
+
+```
+  ld-prime      32.3 ms  sd 2.6   output  458 KB
+  ld-classic    34.5 ms  sd 4.5   output  518 KB
+  blinker       39.7 ms  sd 4.5   output 1031 KB
+```
+
+So blinker is being compared against the *faster* of Apple's two linkers, which
+is the right baseline — it is what a real build uses. Choosing `ld-classic`
+would have flattered blinker by about 7%.
+
+The naming is corrected throughout rather than left as a harmless shorthand:
+"we are 1.1× ld64" and "we are 1.2× ld-prime" are claims about different
+programs, and the second is the one that is true.
+
+### On lld
+
+lld's Mach-O port is a plausible additional baseline and is often the fastest
+linker on other platforms. It is absent here, so any claim about how blinker
+compares to it would be unfounded. Installing it and adding it to
+`scripts/bench.py` is a worthwhile next step; asserting anything about it now
+would not be.
