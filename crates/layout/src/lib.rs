@@ -347,7 +347,76 @@ fn protection_for(segment: &str) -> (Protection, Protection) {
 /// computed here because the load commands cannot be sized until the segments
 /// are known — the caller resolves that circularity by laying out once to
 /// discover the shape, sizing the commands, then laying out again.
+/// Padding left after each contribution so a later edit can grow it in place.
+///
+/// # Why layout carries slop at all
+///
+/// Measured (finding 42): adding `+ 0` to one function body moved **every
+/// section after `__text` by 36 bytes**. Without padding, any edit that changes
+/// a function's size invalidates every cached address downstream, and an
+/// incremental linker's hit rate collapses to near zero on exactly the
+/// one-line edits it exists to accelerate.
+///
+/// The size comes from finding 43: body edits grow a contribution by 0.4–2.5%,
+/// worst case 92 bytes. A flat percentage is not enough on its own — finding 44
+/// found a tiny codegen unit where a 90-byte branch was **172%** of the
+/// contribution — so the budget is a percentage *with a floor*.
+///
+/// Slop costs image size. That is a cheap trade here: blinker's images are
+/// already 2.25× the system linker's for want of dead-stripping, so a few
+/// percent of padding is noise against a gap of 125%.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Slop {
+    /// Fraction of each contribution's size, as a percentage.
+    pub percent: u64,
+    /// Minimum padding regardless of size, in bytes.
+    pub floor: u64,
+}
+
+impl Slop {
+    /// No padding — the layout an ordinary cold link wants.
+    pub const NONE: Slop = Slop {
+        percent: 0,
+        floor: 0,
+    };
+
+    /// The measured default: 5% or 128 bytes, whichever is larger.
+    pub const DEFAULT: Slop = Slop {
+        percent: 5,
+        floor: 128,
+    };
+
+    /// Granularity the padded slot is rounded up to.
+    ///
+    /// This is what makes slop work, and the first implementation left it out.
+    /// Padding computed as a fraction of the *current* size grows when the
+    /// contribution grows — 5% of 4000 is 200, 5% of 4092 is 204 — so the slot
+    /// moved anyway and the whole point was lost. Rounding the padded slot to a
+    /// fixed stride means any growth landing in the same stride keeps exactly
+    /// the same slot, which is the property the incremental design needs.
+    const STRIDE: u64 = 256;
+
+    /// Total space reserved for a contribution of `size`, padding included.
+    fn slot_for(&self, size: u64) -> u64 {
+        if self.percent == 0 && self.floor == 0 {
+            return size;
+        }
+        let padded = size + (size * self.percent / 100).max(self.floor);
+        align_up(padded, Self::STRIDE)
+    }
+}
+
+/// Lay out with no padding. See [`compute_layout_with_slop`].
 pub fn compute_layout(inputs: &[InputPlacement], header_reservation: u64) -> Layout {
+    compute_layout_with_slop(inputs, header_reservation, Slop::NONE)
+}
+
+/// Lay out, leaving `slop` after each contribution.
+pub fn compute_layout_with_slop(
+    inputs: &[InputPlacement],
+    header_reservation: u64,
+    slop: Slop,
+) -> Layout {
     // Group inputs by output section, preserving input order within each group
     // so the layout is deterministic and reproducible.
     let mut groups: BTreeMap<(usize, usize, String, String), Vec<&InputPlacement>> =
@@ -388,7 +457,10 @@ pub fn compute_layout(inputs: &[InputPlacement], header_reservation: u64) -> Lay
                 offset,
                 size: member.size,
             });
-            offset += member.size;
+            // The contribution keeps its declared size; the padding sits after
+            // it, so nothing downstream can tell the difference until an edit
+            // needs the room.
+            offset += slop.slot_for(member.size);
         }
 
         segment_members
@@ -891,5 +963,110 @@ mod tests {
         let json = serde_json::to_string(&layout).expect("serializes");
         let back: Layout = serde_json::from_str(&json).expect("deserializes");
         assert_eq!(layout, back);
+    }
+}
+
+#[cfg(test)]
+mod slop_tests {
+    use super::*;
+
+    fn text(object: u32, size: u64) -> InputPlacement {
+        InputPlacement {
+            object: ObjectId(object),
+            section: SectionId(0),
+            segment: "__TEXT".into(),
+            name: "__text".into(),
+            kind: SectionKind::Code,
+            size,
+            alignment: 4,
+        }
+    }
+
+    fn offsets(layout: &Layout) -> Vec<u64> {
+        layout
+            .sections
+            .iter()
+            .flat_map(|s| s.contributions.iter().map(|c| c.offset))
+            .collect()
+    }
+
+    /// The property the whole incremental design rests on: a contribution can
+    /// grow, within its padding, without moving anything after it.
+    ///
+    /// Finding 42 measured the unpadded case — one `+ 0` moved every section
+    /// after `__text` by 36 bytes.
+    #[test]
+    fn a_contribution_can_grow_without_moving_its_neighbours() {
+        let before = compute_layout_with_slop(
+            &[text(0, 4000), text(1, 4000), text(2, 4000)],
+            0x1000,
+            Slop::DEFAULT,
+        );
+        // The middle contribution grows by 92 bytes — the worst body edit
+        // measured in finding 43 — which is inside its 5% (200 byte) budget.
+        let after = compute_layout_with_slop(
+            &[text(0, 4000), text(1, 4092), text(2, 4000)],
+            0x1000,
+            Slop::DEFAULT,
+        );
+        assert_eq!(
+            offsets(&before),
+            offsets(&after),
+            "growing one contribution within its slop moved another"
+        );
+    }
+
+    /// And the case that must *not* silently succeed: an edit that outgrows its
+    /// padding has to move things, so the caller can detect it and fall back.
+    #[test]
+    fn outgrowing_the_padding_does_move_later_contributions() {
+        let before = compute_layout_with_slop(
+            &[text(0, 4000), text(1, 4000), text(2, 4000)],
+            0x1000,
+            Slop::DEFAULT,
+        );
+        // 5% of 4000 is 200; 400 does not fit.
+        let after = compute_layout_with_slop(
+            &[text(0, 4000), text(1, 4400), text(2, 4000)],
+            0x1000,
+            Slop::DEFAULT,
+        );
+        assert_ne!(offsets(&before), offsets(&after));
+    }
+
+    /// A percentage alone is not enough. Finding 44 found a codegen unit where
+    /// a 90-byte branch was 172% of the contribution.
+    #[test]
+    fn small_contributions_get_the_floor_not_a_percentage() {
+        // 5% of 50 is 2 bytes, so the floor applies: 50 + 128 -> one stride.
+        assert_eq!(Slop::DEFAULT.slot_for(50), 256);
+        // 5% of 10000 is 500, which dominates the floor.
+        assert_eq!(Slop::DEFAULT.slot_for(10_000), align_up(10_500, 256));
+    }
+
+    /// Growth inside one stride must not change the slot at all.
+    #[test]
+    fn a_slot_is_quantised_so_small_growth_keeps_it() {
+        assert_eq!(Slop::DEFAULT.slot_for(4000), Slop::DEFAULT.slot_for(4092));
+        assert_ne!(Slop::DEFAULT.slot_for(4000), Slop::DEFAULT.slot_for(4400));
+    }
+
+    /// Slop must be opt-in: a cold link should lay out exactly as before.
+    #[test]
+    fn no_slop_lays_out_identically_to_the_unpadded_layout() {
+        let inputs = [text(0, 4000), text(1, 1234), text(2, 77)];
+        assert_eq!(
+            offsets(&compute_layout(&inputs, 0x1000)),
+            offsets(&compute_layout_with_slop(&inputs, 0x1000, Slop::NONE)),
+        );
+    }
+
+    /// The padding must not be reported as part of the contribution, or every
+    /// consumer would copy bytes that are not there.
+    #[test]
+    fn a_contributions_size_excludes_its_padding() {
+        let layout = compute_layout_with_slop(&[text(0, 4000)], 0x1000, Slop::DEFAULT);
+        let contribution = &layout.sections[0].contributions[0];
+        assert_eq!(contribution.size, 4000);
     }
 }
