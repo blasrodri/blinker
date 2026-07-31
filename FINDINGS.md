@@ -3479,3 +3479,45 @@ than a performance claim.
 The general form, which cost more to learn than the 9 ms was ever worth:
 **check what the environment *is* before controlling for it, and check it from
 inside the harness rather than from the shell you launched the harness from.**
+
+## 76. Where a link's time is now, and the one stage still worth attacking
+
+After dead-stripping (72), the overlapped stub parse (74) and the withdrawn
+fast path (73), a cold link of the 47-object Rust program:
+
+```
+  read+parse   5.4 ms   34%
+  dead-strip   2.8 ms   17%
+  relocate     3.1 ms   19%
+  resolve      1.0 ms    6%
+  layout       0.6 ms    4%
+  emit+sign    0.8 ms    5%
+```
+
+`read+parse` splits into two halves that behave completely differently:
+
+```
+  parallel phase   2.26 ms    8 objects + 19 archives, read and indexed
+  member pull      4.21 ms    10 members, 4 rounds
+    of which       1.07 ms    recomputing undefined_references each round
+```
+
+**Two thirds of the largest stage is a sequential loop that pulls ten archive
+members.** The parallel loader added earlier only covers the first half — it
+reads and *indexes* archives concurrently, and then extraction and parsing of
+the members happens one at a time, on one thread.
+
+Two contained improvements, neither yet made:
+
+- Parse a round's members concurrently. The pull order is already
+  deterministic — `undefined_references` sorts — so ids can be assigned in
+  order before parsing and the results collected positionally, which keeps the
+  guarantee that no output depends on thread scheduling. Rounds stay
+  sequential because each one's members are what create the next one's
+  undefined names, so the ceiling is roughly the 3.1 ms of parsing, not all of
+  it.
+- Maintain the unresolved-name set incrementally instead of recomputing it
+  over every object every round: 1.07 ms.
+
+Together perhaps 2 ms of 16 — real, and small enough that it should be
+measured again before it is built, on the evidence of finding 73.
