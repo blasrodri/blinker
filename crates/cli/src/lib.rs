@@ -331,7 +331,9 @@ fn internal_link(
     // depends on state from a previous run is one whose output cannot be
     // reproduced from its inputs alone. `--blinker-cache` turns it on.
     if options.incremental_cache {
-        request = request.cached_at(blinker_cache::cache_path(&output));
+        request = request
+            .cached_at(blinker_cache::cache_path(&output))
+            .reusing_relocations(options.reuse_relocations);
     }
     let timings = blinker_link::link_to_file_timed(&request, &output)?;
     #[cfg(unix)]

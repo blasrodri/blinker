@@ -103,7 +103,12 @@ fn link(arguments: &[String], output: &Path, record: &Path) -> serde_json::Value
     let status = Command::new(workspace_binary("blinker"))
         .args([
             "--blinker-internal",
-            "--blinker-cache",
+            // The per-object path specifically: these tests are about reusing
+            // individual objects' relocated bytes, which `--blinker-cache`
+            // alone no longer does. It replays an unchanged image and nothing
+            // else, because recording what every object read cost 10.2 ms to
+            // save at most 5.6 (finding 94).
+            "--blinker-cache-relocations",
             "--blinker-json-diagnostics",
         ])
         .arg(record)

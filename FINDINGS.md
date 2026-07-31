@@ -4557,3 +4557,33 @@ Padding a recomputed layout is not layout reuse. The next thing built is the
 allocator that consumes the previous placement table — and with it, the
 decision that an incremental output need not be byte-identical to a cold one
 (D5), because a history-dependent allocator cannot be and still do its job.
+
+## 95. Two mechanisms called one name, with opposite economics
+
+`--blinker-cache` meant two things at once:
+
+- **replay an unchanged image** — skips the entire linker, costs a fingerprint
+  check, and is the whole of the no-op rebuild case;
+- **reuse individual objects' relocated bytes** — skips one stage of six, and
+  to be *able* to, makes every link record what each object read.
+
+Finding 94 measured the second at 10.2 ms of cost against at most 5.6 ms of
+saving. They are now separate: `--blinker-cache` does the first, and
+`--blinker-cache-relocations` adds the second and says in its help text that it
+measured slower than not using it.
+
+```
+  edit relink, no cache          31.9 ms
+  edit relink, --blinker-cache   37.5 ms      was 42.1
+```
+
+The per-object machinery is kept, and not out of sentiment: it is the record of
+what each object read, which is exactly what the retained-placement allocator
+needs to know when an address it depends on has moved. What it cannot do is
+carry that cost on every ordinary link while returning nothing.
+
+The tests that assert per-object reuse now ask for it explicitly, which is the
+part worth keeping: nine tests failed the moment the default changed, each
+naming the behaviour it depended on. A default that changes silently under a
+green suite is the failure mode finding 64 recorded — a cache that had stopped
+working while every test passed.

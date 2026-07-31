@@ -257,6 +257,25 @@ pub struct LinkRequest {
     /// an incremental output must be the output a cold link would have
     /// produced.
     pub stable_layout: bool,
+    /// Whether to record per-object relocation state and reuse it.
+    ///
+    /// Off by default, and separately from `cache_path`, because the two
+    /// things `--blinker-cache` used to mean have opposite economics:
+    ///
+    /// - **Replaying an unchanged image** skips the entire linker. It is the
+    ///   whole of the no-op rebuild case and it costs a fingerprint check.
+    /// - **Reusing individual objects' relocated bytes** skips one stage of
+    ///   six, and to be able to do it at all every link must record what each
+    ///   object read. That recording *doubles* relocation: 5.6 ms to 11.9 on a
+    ///   681-object link, against a stage that is 5.6 ms in total. Measured end
+    ///   to end, asking for it cost 10.2 ms to save at most 5.6 — a loss at any
+    ///   hit rate (finding 94).
+    ///
+    /// So an ordinary incremental link gets the first and not the second. This
+    /// stays because the machinery is correct and is the scaffolding the
+    /// retained-placement allocator will reuse; it is off because it is not
+    /// yet worth its price, and that is a measurement rather than an opinion.
+    pub reuse_relocations: bool,
 }
 
 impl LinkRequest {
@@ -270,6 +289,7 @@ impl LinkRequest {
             cache_path: None,
             dead_strip: false,
             stable_layout: false,
+            reuse_relocations: false,
         }
     }
 
@@ -293,6 +313,13 @@ impl LinkRequest {
 
     pub fn cached_at(mut self, path: PathBuf) -> Self {
         self.cache_path = Some(path);
+        self
+    }
+
+    /// Also record and reuse per-object relocation state. See
+    /// [`LinkRequest::reuse_relocations`] for why this is not the default.
+    pub fn reusing_relocations(mut self, on: bool) -> Self {
+        self.reuse_relocations = on;
         self
     }
 
@@ -1482,15 +1509,28 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
         &strip,
         &got_slots,
     )?;
+    // Whether this link records what each object read, so a later one can skip
+    // relocating it. See `LinkRequest::reuse_relocations`: it is off by default
+    // because the recording costs more than the reuse saves.
+    let reuse_relocations = request.cache_path.is_some() && request.reuse_relocations;
+
     // The addresses this link produced, in the form the cache compares. Built
-    // before relocation because it is what decides which objects can skip it.
-    let current_addresses = request
-        .cache_path
-        .as_ref()
-        .map(|_| address_table(&addresses, &got_slots, &stub_slots, &tlv_slots));
+    // before relocation because it is what decides which objects can skip it —
+    // and not built at all when nothing will ask.
+    let current_addresses = request.cache_path.as_ref().map(|_| {
+        if reuse_relocations {
+            address_table(&addresses, &got_slots, &stub_slots, &tlv_slots)
+        } else {
+            Vec::new()
+        }
+    });
 
     let cache_step = std::time::Instant::now();
-    let previous = request.cache_path.as_deref().and_then(blinker_cache::load);
+    let previous = request
+        .cache_path
+        .as_deref()
+        .filter(|_| reuse_relocations)
+        .and_then(blinker_cache::load);
     timings.cache_load_ms = elapsed_ms(cache_step);
     timings.cache_bytes_read = request
         .cache_path
@@ -1522,7 +1562,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
             personalities: &eh_personality_fields,
         },
         contents,
-        request.cache_path.is_some(),
+        reuse_relocations,
         plan.as_ref(),
     )?;
     // Built here, while the patched contents still exist, but not written
@@ -1535,7 +1575,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
             &objects,
             &probe,
             addresses,
-            &patched.contents,
+            reuse_relocations.then_some(&patched.contents),
             &patched,
         )),
         _ => None,
@@ -1733,7 +1773,11 @@ fn build_cache(
     objects: &[LoadedObject],
     image: &Image,
     addresses: Vec<(blinker_cache::NameHash, u64)>,
-    contents: &SectionContents,
+    // The patched section bytes, when a later link may reuse them per object.
+    // `None` stores the finished image alone — every byte here is a second copy
+    // of what the image already holds, and without per-object entries to index
+    // them nothing can read them back.
+    contents: Option<&SectionContents>,
     patched: &Patched,
 ) -> blinker_cache::LinkCache {
     // Input keys, one probe per distinct file. Archive members share their
@@ -1778,7 +1822,8 @@ fn build_cache(
         .collect();
 
     let mut sections: Vec<_> = contents
-        .iter()
+        .into_iter()
+        .flatten()
         .map(|(index, bytes)| (*index as u32, bytes.clone()))
         .collect();
     sections.sort_unstable_by_key(|(index, _)| *index);

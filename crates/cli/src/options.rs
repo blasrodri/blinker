@@ -48,6 +48,16 @@ pub struct ProjectOptions {
     /// reproduced from its inputs alone. Turning this on is a statement that
     /// the caller wants that trade.
     pub incremental_cache: bool,
+    /// Also record and reuse per-object relocation state.
+    ///
+    /// Separate from `incremental_cache` because the two mechanisms have
+    /// opposite economics. Replaying an unchanged image skips the whole
+    /// linker; reusing individual objects' relocated bytes skips one stage of
+    /// six and makes every link record what each object read, which measured
+    /// 10.2 ms of cost against at most 5.6 ms of saving (finding 94). It stays
+    /// reachable because it is the scaffolding retained placement will use,
+    /// and it is off because it does not pay.
+    pub reuse_relocations: bool,
     /// Print the human-readable summary.
     pub print_stats: bool,
     /// Compute BLAKE3 hashes for every input (spec §13 verification path).
@@ -163,6 +173,10 @@ pub fn split_args(argv: &[String]) -> Result<SplitArgs, OptionError> {
             }
             "--blinker-internal" => options.internal_link = true,
             "--blinker-cache" => options.incremental_cache = true,
+            "--blinker-cache-relocations" => {
+                options.incremental_cache = true;
+                options.reuse_relocations = true;
+            }
             "--blinker-print-stats" => options.print_stats = true,
             "--blinker-strict-fingerprints" => options.strict_fingerprints = true,
             "--blinker-version" => options.version = true,
@@ -196,7 +210,9 @@ OPTIONS:
     --blinker-json-diagnostics <PATH>  Write the machine-readable record to PATH
     --blinker-diagnostics <LEVEL>      quiet | normal | verbose
     --blinker-internal                 Link internally instead of delegating
-    --blinker-cache                    Reuse relocated output from a previous link
+    --blinker-cache                    Replay an unchanged image from a previous link
+    --blinker-cache-relocations        Also reuse per-object relocations (experimental,
+                                       measured slower than not using it)
     --blinker-print-stats              Print the human-readable summary
     --blinker-strict-fingerprints      Hash every input (slower, exact identity)
     --blinker-version                  Print version

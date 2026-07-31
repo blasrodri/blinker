@@ -49,7 +49,9 @@ fn link_with_cache(tag: &str) -> (Scratch, blinker_cache::LinkCache) {
     let scratch = Scratch::dir(tag).expect("scratch");
     let objects = compile(&scratch, &[("main.c", PROGRAM), ("helper.c", HELPER)]);
     let cache_path = scratch.join("link.blinkcache");
-    let request = LinkRequest::new(objects).cached_at(cache_path.clone());
+    let request = LinkRequest::new(objects)
+        .cached_at(cache_path.clone())
+        .reusing_relocations(true);
     link_to_file(&request, &scratch.join("program")).expect("the link succeeds");
     let cache = blinker_cache::load(&cache_path).expect("a cache was written");
     (scratch, cache)
@@ -170,7 +172,9 @@ fn a_second_link_reuses_the_cache_and_produces_an_identical_binary() {
     let scratch = Scratch::dir("cache-reuse").expect("scratch");
     let objects = compile(&scratch, &[("main.c", PROGRAM), ("helper.c", HELPER)]);
     let cache_path = scratch.join("link.blinkcache");
-    let request = LinkRequest::new(objects).cached_at(cache_path.clone());
+    let request = LinkRequest::new(objects)
+        .cached_at(cache_path.clone())
+        .reusing_relocations(true);
 
     let cold = scratch.join("cold");
     let first = blinker_link::link_to_file_timed(&request, &cold).expect("cold link");
@@ -198,7 +202,9 @@ fn a_second_link_reuses_the_cache_and_produces_an_identical_binary() {
 fn the_binary_from_a_reusing_link_runs_correctly() {
     let scratch = Scratch::dir("cache-run").expect("scratch");
     let objects = compile(&scratch, &[("main.c", PROGRAM), ("helper.c", HELPER)]);
-    let request = LinkRequest::new(objects).cached_at(scratch.join("link.blinkcache"));
+    let request = LinkRequest::new(objects)
+        .cached_at(scratch.join("link.blinkcache"))
+        .reusing_relocations(true);
 
     let program = scratch.join("program");
     blinker_link::link_to_file(&request, &program).expect("cold link");
@@ -217,7 +223,9 @@ fn the_binary_from_a_reusing_link_runs_correctly() {
 fn editing_one_object_invalidates_only_what_depended_on_it() {
     let scratch = Scratch::dir("cache-edit").expect("scratch");
     let objects = compile(&scratch, &[("main.c", PROGRAM), ("helper.c", HELPER)]);
-    let request = LinkRequest::new(objects.clone()).cached_at(scratch.join("link.blinkcache"));
+    let request = LinkRequest::new(objects.clone())
+        .cached_at(scratch.join("link.blinkcache"))
+        .reusing_relocations(true);
     blinker_link::link_to_file(&request, &scratch.join("first")).expect("cold link");
 
     // Same symbols, same sizes, different constant: the body edit that
@@ -258,7 +266,9 @@ fn editing_one_object_invalidates_only_what_depended_on_it() {
 fn an_unchanged_object_is_rebuilt_when_a_symbol_it_reads_moves() {
     let scratch = Scratch::dir("cache-moved").expect("scratch");
     let objects = compile(&scratch, &[("main.c", PROGRAM), ("helper.c", HELPER)]);
-    let request = LinkRequest::new(objects.clone()).cached_at(scratch.join("link.blinkcache"));
+    let request = LinkRequest::new(objects.clone())
+        .cached_at(scratch.join("link.blinkcache"))
+        .reusing_relocations(true);
     blinker_link::link_to_file(&request, &scratch.join("first")).expect("cold link");
 
     let grown = format!(
@@ -316,7 +326,9 @@ int main(void) {
 "#;
     let scratch = Scratch::dir("cache-bss").expect("scratch");
     let objects = compile(&scratch, &[("main.c", WITH_BSS), ("helper.c", HELPER)]);
-    let request = LinkRequest::new(objects).cached_at(scratch.join("link.blinkcache"));
+    let request = LinkRequest::new(objects)
+        .cached_at(scratch.join("link.blinkcache"))
+        .reusing_relocations(true);
 
     let cold = scratch.join("cold");
     blinker_link::link_to_file(&request, &cold).expect("cold link");
@@ -342,7 +354,9 @@ int main(void) {
 fn an_unchanged_relink_reuses_the_finished_binary_outright() {
     let scratch = Scratch::dir("cache-whole").expect("scratch");
     let objects = compile(&scratch, &[("main.c", PROGRAM), ("helper.c", HELPER)]);
-    let request = LinkRequest::new(objects).cached_at(scratch.join("link.blinkcache"));
+    let request = LinkRequest::new(objects)
+        .cached_at(scratch.join("link.blinkcache"))
+        .reusing_relocations(true);
     let out = scratch.join("program");
 
     let cold = blinker_link::link_to_file_timed(&request, &out).expect("cold link");
@@ -364,7 +378,9 @@ fn an_unchanged_relink_reuses_the_finished_binary_outright() {
 fn editing_an_input_defeats_the_whole_image_path() {
     let scratch = Scratch::dir("cache-whole-edit").expect("scratch");
     let objects = compile(&scratch, &[("main.c", PROGRAM), ("helper.c", HELPER)]);
-    let request = LinkRequest::new(objects.clone()).cached_at(scratch.join("link.blinkcache"));
+    let request = LinkRequest::new(objects.clone())
+        .cached_at(scratch.join("link.blinkcache"))
+        .reusing_relocations(true);
     let out = scratch.join("program");
 
     blinker_link::link_to_file_timed(&request, &out).expect("cold link");
@@ -389,11 +405,14 @@ fn changing_the_request_defeats_the_whole_image_path() {
     let cache = scratch.join("link.blinkcache");
     let out = scratch.join("program");
 
-    let first = LinkRequest::new(objects.clone()).cached_at(cache.clone());
+    let first = LinkRequest::new(objects.clone())
+        .cached_at(cache.clone())
+        .reusing_relocations(true);
     blinker_link::link_to_file_timed(&first, &out).expect("cold link");
 
     let renamed = LinkRequest::new(objects)
         .cached_at(cache)
+        .reusing_relocations(true)
         .identifier("something-else");
     let after = blinker_link::link_to_file_timed(&renamed, &out).expect("second link");
     assert!(
