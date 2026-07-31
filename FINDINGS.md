@@ -1152,3 +1152,56 @@ signal has **no exit code** — `code()` returns `None`, and the 134 a shell
 prints is the shell's own `128 + SIGABRT` encoding. The test now distinguishes
 `Exited(n)` from `Signalled(n)`, which is a distinction the platform makes and
 the test had quietly collapsed.
+
+## 30. `__unwind_info`: the addend is stored in the field, not the relocation
+
+`__TEXT,__unwind_info` is now synthesised from the input objects'
+`__LD,__compact_unwind`. Two measurements shaped it, and one caught a bug that
+would have been invisible from the output's structure.
+
+**The table was structurally valid and described almost nothing.** First
+working version produced 17 entries where ld64 produced 469. Every
+compact-unwind record points at its function through a relocation whose
+**addend is stored inline, in the eight bytes being patched** — not in the
+relocation entry. Resolving the relocation target alone gives the *section
+base*, so hundreds of records that all point into `__text` resolved to the same
+handful of addresses and collapsed under de-duplication. Reading the inline
+value and rebasing it out of the object's coordinate space took the count to
+2186, with offsets that line up against `__text`:
+
+```
+__text  addr 0x100000900
+entry   funcOff 0x900   enc 0x04000000
+entry   funcOff 0x940   enc 0x04000000
+```
+
+This is the same coordinate-space confusion as findings 21, 25 and 29, in a
+fourth costume: an address that is meaningful only relative to something, used
+as though it were absolute.
+
+**A size that must be known before the addresses exist.** The table's contents
+depend on the layout, but its *size* has to be fixed before layout runs. It is
+reserved from an upper bound computed from the record count — every record
+assumed distinct, carrying an LSDA, with the maximum three personalities — and
+a test asserts the bound is never exceeded for any shape of input. Over-
+reserving wastes a few kilobytes; under-reserving fails the link.
+
+### Still not working: `panic=unwind`
+
+The unwinder now *consumes* the table — the failure changed from a clean
+`abort` (no tables found) to a `SIGSEGV` (tables found, followed, wrong). The
+remaining defect is visible in the header:
+
+```
+blinker: personalities n=0
+ld64:    personalities n=1   ['0x44000']
+```
+
+Rust's landing pads are reached through `rust_eh_personality`, and blinker
+records no personality at all, so the unwinder has nothing to call. ld64's
+entry is an image-relative offset to the **GOT slot** holding the personality
+pointer, not to the function — so the fix is to route the personality
+relocation through the GOT the way a data reference to an import already is,
+rather than resolving it to an address directly.
+
+Recorded as the precise next step rather than left as "unwinding is broken".

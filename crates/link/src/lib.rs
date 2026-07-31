@@ -36,7 +36,7 @@ use blinker_macho::{
 };
 use blinker_output::image::Dylib;
 use blinker_output::symtab::OutputSymbol;
-use blinker_output::{Bind, Image, ImageBuilder, Rebase};
+use blinker_output::{Bind, Image, ImageBuilder, Rebase, UnwindEntry};
 use blinker_relocations::{apply, Context};
 use blinker_symbols::{SymbolProvider, SymbolTable};
 
@@ -134,6 +134,125 @@ fn is_linker_internal(section: &InputSection) -> bool {
     section.segment == "__LD"
         || section.kind == SectionKind::Debug
         || section.name == "__compact_unwind"
+}
+
+/// Section id of the synthesised `__unwind_info`.
+const UNWIND_SECTION: SectionId = SectionId(3);
+
+/// Bytes in one `__LD,__compact_unwind` record.
+const COMPACT_UNWIND_RECORD: u64 = 32;
+
+/// Field offsets within a compact unwind record.
+const CU_FUNCTION: u64 = 0;
+const CU_LENGTH: u64 = 8;
+const CU_ENCODING: u64 = 12;
+const CU_PERSONALITY: u64 = 16;
+const CU_LSDA: u64 = 24;
+
+/// Read the compact unwind records the compiler emitted.
+///
+/// Each record names a function, how long it is, how to restore its frame, and
+/// optionally a personality routine and an LSDA. The pointers are *relocations*
+/// rather than values — the object is not laid out yet — so the targets come
+/// from the relocation list and the scalars from the section bytes.
+fn compact_unwind_entries(
+    objects: &[LoadedObject],
+    image: &Image,
+    addresses: &AddressMap,
+) -> Vec<UnwindEntry> {
+    let Some(text) = image.layout.segment("__TEXT") else {
+        return Vec::new();
+    };
+    let image_base = text.vm_address;
+    let mut entries = Vec::new();
+
+    for object in objects {
+        for section in &object.parsed.sections {
+            if section.name != "__compact_unwind" {
+                continue;
+            }
+            let Some(file_offset) = section.file_offset else {
+                continue;
+            };
+
+            // Relocation targets, indexed by (record, field).
+            //
+            // The addend is stored **inline**, in the eight bytes being
+            // patched, not in the relocation entry. Ignoring it made every
+            // record that points into `__text` resolve to the same section
+            // base: 469 functions collapsed to 17 distinct offsets, and the
+            // unwinder was handed a table describing almost nothing.
+            //
+            // For a section target the inline value is an address in the
+            // object's own coordinate space, so the offset within that section
+            // has to be recovered before rebasing onto the output address.
+            let mut targets: HashMap<(u64, u64), u64> = HashMap::new();
+            for relocation in object
+                .parsed
+                .relocations
+                .iter()
+                .filter(|r| r.section == section.id)
+            {
+                let Ok(base) = target_address(object, image, addresses, relocation.target) else {
+                    continue;
+                };
+
+                let field_at = (file_offset + relocation.offset) as usize;
+                let inline = object
+                    .data
+                    .get(field_at..field_at + 8)
+                    .map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes")))
+                    .unwrap_or(0);
+
+                let address = match relocation.target {
+                    RelocationTarget::Section(id) => {
+                        let origin = object.parsed.section(id).map(|s| s.vm_address).unwrap_or(0);
+                        base + inline.saturating_sub(origin)
+                    }
+                    // For a symbol the inline value is a plain addend.
+                    RelocationTarget::Symbol(_) => base + inline,
+                };
+
+                let record = relocation.offset / COMPACT_UNWIND_RECORD;
+                let field = relocation.offset % COMPACT_UNWIND_RECORD;
+                targets.insert((record, field), address);
+            }
+
+            let count = section.size / COMPACT_UNWIND_RECORD;
+            for record in 0..count {
+                let base = file_offset + record * COMPACT_UNWIND_RECORD;
+                let read_u32 = |at: u64| -> Option<u32> {
+                    let start = (base + at) as usize;
+                    object
+                        .data
+                        .get(start..start + 4)
+                        .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
+                };
+
+                // A record whose function pointer has no relocation refers to
+                // a function that was dead-stripped or never placed.
+                let Some(function) = targets.get(&(record, CU_FUNCTION)) else {
+                    continue;
+                };
+                let Some(encoding) = read_u32(CU_ENCODING) else {
+                    continue;
+                };
+                let _length = read_u32(CU_LENGTH);
+
+                entries.push(UnwindEntry {
+                    function_offset: (function - image_base) as u32,
+                    encoding,
+                    personality: targets
+                        .get(&(record, CU_PERSONALITY))
+                        .map(|a| (a - image_base) as u32),
+                    lsda: targets
+                        .get(&(record, CU_LSDA))
+                        .map(|a| (a - image_base) as u32),
+                });
+            }
+        }
+    }
+    entries
 }
 
 /// Section id of the synthesised `__thread_ptrs`.
@@ -405,6 +524,22 @@ pub fn link(request: &LinkRequest) -> Result<Image, LinkError> {
             alignment: 4,
         });
     }
+    // `__unwind_info` needs addresses to be built, but its *size* must be known
+    // before layout runs. Sized from the record count, which is known now: one
+    // entry per record, and the encoder's own size formula.
+    let unwind_size = unwind_table_size(&objects);
+    if unwind_size > 0 {
+        placements.push(InputPlacement {
+            object: SYNTHETIC_OBJECT,
+            section: UNWIND_SECTION,
+            segment: "__TEXT".into(),
+            name: "__unwind_info".into(),
+            kind: SectionKind::Unwind,
+            size: unwind_size,
+            alignment: 4,
+        });
+    }
+
     let tlv = tlv_symbols(&objects);
     if !tlv.is_empty() {
         placements.push(InputPlacement {
@@ -447,6 +582,7 @@ pub fn link(request: &LinkRequest) -> Result<Image, LinkError> {
     fill_got(&mut contents, &probe, &got, &addresses, &imports)?;
     fill_stubs(&mut contents, &probe, &stubs, &got_slots)?;
     fill_pointer_table(&mut contents, &probe, &tlv, &addresses, "__thread_ptrs")?;
+    fill_unwind_info(&mut contents, &probe, &objects, &addresses)?;
     let patched = apply_relocations(
         &objects,
         &probe,
@@ -520,6 +656,59 @@ fn resolve_imports(
         return Err(LinkError::UndefinedSymbols { names: missing });
     }
     Ok(imports)
+}
+
+/// Size the `__unwind_info` table will come to.
+///
+/// Computed from the record count rather than by building the table, because
+/// layout needs the size before any address exists. Building it twice would
+/// need addresses that do not exist yet.
+fn unwind_table_size(objects: &[LoadedObject]) -> u64 {
+    let records: usize = objects
+        .iter()
+        .flat_map(|o| o.parsed.sections.iter())
+        .filter(|s| s.name == "__compact_unwind")
+        .map(|s| (s.size / COMPACT_UNWIND_RECORD) as usize)
+        .sum();
+    if records == 0 {
+        return 0;
+    }
+    // Deliberately generous: the real table is smaller once duplicate function
+    // offsets collapse and only some entries carry an LSDA. Over-reserving
+    // wastes a few kilobytes; under-reserving is a link failure.
+    blinker_output::unwind::upper_bound_size(records) as u64
+}
+
+/// Build the unwind table and write it into its section.
+fn fill_unwind_info(
+    contents: &mut SectionContents,
+    image: &Image,
+    objects: &[LoadedObject],
+    addresses: &AddressMap,
+) -> Result<(), LinkError> {
+    let Some((index, section)) = image
+        .layout
+        .sections
+        .iter()
+        .enumerate()
+        .find(|(_, s)| s.name == "__unwind_info")
+    else {
+        return Ok(());
+    };
+
+    let entries = compact_unwind_entries(objects, image, addresses);
+    let mut table = blinker_output::unwind::build(entries);
+
+    if table.len() as u64 > section.size {
+        return Err(LinkError::UnwindTableTooLarge {
+            reserved: section.size,
+            needed: table.len(),
+        });
+    }
+    // The reservation is an upper bound, so the tail is padding.
+    table.resize(section.size as usize, 0);
+    contents.insert(index, table);
+    Ok(())
 }
 
 /// Address of each stub.

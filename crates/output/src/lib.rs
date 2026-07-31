@@ -19,6 +19,7 @@ pub mod format;
 pub mod image;
 pub mod signature;
 pub mod symtab;
+pub mod unwind;
 
 pub use commands::{LinkEditLayout, SymbolGroups};
 pub use dyld_info::{Bind, Rebase};
@@ -26,3 +27,4 @@ pub use format::{MachHeader, Writer};
 pub use image::{Dylib, Image, ImageBuilder, ImageError};
 pub use signature::{sign, signature_size, SignatureRequest};
 pub use symtab::{OutputSymbol, SymbolGroup, SymbolTable, SymbolTableBuilder};
+pub use unwind::UnwindEntry;

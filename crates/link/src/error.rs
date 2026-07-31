@@ -56,6 +56,11 @@ pub enum LinkError {
         object: ObjectId,
         offset: u64,
     },
+    /// The unwind table did not fit the space reserved for it.
+    UnwindTableTooLarge {
+        reserved: u64,
+        needed: usize,
+    },
     Relocation {
         object: ObjectId,
         kind: Arm64RelocationKind,
@@ -106,6 +111,10 @@ impl std::fmt::Display for LinkError {
                 f,
                 "object {}: ARM64_RELOC_SUBTRACTOR at {offset:#x} has no paired relocation",
                 object.0
+            ),
+            LinkError::UnwindTableTooLarge { reserved, needed } => write!(
+                f,
+                "the unwind table needs {needed} bytes but {reserved} were reserved"
             ),
             LinkError::Relocation {
                 object,
