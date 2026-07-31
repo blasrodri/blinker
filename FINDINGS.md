@@ -2214,3 +2214,53 @@ produced *named the relocation kind*. Reading the implementation of the kind
 already known to be involved would have found this immediately, and it is what
 "start by dumping what `apply` computes" should have meant on the first pass
 rather than the fourth.
+
+## 52. Fixed: `POINTER_TO_GOT` now honours PC-relativity, and unwinding gets much further
+
+The fix from finding 51, applied: `Context` carries `pc_relative`, and
+`PointerToGot` writes `got - place` when it is set. Five lines, plus tests
+pinning both forms.
+
+The CIE's personality pointer is now correct:
+
+```
+  before:  raw=0xce878   -> 0x10017d873   (odd — not a slot address)
+  after:   raw=0x1f87d   -> 0x1000ce878   (8-byte aligned — a real slot)
+```
+
+And the failure changed character entirely:
+
+```
+  before:  SIGSEGV inside libunwind's CIE parser
+  after:   thread 'main' panicked at src/main.rs:1:33:
+           boom
+           fatal runtime error: failed to initiate panic, error 3, aborting
+```
+
+libunwind no longer crashes. It parses the CIE, finds the personality, runs
+phase 1 of the unwind, and *reports a failure* — error 3 is
+`_URC_FATAL_PHASE1_ERROR`, the search phase failing to find a handler. A clean
+diagnosable error where there was a segfault.
+
+### Why the flag was missing for so long
+
+Every other ARM64 relocation kind implies its own relativity: `BRANCH26` and
+`PAGE21` are always PC-relative, `UNSIGNED` never is. `POINTER_TO_GOT` is the
+only kind that appears in both forms — absolute in a pointer table,
+PC-relative in a CIE — so it is the only one for which the flag on
+`InputRelocation`, present since the parser was written, ever mattered.
+
+Three tests now pin it: the absolute form, the PC-relative form, and a
+backwards displacement, since a slot below the field must survive truncation to
+four bytes as two's complement.
+
+### What remains
+
+Phase 1 failing means the unwinder cannot find a handler for the frame. The
+next candidates are the LSDA pointer in the FDE — encoded the same indirect way
+and reached by the same relocation machinery — and the FDE's address range,
+which decides whether the unwinder believes the frame is covered at all.
+
+`panic=unwind` still does not work. But it has gone from "segfault in a CIE
+parser" to "the unwinder ran and could not find a handler", and each of those
+is a different and much smaller problem.

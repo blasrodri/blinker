@@ -38,6 +38,16 @@ pub struct Context {
     pub got: Option<u64>,
     /// Address of the target's thread-local descriptor, for the TLV kinds.
     pub tlv: Option<u64>,
+    /// Whether the patched field is PC-relative.
+    ///
+    /// Only [`Arm64RelocationKind::PointerToGot`] consults this. Every other
+    /// kind implies its own relativity — `BRANCH26` and `PAGE21` are always
+    /// relative, `UNSIGNED` never is — which is why the flag went unplumbed for
+    /// so long. `POINTER_TO_GOT` appears in **both** forms: absolute in a
+    /// pointer table, PC-relative in a CIE's personality field, where the DWARF
+    /// encoding is `pcrel|sdata4`. Writing the absolute form there produced a
+    /// value libunwind dereferenced and died on (finding 51).
+    pub pc_relative: bool,
 }
 
 impl Context {
@@ -48,6 +58,7 @@ impl Context {
             target,
             addend,
             got: None,
+            pc_relative: false,
             tlv: None,
         }
     }
@@ -242,7 +253,14 @@ pub fn apply(
                 kind,
                 place: context.place,
             })?;
-            write_scalar(bytes, offset, got, length).ok_or_else(out_of_bounds)
+            // A CIE stores its personality as a PC-relative displacement to the
+            // slot; a pointer table stores the slot's address outright.
+            let value = if context.pc_relative {
+                got.wrapping_sub(context.place)
+            } else {
+                got
+            };
+            write_scalar(bytes, offset, value, length).ok_or_else(out_of_bounds)
         }
     }
 }
@@ -495,6 +513,7 @@ mod tests {
             addend: 0,
             got: Some(0x5000),
             tlv: None,
+            pc_relative: false,
         };
         apply(
             GotLoadPage21,
@@ -520,6 +539,7 @@ mod tests {
             addend: 0,
             got: Some(0x9_0000),
             tlv: Some(0x3000),
+            pc_relative: false,
         };
         apply(
             TlvpLoadPage21,
@@ -572,6 +592,7 @@ mod tests {
             addend: 0,
             got: Some(0x1_0000_8000),
             tlv: None,
+            pc_relative: false,
         };
         apply(PointerToGot, RelocationLength::Long, 0, context, &mut bytes).expect("applies");
         assert_eq!(
@@ -702,5 +723,88 @@ mod tests {
             reconstructed, target,
             "ADRP/ADD did not reconstruct the target"
         );
+    }
+}
+
+#[cfg(test)]
+mod pointer_to_got_tests {
+    use super::*;
+
+    fn field() -> Vec<u8> {
+        vec![0u8; 16]
+    }
+
+    /// The absolute form: a pointer table stores the slot's address.
+    #[test]
+    fn an_absolute_pointer_to_got_stores_the_slot_address() {
+        let mut bytes = field();
+        apply(
+            Arm64RelocationKind::PointerToGot,
+            RelocationLength::Long,
+            0,
+            Context {
+                place: 0x1_0000_0000,
+                target: 0,
+                addend: 0,
+                got: Some(0x1_0004_4000),
+                tlv: None,
+                pc_relative: false,
+            },
+            &mut bytes,
+        )
+        .expect("applies");
+        assert_eq!(
+            u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+            0x1_0004_4000
+        );
+    }
+
+    /// The PC-relative form: a CIE's personality field stores the displacement
+    /// from the field to the slot. Writing the absolute value here is what
+    /// libunwind dereferenced and died on (finding 51).
+    #[test]
+    fn a_pc_relative_pointer_to_got_stores_the_displacement() {
+        let mut bytes = field();
+        apply(
+            Arm64RelocationKind::PointerToGot,
+            RelocationLength::Word,
+            0,
+            Context {
+                place: 0x1_0003_0000,
+                target: 0,
+                addend: 0,
+                got: Some(0x1_0004_4000),
+                tlv: None,
+                pc_relative: true,
+            },
+            &mut bytes,
+        )
+        .expect("applies");
+        let written = u32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        assert_eq!(written, 0x0001_4000, "slot minus place");
+    }
+
+    /// A slot *below* the field gives a negative displacement, which must
+    /// survive truncation to four bytes as a two's-complement value.
+    #[test]
+    fn a_backwards_displacement_is_negative() {
+        let mut bytes = field();
+        apply(
+            Arm64RelocationKind::PointerToGot,
+            RelocationLength::Word,
+            0,
+            Context {
+                place: 0x1_0005_0000,
+                target: 0,
+                addend: 0,
+                got: Some(0x1_0004_4000),
+                tlv: None,
+                pc_relative: true,
+            },
+            &mut bytes,
+        )
+        .expect("applies");
+        let written = i32::from_le_bytes(bytes[0..4].try_into().unwrap());
+        assert_eq!(written, -0xc000);
     }
 }

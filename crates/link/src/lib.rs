@@ -1975,6 +1975,7 @@ fn apply_relocations(
                     addend: relocation.addend,
                     got,
                     tlv,
+                    pc_relative: relocation.pc_relative,
                 },
                 buffer,
             )
