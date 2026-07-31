@@ -133,7 +133,17 @@ fn section_flags(section: &OutputSection) -> u32 {
     match section.kind {
         SectionKind::Code => S_REGULAR | S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS,
         SectionKind::Bss => S_ZEROFILL,
-        SectionKind::ThreadLocal if section.name.contains("vars") => S_THREAD_LOCAL_VARIABLES,
+        // Every thread-local section needs its own *type*, not just placement
+        // in __DATA. dyld computes the size of the per-thread block from the
+        // sections typed as thread-local data; with them left S_REGULAR it
+        // computes zero and rejects the image with "malformed thread-local,
+        // offset=… is larger than total size=0x0".
+        SectionKind::ThreadLocal if section.name == "__thread_vars" => S_THREAD_LOCAL_VARIABLES,
+        SectionKind::ThreadLocal if section.name == "__thread_bss" => S_THREAD_LOCAL_ZEROFILL,
+        SectionKind::ThreadLocal if section.name == "__thread_ptrs" => {
+            S_THREAD_LOCAL_VARIABLE_POINTERS
+        }
+        SectionKind::ThreadLocal => S_THREAD_LOCAL_REGULAR,
         _ if section.name == "__cstring" => S_CSTRING_LITERALS,
         _ if section.name == "__got" => S_NON_LAZY_SYMBOL_POINTERS,
         _ if section.name == "__la_symbol_ptr" => S_LAZY_SYMBOL_POINTERS,

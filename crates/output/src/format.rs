@@ -95,7 +95,13 @@ pub const S_LAZY_SYMBOL_POINTERS: u32 = 0x7;
 /// Symbol stubs, the indirection a lazily-bound call goes through.
 pub const S_SYMBOL_STUBS: u32 = 0x8;
 /// Thread-local variable descriptors.
+/// Initialised thread-local data — the template copied per thread.
+pub const S_THREAD_LOCAL_REGULAR: u32 = 0x11;
+/// Zero-filled thread-local data.
+pub const S_THREAD_LOCAL_ZEROFILL: u32 = 0x12;
 pub const S_THREAD_LOCAL_VARIABLES: u32 = 0x13;
+/// Pointers to thread-local descriptors, the TLV analogue of `__got`.
+pub const S_THREAD_LOCAL_VARIABLE_POINTERS: u32 = 0x14;
 
 /// Section contains executable instructions.
 pub const S_ATTR_PURE_INSTRUCTIONS: u32 = 0x8000_0000;

@@ -449,9 +449,11 @@ pub fn link(request: &LinkRequest) -> Result<Image, LinkError> {
     // Each GOT slot holds an absolute address, and the image is position
     // independent, so dyld must relocate every one of them at load time.
     // A slot whose value we know is rebased; a slot dyld fills is bound.
-    let rebases = got_rebases(&probe, &got, &imports);
+    let mut rebases = got_rebases(&probe, &got, &imports);
     let mut binds = got_binds(&probe, &got, &imports);
     binds.extend(patched.binds);
+    rebases.extend(pointer_table_rebases(&probe, "__thread_ptrs", tlv.len()));
+    rebases.extend(patched.rebases);
 
     assemble(
         request,
@@ -678,6 +680,40 @@ fn fill_got(
         buffer[start..start + 8].copy_from_slice(&address.to_le_bytes());
     }
     Ok(())
+}
+
+/// One rebase entry per slot of a synthesised pointer table.
+///
+/// The GOT is not the only such table: `__thread_ptrs` holds absolute
+/// addresses of thread-local descriptors and needs sliding just the same.
+/// Missing these produced a `SIGSEGV` in `lang_start_internal`, the first code
+/// to walk a thread-local pointer, with a fault address in the *unslid*
+/// address space — the signature of a pointer dyld was never told about.
+fn pointer_table_rebases(image: &Image, section_name: &str, count: usize) -> Vec<Rebase> {
+    let Some(section) = image
+        .layout
+        .sections
+        .iter()
+        .find(|s| s.name == section_name)
+    else {
+        return Vec::new();
+    };
+    let Some((segment_index, segment)) = image
+        .layout
+        .segments
+        .iter()
+        .enumerate()
+        .find(|(_, seg)| seg.name == section.segment)
+    else {
+        return Vec::new();
+    };
+    let base = section.vm_address - segment.vm_address;
+    (0..count as u64)
+        .map(|slot| Rebase {
+            segment: segment_index as u8,
+            offset: base + slot * GOT_ENTRY_SIZE,
+        })
+        .collect()
 }
 
 /// One rebase entry per GOT slot.
@@ -1021,6 +1057,32 @@ fn build_contents(
 }
 
 /// Patch every relocation against the addresses layout assigned.
+/// Start of the per-thread block: the address `__thread_data` was placed at.
+///
+/// A TLV descriptor's third word is the variable's **offset within this
+/// block**, not its address. dyld copies the block per thread, so an absolute
+/// address there is meaningless — it rejects the image with "malformed
+/// thread-local, offset=… is larger than total size".
+fn thread_local_base(image: &Image) -> Option<u64> {
+    image
+        .layout
+        .sections
+        .iter()
+        .filter(|s| s.name == "__thread_data" || s.name == "__thread_bss")
+        .map(|s| s.vm_address)
+        .min()
+}
+
+/// Whether an address falls inside the per-thread block.
+fn in_thread_local_block(image: &Image, address: u64) -> bool {
+    image
+        .layout
+        .sections
+        .iter()
+        .filter(|s| s.name == "__thread_data" || s.name == "__thread_bss")
+        .any(|s| address >= s.vm_address && address < s.vm_address + s.size)
+}
+
 /// Section content keyed by output-section index.
 type SectionContents = HashMap<usize, Vec<u8>>;
 
@@ -1035,10 +1097,20 @@ struct IndirectTables<'a> {
     imports: &'a [String],
 }
 
-/// Patched content, plus binds for locations dyld must fill.
+/// Patched content, plus the fixups dyld must apply at load time.
 struct Patched {
     contents: SectionContents,
     binds: Vec<Bind>,
+    /// Absolute pointers written into data, which dyld must slide.
+    ///
+    /// **Every** such pointer needs an entry, not just the GOT's. A
+    /// position-independent image is loaded at a random offset, so an absolute
+    /// address baked in at link time is stale the moment it loads. C programs
+    /// hid this for a long time: their globals are reached PC-relatively, so
+    /// they contain almost no absolute pointers. Rust's vtables, statics and
+    /// panic metadata are full of them, and the result was a `SIGSEGV` inside
+    /// `std::rt::lang_start_internal` — the first code to walk one.
+    rebases: Vec<Rebase>,
 }
 
 fn apply_relocations(
@@ -1048,6 +1120,7 @@ fn apply_relocations(
     tables: &IndirectTables<'_>,
     mut contents: SectionContents,
 ) -> Result<Patched, LinkError> {
+    let mut extra_rebases = Vec::new();
     let IndirectTables {
         got: got_slots,
         stubs: stub_slots,
@@ -1196,6 +1269,16 @@ fn apply_relocations(
                 }
             }
 
+            // A descriptor's pointer to its variable is stored as an offset
+            // into the per-thread block rather than as an address.
+            let thread_local_offset = if relocation.kind == Arm64RelocationKind::Unsigned
+                && output_section.name == "__thread_vars"
+            {
+                thread_local_base(image)
+            } else {
+                None
+            };
+
             let target = match (stub, got.or(tlv)) {
                 (Some(address), _) => address,
                 // A GOT-based reference to an *imported* symbol has no address
@@ -1212,6 +1295,38 @@ fn apply_relocations(
             let Some(buffer) = contents.get_mut(&section_index) else {
                 continue; // zero-filled section: nothing to patch
             };
+
+            // Rewrite an address into a block-relative offset where the
+            // descriptor expects one. Only targets that actually land in the
+            // block are converted: a descriptor also holds a bound thunk
+            // pointer and a key, and those are not offsets.
+            let target = match thread_local_offset {
+                Some(base) if in_thread_local_block(image, target) => target - base,
+                _ => target,
+            };
+
+            // An absolute pointer stored in data has to be slid by dyld.
+            // Excluded: fields in read-only segments (nothing writes them),
+            // and thread-local descriptor offsets, which are offsets rather
+            // than addresses and must not move.
+            if relocation.kind == Arm64RelocationKind::Unsigned
+                && relocation.length == blinker_macho::RelocationLength::Long
+                && thread_local_offset.is_none()
+                && output_section.segment != "__TEXT"
+            {
+                if let Some((segment_index, segment)) = image
+                    .layout
+                    .segments
+                    .iter()
+                    .enumerate()
+                    .find(|(_, seg)| seg.name == output_section.segment)
+                {
+                    extra_rebases.push(Rebase {
+                        segment: segment_index as u8,
+                        offset: place - segment.vm_address,
+                    });
+                }
+            }
 
             let field_offset = chunk_offset + relocation.offset;
             apply(
@@ -1237,6 +1352,7 @@ fn apply_relocations(
     Ok(Patched {
         contents,
         binds: extra_binds,
+        rebases: extra_rebases,
     })
 }
 

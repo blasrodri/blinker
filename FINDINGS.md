@@ -964,3 +964,71 @@ Each wall was found by running the thing, took one measurement to identify, and
 had an unambiguous fix. None would have been found by more unit tests of the
 stages in isolation, because every stage was individually correct — what was
 missing was a case none of them had ever been handed.
+
+## 25. Every absolute pointer in data needs a rebase, and C never taught us that
+
+With thread-local sections correctly typed, the Rust binary loaded and then
+segfaulted:
+
+```
+EXC_BAD_ACCESS  KERN_INVALID_ADDRESS at 0x00000001000c8fa8
+  rs2 +199596  std::rt::lang_start_internal
+```
+
+The fault address is the giveaway. The image had loaded at `0x102064000`, but
+the address being dereferenced was `0x1000c8fa8` — in the **unslid** address
+space. That is the signature of a pointer written at link time and never
+rebased: correct arithmetic, applied to a base the process is not using.
+
+A position-independent image is loaded at a random offset, so *every* absolute
+address baked into data must be listed in the rebase stream for dyld to slide.
+blinker was emitting rebases only for GOT slots.
+
+C hid this completely. C globals are reached PC-relatively through
+`ADRP`/`ADD`, so a small C program contains almost no absolute pointers in
+data — the C test suite could never have caught it. Rust's vtables, statics
+and panic metadata are full of them, and `lang_start_internal` is simply the
+first code that walks one.
+
+Two fixes, both the same rule applied twice:
+
+1. Every pointer-sized `UNSIGNED` relocation writing into a writable segment
+   gets a rebase entry — not just the GOT's.
+2. **Synthesised pointer tables need them too.** `__thread_ptrs` holds absolute
+   addresses of thread-local descriptors, and it was missed even after fix 1,
+   because its contents are written by the linker rather than derived from a
+   relocation. That omission alone reproduced the identical crash, in the
+   identical function.
+
+### Diagnosed without a debugger
+
+`lldb` on macOS triggers the Developer Tools Access authorization prompt, which
+wants a password; nothing else in this project needs one, and a build that
+demands `sudo` is not one an agent can run unattended. The OS had already
+written everything needed to
+`~/Library/Logs/DiagnosticReports/*.ips` — fault address, signal, and a
+symbolicated stack. Reading the crash report is both faster and unprivileged.
+
+## 26. Thread-local descriptors store offsets, not addresses
+
+Before the crash above, dyld rejected the image outright:
+
+```
+malformed thread-local, offset=0x1007F9ED0 is larger than total size=0x0
+```
+
+Both halves of that message were wrong for the same reason, and neither is
+about the offset it names.
+
+**`total size=0x0`** — dyld computes the per-thread block's size from the
+sections *typed* as thread-local data. blinker was placing `__thread_data` and
+`__thread_bss` in `__DATA` correctly but leaving them typed `S_REGULAR`, so
+dyld found no thread-local storage at all. Measured from a real binary, the
+types are `__thread_data` = `0x11`, `__thread_bss` = `0x12`, `__thread_vars` =
+`0x13`, and the pointer table `0x14`.
+
+**`offset=0x1007F9ED0`** — a TLV descriptor's three words are
+`{thunk, key, offset}`, and the third is the variable's offset **within the
+block**, not its address. The block is copied per thread, so an address there
+is meaningless. Confirmed by reading a real descriptor, whose third word was
+`0x38` where blinker was writing a full `0x1_0000_0000`-based address.
