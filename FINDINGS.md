@@ -3649,3 +3649,75 @@ worth of measurements, every one of them carefully interleaved and
 negative-controlled, were all taken on a workload too small to exhibit the
 dominant behaviour of the system. The methodology was sound and the sample was
 not, and no amount of care inside the harness could have shown that.
+
+## 78. Three changes that were worth nothing at fixture scale, and 60 ms at real scale
+
+Finding 77 fixed the quadratic address lookup and left blinker at 3.77x the
+system linker on its own binary. Profiling *that* workload rather than the
+fixture turned up three more, and two of them had already been examined and
+dismissed.
+
+```
+                     fixture   blinker's own binary
+  member_defining      ~0 ms      25 ms
+  the frontier          0 ms      23 ms      <- built, measured, reverted (76)
+  the verify pass     0.9 ms      14 ms      <- measured, declined (76)
+```
+
+### `member_defining` was a linear scan
+
+```rust
+self.symbol_map.iter().find(|(name, _)| name == symbol)
+```
+
+`libstd.rlib` lists tens of thousands of symbols, and the linker asks this
+question once per still-undefined name, per archive, per extraction round. It
+reads like a lookup and behaved like one at 27 inputs. The table is now sorted
+at parse time and binary-searched — a sorted `Vec` rather than a `HashMap`
+because it is built once, read many times, stays serialisable, and needs no
+second copy of every name.
+
+### The frontier, reverted in 76, restored here
+
+Carrying the undefined set across extraction rounds instead of recomputing it
+was built, measured at **0 ms** on the fixture, and reverted with a clear
+explanation: the recomputation borrows (`HashSet<&str>`) and an incremental
+version must own its names, so incrementality cost more than the computation.
+
+That explanation was correct and the conclusion was wrong. The fixture ran four
+rounds over 47 objects; a real link runs **eleven rounds over 921**. The
+allocation cost is linear in names and the scan cost is quadratic in rounds ×
+objects, so the trade flips. Restored, it is worth 23 ms.
+
+### The verify pass, declined in 76, made cheap here
+
+Dead-stripping ends by walking every live atom's relocations to confirm nothing
+live points at anything dead. At 0.9 ms it was left alone, deliberately —
+removing a correctness guarantee for a gain that size is a bad trade.
+
+At 14 ms it is worth thinking about, and thinking produced a version that keeps
+the guarantee whole. Propagation marks the targets of every atom it visits, and
+every live atom is visited exactly once, so the invariant holds by construction
+everywhere *except* the atoms whose edges were deliberately suppressed. Only
+those need checking. The guarantee is identical; the work is proportional to
+the suppressed set rather than to the live one.
+
+```
+  dead-strip   32.3 ms -> 18.7 ms      byte-identical output
+```
+
+### What the sequence shows
+
+```
+  7.44x  ->  3.77x  ->  3.04x  ->  2.92x      against ld-prime
+```
+
+Two of these three were correctly analysed and wrongly concluded, months of
+reasoning apart from nothing but a change of workload. The analysis said "this
+costs 0.9 ms and buys a guarantee"; it was true, and it was true of a link
+nobody runs.
+
+**A decision not to optimise is as scale-dependent as a decision to.** Both
+need re-deciding when the workload changes, and a rejected optimisation leaves
+no trace in the code to prompt it — which is why the two above are named in the
+comments where they now live.

@@ -4,36 +4,57 @@ An incremental Mach-O linker for repeated Rust development builds on Apple
 Silicon, aimed at cutting the link latency in edit–build–test loops run by
 humans, IDEs, and coding agents.
 
-**Status: it links.** blinker produces Mach-O executables from real object
-files and archives, signs them itself, and the results run.
+**Status: it links Rust, and it links itself.** blinker builds its own 5.4 MB
+binary from 921 objects, dead-strips it, signs it, and the result links other
+programs.
 
 | | |
 |---|---|
-| C programs | work, results match the system linker |
-| Rust, `-C panic=abort` | works, including panic messages and `SIGABRT` |
-| Rust, default (`panic=unwind`) | links and runs until something panics |
-| Speed | ~1.2× `ld-prime`, Apple's default linker |
-| Output size | 2.25× larger — no dead-stripping yet |
+| C programs | work; behaviour matches the system linker |
+| Rust, `panic=abort` and `panic=unwind` | work, including caught panics, destructors and symbolized backtraces |
+| `cargo test` binaries | work |
+| Dylibs, bundles, partial links | delegated to the system linker, with a recorded reason |
+| Output size | **0.73–0.79×** `ld-prime`'s, with dead-stripping |
+| Speed, small link (47 objects) | **0.92×** `ld-prime` |
+| Speed, large link (921 objects) | **2.92×** `ld-prime` |
+| Unchanged relink | 10.4 ms — the whole image comes from cache |
+| One-line edit | 16.1 ms, reusing 24 of 26 objects and 100% of relocations |
 
 Delegation to the system linker remains the default; pass `--blinker-internal`
 to link internally.
 
 See [PRODUCT_SPEC.md](PRODUCT_SPEC.md) for the product definition,
 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for the milestone sequence,
-and **[FINDINGS.md](FINDINGS.md)** for the 41 places reality contradicted the
+and **[FINDINGS.md](FINDINGS.md)** for the 78 places reality contradicted the
 plan — several of them contradicting earlier entries in the same file.
 
 ## What is not done
 
-- **Unwinding.** `panic=unwind` faults after printing the panic message. The
-  `__unwind_info` table is built and matches the system linker's values; the
-  fault is elsewhere and has not been located.
-- **Dead-stripping.** Every archive member pulled in is emitted whole, which is
-  where the 2.25× size comes from.
-- **The cache.** The whole point of the project, and not started. The parse
-  cache originally planned was measured and struck (finding 41): parsing is
-  faster than any deserialiser. The addressable cost is `resolve` and
-  `relocate`, so the cache must store relocated output keyed by codegen unit.
+- **Debug information.** No `N_OSO` debug-map stabs and no local symbols in the
+  output, so breakpoints by function name and source-line display do not work.
+  Panic backtraces do, and match the system linker frame for frame. This is the
+  largest missing feature.
+- **Dynamic library output.** Proc-macro crates and `cdylib`s are delegated
+  rather than linked. Correct, but it means a workspace is only partly linked
+  by blinker.
+- **Speed at scale.** 2.92× the system linker on a large link, against 0.92× on
+  a small one. `read+parse` is the largest remaining stage, and the reason is
+  structural: every symbol and relocation is materialised into owned `String`s,
+  a representation chosen for a parse cache that was later measured and
+  abandoned (finding 41).
+- **The daemon, dirty-range output rewriting, stable addresses across edits.**
+  The layout machinery for the last of these exists and is tested, but nothing
+  calls it.
+- **`x86_64`, universal binaries, LTO.**
+
+## A note on the numbers
+
+Every performance figure above is from an interleaved A/B against the system
+linker on real captured link arguments, not a synthetic benchmark. They moved a
+lot: blinker was measured at 0.92× on a 47-object fixture and turned out to be
+**7.44×** on a real binary, because a linear scan that was invisible at small
+scale was quadratic at large. See finding 77 — and treat any single-fixture
+number here, including these, as a claim about one workload.
 
 ## Measuring it
 
