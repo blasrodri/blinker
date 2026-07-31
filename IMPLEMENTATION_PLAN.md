@@ -645,3 +645,41 @@ taking blinker from ~1.15× ld-prime to roughly 0.85×. Going below that means
 reusing `resolve` (6.3 ms) and skipping the read of unchanged inputs, which
 needs the symbol table cached too — a later step, and one whose premise should
 be measured the same way before it is built.
+
+## Cache status: reuse works, and where the remaining time is
+
+Steps 1 and 2 of the three above are done. A warm link on the 47-object Rust
+fixture reuses **every** object and produces a byte-identical binary.
+
+```
+                        internal link   relocate
+  no cache                 25.3 ms        7.4 ms
+  warm cache               22.6 ms        4.5 ms
+```
+
+(15 iterations, warmup discarded, sd < 0.2 ms per stage.)
+
+Relocate falls by 2.9 ms rather than by all 7.4: reuse still pays the byte copy
+and the recording pass that keeps the cache current. Against `ld-prime` the
+process-level comparison is currently too noisy to read — 49% spread on the
+baseline over 12 interleaved runs — so it is not quoted here as a result.
+
+### What the cache cannot reach
+
+`read+parse` (6.9 ms) and `resolve` (6.2 ms) are now 58% of the link and are
+untouched, because both run before the cache is consulted: the addresses have
+to exist before anything can be checked against them. Getting under them means
+caching the symbol table and the layout, so unchanged inputs need not be read
+at all — and per finding 60, the premise to measure first is whether skipping
+those reads survives the cost of proving the inputs unchanged.
+
+### Still open
+
+- **Step 3, fallback reporting.** `reused_objects` is on `LinkTimings` but not
+  in `LinkRecord`, so a JSON consumer cannot see the hit rate. Finding 64 is
+  the argument for surfacing it by default rather than on request.
+- **A test that reproduces finding 64.** The C fixture written for it passes
+  with the fix reverted; only the Rust link distinguishes them.
+- **Tentative (common) symbols** (finding 65), unrelated to the cache but
+  found by it.
+- **Dead-stripping.** Output is 2.0x ld-prime's.
