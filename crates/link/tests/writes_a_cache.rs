@@ -420,3 +420,52 @@ fn changing_the_request_defeats_the_whole_image_path() {
         "a different request reused the previous binary"
     );
 }
+
+/// The cache carries where this link put things, keyed by an identity that
+/// survives the next one.
+///
+/// The unit tests in `blinker-cache` prove the table round-trips through the
+/// file. This proves the *linker* filled it in — a placement table that is
+/// empty, or one whose sections do not match the image's, would pass every one
+/// of them and be worthless. That is the failure this whole file exists for.
+#[test]
+fn the_cache_records_where_every_contribution_was_placed() {
+    let scratch = Scratch::dir("cache-placements").expect("scratch");
+    let objects = compile(&scratch, &[("main.c", PROGRAM), ("helper.c", HELPER)]);
+    let cache_path = scratch.join("link.blinkcache");
+    let request = LinkRequest::new(objects).cached_at(cache_path.clone());
+    link_to_file(&request, &scratch.join("program")).expect("the link succeeds");
+
+    let cache = blinker_cache::load(&cache_path).expect("a cache was written");
+    assert!(
+        !cache.layout.slots.is_empty(),
+        "no contribution was recorded, so the next link has nothing to reuse"
+    );
+    assert!(
+        cache.layout.sections.contains_key("__TEXT,__text"),
+        "the section every link has is missing: {:?}",
+        cache.layout.sections.keys().collect::<Vec<_>>()
+    );
+
+    // Every slot must name a section the table also describes, or the
+    // allocator would keep an offset measured against nothing.
+    for (key, slot) in &cache.layout.slots {
+        assert!(
+            cache.layout.sections.contains_key(&slot.section),
+            "slot {key:?} names section {}, which the table does not describe",
+            slot.section
+        );
+        assert!(
+            slot.capacity > 0,
+            "slot {key:?} was given no room, so nothing can ever stay in it"
+        );
+    }
+
+    // Recorded without the per-object relocation machinery, which is off by
+    // default: the placement table is what an ordinary incremental link needs,
+    // and it must not arrive only when the experimental flag is passed.
+    assert!(
+        cache.entries.is_empty(),
+        "this link should not have recorded per-object entries"
+    );
+}

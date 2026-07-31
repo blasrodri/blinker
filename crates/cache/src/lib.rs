@@ -61,7 +61,7 @@ use codec::{Decoder, Encoder};
 /// A stale layout read as a current one is the one failure mode of a cache
 /// that produces a *wrong* binary rather than a slow one, so the version is
 /// checked before any other byte is trusted.
-pub const SCHEMA: u32 = 1;
+pub const SCHEMA: u32 = 2;
 
 const MAGIC: &[u8; 8] = b"BLNKCAC\x01";
 
@@ -276,6 +276,15 @@ pub struct LinkCache {
     /// identifier. Identical inputs linked with a different entry point are a
     /// different binary, and nothing in `inputs` would say so.
     pub request: [u8; 32],
+    /// Where this link put everything, so the next one can put it back.
+    ///
+    /// The one part of this cache that is *not* a copy of something the output
+    /// already holds. Entries, addresses and sections are all recoverable from
+    /// the image and the inputs; where a contribution sat is a decision, and a
+    /// decision cannot be recomputed — recomputing it with padding and hoping
+    /// it lands the same is what finding 94 measured at 9 reused relocations
+    /// out of 84 116.
+    pub layout: blinker_layout::PreviousLayout,
     /// The finished, signed binary.
     ///
     /// Present so that a link whose inputs are *all* unchanged can skip the
@@ -456,6 +465,38 @@ fn encode(cache: &LinkCache) -> Vec<u8> {
         encode_key(&mut out, key);
     }
     out.bytes_raw(&cache.request);
+
+    out.u32(cache.layout.sections.len() as u32);
+    for (name, section) in &cache.layout.sections {
+        out.u32(name.len() as u32);
+        out.bytes_raw(name.as_bytes());
+        out.u64(section.vm_address);
+        // `None` is a zero-filled section, which occupies no file bytes. Sent
+        // as a discriminant rather than as a sentinel offset: offset zero is a
+        // real place, and __TEXT starts there.
+        match section.file_offset {
+            Some(offset) => {
+                out.u32(1);
+                out.u64(offset);
+            }
+            None => out.u32(0),
+        }
+        out.u64(section.reserved);
+    }
+
+    let mut slots: Vec<_> = cache.layout.slots.iter().collect();
+    // Sorted so that two equal caches encode identically, which is what lets a
+    // test compare bytes rather than structures.
+    slots.sort_unstable_by_key(|(key, _)| key.0);
+    out.u32(slots.len() as u32);
+    for (key, slot) in slots {
+        out.u64(key.0);
+        out.u32(slot.section.len() as u32);
+        out.bytes_raw(slot.section.as_bytes());
+        out.u64(slot.offset);
+        out.u64(slot.capacity);
+    }
+
     out.u32(cache.image.len() as u32);
     out.bytes_raw(&cache.image);
     out.finish()
@@ -570,6 +611,44 @@ fn decode(bytes: &[u8]) -> Option<LinkCache> {
         inputs.push((path, decode_key(&mut input)?));
     }
     let request: [u8; 32] = input.bytes_raw(32)?.try_into().ok()?;
+
+    let mut layout = blinker_layout::PreviousLayout::default();
+    for _ in 0..input.u32()? {
+        let length = input.u32()? as usize;
+        let name = std::str::from_utf8(input.bytes_raw(length)?)
+            .ok()?
+            .to_string();
+        let vm_address = input.u64()?;
+        let file_offset = match input.u32()? {
+            1 => Some(input.u64()?),
+            0 => None,
+            _ => return None,
+        };
+        layout.sections.insert(
+            name,
+            blinker_layout::PreviousSection {
+                vm_address,
+                file_offset,
+                reserved: input.u64()?,
+            },
+        );
+    }
+    for _ in 0..input.u32()? {
+        let key = blinker_layout::ContributionKey(input.u64()?);
+        let length = input.u32()? as usize;
+        let section = std::str::from_utf8(input.bytes_raw(length)?)
+            .ok()?
+            .to_string();
+        layout.slots.insert(
+            key,
+            blinker_layout::PreviousSlot {
+                section,
+                offset: input.u64()?,
+                capacity: input.u64()?,
+            },
+        );
+    }
+
     let length = input.u32()? as usize;
     let image = input.bytes_raw(length)?.to_vec();
 
@@ -580,6 +659,7 @@ fn decode(bytes: &[u8]) -> Option<LinkCache> {
         sections,
         inputs,
         request,
+        layout,
         image,
     })
 }
@@ -626,6 +706,36 @@ mod tests {
             sections: vec![(1, vec![0xab; 64])],
             inputs: vec![(PathBuf::from("/tmp/a.o"), InputKey::Content([1u8; 32]))],
             request: [2u8; 32],
+            layout: {
+                let mut layout = blinker_layout::PreviousLayout::default();
+                layout.sections.insert(
+                    "__TEXT,__text".to_string(),
+                    blinker_layout::PreviousSection {
+                        vm_address: 0x1_0000_4000,
+                        file_offset: Some(0x4000),
+                        reserved: 0x8000,
+                    },
+                );
+                // A zero-filled section, so the file-offset discriminant is
+                // exercised rather than only the common case.
+                layout.sections.insert(
+                    "__DATA,__bss".to_string(),
+                    blinker_layout::PreviousSection {
+                        vm_address: 0x1_0001_0000,
+                        file_offset: None,
+                        reserved: 0x1000,
+                    },
+                );
+                layout.slots.insert(
+                    blinker_layout::ContributionKey(0x9e37_79b9_7f4a_7c15),
+                    blinker_layout::PreviousSlot {
+                        section: "__TEXT,__text".to_string(),
+                        offset: 0x120,
+                        capacity: 0x200,
+                    },
+                );
+                layout
+            },
             image: vec![0xcd; 128],
         }
     }

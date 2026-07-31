@@ -1570,6 +1570,14 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     // Built here, while the patched contents still exist, but not written
     // until the image does — the fast path needs the finished binary, and that
     // is the last thing produced.
+    // Names for every contribution that survive into the next link. Built only
+    // when something will store them: it is a hash per input section, which is
+    // cheap, and cheap is not free on a link that will not use it.
+    let contribution_keys = match request.cache_path {
+        Some(_) => identity::ContributionKeys::build(&objects),
+        None => identity::ContributionKeys::default(),
+    };
+
     let cache_step = std::time::Instant::now();
     let mut cache = match (&request.cache_path, current_addresses) {
         (Some(_), Some(addresses)) => Some(build_cache(
@@ -1579,6 +1587,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
             addresses,
             reuse_relocations.then_some(&patched.contents),
             &patched,
+            &contribution_keys,
         )),
         _ => None,
     };
@@ -1781,6 +1790,7 @@ fn build_cache(
     // them nothing can read them back.
     contents: Option<&SectionContents>,
     patched: &Patched,
+    identities: &identity::ContributionKeys,
 ) -> blinker_cache::LinkCache {
     // Input keys, one probe per distinct file. Archive members share their
     // archive's path and therefore its key: an rlib is proven unchanged once,
@@ -1836,6 +1846,13 @@ fn build_cache(
         sections,
         inputs: input_keys(request).unwrap_or_default(),
         request: request_hash(request),
+        // Read back off the layout this link produced, keyed by an identity
+        // that survives the next one. This is what the retained-placement
+        // allocator consumes; recording it costs a walk over the contributions
+        // that already exist.
+        layout: blinker_layout::PreviousLayout::record(&image.layout, |object, section| {
+            identities.key_or_fresh(object, section)
+        }),
         // Filled in once the image exists; a cache written without it simply
         // has no fast path, which is a slower link and not a wrong one.
         image: Vec::new(),
