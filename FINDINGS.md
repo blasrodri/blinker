@@ -1807,3 +1807,53 @@ rather than a design one. It cost two builds and a diff to learn instead.
 
 That is the sixth premise in this project tested against reality rather than
 argued about, and the second one tested *before* the code that depends on it.
+
+## 43. Slop of about 5% covers every body edit measured
+
+Finding 42 established that the output cache needs per-contribution padding or
+it has a near-zero hit rate. The open question was how much. Measured across a
+range of edits to a debug-profile Rust object (`opt-level=0`, which is what an
+edit–build–test loop uses):
+
+| edit | `__text` delta | of the contribution |
+|---|---|---|
+| `a + b` → `a + b + 0` | **+36** | 1.0% |
+| add a branch | **+92** | 2.5% |
+| `x * k` → `x * k + 1` | +44 | 1.2% |
+| tighten a bounds check | +16 | 0.4% |
+| add a `println!` | +52 | 1.4% |
+| signature: add a parameter | +52 | 1.4% |
+| additive: new unused function | +0 | 0.0% |
+| struct: add a field | +0 | 0.0% |
+
+Every body edit lands between **0.4% and 2.5%**, worst case 92 bytes. The +36
+for `+ 0` reproduces finding 17 exactly, on a different project and a different
+build path.
+
+**Padding each contribution by ~5% of its size absorbs every edit measured**,
+with the worst case at half the budget. That is a cheap price: blinker's images
+are *already* 2.25× larger than the system linker's for want of dead-stripping
+(finding 34), so 5% of slop is noise against a gap that is 125%.
+
+### Two caveats this does not settle
+
+- **Optimised builds behave differently.** At `-O` every one of these edits
+  measured **+0**, because the optimiser deletes `+ 0`, and the small functions
+  inline into their callers so the edit does not change a contribution at all.
+  Slop is a debug-build concern, which is the right place for it — but a
+  release build should not pay for padding it cannot use.
+- **The two +0 rows are artifacts, not good news.** The new function was unused
+  and removed; the struct field changed no code path. They are not evidence
+  that additive and layout edits are free — findings 17 and 42 already showed
+  otherwise for cases that are actually reached.
+
+### What is now specified
+
+The output cache can be designed against numbers rather than hopes: pad
+contributions by 5%, invalidate on a CGU content-hash change (finding 15), fall
+back to a cold link when an edit outgrows its padding, and expect that fallback
+to be rare for the body edits that dominate an agent's edit loop.
+
+What remains unmeasured is the *distribution over a real workload* rather than
+eight hand-written edits — how often an agent's changes exceed 5%. That needs
+the telemetry harness, and it is the last unknown before the cache is buildable.
