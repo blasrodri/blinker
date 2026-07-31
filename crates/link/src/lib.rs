@@ -605,6 +605,7 @@ fn personality_field_in_cie(data: &[u8], start: usize, start_offset: u64) -> Opt
 fn eh_frame_fde_offsets(
     objects: &[LoadedObject],
     image: &Image,
+    placed: &Placed,
     addresses: &AddressMap,
     strip: &Strip,
 ) -> HashMap<u64, u32> {
@@ -641,7 +642,7 @@ fn eh_frame_fde_offsets(
                 .iter()
                 .filter(|r| r.section == section.id)
             {
-                if let Ok(address) = target_address(object, image, addresses, relocation.target) {
+                if let Ok(address) = target_address(object, placed, addresses, relocation.target) {
                     targets.insert(relocation.offset, address);
                 }
             }
@@ -786,6 +787,7 @@ fn survey_relocations(
 fn compact_unwind_entries(
     objects: &[LoadedObject],
     image: &Image,
+    placed: &Placed,
     addresses: &AddressMap,
     strip: &Strip,
     got_slots: &HashMap<String, u64>,
@@ -827,7 +829,7 @@ fn compact_unwind_entries(
                 .iter()
                 .filter(|r| r.section == section.id)
             {
-                let Ok(base) = target_address(object, image, addresses, relocation.target) else {
+                let Ok(base) = target_address(object, placed, addresses, relocation.target) else {
                     continue;
                 };
 
@@ -1339,7 +1341,9 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
 
     // With addresses known, copy content and patch it.
     let step = std::time::Instant::now();
-    let mut addresses = address_map(&objects, &probe, &strip);
+    // Built once from the layout, and consulted a few hundred thousand times.
+    let placed = Placed::index(&probe);
+    let mut addresses = address_map(&objects, &placed, &strip);
     // Commons have no section of their own in any input, so `address_map` —
     // which walks each symbol's defining section — cannot see them. They are
     // definitions all the same, and every reference resolves here.
@@ -1358,6 +1362,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
         &mut contents,
         &probe,
         &objects,
+        &placed,
         &addresses,
         &strip,
         &got_slots,
@@ -1382,6 +1387,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
         &Placement {
             addresses: &addresses,
             strip: &strip,
+            placed: &placed,
         },
         &IndirectTables {
             got: &got_slots,
@@ -1424,7 +1430,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     // The symbol table grows between passes, which changes `LC_SYMTAB`'s
     // contents but not the load commands' *sizes* — so the section addresses
     // the relocations were computed against still hold.
-    let symbols = output_symbols(&objects, &probe, &strip)?;
+    let symbols = output_symbols(&objects, &placed, &strip)?;
 
     // Each GOT slot holds an absolute address, and the image is position
     // independent, so dyld must relocate every one of them at load time.
@@ -1823,6 +1829,7 @@ fn fill_unwind_info(
     contents: &mut SectionContents,
     image: &Image,
     objects: &[LoadedObject],
+    placed: &Placed,
     addresses: &AddressMap,
     strip: &Strip,
     got_slots: &HashMap<String, u64>,
@@ -1837,8 +1844,16 @@ fn fill_unwind_info(
         return Ok(());
     };
 
-    let fde_offsets = eh_frame_fde_offsets(objects, image, addresses, strip);
-    let entries = compact_unwind_entries(objects, image, addresses, strip, got_slots, &fde_offsets);
+    let fde_offsets = eh_frame_fde_offsets(objects, image, placed, addresses, strip);
+    let entries = compact_unwind_entries(
+        objects,
+        image,
+        placed,
+        addresses,
+        strip,
+        got_slots,
+        &fde_offsets,
+    );
     let mut table = blinker_output::unwind::build(entries);
 
     if table.len() as u64 > section.size {
@@ -2417,7 +2432,7 @@ fn assemble(request: &LinkRequest, assembly: &Assembly<'_>) -> Result<Image, Lin
 /// not implemented.
 fn output_symbols(
     objects: &[LoadedObject],
-    image: &Image,
+    placed: &Placed,
     strip: &Strip,
 ) -> Result<Vec<OutputSymbol>, LinkError> {
     let mut out = Vec::new();
@@ -2442,12 +2457,7 @@ fn output_symbols(
             ) else {
                 continue;
             };
-            let Some(chunk) = image
-                .layout
-                .sections
-                .iter()
-                .find_map(|s| s.address_of(object.parsed.id, section_id))
-            else {
+            let Some(chunk) = placed.address(object.parsed.id, section_id) else {
                 continue;
             };
             out.push(OutputSymbol::exported(
@@ -2773,14 +2783,59 @@ fn dependency_hashes(
     hashes
 }
 
+/// Where each input section's bytes landed, by `(object, section)`.
+///
+/// The same question `Layout::address_of` answers, asked once per input
+/// section instead of once per relocation.
+///
+/// `address_of` scans every output section, and within each one every
+/// contribution. That is fine at 27 inputs and quadratic at 79: relocation
+/// went from 3.1 ms to **187 ms** on a link five times the size, and the
+/// linker that was 0.92x the system linker on a fixture was 7.4x on a real
+/// binary (finding 77). Nothing was wrong with the lookup except how often it
+/// was asked.
+#[derive(Default)]
+struct Placed {
+    /// `(object, section)` -> the output section's index, and the address the
+    /// chunk starts at.
+    chunks: HashMap<(u32, u32), (usize, u64)>,
+}
+
+impl Placed {
+    fn index(image: &Image) -> Placed {
+        let mut chunks = HashMap::new();
+        for (index, section) in image.layout.sections.iter().enumerate() {
+            for contribution in &section.contributions {
+                chunks.insert(
+                    (contribution.object.0, contribution.section.0),
+                    (index, section.vm_address + contribution.offset),
+                );
+            }
+        }
+        Placed { chunks }
+    }
+
+    /// The output section index and chunk address for one input section.
+    fn chunk(&self, object: ObjectId, section: SectionId) -> Option<(usize, u64)> {
+        self.chunks.get(&(object.0, section.0)).copied()
+    }
+
+    /// Just the address, which is what most callers want.
+    fn address(&self, object: ObjectId, section: SectionId) -> Option<u64> {
+        self.chunk(object, section).map(|(_, address)| address)
+    }
+}
+
 /// Where the inputs ended up.
 ///
-/// The two travel together because they answer halves of one question: the
-/// address map says where a *name* went, and the strip says where a *byte*
-/// went, and a relocation needs both to place its field and find its target.
+/// The three travel together because they answer parts of one question: the
+/// address map says where a *name* went, the strip says where a *byte* went,
+/// and `placed` says where a *section* went — and a relocation needs all three
+/// to place its field and find its target.
 struct Placement<'a> {
     addresses: &'a AddressMap,
     strip: &'a Strip,
+    placed: &'a Placed,
 }
 
 fn apply_relocations(
@@ -2799,7 +2854,11 @@ fn apply_relocations(
     reuse: Option<&ReusePlan<'_>>,
 ) -> Result<Patched, LinkError> {
     let mut extra_rebases = Vec::new();
-    let Placement { addresses, strip } = *placement;
+    let Placement {
+        addresses,
+        strip,
+        placed,
+    } = *placement;
     let IndirectTables {
         got: got_slots,
         stubs: stub_slots,
@@ -2888,12 +2947,9 @@ fn apply_relocations(
             index += 1;
 
             // Where the patched field lives in the output.
-            let Some((section_index, output_section)) = image
-                .layout
-                .sections
-                .iter()
-                .enumerate()
-                .find(|(_, s)| s.address_of(object.parsed.id, relocation.section).is_some())
+            let Some((section_index, chunk_address)) = placed
+                .chunk(object.parsed.id, relocation.section)
+                .and_then(|(index, address)| image.layout.section(index).map(|_| (index, address)))
             else {
                 // The relocation patches a section that was dropped as
                 // linker-internal; nothing in the output refers to it.
@@ -2908,9 +2964,7 @@ fn apply_relocations(
                 note_reference(&mut referenced, relocation);
             }
 
-            let chunk_address = output_section
-                .address_of(object.parsed.id, relocation.section)
-                .expect("just matched");
+            let output_section = image.layout.section(section_index).expect("just matched");
             let chunk_offset = chunk_address - output_section.vm_address;
             // Where the field moved to. `None` means the bytes holding it were
             // stripped, so there is nothing to patch — and, for a `SUBTRACTOR`,
@@ -2942,10 +2996,10 @@ fn apply_relocations(
                 if record {
                     note_reference(&mut referenced, pair);
                 }
-                let subtrahend = target_address(object, image, addresses, relocation.target)?;
+                let subtrahend = target_address(object, placed, addresses, relocation.target)?;
                 let minuend = match indirect_personality(object, pair) {
                     Some(slot) => slot,
-                    None => target_address(object, image, addresses, pair.target)?,
+                    None => target_address(object, placed, addresses, pair.target)?,
                 };
 
                 // Mach-O relocations carry their addend **in the bytes being
@@ -3089,9 +3143,9 @@ fn apply_relocations(
                 // is unused for these kinds, so a failed lookup here is
                 // expected rather than an error.
                 (None, Some(_)) => {
-                    target_address(object, image, addresses, relocation.target).unwrap_or(0)
+                    target_address(object, placed, addresses, relocation.target).unwrap_or(0)
                 }
-                (None, None) => target_address(object, image, addresses, relocation.target)?,
+                (None, None) => target_address(object, placed, addresses, relocation.target)?,
             };
 
             let Some(buffer) = contents.get_mut(&section_index) else {
@@ -3229,20 +3283,19 @@ fn inline_addend(object: &LoadedObject, relocation: &InputRelocation) -> i64 {
 /// The output address a relocation refers to.
 fn target_address(
     object: &LoadedObject,
-    image: &Image,
+    placed: &Placed,
     addresses: &AddressMap,
     target: RelocationTarget,
 ) -> Result<u64, LinkError> {
     match target {
-        RelocationTarget::Section(section) => image
-            .layout
-            .sections
-            .iter()
-            .find_map(|s| s.address_of(object.parsed.id, section))
-            .ok_or(LinkError::MissingSection {
-                object: object.parsed.id,
-                section,
-            }),
+        RelocationTarget::Section(section) => {
+            placed
+                .address(object.parsed.id, section)
+                .ok_or(LinkError::MissingSection {
+                    object: object.parsed.id,
+                    section,
+                })
+        }
         RelocationTarget::Symbol(symbol_id) => {
             let symbol = object
                 .parsed
@@ -3299,7 +3352,7 @@ impl AddressMap {
 }
 
 /// Compute the output address of every definition.
-fn address_map(objects: &[LoadedObject], image: &Image, strip: &Strip) -> AddressMap {
+fn address_map(objects: &[LoadedObject], placed: &Placed, strip: &Strip) -> AddressMap {
     let mut map = AddressMap::default();
 
     for object in objects {
@@ -3313,12 +3366,7 @@ fn address_map(objects: &[LoadedObject], image: &Image, strip: &Strip) -> Addres
             let Some(input) = object.parsed.section(section_id) else {
                 continue;
             };
-            let Some(chunk) = image
-                .layout
-                .sections
-                .iter()
-                .find_map(|s| s.address_of(object.parsed.id, section_id))
-            else {
+            let Some(chunk) = placed.address(object.parsed.id, section_id) else {
                 // Its section was dropped as linker-internal.
                 continue;
             };
