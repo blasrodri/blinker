@@ -1380,3 +1380,50 @@ time**, and the verification belongs in the harness rather than in the
 operator's memory. The run above checks exit status and file size for both
 linkers, and it is the reason the third set of numbers can be trusted where the
 first cannot.
+
+## 35. No phase dominates, which changes what M4 can be worth
+
+The plan assumed a persistent cache of *parse results* would be the win, on the
+reasoning that parsing dominates a cold link. Profiling the link says
+otherwise. Same 27-input Rust link as finding 34:
+
+```
+  read+parse      7.4 ms   29.6%
+  resolve         6.9 ms   27.8%
+  layout          1.6 ms    6.3%
+  relocate        6.2 ms   24.8%
+  emit+sign       2.1 ms    8.5%
+  total          24.8 ms
+```
+
+Three phases are within a factor of 1.2 of each other and together are 82% of
+the time. **Caching parses can save at most 7.4 ms of 24.8 ms**, and only if
+the cache lookup itself were free — it is not, since it requires hashing the
+same inputs the parse would have read.
+
+That is an upper bound of about 30%, against a linker that is currently 1.6×
+slower than ld64. A perfect parse cache would bring blinker from 44.6 ms to
+roughly 37 ms, still behind ld64's 27.9 ms. **A parse cache alone cannot make
+blinker faster than the thing it replaces.**
+
+### What the numbers actually argue for
+
+The win has to come from not redoing `resolve` and `relocate` either — which
+means caching the *linked output* and patching it, not the parsed inputs. That
+is M5's incremental relink, and this profile says it is not an optimisation to
+layer on top of M4 but the point of the exercise.
+
+Findings 15–18 remain the design for how to key that cache (CGU identity or
+content hash, never path; rustc's own incremental verdict readable from which
+`.rcgu.o` files changed). What changes is *what is stored under that key*: not
+`ParsedObject`s, but enough of the finished layout and patched section content
+to rebuild an image while touching only the CGUs that changed.
+
+### Also visible: the driver costs more than the link
+
+The library links in 24.8 ms; the same link through the CLI takes 44.6 ms. The
+~20 ms difference is process start plus `fingerprint_input`, which reads every
+input to hash it — work the link then repeats when it reads the same files to
+parse them. For a cache that must hash inputs anyway, reading them twice is
+pure waste, and merging those two passes is a prerequisite for M4 rather than a
+tidy-up.

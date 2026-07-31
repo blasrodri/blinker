@@ -15,8 +15,18 @@ fn main() {
     let request = blinker_link::LinkRequest::new(objects.iter().map(Into::into).collect())
         .identifier(output.rsplit('/').next().unwrap_or("a.out"));
 
-    match blinker_link::link_to_file(&request, std::path::Path::new(output)) {
-        Ok(image) => println!("linked {} ({} bytes)", output, image.bytes.len()),
+    match blinker_link::link_timed(&request) {
+        Ok((image, timings)) => {
+            std::fs::write(output, &image.bytes).expect("writable");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(output, std::fs::Permissions::from_mode(0o755))
+                    .expect("chmod");
+            }
+            println!("linked {} ({} bytes)", output, image.bytes.len());
+            println!("{timings}");
+        }
         Err(error) => {
             eprintln!("link failed: {error}");
             std::process::exit(1);

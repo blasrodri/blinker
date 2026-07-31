@@ -43,6 +43,72 @@ use blinker_symbols::{SymbolProvider, SymbolTable};
 pub mod error;
 pub use error::LinkError;
 
+/// How long each stage of a link took.
+///
+/// Recorded because M4's cache has to know *what* to cache. Caching the wrong
+/// stage buys nothing: if emitting dominates, storing parse results saves
+/// almost none of the 44.6 ms a cold link costs. This is measured rather than
+/// assumed for the same reason every other number in this project is.
+#[derive(Debug, Clone, Default)]
+pub struct LinkTimings {
+    pub read_and_parse_ms: f64,
+    pub resolve_ms: f64,
+    pub layout_probe_ms: f64,
+    pub relocate_ms: f64,
+    pub emit_ms: f64,
+    pub total_ms: f64,
+}
+
+impl std::fmt::Display for LinkTimings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let pct = |v: f64| {
+            if self.total_ms > 0.0 {
+                v / self.total_ms * 100.0
+            } else {
+                0.0
+            }
+        };
+        writeln!(
+            f,
+            "  read+parse  {:7.1} ms  {:5.1}%",
+            self.read_and_parse_ms,
+            pct(self.read_and_parse_ms)
+        )?;
+        writeln!(
+            f,
+            "  resolve     {:7.1} ms  {:5.1}%",
+            self.resolve_ms,
+            pct(self.resolve_ms)
+        )?;
+        writeln!(
+            f,
+            "  layout      {:7.1} ms  {:5.1}%",
+            self.layout_probe_ms,
+            pct(self.layout_probe_ms)
+        )?;
+        writeln!(
+            f,
+            "  relocate    {:7.1} ms  {:5.1}%",
+            self.relocate_ms,
+            pct(self.relocate_ms)
+        )?;
+        writeln!(
+            f,
+            "  emit+sign   {:7.1} ms  {:5.1}%",
+            self.emit_ms,
+            pct(self.emit_ms)
+        )?;
+        write!(f, "  total       {:7.1} ms", self.total_ms)
+    }
+}
+
+/// Link, reporting how long each stage took.
+pub fn link_timed(request: &LinkRequest) -> Result<(Image, LinkTimings), LinkError> {
+    let mut timings = LinkTimings::default();
+    let image = link_inner(request, &mut timings)?;
+    Ok((image, timings))
+}
+
 /// What to link.
 #[derive(Debug, Clone)]
 pub struct LinkRequest {
@@ -646,7 +712,15 @@ fn got_symbols(objects: &[LoadedObject]) -> Vec<TableEntry> {
 
 /// Link the request into an image.
 pub fn link(request: &LinkRequest) -> Result<Image, LinkError> {
+    link_inner(request, &mut LinkTimings::default())
+}
+
+fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image, LinkError> {
+    let overall = std::time::Instant::now();
+
+    let step = std::time::Instant::now();
     let objects = load_objects(&request.objects)?;
+    timings.read_and_parse_ms = elapsed_ms(step);
     let mut placements = placements_for(&objects);
 
     if placements.is_empty() {
@@ -657,12 +731,14 @@ pub fn link(request: &LinkRequest) -> Result<Image, LinkError> {
     // undefined reference is only an error once the dylibs have had their
     // chance at it. Checking first reported `_printf` as undefined in a
     // program that links against libSystem.
+    let step = std::time::Instant::now();
     let imports = resolve_imports(&objects, request)?;
 
     // Resolution runs for its diagnostics: it is what turns a genuinely
     // missing definition into a named error rather than a relocation against
     // zero.
     resolve_symbols(&objects, &imports)?;
+    timings.resolve_ms = elapsed_ms(step);
 
     let stubs = stub_symbols(&objects, &imports);
     // Synthesise `__got` before layout, so it is placed and addressed like any
@@ -735,6 +811,7 @@ pub fn link(request: &LinkRequest) -> Result<Image, LinkError> {
     }
 
     // Pass one: learn where everything lands.
+    let step = std::time::Instant::now();
     let probe = assemble(
         request,
         &Assembly {
@@ -743,7 +820,10 @@ pub fn link(request: &LinkRequest) -> Result<Image, LinkError> {
         },
     )?;
 
+    timings.layout_probe_ms = elapsed_ms(step);
+
     // With addresses known, copy content and patch it.
+    let step = std::time::Instant::now();
     let addresses = address_map(&objects, &probe);
     let got_slots = got_slot_addresses(&got, &probe);
     let stub_slots = stub_addresses(&stubs, &probe);
@@ -767,6 +847,7 @@ pub fn link(request: &LinkRequest) -> Result<Image, LinkError> {
     )?;
     let contents = patched.contents;
     let entry_offset = entry_offset(request, &objects, &probe)?;
+    timings.relocate_ms = elapsed_ms(step);
 
     // Pass two: the same layout, with real bytes.
     //
@@ -784,7 +865,8 @@ pub fn link(request: &LinkRequest) -> Result<Image, LinkError> {
     rebases.extend(pointer_table_rebases(&probe, "__thread_ptrs", tlv.len()));
     rebases.extend(patched.rebases);
 
-    assemble(
+    let step = std::time::Instant::now();
+    let image = assemble(
         request,
         &Assembly {
             placements: &placements,
@@ -794,7 +876,14 @@ pub fn link(request: &LinkRequest) -> Result<Image, LinkError> {
             binds: &binds,
             entry_offset,
         },
-    )
+    );
+    timings.emit_ms = elapsed_ms(step);
+    timings.total_ms = elapsed_ms(overall);
+    image
+}
+
+fn elapsed_ms(start: std::time::Instant) -> f64 {
+    start.elapsed().as_secs_f64() * 1000.0
 }
 
 /// Undefined references, checked against what `libSystem` actually exports.
