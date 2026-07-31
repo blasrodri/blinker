@@ -3841,3 +3841,69 @@ And the first attempt tied slack to *whether a cache was being written*, which
 made a cold link and a cached one lay out differently — breaking the property
 the entire design rests on, that an incremental output is what a cold link
 would have produced. It is a property of the request now, applied to both.
+
+## 81. The layout probe was signing an image nobody reads
+
+The linker assembles twice: once to discover where everything lands, once with
+real content. Both passes went through the same builder, so both produced a
+complete Mach-O image — including an ad-hoc code signature, which is SHA-256
+over every page of the file.
+
+The probe's bytes are dropped; only `Image::layout` is read from it.
+
+```
+  layout stage    6.9 ms  ->  0.8 ms
+  whole link      122 ms  ->  107 ms       byte-identical output
+  vs ld-prime     2.92x   ->  2.65x
+```
+
+**6.2 ms per link, cold and warm alike, hashing megabytes that are then
+freed.** It hid inside `layout_probe_ms`, which is why every profile in
+findings 76–80 reported layout as a 6 ms stage and nobody asked what a layout
+pass was doing for six milliseconds.
+
+The space is still reserved when the signature is skipped, so the offsets the
+probe reports are the ones the signed image will have — otherwise the probe
+would describe a layout the real pass does not produce.
+
+### The reason it survived four rounds of profiling
+
+The stage names came from the pipeline's structure rather than from what the
+code does, and `layout` sounded like an answer. A stage that is 6% of the link
+and named after something cheap does not invite the question "6% of *what*?" —
+and the two passes were only visible from inside `assemble`, one call away from
+the timer.
+
+**A profile is only as honest as its stage boundaries.** These were drawn where
+the functions were, not where the work was.
+
+## 82. Where this leaves the linker
+
+```
+  ld-prime, every time         41.9 ms
+  blinker, unchanged relink    13.3 ms   0.32x    921/921 objects reused
+  blinker, one crate edited   123 ms     2.9x     728/937, 80% of relocations
+  blinker, cold               111 ms     2.65x
+```
+
+Measured on blinker linking its own 937-object binary. The cold link came down
+from 7.44x over findings 77–81, entirely by removing work that was quadratic,
+redundant, or thrown away — no algorithmic cleverness and no risk taken with
+correctness: every step verified byte-identical output.
+
+The unchanged relink is three times faster than the system linker and is the
+proof that the caching design works. The edit relink is the product and it is
+still 2.9x, because reuse covers `relocate` and nothing else:
+
+```
+  read+parse   26.8 ms   re-runs        relocate   28.8 ms   reused
+  dead-strip   20.9 ms   re-runs        emit+sign  11.4 ms   re-runs
+  resolve       9.1 ms   re-runs        layout      0.8 ms   re-runs
+```
+
+What remains is not tuning. Five stages need incremental forms, and the two
+that matter — `read+parse` and `dead-strip`, 48 ms between them — are genuine
+design work. Finding 41 already ruled out the obvious answer for the first
+(deserialising a parsed object is slower than parsing it), which points at the
+daemon the spec's Stage G was always for: the only way not to re-read 89 MB is
+to still have it.
