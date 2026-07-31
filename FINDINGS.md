@@ -2406,3 +2406,46 @@ explanation that fits the evidence is worth roughly nothing here until it is
 tested, and the test is almost always cheaper than the implementation. This one
 cost a revert; finding 41's cost nothing because it was tested first. The
 difference between those two outcomes is entirely in the order of operations.
+
+## 56. The LSDA relocation, read at last
+
+Reading what actually sits at an LSDA field's offset in a real `libstd` object,
+instead of proposing an explanation:
+
+```
+FDE@0x99c4  LSDA field at section offset 0x99dd, encoding 0x10 (pcrel, 8 bytes)
+
+relocations at that offset (__TEXT,__eh_frame):
+  address   pcrel length extern type            symbolnum
+  000099dd  0     3      1      1  SUBTRACTOR   1788
+  000099dd  0     3      1      0  UNSIGNED       26
+```
+
+So they **are** `SUBTRACTOR` pairs, and finding 54's structural guess was
+right — which makes finding 55's null result the interesting part. The pair
+path *is* what patches these fields, yet reading the inline addend changed
+nothing, which means the inline value is already zero and the addend was never
+the problem.
+
+The decisive detail is `extern=1` on both halves: the target is **symbol 26**,
+not a section. These are symbol-relative pairs — `value = symbol26 -
+symbol1788` — where symbol 26 is presumably a local label inside
+`__gcc_except_tab` and 1788 is the FDE's own anchor.
+
+That reframes the whole thing. A per-contribution offset error was the theory
+because six LSDAs are right and 350 wrong; but if the targets are *local
+symbols*, the suspect is local symbol resolution, which finding 29 already
+found broken once — pointer-table slots were looked up under the linker's
+synthetic object id and could not see locals, leaving them null.
+
+`AddressMap` keys locals by `(object, name)`. Whether `target_address` reaches
+them correctly for these relocations is the next thing to check, and it is a
+check, not a hypothesis: resolve symbol 26 for this object and compare the
+address against `__gcc_except_tab`'s bounds.
+
+### 264 FDEs with an LSDA in one object
+
+Worth recording for scale: this single `libstd` codegen unit has 264 FDEs
+carrying LSDAs and 2361 relocations in `__eh_frame` alone. The six-correct,
+350-wrong split across the whole link is consistent with one object resolving
+and the rest not.
