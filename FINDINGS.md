@@ -2711,3 +2711,67 @@ result was believed without checking that the code ran; here, a passing test
 was nearly believed without checking that it could fail. Both are the same
 missing step — **confirm the experiment can produce the other answer** — and it
 costs one deliberate break.
+
+## 64. The cache reused nothing on a real link, and had no symptom
+
+The reuse path was wired, all ten tests passed, and the C fixture reused both
+objects. On the real 47-object Rust link it reused **zero**, and nothing said
+so: the binary was byte-identical, the link succeeded, and the only trace was
+that `relocate` had gone *up* rather than down.
+
+```
+  no cache          relocate  7.8 ms
+  cache, no reuse   relocate 10.6 ms     <- the recording cost, no saving
+  cache, reusing    relocate  4.9 ms
+```
+
+Instrumenting the plan showed every condition passing:
+
+```
+  previous entries 47   addresses 7121 -> 7121   changed 0
+```
+
+47 entries matched, no address moved, and no object was reused. The failure was
+past all three conditions, in the byte copy: a **zero-filled section** has
+contributions with a real length and no bytes on either side, and the copy read
+that as the two layouts disagreeing and refused. Rust objects touch `__bss` and
+the thread-local block almost universally, so almost every object failed.
+
+### The symptom that did not exist
+
+This is a new failure class for this project. Every previous bug produced a
+crash, a wrong answer, or a number that moved the wrong way in a benchmark. This
+one produced a *correct binary* and a cache that did nothing, and it survived a
+test suite that was written specifically for it.
+
+What eventually caught it was printing a count that had never been printed —
+`reused_objects` was a field on `LinkTimings` that nothing displayed. The
+general form: **a cache needs a hit-rate counter surfaced by default**, because
+correctness tests cannot see the difference between a cache that works and a
+cache that is switched off, and that is precisely the difference it exists to
+make.
+
+### The test for it does not work
+
+The C fixture written to cover this passes with the fix reverted. It is kept,
+with its doc comment saying so plainly, because a test whose negative control
+passes proves nothing and mislabelling it is worse than not having it. Finding
+a C fixture that reaches the same path — or driving the Rust link from a test —
+is unfinished.
+
+## 65. Tentative (common) symbols are not resolved
+
+Found incidentally: a C file-scope `int arr[4096];` with no initialiser is a
+*tentative* definition, which the assembler emits as a common symbol rather
+than a `__bss` definition. blinker reports it undefined:
+
+```
+UndefinedSymbols { names: ["_big_uninitialised"] }
+```
+
+`static int arr[4096];` links fine, because file-local storage is a plain
+`__bss` definition with no tentative-definition rules to apply.
+
+Rust never emits these, which is why nothing had hit it before, and C code that
+does is common enough that this is a real gap rather than a curiosity. Recorded
+where it was found rather than fixed in passing.

@@ -13,6 +13,7 @@ name = "blinker_cli"
 path = "src/lib.rs"
 
 [dependencies]
+blinker-cache = { workspace = true }
 blinker-arguments = { workspace = true }
 blinker-diagnostics = { workspace = true }
 blinker-link = { workspace = true }

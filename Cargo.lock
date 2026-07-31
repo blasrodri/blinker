@@ -84,6 +84,7 @@ name = "blinker-cli"
 version = "0.1.0"
 dependencies = [
  "blinker-arguments",
+ "blinker-cache",
  "blinker-diagnostics",
  "blinker-link",
  "blinker-test-support",

@@ -169,7 +169,7 @@ pub fn run(argv: &[String]) -> Result<Outcome, DriverError> {
         if options.verbosity == Verbosity::Verbose {
             eprintln!("blinker: linking internally");
         }
-        let phases = internal_link(&parsed).map_err(|e| DriverError::Link {
+        let phases = internal_link(&parsed, &options).map_err(|e| DriverError::Link {
             detail: e.to_string(),
         })?;
         record.set_timing_internal_link(
@@ -221,6 +221,7 @@ pub fn run(argv: &[String]) -> Result<Outcome, DriverError> {
 /// silently ignores an input produces a binary missing whatever was in it.
 fn internal_link(
     parsed: &ParsedInvocation,
+    options: &ProjectOptions,
 ) -> Result<blinker_link::LinkTimings, blinker_link::LinkError> {
     let output = parsed
         .output_path()
@@ -238,7 +239,13 @@ fn internal_link(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "a.out".to_string());
 
-    let request = blinker_link::LinkRequest::new(objects).identifier(&identifier);
+    let mut request = blinker_link::LinkRequest::new(objects).identifier(&identifier);
+    // Opt-in for now: the reuse path is new, and a linker that silently
+    // depends on state from a previous run is one whose output cannot be
+    // reproduced from its inputs alone. `--blinker-cache` turns it on.
+    if options.incremental_cache {
+        request = request.cached_at(blinker_cache::cache_path(&output));
+    }
     let (image, timings) = blinker_link::link_timed(&request)?;
 
     std::fs::write(&output, &image.bytes).map_err(|source| blinker_link::LinkError::Write {

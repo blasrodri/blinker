@@ -41,6 +41,13 @@ pub struct ProjectOptions {
     /// ld64's. Flipping the default is a decision to make from evidence, not
     /// a side effect of the path existing.
     pub internal_link: bool,
+    /// Reuse relocated output from a previous link, and record this one.
+    ///
+    /// Opt-in for the same reason `internal_link` is: a linker that silently
+    /// depends on state from an earlier run produces output that cannot be
+    /// reproduced from its inputs alone. Turning this on is a statement that
+    /// the caller wants that trade.
+    pub incremental_cache: bool,
     /// Print the human-readable summary.
     pub print_stats: bool,
     /// Compute BLAKE3 hashes for every input (spec §13 verification path).
@@ -155,6 +162,7 @@ pub fn split_args(argv: &[String]) -> Result<SplitArgs, OptionError> {
                 };
             }
             "--blinker-internal" => options.internal_link = true,
+            "--blinker-cache" => options.incremental_cache = true,
             "--blinker-print-stats" => options.print_stats = true,
             "--blinker-strict-fingerprints" => options.strict_fingerprints = true,
             "--blinker-version" => options.version = true,
@@ -188,6 +196,7 @@ OPTIONS:
     --blinker-json-diagnostics <PATH>  Write the machine-readable record to PATH
     --blinker-diagnostics <LEVEL>      quiet | normal | verbose
     --blinker-internal                 Link internally instead of delegating
+    --blinker-cache                    Reuse relocated output from a previous link
     --blinker-print-stats              Print the human-readable summary
     --blinker-strict-fingerprints      Hash every input (slower, exact identity)
     --blinker-version                  Print version

@@ -57,6 +57,10 @@ pub struct LinkTimings {
     pub relocate_ms: f64,
     pub emit_ms: f64,
     pub total_ms: f64,
+    /// Objects whose patched bytes came from the cache rather than from
+    /// relocating them again. Zero on a cold link, and on every link that did
+    /// not ask for a cache.
+    pub reused_objects: u64,
 }
 
 impl std::fmt::Display for LinkTimings {
@@ -68,6 +72,9 @@ impl std::fmt::Display for LinkTimings {
                 0.0
             }
         };
+        if self.reused_objects > 0 {
+            writeln!(f, "  reused      {:7} objects", self.reused_objects)?;
+        }
         writeln!(
             f,
             "  read+parse  {:7.1} ms  {:5.1}%",
@@ -975,6 +982,20 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     fill_stubs(&mut contents, &probe, &stubs, &got_slots)?;
     fill_pointer_table(&mut contents, &probe, &tlv, &addresses, "__thread_ptrs")?;
     fill_unwind_info(&mut contents, &probe, &objects, &addresses, &got_slots)?;
+    // The addresses this link produced, in the form the cache compares. Built
+    // before relocation because it is what decides which objects can skip it.
+    let current_addresses = request
+        .cache_path
+        .as_ref()
+        .map(|_| address_table(&addresses, &got_slots, &stub_slots, &tlv_slots));
+
+    let previous = request.cache_path.as_deref().and_then(blinker_cache::load);
+    let plan = match (&previous, &current_addresses) {
+        (Some(previous), Some(current)) => Some(plan_reuse(&objects, &probe, previous, current)),
+        _ => None,
+    };
+    timings.reused_objects = plan.as_ref().map_or(0, |p| p.entries.len() as u64);
+
     let patched = apply_relocations(
         &objects,
         &probe,
@@ -988,18 +1009,10 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
         },
         contents,
         request.cache_path.is_some(),
+        plan.as_ref(),
     )?;
-    if let Some(path) = &request.cache_path {
-        let cache = build_cache(
-            &objects,
-            &probe,
-            &addresses,
-            &got_slots,
-            &stub_slots,
-            &tlv_slots,
-            &patched.contents,
-            &patched,
-        );
+    if let (Some(path), Some(addresses)) = (&request.cache_path, current_addresses) {
+        let cache = build_cache(&objects, &probe, addresses, &patched.contents, &patched);
         // A cache that cannot be written is not an error: the link succeeded,
         // and the only consequence is that the next one is cold.
         let _ = blinker_cache::store(path, &cache);
@@ -1042,6 +1055,126 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     image
 }
 
+/// Copy one object's cached bytes into the sections being assembled.
+///
+/// Returns whether every range landed. A range that does not fit is a cache
+/// describing a layout this link did not produce, and the caller relocates the
+/// object instead — bounds are checked rather than trusted because the file
+/// came off disk and may have been written by anything.
+fn copy_cached_bytes(
+    entry: &blinker_cache::Entry,
+    plan: &ReusePlan<'_>,
+    contents: &mut SectionContents,
+) -> bool {
+    for range in &entry.ranges {
+        let source = plan.sections.get(&range.section);
+        // A zero-filled section — `__bss` and the thread-local block — has a
+        // contribution with a real length and no bytes anywhere, in this link
+        // or the cached one. There is nothing to copy and nothing wrong. This
+        // is why a first version reused nothing at all on a Rust link: every
+        // object that touched `__bss` failed the copy and fell back, which
+        // looked exactly like a cache that never matched.
+        if !contents.contains_key(&(range.section as usize)) {
+            if source.is_none() {
+                continue;
+            }
+            return false;
+        }
+        let (Some(source), Some(destination)) =
+            (source, contents.get_mut(&(range.section as usize)))
+        else {
+            return false;
+        };
+        let (start, end) = (range.start as usize, (range.start + range.len) as usize);
+        let (Some(from), Some(to)) = (source.get(start..end), destination.get_mut(start..end))
+        else {
+            return false;
+        };
+        to.copy_from_slice(from);
+    }
+    true
+}
+
+/// What a previous link left that this one can reuse.
+///
+/// Built once, before relocation, so the relocation loop's decision is a map
+/// lookup rather than a re-derivation per object.
+struct ReusePlan<'a> {
+    /// Entries whose three conditions all hold, by object.
+    entries: HashMap<u32, &'a blinker_cache::Entry>,
+    /// The previous link's patched section bytes.
+    sections: HashMap<u32, &'a [u8]>,
+}
+
+impl ReusePlan<'_> {
+    fn entry(&self, object: ObjectId) -> Option<&blinker_cache::Entry> {
+        self.entries.get(&object.0).copied()
+    }
+}
+
+/// Decide, for every object, whether its bytes survive from the previous link.
+///
+/// Entries are matched to objects by **where their bytes went**, not by
+/// position in the cache: adding or removing one input shifts every later
+/// object's id, and an entry matched by index would then be checked against a
+/// different object's content hash and pass. The first range is unique to an
+/// object — two contributions cannot begin at the same offset of the same
+/// section — so it identifies the entry without needing a name.
+fn plan_reuse<'a>(
+    objects: &[LoadedObject],
+    image: &Image,
+    previous: &'a blinker_cache::LinkCache,
+    current_addresses: &[(blinker_cache::NameHash, u64)],
+) -> ReusePlan<'a> {
+    let changed: std::collections::HashSet<blinker_cache::NameHash> = blinker_cache::LinkCache {
+        addresses: current_addresses.to_vec(),
+        ..blinker_cache::LinkCache::default()
+    }
+    .changed_addresses(previous)
+    .into_iter()
+    .collect();
+
+    let by_placement: HashMap<(u32, u64), &blinker_cache::Entry> = previous
+        .entries
+        .iter()
+        .filter_map(|entry| entry.ranges.first().map(|r| ((r.section, r.start), entry)))
+        .collect();
+
+    // One probe per distinct file: an archive is proven unchanged once, not
+    // once per member pulled out of it.
+    let mut keys: HashMap<&Path, Option<blinker_cache::InputKey>> = HashMap::new();
+    let mut entries = HashMap::new();
+    for object in objects {
+        let ranges = object_ranges(image, object.parsed.id);
+        let Some(first) = ranges.first() else {
+            continue;
+        };
+        let Some(entry) = by_placement.get(&(first.section, first.start)) else {
+            continue;
+        };
+        let path = object.parsed.metadata.path.as_path();
+        let Some(key) = keys
+            .entry(path)
+            .or_insert_with(|| blinker_cache::InputKey::probe(path))
+            .clone()
+        else {
+            continue;
+        };
+        if entry.is_reusable(&key, &ranges, &changed) {
+            entries.insert(object.parsed.id.0, *entry);
+        }
+    }
+
+    ReusePlan {
+        entries,
+        sections: previous
+            .sections
+            .iter()
+            .map(|(index, bytes)| (*index, bytes.as_slice()))
+            .collect(),
+    }
+}
+
 /// Assemble the record a later link can reuse.
 ///
 /// Built after relocation, from what that pass already produced: the patched
@@ -1049,14 +1182,10 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
 /// here is computed for the cache's sake alone except the input keys and the
 /// hashing of names, which is why writing a cache costs a fraction of using
 /// one.
-#[allow(clippy::too_many_arguments)]
 fn build_cache(
     objects: &[LoadedObject],
     image: &Image,
-    addresses: &AddressMap,
-    got_slots: &HashMap<String, u64>,
-    stub_slots: &HashMap<String, u64>,
-    tlv_slots: &HashMap<String, u64>,
+    addresses: Vec<(blinker_cache::NameHash, u64)>,
     contents: &SectionContents,
     patched: &Patched,
 ) -> blinker_cache::LinkCache {
@@ -1108,7 +1237,7 @@ fn build_cache(
 
     blinker_cache::LinkCache {
         entries,
-        addresses: address_table(addresses, got_slots, stub_slots, tlv_slots),
+        addresses,
         sections,
     }
 }
@@ -1987,6 +2116,8 @@ fn apply_relocations(
     // their names costs 1.9 ms on a 27.6 ms link — worth paying to *write* a
     // cache, and pure waste on a link that will not.
     record: bool,
+    // Objects whose patched bytes a previous link already produced.
+    reuse: Option<&ReusePlan<'_>>,
 ) -> Result<Patched, LinkError> {
     let mut extra_rebases = Vec::new();
     let IndirectTables {
@@ -2030,6 +2161,38 @@ fn apply_relocations(
         // relocations — an object typically has several times more of the
         // latter.
         let mut referenced: HashSet<(u32, u8)> = HashSet::new();
+
+        // The whole point of the cache: this object's bytes were relocated by
+        // a previous link, nothing it reads has moved, and it has not moved
+        // itself — so copy them and skip every relocation it holds.
+        if let Some(entry) = reuse.and_then(|plan| plan.entry(object.parsed.id)) {
+            let plan = reuse.expect("just matched");
+            if copy_cached_bytes(entry, plan, &mut contents) {
+                extra_binds.extend(entry.binds.iter().map(|bind| Bind {
+                    segment: bind.segment,
+                    offset: bind.offset,
+                    symbol: bind.symbol.clone(),
+                    library_ordinal: bind.library_ordinal,
+                    addend: bind.addend,
+                }));
+                extra_rebases.extend(entry.rebases.iter().map(|rebase| Rebase {
+                    segment: rebase.segment,
+                    offset: rebase.offset,
+                }));
+                if record {
+                    records.push(ObjectRecord {
+                        object: object.parsed.id,
+                        deps: entry.deps.clone(),
+                        binds: bind_start..extra_binds.len(),
+                        rebases: rebase_start..extra_rebases.len(),
+                    });
+                }
+                continue;
+            }
+            // The cached bytes did not fit where they claimed to. Nothing is
+            // wrong with the link, only with the cache, so fall through and
+            // relocate this object as though there had been no entry at all.
+        }
 
         // Indexed rather than iterated: `SUBTRACTOR` is one half of a pair and
         // needs the relocation that follows it, so the loop has to be able to
@@ -2488,7 +2651,15 @@ fn entry_offset(
 
 /// Convenience: link and write the result.
 pub fn link_to_file(request: &LinkRequest, output: &Path) -> Result<Image, LinkError> {
-    let image = link(request)?;
+    link_to_file_timed(request, output).map(|(image, _)| image)
+}
+
+/// As [`link_to_file`], reporting what the link did.
+pub fn link_to_file_timed(
+    request: &LinkRequest,
+    output: &Path,
+) -> Result<(Image, LinkTimings), LinkError> {
+    let (image, timings) = link_timed(request)?;
     std::fs::write(output, &image.bytes).map_err(|source| LinkError::Write {
         path: output.to_path_buf(),
         source,
@@ -2503,5 +2674,5 @@ pub fn link_to_file(request: &LinkRequest, output: &Path) -> Result<Image, LinkE
             },
         )?;
     }
-    Ok(image)
+    Ok((image, timings))
 }
