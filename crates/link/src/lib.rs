@@ -2347,32 +2347,89 @@ fn load_objects(paths: &[PathBuf]) -> Result<Vec<LoadedObject>, LinkError> {
         probed.extend(wanted.iter().cloned());
         let mut added = false;
 
+        // Which members this round wants, in the order it wants them. Chosen
+        // before any of them is parsed, so the ids below are assigned by
+        // position and no thread's timing can reach the output.
+        let mut round: Vec<(usize, blinker_archive::MemberId)> = Vec::new();
         for name in &wanted {
-            for (archive_index, (path, index, data)) in archives.iter().enumerate() {
+            for (archive_index, (_, index, _)) in archives.iter().enumerate() {
                 let Some(member_id) = index.member_defining(name) else {
                     continue;
                 };
                 if !extracted.insert((archive_index, member_id.0)) {
                     continue; // already in the link
                 }
-                let Some(member) = index.member(member_id) else {
-                    continue;
-                };
-                let bytes = blinker_archive::member_data(data, member, path)
-                    .map_err(|source| LinkError::Archive(Box::new(source)))?;
-                let parsed = parse_object(bytes, path, Some(&member.name), ObjectId(next_id))
-                    .map_err(|source| LinkError::Parse(Box::new(source)))?;
-                next_id += 1;
-                let start = member.offset as usize;
-                let loaded = LoadedObject {
-                    parsed,
-                    data: SourceBytes::window(data, start..start + bytes.len()),
-                };
-                frontier.absorb(&loaded);
-                objects.push(loaded);
-                added = true;
+                round.push((archive_index, member_id));
                 break;
             }
+        }
+        if round.is_empty() {
+            return Ok(objects);
+        }
+
+        // Parsing a member touches nothing shared. A round is typically
+        // dozens of them and a Rust link has 900 in total, all of which were
+        // parsed one after another on one thread.
+        let base = next_id;
+        next_id += round.len() as u32;
+        let round = &round;
+        let archives_ref = &archives;
+        let parsed: Vec<Result<LoadedObject, LinkError>> = {
+            let cursor = std::sync::atomic::AtomicUsize::new(0);
+            let threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(round.len());
+            let claimed: Vec<Vec<(usize, Result<LoadedObject, LinkError>)>> =
+                std::thread::scope(|scope| {
+                    let workers: Vec<_> = (0..threads.max(1))
+                        .map(|_| {
+                            let cursor = &cursor;
+                            scope.spawn(move || {
+                                let mut mine = Vec::new();
+                                loop {
+                                    let at =
+                                        cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if at >= round.len() {
+                                        return mine;
+                                    }
+                                    let (archive_index, member_id) = round[at];
+                                    let (path, index, data) = &archives_ref[archive_index];
+                                    mine.push((
+                                        at,
+                                        parse_member(
+                                            path,
+                                            index,
+                                            data,
+                                            member_id,
+                                            ObjectId(base + at as u32),
+                                        ),
+                                    ));
+                                }
+                            })
+                        })
+                        .collect();
+                    workers
+                        .into_iter()
+                        .map(|worker| worker.join().expect("a member parser panicked"))
+                        .collect()
+                });
+            let mut ordered: Vec<Option<Result<LoadedObject, LinkError>>> =
+                (0..round.len()).map(|_| None).collect();
+            for (at, result) in claimed.into_iter().flatten() {
+                ordered[at] = Some(result);
+            }
+            ordered
+                .into_iter()
+                .map(|slot| slot.expect("every member was visited"))
+                .collect()
+        };
+
+        for loaded in parsed {
+            let loaded = loaded?;
+            frontier.absorb(&loaded);
+            objects.push(loaded);
+            added = true;
         }
 
         if !added {
@@ -2419,6 +2476,28 @@ fn resolve_symbols(objects: &[LoadedObject], imports: &[String]) -> Result<Symbo
         });
     }
     Ok(table)
+}
+
+/// Read and parse one archive member.
+fn parse_member(
+    path: &Path,
+    index: &blinker_archive::ArchiveIndex,
+    data: &std::sync::Arc<Vec<u8>>,
+    member_id: blinker_archive::MemberId,
+    id: ObjectId,
+) -> Result<LoadedObject, LinkError> {
+    let member = index
+        .member(member_id)
+        .ok_or(LinkError::MissingObject { object: id })?;
+    let bytes = blinker_archive::member_data(data, member, path)
+        .map_err(|source| LinkError::Archive(Box::new(source)))?;
+    let parsed = parse_object(bytes, path, Some(&member.name), id)
+        .map_err(|source| LinkError::Parse(Box::new(source)))?;
+    let start = member.offset as usize;
+    Ok(LoadedObject {
+        parsed,
+        data: SourceBytes::window(data, start..start + bytes.len()),
+    })
 }
 
 /// Every input section that belongs in the output, in object order.
