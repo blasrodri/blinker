@@ -106,7 +106,13 @@ pub struct ArchiveMember {
 pub struct ArchiveIndex {
     pub path: PathBuf,
     pub members: Vec<ArchiveMember>,
-    /// Symbol name → the member defining it, from the archive symbol table.
+    /// Symbol name → the member defining it, from the archive symbol table,
+    /// **sorted by name**.
+    ///
+    /// Sorted so that `member_defining` can binary-search it. The archive's own
+    /// order carries no meaning here — it is a lookup table, and the ordering
+    /// that matters for resolution is the order of `members`, which is
+    /// untouched.
     ///
     /// Empty when the archive has no symbol table, which is not an error: the
     /// resolver then falls back to examining linkable members directly.
@@ -127,10 +133,29 @@ impl ArchiveIndex {
     }
 
     /// Which member defines `symbol`, according to the archive symbol table.
+    ///
+    /// # Why this binary-searches
+    ///
+    /// Scanning is fine for one question and quadratic for the way a linker
+    /// actually asks: every still-undefined name, against every archive, once
+    /// per extraction round. `libstd.rlib` lists tens of thousands of symbols,
+    /// and on blinker's own binary that scan was **25 ms of a 148 ms link** —
+    /// the second-largest cost in it, inside a function that reads like a
+    /// lookup (finding 78).
+    ///
+    /// A sorted `Vec` rather than a `HashMap` because the table is built once
+    /// and read many times, it stays serialisable, and it costs no second copy
+    /// of every symbol name.
     pub fn member_defining(&self, symbol: &str) -> Option<MemberId> {
+        // `partition_point` rather than `binary_search`: an archive may list a
+        // name more than once, and the first definition has to win exactly as
+        // it did when this was a forward scan.
+        let at = self
+            .symbol_map
+            .partition_point(|(name, _)| name.as_str() < symbol);
         self.symbol_map
-            .iter()
-            .find(|(name, _)| name == symbol)
+            .get(at)
+            .filter(|(name, _)| name == symbol)
             .map(|(_, id)| *id)
     }
 
@@ -183,7 +208,11 @@ pub fn index_archive(data: &[u8], path: &Path) -> Result<ArchiveIndex, ArchiveEr
         });
     }
 
-    let symbol_map = parse_symbol_map(&archive, &members);
+    let mut symbol_map = parse_symbol_map(&archive, &members);
+    // Sorted for lookup. Stable, so that a name listed twice keeps the earlier
+    // member first and `member_defining` still resolves it the way a forward
+    // scan of the archive's own order would have.
+    symbol_map.sort_by(|(a, _), (b, _)| a.cmp(b));
 
     Ok(ArchiveIndex {
         path: path.to_path_buf(),

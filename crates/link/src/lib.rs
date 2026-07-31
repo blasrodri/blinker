@@ -1126,6 +1126,57 @@ fn needs_got(kind: Arm64RelocationKind) -> bool {
 /// table of every object, four times, to answer a question about set
 /// membership. The sets borrow now, and only the handful of names actually
 /// returned are copied.
+/// The names still looking for a definition, carried as members arrive.
+///
+/// Pulling an archive member can only *satisfy* the names it defines and
+/// *raise* the ones it references, so recomputing the whole undefined set from
+/// every symbol of every object each round is work proportional to the link
+/// rather than to what changed.
+///
+/// This was built once before, measured on a 47-object fixture, found to be
+/// worth nothing, and reverted (76) — the fixture had four rounds over 47
+/// objects, where the scan is cheap and owning the names is not. On blinker's
+/// own binary it is **eleven rounds over 921 objects, 22.7 ms**, and the
+/// trade reverses completely. Same code, same reasoning, opposite answer,
+/// because the workload was two orders of magnitude apart (77).
+struct Frontier {
+    defined: HashSet<String>,
+    /// Ordered, so which member is pulled first — and therefore what object id
+    /// it gets — never depends on a hash seed.
+    wanted: BTreeSet<String>,
+}
+
+impl Frontier {
+    fn new(objects: &[LoadedObject]) -> Frontier {
+        let mut frontier = Frontier {
+            defined: HashSet::new(),
+            wanted: BTreeSet::new(),
+        };
+        for object in objects {
+            frontier.absorb(object);
+        }
+        frontier
+    }
+
+    /// Fold one newly arrived object in.
+    ///
+    /// Definitions first: a symbol defined later in the same object satisfies a
+    /// reference made earlier in it, and one pass would leave the name wanted
+    /// and pull a member to define what had just arrived.
+    fn absorb(&mut self, object: &LoadedObject) {
+        for symbol in &object.parsed.symbols {
+            if symbol.strength.is_definition() && self.defined.insert(symbol.name.clone()) {
+                self.wanted.remove(&symbol.name);
+            }
+        }
+        for symbol in &object.parsed.symbols {
+            if !symbol.strength.is_definition() && !self.defined.contains(&symbol.name) {
+                self.wanted.insert(symbol.name.clone());
+            }
+        }
+    }
+}
+
 fn undefined_references(objects: &[LoadedObject]) -> Vec<String> {
     let mut defined: HashSet<&str> = HashSet::new();
     for object in objects {
@@ -2264,8 +2315,19 @@ fn load_objects(paths: &[PathBuf]) -> Result<Vec<LoadedObject>, LinkError> {
 
     // Pull members in until nothing new is needed.
     let mut extracted: std::collections::HashSet<(usize, u32)> = std::collections::HashSet::new();
+    let mut frontier = Frontier::new(&objects);
+    // Names already offered to every archive. One that no archive defines will
+    // still be wanted next round, and asking again cannot produce a different
+    // answer — the archives do not change.
+    let mut probed: HashSet<String> = HashSet::new();
     loop {
-        let wanted = undefined_references(&objects);
+        let wanted: Vec<String> = frontier
+            .wanted
+            .iter()
+            .filter(|name| !probed.contains(*name))
+            .cloned()
+            .collect();
+        probed.extend(wanted.iter().cloned());
         let mut added = false;
 
         for name in &wanted {
@@ -2285,10 +2347,12 @@ fn load_objects(paths: &[PathBuf]) -> Result<Vec<LoadedObject>, LinkError> {
                     .map_err(|source| LinkError::Parse(Box::new(source)))?;
                 next_id += 1;
                 let start = member.offset as usize;
-                objects.push(LoadedObject {
+                let loaded = LoadedObject {
                     parsed,
                     data: SourceBytes::window(data, start..start + bytes.len()),
-                });
+                };
+                frontier.absorb(&loaded);
+                objects.push(loaded);
                 added = true;
                 break;
             }
