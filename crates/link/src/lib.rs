@@ -36,6 +36,7 @@
 #![deny(clippy::print_stderr, clippy::print_stdout)]
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use blinker_layout::InputPlacement;
@@ -3491,20 +3492,46 @@ fn reuse_finished_image(
     }))
 }
 
+/// Write the finished image, replacing the previous one only once it is whole.
+///
+/// Writing straight to the output path truncates it before the first byte
+/// lands, so a link killed partway — `^C`, a full disk, a panic — replaces a
+/// working executable with a fragment. The spec calls for the opposite: a
+/// failed or cancelled link must leave the previous output intact.
+///
+/// So the bytes go to a temporary file beside the target and are renamed over
+/// it, which POSIX guarantees is atomic within a filesystem. Beside it, rather
+/// than in `/tmp`, because a rename across filesystems is not a rename — it is
+/// a copy, and the guarantee is lost exactly where the output is large.
 fn write_output(bytes: &[u8], output: &Path) -> Result<(), LinkError> {
-    std::fs::write(output, bytes).map_err(|source| LinkError::Write {
+    let failed = |source: std::io::Error| LinkError::Write {
         path: output.to_path_buf(),
         source,
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(output, std::fs::Permissions::from_mode(0o755)).map_err(
-            |source| LinkError::Write {
-                path: output.to_path_buf(),
-                source,
-            },
-        )?;
-    }
-    Ok(())
+    };
+    // The pid keeps concurrent links to different outputs in one directory
+    // from colliding, and the file name keeps two links to the *same*
+    // directory from sharing a temporary.
+    let name = output.file_name().unwrap_or_else(|| OsStr::new("a.out"));
+    let mut temporary = name.to_os_string();
+    temporary.push(format!(".blinker-{}.tmp", std::process::id()));
+    let temporary = output.with_file_name(temporary);
+
+    let write = || -> std::io::Result<()> {
+        std::fs::write(&temporary, bytes)?;
+        // Set on the temporary, so the file is never visible at the output
+        // path without its permissions.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o755))?;
+        }
+        std::fs::rename(&temporary, output)
+    };
+
+    write().map_err(|source| {
+        // A failure leaves the previous output untouched; the temporary is the
+        // only casualty and must not be left behind.
+        let _ = std::fs::remove_file(&temporary);
+        failed(source)
+    })
 }
