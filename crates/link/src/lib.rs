@@ -1196,12 +1196,15 @@ impl Frontier {
     /// result depends on how many allocations it performed, so this is a
     /// change of cost and not of meaning.
     ///
-    /// **It measures zero on the 60-input link this repository benchmarks**:
-    /// two interleaved runs gave -0.6 ms and +0.7 ms, disagreeing in sign. The
-    /// 5.9 ms it targets was measured on a 921-object link (finding 83), which
-    /// is not the workload set up here. Kept because it is a reordering with
-    /// no new machinery rather than because a number says it helps — and said
-    /// plainly so nobody later reads a win into it.
+    /// **It measures zero, and now on three workloads rather than one.** Two
+    /// interleaved runs on a 60-input link gave -0.6 ms and +0.7 ms; the
+    /// defence offered at the time was that the 5.9 ms it targets had been
+    /// measured on a 921-object link (finding 83) and no such workload was set
+    /// up here. One is now (`scripts/workload.py`), and the answer did not
+    /// change: +0.5 ms at 681 objects, +0.1 ms at 745, against a noise floor
+    /// of 0.3 ms. Kept because it is a reordering with no new machinery rather
+    /// than because a number says it helps — said plainly so nobody reads a
+    /// win into it, and now so nobody re-derives the 5.9 ms either.
     fn absorb(&mut self, object: &LoadedObject) {
         for symbol in &object.parsed.symbols {
             if !symbol.strength.is_definition() || self.defined.contains(symbol.name.as_str()) {

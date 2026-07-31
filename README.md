@@ -58,16 +58,32 @@ number here, including these, as a claim about one workload.
 
 ## Measuring it
 
+Build a workload first. It is rebuilt from the repository rather than found
+lying around, because every workload this project measured before finding 93
+was archived into a temporary directory and is gone:
+
 ```bash
-# capture a real link's arguments with a shim linker, then:
-scripts/bench.py <captured-args>            # blinker vs the system linker
-scripts/bench.py <captured-args> --profile  # blinker's own stage breakdown
+scripts/workload.py self                     # blinker linking itself, release
+scripts/workload.py self-debug --profile debug
+scripts/workload.py rg --project ~/src/ripgrep
 ```
 
-The harness interleaves both linkers, discards warmup, verifies every run
-succeeded, and reports spread. Each of those exists because an earlier version
-without it produced a wrong number that was believed — see the header of
-`scripts/bench.py`.
+Each lands in `target/workloads/<name>/` with an `argv.txt`, a copy of every
+input, and a manifest. Then:
+
+```bash
+scripts/bench.py  target/workloads/self/argv.txt            # vs the system linker
+scripts/bench.py  target/workloads/self/argv.txt --profile  # stage breakdown
+scripts/ab.py     target/workloads/self/argv.txt A B        # two blinker builds
+scripts/ab.py     target/workloads/self/argv.txt A A        # the noise floor
+```
+
+The harnesses interleave the arms, discard warmup, verify every run succeeded,
+and report spread. Each of those exists because an earlier version without it
+produced a wrong number that was believed — see the header of
+`scripts/bench.py`. `scripts/ab.py` reports the link and the process around it
+separately, because on a 60 ms run 20 ms of it is spawn and page cache, and
+measuring that as though it were linking spreads the result by 42%.
 
 ## Requirements
 

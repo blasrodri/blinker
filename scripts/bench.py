@@ -119,10 +119,15 @@ def profile(args, options):
     out_index = blinker_args.index("-o") + 1
     blinker_args[out_index] = "/tmp/bench_profile"
 
+    # Every stage the record reports. A stage missing from this table is not
+    # absent from the link, it is silently folded into `unmeasured` — which is
+    # where dead-strip sat for as long as it took someone to notice that 23% of
+    # the link was unaccounted for.
     stages = {
         "read+parse": "link_read_and_parse_ms",
         "resolve": "link_resolve_ms",
         "layout": "link_layout_ms",
+        "dead-strip": "link_dead_strip_ms",
         "relocate": "link_relocate_ms",
         "emit+sign": "link_emit_ms",
     }

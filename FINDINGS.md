@@ -4395,3 +4395,92 @@ next performance question worth asking is not which micro-cost to attack but
 whether the 60-input benchmark can still see the answer — finding 77 recorded
 the same failure one scale down, when a twelve-object fixture could not show a
 quadratic linker.
+
+## 93. The benchmark could see the answer; the harness was measuring the wrong thing
+
+Finding 92 ended by asking whether the 60-input link could still resolve a
+2% change, and named a 921-object workload as the thing that would settle it.
+Building that workload turned up two answers, and the first one was not about
+scale at all.
+
+### Every workload this project ever measured had already evaporated
+
+`corpus/` holds thirteen recorded invocations. Every one of them names an
+inputs directory, and **all thirteen are gone** — they were archived under
+`/private/tmp/.../scratchpad/`, which is where the operating system reclaims
+things. The records survived because they are small text. The 89 MB of object
+files they describe did not.
+
+So the workload behind findings 77–83 could not be re-run, and neither could
+any of the twelve others. That is not a filing accident: it is why finding 92
+had to leave its question open, and it made every number in this file a claim
+nobody could check.
+
+`scripts/workload.py` builds one from nothing but the repository and cargo. It
+drives the machinery that already existed for this — `--blinker-record-invocation`
+archives inputs precisely because rustc deletes them the instant the link
+returns — and writes `target/workloads/<name>/`, which is gitignored but lives
+in the repository rather than in a temporary directory.
+
+```
+  self         61 files    681 objects   59.5 MB   (release)
+  self-debug  132 files    745 objects   34.6 MB   (debug)
+```
+
+Three details in that script are load-bearing rather than tidy: the linker is
+**copied** before the build, because capturing this repository's own link has
+cargo rewrite the binary it is executing; the build gets its **own target
+directory**, so capturing a workload cannot invalidate the repository's build;
+and the result is **verified to link with both linkers** before it is written,
+because a workload that fails produces timings, and produces them fast (75).
+
+### The noise was in the harness, not the workload
+
+The new workload's first measurement spread 42% around its median — far worse
+than the 60-input link it was meant to replace. It was not the workload:
+
+```
+  wall clock (spawn to exit)      sd 1.5 ms on 41    spread 17%
+  the link itself (own record)    sd 0.5 ms on 31    spread 11%
+```
+
+Twenty of the sixty milliseconds are process spawn, dyld, and the kernel
+handing over 59 MB of page cache. Real cost — but cost that does not move when
+the linker moves, so it is variance laid on top of the signal. Every A/B in
+findings 84–92 was taken through it.
+
+Measured from blinker's own record instead, **the noise floor is ±0.3 ms on a
+31 ms link**, roughly 1% — a sharper instrument than the workload it replaced,
+not a blunter one. `scripts/ab.py` now reports both arms, and running it with
+the same binary twice measures the floor directly.
+
+### With that fixed, the answers
+
+The session's four optimisation commits, re-measured at scale:
+
+```
+                        before    after     delta
+  60 inputs             46.3      38.2      -8.1 ms   -17.5%
+  681 objects           35.8      29.9      -5.9 ms   -16.5%
+  745 objects, debug    39.6      33.1      -6.5 ms   -16.4%
+```
+
+Stable to within half a percentage point across three workloads and two build
+profiles. The changes were proportional, and the small workload had been
+telling the truth about them.
+
+And the change finding 92 kept as an explicit null result, `Frontier::absorb`,
+re-measured on the workload whose absence was its defence: **+0.5 ms at 681
+objects, +0.1 ms at 745**, against a 0.3 ms floor. It does not help at any
+scale reachable here. It stays, for the reason already recorded — no new
+machinery — and its comment now says it was retested rather than leaving the
+921-object figure standing as an unpaid promise.
+
+### The rule
+
+Finding 77 said a fixture is a claim about scale and it expires. This is the
+other half: **a workload that cannot be rebuilt has already expired, and a
+harness is part of the instrument.** The 42% spread was not noise to average
+away over more iterations; it was 20 ms of process startup being measured as
+though it were linking, and no amount of interleaving removes a constant that
+large. Measure the thing that changes.
