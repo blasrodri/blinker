@@ -263,13 +263,53 @@ fn build_code_directory(image: &[u8], request: &SignatureRequest, code_slots: us
     // One SHA-256 per page of the covered region. The final page is short
     // unless code_limit happens to be page-aligned, and is hashed at its real
     // length rather than padded.
+    //
+    // # Why this is threaded
+    //
+    // A profile of the linker found `sha256::compress256` to be its single
+    // largest cost — larger than reading every input from disk. It is also the
+    // most parallel thing the linker does: each page's hash depends on that
+    // page and nothing else, so there is no ordering to preserve and no state
+    // to share.
+    //
+    // Determinism is by construction rather than by care: every slot writes to
+    // its own index in a pre-sized vector, so no thread's timing can reach the
+    // output. The bytes are identical to the serial version's, which
+    // `the_threaded_hashes_match_the_serial_ones` checks rather than assumes.
     let limit = request.code_limit as usize;
-    for slot in 0..code_slots {
+    let hash_page = |slot: usize, out: &mut [u8; HASH_SIZE]| {
         let start = slot * PAGE_SIZE;
         let end = ((slot + 1) * PAGE_SIZE).min(limit);
-        let mut hasher = Sha256::new();
-        hasher.update(&image[start..end]);
-        cd.extend_from_slice(&hasher.finalize());
+        out.copy_from_slice(&Sha256::digest(&image[start..end]));
+    };
+
+    let mut hashes = vec![[0u8; HASH_SIZE]; code_slots];
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(code_slots.max(1));
+    if threads <= 1 {
+        for (slot, out) in hashes.iter_mut().enumerate() {
+            hash_page(slot, out);
+        }
+    } else {
+        // Contiguous runs rather than a shared cursor: pages are equal-cost,
+        // so there is nothing for work-stealing to balance, and a `chunks_mut`
+        // split hands each thread a disjoint slice the borrow checker can
+        // prove is disjoint.
+        let per_thread = code_slots.div_ceil(threads);
+        std::thread::scope(|scope| {
+            for (chunk, run) in hashes.chunks_mut(per_thread).enumerate() {
+                let hash_page = &hash_page;
+                scope.spawn(move || {
+                    for (offset, out) in run.iter_mut().enumerate() {
+                        hash_page(chunk * per_thread + offset, out);
+                    }
+                });
+            }
+        });
+    }
+    for hash in &hashes {
+        cd.extend_from_slice(hash);
     }
 
     debug_assert_eq!(cd.len(), length);
@@ -327,6 +367,46 @@ mod tests {
     }
 
     /// Each code slot must hold the SHA-256 of its page of the file.
+    #[test]
+    fn the_threaded_hashes_match_the_serial_ones() {
+        // Large enough to be split across every core, and not a multiple of
+        // the page size, so the short final page is covered too.
+        let image: Vec<u8> = (0..PAGE_SIZE * 40 + 123).map(|i| (i * 7) as u8).collect();
+        let request = SignatureRequest {
+            identifier: "threaded".into(),
+            code_limit: image.len() as u64,
+            exec_segment_base: 0,
+            exec_segment_limit: 0,
+        };
+        let slots = code_slot_count(request.code_limit);
+        let directory = build_code_directory(&image, &request, slots);
+
+        let base = hash_offset(&request.identifier);
+        for slot in 0..slots {
+            let start = slot * PAGE_SIZE;
+            let end = ((slot + 1) * PAGE_SIZE).min(image.len());
+            let at = base + slot * HASH_SIZE;
+            assert_eq!(
+                &directory[at..at + HASH_SIZE],
+                &Sha256::digest(&image[start..end])[..],
+                "slot {slot} of {slots} does not hold its page's hash"
+            );
+        }
+    }
+
+    /// Threading must not make the output depend on how the work was split.
+    #[test]
+    fn signing_the_same_image_twice_produces_the_same_bytes() {
+        let image: Vec<u8> = (0..PAGE_SIZE * 33 + 9).map(|i| (i * 13) as u8).collect();
+        let request = SignatureRequest {
+            identifier: "stable".into(),
+            code_limit: image.len() as u64,
+            exec_segment_base: 0,
+            exec_segment_limit: 0,
+        };
+        assert_eq!(sign(&image, &request), sign(&image, &request));
+    }
+
     #[test]
     fn code_slots_hold_the_hash_of_each_page() {
         let limit = 40_000usize;

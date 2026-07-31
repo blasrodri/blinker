@@ -4295,3 +4295,41 @@ The half the comment had ruled out was worth as much as the half it allowed.
 priority that had been inferred rather than measured, and each inference was
 reasonable. The stage timer was the best instrument available and it was still
 pointing at the wrong stage. Getting a second instrument cost twenty minutes.
+
+## 90. Signing was the largest cost and the most parallel work in the linker
+
+Finding 89's profile put `sha256::compress256` at the top — above reading every
+input from disk. It is also the most parallel thing the linker does: each
+page's hash depends on that page and nothing else.
+
+```
+  serial page hashing     43.9 ms
+  threaded                41.0 ms      -2.9 ms  (6.6%)
+```
+
+Determinism is by construction rather than by care: every slot writes to its
+own index in a pre-sized vector, so no thread's timing can reach the output.
+Two tests hold that — one comparing every slot against a serial `Sha256` of the
+same page, one signing the same image twice and comparing the bytes.
+
+**Less than the profile suggested, and the reason is worth recording.** 2259 of
+~14 000 samples is 16% of self time, and this took 6.6% off the wall clock.
+Profiler self-time counts where the CPU was, not what the wall clock was
+waiting for — and the same profile has 2831 samples in `read`/`open`/`close`,
+which no amount of threading the hashing overlaps with. A share of CPU time is
+an upper bound on what removing that CPU time can buy, not a prediction.
+
+Cumulative for the session's performance work, all interleaved against the
+unchanged linker on the same 60-input link:
+
+```
+  fast hashing, (object, section) maps    -2.5 ms
+  fast hashing, names included            -2.7 ms
+  threaded page hashing                   -2.9 ms
+  quadratic scan in build_contents         0    ms   (kept; asymptotic only)
+                                          -8.1 ms of 46.3   (17.5%)
+```
+
+What remains at the top of the profile is the part threading cannot touch:
+file I/O, which is the daemon's problem, and the allocator, which is the
+owned-`String` representation finding 82 named.
