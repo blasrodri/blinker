@@ -4109,3 +4109,112 @@ the status of. Four now work and are tested: breakpoint-by-name has the
 symbols to resolve against, and stack traces, source-line display, panic
 backtraces and test-failure backtraces all produce what `ld`'s output does.
 Full `.dSYM` production remains out of scope, as §23 allows.
+
+## 87. The largest hidden stage, and what it was hiding
+
+`dead_strip_ms` was measured inside the link and dropped on the way out: the
+record carried five stages that summed to well under the link's own total, and
+nothing said where the rest went. Plumbing it through is four lines. What it
+showed made the plan for the next three days wrong.
+
+The whole link, on a 60-input Rust workload (blinker linking itself):
+
+```
+  read+parse    7.94   22.2%
+  emit+sign     7.36   20.6%
+  relocate      6.71   18.8%
+  dead-strip    4.82   13.5%
+  unaccounted   3.92   11.0%
+  layout        2.58    7.2%
+  resolve       2.40    6.7%
+                              35.7 ms
+```
+
+Dead-strip is **4.8 ms, not the 21 ms** the plan called it. The 21 ms came from
+a different, larger workload and had been carried forward as though it were a
+property of the linker. It is fourth, not first.
+
+The rule: a number measured on one workload is a fact about that workload. It
+stops being evidence the moment the workload changes, and carrying it forward
+is how a plan comes to be about a linker that does not exist.
+
+## 88. A one-crate edit reused nine relocations out of eighty-three thousand
+
+With the stage visible, the next question was what an *edit* relink costs. The
+first attempt answered 1.38 ms and reused everything — measuring the second
+link, not the first: after one edit the inputs stop changing, so iterations two
+and three replayed a cached whole image. Alternating the edited rlib between
+two versions so every iteration really is an edit:
+
+```
+  reused_inputs           1 of 105
+  reused_relocations      9 of 83 687
+  wall                   55.2 ms      against a 35.7 ms cold link
+```
+
+The incremental path was **slower than the cold path**, on the workload it
+exists for, while reporting `mode: incremental`.
+
+**First hypothesis, refuted:** dead-stripping compacts each section to exactly
+its surviving bytes, so a liveness change anywhere resizes contributions
+everywhere — which would defeat the reserved slack. Re-running with
+`-dead_strip` removed: still 1 input, still 9 relocations. Not it. Five minutes
+to test, and it would have been a day to build the fix for.
+
+**What it actually was**, found by asking the only question that separates the
+candidates — does the edit move addresses? — and answering it by diffing the
+two images:
+
+```
+  symbols in both  2413      moved  1381  (57.2%)
+
+  __TEXT,__text        100000900 -> 100000900   1016064 -> 1015296   changed size
+  __TEXT,__stubs       1000f8a00 -> 1000f8700      1536 ->    1536   moved
+  __TEXT,__const       1000f9000 -> 1000f8d00    220672 ->  220672   moved
+  __TEXT,__cstring     100139e00 -> 100139b00     36352 ->   36352   moved
+  ... six more, all moved by exactly 0x300, none changed size
+```
+
+`__text` changed by 768 bytes and every section after it slid by exactly that,
+with their own sizes unchanged to the byte. The cache matches an object's
+cached bytes by *where they landed*, so almost nothing matched.
+
+Slop reserved padding after each contribution — inside a section. Nothing
+reserved anything between sections, so the stabilisation stopped at the first
+section boundary. Padding the *gap* fixes it, and padding the gap rather than
+the sections is what makes it safe: nothing reads the gap, so no section's size
+or internal structure changes. That is not a detail — a padded `__eh_frame`
+dies in the unwinder and dyld rejects a `__thread_vars` whose size is not a
+multiple of its record size, both learned the hard way (finding 80).
+
+Choosing the stride, by the two things that trade against each other:
+
+```
+  stride    relocations reused    image      edit relink
+   none            9 of 83687     1775 KB      55.2 ms
+   1 KB            9 of 83687     1920 KB      57.9 ms     all cost, no benefit
+   4 KB       13 123 of 83687     1952 KB      51.1 ms
+  16 KB       13 123 of 83687     2096 KB      51.1 ms     144 KB for nothing
+```
+
+4 KB. The arm64 page is 16 KB and buys nothing beyond 4 KB; 1 KB is smaller
+than the shift one edit produces, so it pays the space and stabilises nothing —
+which is worth recording, because 1 KB is the value a reasonable person would
+have picked without measuring.
+
+**Where this leaves it.** 9 relocations to 13 123, and 55.2 ms to 51.1. Both
+real, neither large: 84% of relocations still miss, because `__text` itself
+changed size and everything after the edited crate's contribution *within* it
+still moved.
+
+**And the honest conclusion, which is the useful part.** Contribution slop
+cannot close that gap. Reserving enough slack per contribution to absorb a real
+code change means reserving kilobytes each, and a Rust link has thousands of
+contributions — tens of megabytes of padding to save a few milliseconds. The
+approach does not scale, and no amount of tuning makes it.
+
+The spec already says what does: Stage E is "reuse the previous output layout
+when possible … avoid moving unchanged content" — *reuse* it, not recompute it
+with padding and hope the result matches. Place the changed object's sections
+into a hole or at the end and leave every other address exactly as it was. That
+is a different mechanism from the one built here, and it is the next one.

@@ -72,9 +72,31 @@ pub struct PhaseTimings {
     pub link_read_and_parse_ms: Option<f64>,
     pub link_resolve_ms: Option<f64>,
     pub link_layout_ms: Option<f64>,
+    /// Reachability analysis, when `-dead_strip` was asked for.
+    ///
+    /// Reported because it is one of the two largest stages and was invisible:
+    /// it was measured inside the link and then dropped on the way out, so a
+    /// record showed five stages summing to well under the link's own total
+    /// and nothing saying where the rest went.
+    pub link_dead_strip_ms: Option<f64>,
     pub link_relocate_ms: Option<f64>,
     pub link_emit_ms: Option<f64>,
     pub total_ms: Option<f64>,
+}
+
+/// How long each stage of an internal link took, in milliseconds.
+///
+/// A struct rather than six positional arguments: they are all `f64` and all
+/// milliseconds, so a caller that swapped two would compile and report a
+/// plausible breakdown of the wrong shape.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LinkStages {
+    pub read_and_parse: f64,
+    pub resolve: f64,
+    pub layout: f64,
+    pub dead_strip: f64,
+    pub relocate: f64,
+    pub emit: f64,
 }
 
 fn as_ms(d: Duration) -> f64 {
@@ -169,19 +191,22 @@ impl LinkRecord {
     }
 
     /// Record the internal link's total and its per-stage breakdown.
-    pub fn set_timing_internal_link(
-        &mut self,
-        total: Duration,
-        read_and_parse: f64,
-        resolve: f64,
-        layout: f64,
-        relocate: f64,
-        emit: f64,
-    ) {
+    pub fn set_timing_internal_link(&mut self, total: Duration, stages: LinkStages) {
+        let LinkStages {
+            read_and_parse,
+            resolve,
+            layout,
+            dead_strip,
+            relocate,
+            emit,
+        } = stages;
         self.timings.internal_link_ms = Some(as_ms(total));
         self.timings.link_read_and_parse_ms = Some(read_and_parse);
         self.timings.link_resolve_ms = Some(resolve);
         self.timings.link_layout_ms = Some(layout);
+        // Absent rather than zero when nothing was stripped, so "the stage did
+        // not run" and "the stage was free" stay distinguishable.
+        self.timings.link_dead_strip_ms = (dead_strip > 0.0).then_some(dead_strip);
         self.timings.link_relocate_ms = Some(relocate);
         self.timings.link_emit_ms = Some(emit);
     }
@@ -251,6 +276,7 @@ impl LinkRecord {
         for (label, value) in [
             ("read+parse", self.timings.link_read_and_parse_ms),
             ("resolve", self.timings.link_resolve_ms),
+            ("dead-strip", self.timings.link_dead_strip_ms),
             ("layout", self.timings.link_layout_ms),
             ("relocate", self.timings.link_relocate_ms),
             ("emit+sign", self.timings.link_emit_ms),

@@ -404,6 +404,50 @@ impl Slop {
         let padded = size + (size * self.percent / 100).max(self.floor);
         align_up(padded, Self::STRIDE)
     }
+
+    /// Stride the *next section* starts on.
+    ///
+    /// [`Self::slot_for`] keeps a contribution from moving when its neighbours
+    /// change, and that turned out to stabilise almost nothing: sections are
+    /// laid end to end, so a section that changes size at all moves every
+    /// section after it, and with them every symbol those sections contain. A
+    /// one-line edit to one crate moved **57% of the symbols in the image**,
+    /// because `__text` changed by 768 bytes and the nine sections following
+    /// it — whose own sizes did not change by a byte — all slid by exactly
+    /// that much.
+    ///
+    /// Padding the *gap between* sections rather than the sections themselves
+    /// is what makes this safe. Nothing reads the gap, so no section's size,
+    /// content, or internal structure changes — which matters because several
+    /// of them cannot tolerate padding at all: a padded `__eh_frame` dies in
+    /// the unwinder, and dyld rejects a `__thread_vars` whose size is not a
+    /// multiple of its record size.
+    ///
+    /// # Choosing the stride
+    ///
+    /// Measured on a one-crate edit to a 60-input link, by the two things that
+    /// trade against each other — how many of the previous link's relocations
+    /// stay valid, and how much the image grows:
+    ///
+    /// ```text
+    ///   stride    relocations reused    image
+    ///    none            9 of 83687     1775 KB
+    ///    1 KB            9 of 83687     1920 KB      all cost, no benefit
+    ///    4 KB       13 123 of 83687     1952 KB
+    ///   16 KB       13 123 of 83687     2096 KB      same benefit, 144 KB more
+    /// ```
+    ///
+    /// 4 KB, because 16 KB — the arm64 page — buys nothing beyond it, and 1 KB
+    /// is smaller than the shift a single edit produces, so it pays the space
+    /// and stabilises nothing.
+    const SECTION_STRIDE: u64 = 4096;
+
+    fn section_stride(&self, cursor: u64) -> u64 {
+        if self.percent == 0 && self.floor == 0 {
+            return cursor;
+        }
+        align_up(cursor, Self::SECTION_STRIDE)
+    }
 }
 
 /// Lay out with no padding. See [`compute_layout_with_slop`].
@@ -487,7 +531,7 @@ pub fn compute_layout_with_slop(
         });
     }
 
-    let segments = assign_addresses(&mut sections, &segment_members, header_reservation);
+    let segments = assign_addresses(&mut sections, &segment_members, header_reservation, slop);
     let file_size = segments
         .iter()
         .map(|s| s.file_offset + s.file_size)
@@ -542,6 +586,7 @@ fn assign_addresses(
     sections: &mut [OutputSection],
     segment_members: &BTreeMap<String, Vec<usize>>,
     header_reservation: u64,
+    slop: Slop,
 ) -> Vec<OutputSegment> {
     let mut segments = Vec::new();
 
@@ -585,6 +630,9 @@ fn assign_addresses(
                 Some(segment_file_start + cursor)
             };
             cursor += section.size;
+            // Leave the next section on a stride boundary, so this one
+            // changing size does not move it. See `Slop::section_stride`.
+            cursor = slop.section_stride(cursor);
         }
 
         let content_size = cursor;

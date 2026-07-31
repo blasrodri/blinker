@@ -184,11 +184,14 @@ pub fn run(argv: &[String]) -> Result<Outcome, DriverError> {
         })?;
         record.set_timing_internal_link(
             exec_started.elapsed(),
-            phases.read_and_parse_ms,
-            phases.resolve_ms,
-            phases.layout_probe_ms,
-            phases.relocate_ms,
-            phases.emit_ms,
+            blinker_diagnostics::LinkStages {
+                read_and_parse: phases.read_and_parse_ms,
+                resolve: phases.resolve_ms,
+                layout: phases.layout_probe_ms,
+                dead_strip: phases.dead_strip_ms,
+                relocate: phases.relocate_ms,
+                emit: phases.emit_ms,
+            },
         );
         if wants_dead_strip(&parsed) {
             record.set_dead_strip(phases.stripped_bytes, phases.revived_atoms);
