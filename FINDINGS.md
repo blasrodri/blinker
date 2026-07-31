@@ -2308,3 +2308,59 @@ output and comparing, rather than by reasoning about the format. That approach
 has now found two real bugs (52, and the section ordering in 28) and cleared
 four suspects, at roughly one script each. It is the only technique in this
 project with a positive record.
+
+## 54. Found: LSDA pointers land outside `__gcc_except_tab`
+
+Decoding each FDE's LSDA through its CIE's `L` encoding and checking it against
+the section it must point into:
+
+```
+blinker:   __gcc_except_tab 0x1000a047c..0x1000a2eec
+  FDE@0x94    lsda=0x1000a0529   in __gcc_except_tab
+  FDE@0x9bc4  lsda=0x1000a9e65   *** OUTSIDE ***
+  FDE@0x9c20  lsda=0x1000a9eed   *** OUTSIDE ***
+  FDE@0x9c78  lsda=0x1000a9f81   *** OUTSIDE ***
+
+ld-prime:  __gcc_except_tab 0x100039b88..0x10003ad20
+  every LSDA inside
+```
+
+That is a phase-1 failure exactly: the unwinder finds the frame, calls the
+personality, and the personality reads its action table from an address roughly
+0x7000 past the end of the section that holds them.
+
+**The first LSDA is correct and the later ones are not.** That pattern is the
+tell — the first contribution to `__gcc_except_tab` starts at the section base,
+so an error in the per-contribution offset is invisible there and grows for
+every object after it.
+
+### The likely cause, consistent with finding 30
+
+`__eh_frame`'s LSDA references are `SUBTRACTOR` pairs, and in Mach-O the
+**addend for these is stored inline in the patched field**, not in the
+relocation entry. Finding 30 established exactly this for `__compact_unwind`
+and had to read the inline value by hand; the generic relocation path passes
+`pair.addend` from the parsed relocation, which for these is zero.
+
+The FDE PC-begin fields are also `SUBTRACTOR` pairs and came out *correct* —
+because their addend genuinely is zero: the target is the function symbol
+itself. The LSDA's target is `__gcc_except_tab` **plus an offset**, so its
+addend is non-zero, and dropping it produces precisely this failure.
+
+If that holds, the fix belongs in `apply_relocations`' pair path — read the
+inline value from the field and rebase it out of the input section's coordinate
+space, the same correction finding 30 applied to compact unwind — and it will
+fix every `SUBTRACTOR` pair with a non-zero addend, not just the LSDA.
+
+**Recorded as the leading explanation, not a conclusion.** The evidence for it
+is strong (the first-correct-then-wrong pattern, and the exact precedent in
+finding 30), but this project has six hypotheses that died to measurement. The
+test is to dump one LSDA relocation's inline field value and check whether it
+equals the missing displacement.
+
+### Where this leaves the unwinding chase
+
+Every piece the unwinder touches has now been decoded and compared against
+ld-prime: `__unwind_info` (30, 32), the `__eh_frame` chain (47), CIE
+personalities (52, fixed), FDE ranges (53), and now the LSDA — which is the one
+that is wrong.
