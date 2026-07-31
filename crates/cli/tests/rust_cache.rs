@@ -169,6 +169,18 @@ fn a_rust_relink_reuses_every_object() {
         reused, objects,
         "reused {reused} of {objects} objects on an unchanged relink"
     );
+
+    // And in the unit that means something. Object counts hide the result:
+    // the same revert that this catches reports "46 of 47 objects" — which
+    // reads as a near-perfect hit rate and is 32% of the actual work
+    // (finding 66).
+    let done = warm["counters"]["reused_relocations"]
+        .as_u64()
+        .expect("a count");
+    let all = warm["counters"]["total_relocations"]
+        .as_u64()
+        .expect("a count");
+    assert_eq!(done, all, "skipped {done} of {all} relocations");
     assert_eq!(warm["mode"], "incremental");
     assert_eq!(
         first,

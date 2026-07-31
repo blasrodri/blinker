@@ -68,6 +68,15 @@ pub struct LinkTimings {
     /// rlibs on the command line can become 200 objects in the link, and a
     /// hit rate computed against the file count is meaningless.
     pub total_objects: u64,
+    /// Relocations that did not have to be applied, and the total.
+    ///
+    /// The honest unit. Object sizes in a Rust link span three orders of
+    /// magnitude — one libstd codegen unit holds more relocations than every
+    /// other object together — so "46 of 47 objects reused" describes a link
+    /// that saved almost nothing (finding 66). Counting the work rather than
+    /// the files is what makes the number mean what it appears to mean.
+    pub reused_relocations: u64,
+    pub total_relocations: u64,
 }
 
 impl std::fmt::Display for LinkTimings {
@@ -80,10 +89,15 @@ impl std::fmt::Display for LinkTimings {
             }
         };
         if self.total_objects > 0 {
+            let share = if self.total_relocations > 0 {
+                self.reused_relocations as f64 / self.total_relocations as f64 * 100.0
+            } else {
+                0.0
+            };
             writeln!(
                 f,
-                "  reused      {:7} of {} objects",
-                self.reused_objects, self.total_objects
+                "  reused      {:7} of {} objects, {:.0}% of relocations",
+                self.reused_objects, self.total_objects, share
             )?;
         }
         writeln!(
@@ -1030,6 +1044,11 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     }
 
     timings.reused_objects = patched.reused;
+    timings.reused_relocations = patched.reused_relocations;
+    timings.total_relocations = objects
+        .iter()
+        .map(|o| o.parsed.relocations.len() as u64)
+        .sum();
     let contents = patched.contents;
     let entry_offset = entry_offset(request, &objects, &probe)?;
     timings.relocate_ms = elapsed_ms(step);
@@ -2046,6 +2065,8 @@ struct Patched {
     /// make a dead cache visible had the dead cache's own failure mode, and
     /// only the relocate time — 10.1 ms against 4.7 — gave it away.
     reused: u64,
+    /// Relocations skipped because their object's bytes were reused.
+    reused_relocations: u64,
 }
 
 /// One object's trace through the relocation pass.
@@ -2170,6 +2191,7 @@ fn apply_relocations(
     let mut extra_binds = Vec::new();
     let mut records: Vec<ObjectRecord> = Vec::new();
     let mut reused = 0u64;
+    let mut reused_relocations = 0u64;
     for object in objects {
         // Where this object's fixups start. Binds and rebases are produced as
         // a side effect of relocating, so an object whose bytes are later
@@ -2191,6 +2213,7 @@ fn apply_relocations(
             let plan = reuse.expect("just matched");
             if copy_cached_bytes(entry, plan, &mut contents) {
                 reused += 1;
+                reused_relocations += object.parsed.relocations.len() as u64;
                 extra_binds.extend(entry.binds.iter().map(|bind| Bind {
                     segment: bind.segment,
                     offset: bind.offset,
@@ -2477,6 +2500,7 @@ fn apply_relocations(
         rebases: extra_rebases,
         records,
         reused,
+        reused_relocations,
     })
 }
 

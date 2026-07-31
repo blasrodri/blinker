@@ -87,6 +87,14 @@ pub struct Counters {
     pub input_count: u64,
     pub changed_inputs: Option<u64>,
     pub reused_inputs: Option<u64>,
+    /// Relocations skipped because their object was reused, and the total.
+    ///
+    /// The unit that makes a hit rate mean what it looks like it means. Object
+    /// sizes in a Rust link span three orders of magnitude, so "46 of 47
+    /// objects reused" can describe a link that saved nothing at all — that is
+    /// exactly what it described (finding 66).
+    pub reused_relocations: Option<u64>,
+    pub total_relocations: Option<u64>,
     pub bytes_read: u64,
     pub bytes_written: Option<u64>,
 }
@@ -178,9 +186,11 @@ impl LinkRecord {
     ///
     /// The mode follows from the counters rather than being set separately, so
     /// a record cannot claim to be incremental while reporting no reuse.
-    pub fn set_reuse(&mut self, reused: u64, total: u64) {
+    pub fn set_reuse(&mut self, reused: u64, total: u64, work: (u64, u64)) {
         self.counters.reused_inputs = Some(reused);
         self.counters.changed_inputs = Some(total.saturating_sub(reused));
+        self.counters.reused_relocations = Some(work.0);
+        self.counters.total_relocations = Some(work.1);
         self.mode = if reused == 0 {
             LinkMode::Cold
         } else {
@@ -257,11 +267,17 @@ impl LinkRecord {
             self.counters.input_count, self.counters.bytes_read
         );
         if let Some(reused) = self.counters.reused_inputs {
-            s.push_str(&format!(
-                "\n  reused: {reused}/{} objects",
-                self.counters.reused_inputs.unwrap_or(0)
-                    + self.counters.changed_inputs.unwrap_or(0)
-            ));
+            let total = reused + self.counters.changed_inputs.unwrap_or(0);
+            let share = match (
+                self.counters.reused_relocations,
+                self.counters.total_relocations,
+            ) {
+                (Some(done), Some(all)) if all > 0 => {
+                    format!(", {:.0}% of relocations", done as f64 / all as f64 * 100.0)
+                }
+                _ => String::new(),
+            };
+            s.push_str(&format!("\n  reused: {reused}/{total} objects{share}"));
         }
         if !self.unrecognized_arguments.is_empty() {
             s.push_str(&format!(
@@ -376,10 +392,12 @@ mod reuse_tests {
                 .map(|n| InputFingerprint::for_test("o", n))
                 .collect(),
         );
-        record.set_reuse(47, 47);
+        record.set_reuse(47, 47, (900, 1000));
         assert_eq!(record.counters.reused_inputs, Some(47));
         assert_eq!(record.counters.changed_inputs, Some(0));
-        assert!(record.to_summary().contains("reused: 47/47 objects"));
+        assert!(record
+            .to_summary()
+            .contains("reused: 47/47 objects, 90% of relocations"));
     }
 
     /// The failure this exists to make visible: every input rebuilt, and a
@@ -392,7 +410,7 @@ mod reuse_tests {
                 .map(|n| InputFingerprint::for_test("o", n))
                 .collect(),
         );
-        record.set_reuse(0, 47);
+        record.set_reuse(0, 47, (0, 1000));
         assert!(record.to_summary().contains("reused: 0/47 objects"));
         assert_eq!(parse(&record)["counters"]["reused_inputs"], 0);
     }
@@ -402,9 +420,9 @@ mod reuse_tests {
     #[test]
     fn the_mode_follows_the_counters() {
         let mut record = LinkRecord::delegated();
-        record.set_reuse(0, 10);
+        record.set_reuse(0, 10, (0, 100));
         assert_eq!(parse(&record)["mode"], "cold");
-        record.set_reuse(3, 10);
+        record.set_reuse(3, 10, (30, 100));
         assert_eq!(parse(&record)["mode"], "incremental");
     }
 

@@ -2811,8 +2811,17 @@ Counting at the copy instead:
 One object, and half the relocate time — it is the libstd codegen unit that
 holds most of the link's relocations, which is also why "reuse 46 of 47" is a
 catastrophic result rather than a good one. **A hit rate by object count is the
-wrong unit** when object sizes span three orders of magnitude; weighting by
-relocations would have made this obvious immediately.
+wrong unit** when object sizes span three orders of magnitude. Reporting the
+share of relocations skipped instead, which is what the cache is actually for:
+
+```
+  with the fix     47/47 objects, 100% of relocations   relocate 4.6 ms
+  without the fix  46/47 objects,  32% of relocations   relocate 9.6 ms
+```
+
+"46 of 47" reads as a near-perfect hit rate. "32% of relocations" reads as the
+failure it is. Same link, same instant, two units — and only one of them can be
+acted on.
 
 ### The lesson, which is not the one finding 64 drew
 

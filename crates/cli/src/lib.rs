@@ -181,7 +181,11 @@ pub fn run(argv: &[String]) -> Result<Outcome, DriverError> {
             phases.emit_ms,
         );
         if options.incremental_cache {
-            record.set_reuse(phases.reused_objects, phases.total_objects);
+            record.set_reuse(
+                phases.reused_objects,
+                phases.total_objects,
+                (phases.reused_relocations, phases.total_relocations),
+            );
         } else {
             record.mode = blinker_diagnostics::LinkMode::Cold;
         }
