@@ -226,8 +226,11 @@ def main():
 
     accounted = 0.0
     for name in ["read_and_parse", "resolve", "layout", "dead_strip",
-                 "relocate", "emit"]:
-        value = timings.get(f"link_{name}_ms") or 0.0
+                 "relocate", "emit", "cache_load", "cache_plan",
+                 "cache_build", "cache_store"]:
+        value = timings.get(f"link_{name}_ms")
+        if value is None:
+            continue
         accounted += value
         print(f"    {name:<16}{value:6.2f} ms  {value / total * 100:5.1f}%")
     print(f"    {'unmeasured':<16}{total - accounted:6.2f} ms  "

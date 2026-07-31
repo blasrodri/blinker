@@ -113,6 +113,23 @@ pub struct LinkTimings {
     /// to describe the input, caught by the verification pass rather than by a
     /// crash in the linked program.
     pub revived_atoms: u64,
+    /// What the cache costs, separated from what it saves.
+    ///
+    /// Every part of this was previously charged to a stage that had nothing
+    /// to do with it: decoding and planning to `relocate`, building and
+    /// storing to nothing at all, because they happen after `emit_ms` stops.
+    /// So the headline read "78% of relocations reused" while an edit relink
+    /// with the cache on was 5.5 ms *slower* than one with it off, and no
+    /// number in the record could say where the 5.5 ms went.
+    ///
+    /// A cache is a trade, and a trade shows up in a report as two numbers.
+    pub cache_load_ms: f64,
+    pub cache_plan_ms: f64,
+    pub cache_build_ms: f64,
+    pub cache_store_ms: f64,
+    /// Bytes the cache read and wrote, for the same reason.
+    pub cache_bytes_read: u64,
+    pub cache_bytes_written: u64,
 }
 
 impl std::fmt::Display for LinkTimings {
@@ -1472,11 +1489,21 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
         .as_ref()
         .map(|_| address_table(&addresses, &got_slots, &stub_slots, &tlv_slots));
 
+    let cache_step = std::time::Instant::now();
     let previous = request.cache_path.as_deref().and_then(blinker_cache::load);
+    timings.cache_load_ms = elapsed_ms(cache_step);
+    timings.cache_bytes_read = request
+        .cache_path
+        .as_deref()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map_or(0, |meta| meta.len());
+
+    let cache_step = std::time::Instant::now();
     let plan = match (&previous, &current_addresses) {
         (Some(previous), Some(current)) => Some(plan_reuse(&objects, &probe, previous, current)),
         _ => None,
     };
+    timings.cache_plan_ms = elapsed_ms(cache_step);
     timings.total_objects = objects.len() as u64;
 
     let patched = apply_relocations(
@@ -1501,6 +1528,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     // Built here, while the patched contents still exist, but not written
     // until the image does — the fast path needs the finished binary, and that
     // is the last thing produced.
+    let cache_step = std::time::Instant::now();
     let mut cache = match (&request.cache_path, current_addresses) {
         (Some(_), Some(addresses)) => Some(build_cache(
             request,
@@ -1512,6 +1540,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
         )),
         _ => None,
     };
+    timings.cache_build_ms = elapsed_ms(cache_step);
 
     timings.reused_objects = patched.reused;
     timings.reused_relocations = patched.reused_relocations;
@@ -1559,10 +1588,13 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     timings.emit_ms = elapsed_ms(step);
 
     if let (Some(path), Some(cache), Ok(image)) = (&request.cache_path, &mut cache, &image) {
+        let cache_step = std::time::Instant::now();
         cache.image = image.bytes.clone();
         // A cache that cannot be written is not an error: the link succeeded,
         // and the only consequence is that the next one is cold.
         let _ = blinker_cache::store(path, cache);
+        timings.cache_store_ms = elapsed_ms(cache_step);
+        timings.cache_bytes_written = std::fs::metadata(path).map_or(0, |meta| meta.len());
     }
 
     timings.total_ms = elapsed_ms(overall);

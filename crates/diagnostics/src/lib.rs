@@ -81,6 +81,18 @@ pub struct PhaseTimings {
     pub link_dead_strip_ms: Option<f64>,
     pub link_relocate_ms: Option<f64>,
     pub link_emit_ms: Option<f64>,
+    /// What the cache cost, as against what it saved.
+    ///
+    /// Absent when no cache was asked for. Reported because reuse counters
+    /// alone describe only one side of a trade: an edit relink reusing 78% of
+    /// its relocations measured 5.5 ms *slower* than the same link with the
+    /// cache switched off, and none of the 5.5 ms appeared under any stage —
+    /// decoding and planning were charged to `relocate`, and building and
+    /// storing happened after `emit` had stopped.
+    pub link_cache_load_ms: Option<f64>,
+    pub link_cache_plan_ms: Option<f64>,
+    pub link_cache_build_ms: Option<f64>,
+    pub link_cache_store_ms: Option<f64>,
     pub total_ms: Option<f64>,
 }
 
@@ -97,6 +109,28 @@ pub struct LinkStages {
     pub dead_strip: f64,
     pub relocate: f64,
     pub emit: f64,
+    /// Load, plan, build, store — the cache's four costs, zero without one.
+    pub cache: CacheStages,
+}
+
+/// What the incremental cache spends, split by what it is doing.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CacheStages {
+    /// Reading and decoding the previous cache.
+    pub load: f64,
+    /// Deciding which objects may skip relocation.
+    pub plan: f64,
+    /// Assembling the cache this link will leave behind.
+    pub build: f64,
+    /// Encoding and writing it, including the copy of the finished image.
+    pub store: f64,
+}
+
+impl CacheStages {
+    /// Whether a cache ran at all, so absent and free stay distinguishable.
+    fn ran(&self) -> bool {
+        self.load > 0.0 || self.plan > 0.0 || self.build > 0.0 || self.store > 0.0
+    }
 }
 
 fn as_ms(d: Duration) -> f64 {
@@ -119,6 +153,15 @@ pub struct Counters {
     pub total_relocations: Option<u64>,
     pub bytes_read: u64,
     pub bytes_written: Option<u64>,
+    /// Bytes the incremental cache read and wrote, counted apart from the
+    /// inputs and the output.
+    ///
+    /// The cache currently stores every patched output section *and* a copy of
+    /// the finished binary, so what it writes is comparable in size to what the
+    /// link produces. Rolled into `bytes_written` that would look like a large
+    /// output; named, it looks like what it is.
+    pub cache_bytes_read: Option<u64>,
+    pub cache_bytes_written: Option<u64>,
     /// `__text` bytes dead-stripping removed. `None` when it did not run.
     pub stripped_bytes: Option<u64>,
     /// Atoms the reachability propagation left dead that something live then
@@ -199,6 +242,7 @@ impl LinkRecord {
             dead_strip,
             relocate,
             emit,
+            cache,
         } = stages;
         self.timings.internal_link_ms = Some(as_ms(total));
         self.timings.link_read_and_parse_ms = Some(read_and_parse);
@@ -209,6 +253,18 @@ impl LinkRecord {
         self.timings.link_dead_strip_ms = (dead_strip > 0.0).then_some(dead_strip);
         self.timings.link_relocate_ms = Some(relocate);
         self.timings.link_emit_ms = Some(emit);
+        if cache.ran() {
+            self.timings.link_cache_load_ms = Some(cache.load);
+            self.timings.link_cache_plan_ms = Some(cache.plan);
+            self.timings.link_cache_build_ms = Some(cache.build);
+            self.timings.link_cache_store_ms = Some(cache.store);
+        }
+    }
+
+    /// Record what the cache moved, as bytes.
+    pub fn set_cache_bytes(&mut self, read: u64, written: u64) {
+        self.counters.cache_bytes_read = Some(read);
+        self.counters.cache_bytes_written = Some(written);
     }
 
     /// Record how much of the link came from the cache.
@@ -280,6 +336,14 @@ impl LinkRecord {
             ("layout", self.timings.link_layout_ms),
             ("relocate", self.timings.link_relocate_ms),
             ("emit+sign", self.timings.link_emit_ms),
+            // Last, and named for what they are rather than folded into the
+            // stage they happen to run inside: these are the cache's price,
+            // and a reader comparing them against the reuse counters above is
+            // reading the trade the cache actually made.
+            ("cache load", self.timings.link_cache_load_ms),
+            ("cache plan", self.timings.link_cache_plan_ms),
+            ("cache build", self.timings.link_cache_build_ms),
+            ("cache store", self.timings.link_cache_store_ms),
         ] {
             if let Some(text) = stage(label, value) {
                 out.push_str(&text);

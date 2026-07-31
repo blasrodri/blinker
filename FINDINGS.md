@@ -4484,3 +4484,76 @@ harness is part of the instrument.** The 42% spread was not noise to average
 away over more iterations; it was 20 ms of process startup being measured as
 though it were linking, and no amount of interleaving removes a constant that
 large. Measure the thing that changes.
+
+## 94. The cache cannot win at its current design point, at any hit rate
+
+An architectural review made the case that blinker is "a fast full linker with
+a post-layout relocation cache", not an incremental linker, and that the cache
+is consulted so late that even perfect reuse has a low ceiling. The reviewer
+could not run the benchmarks. With the workload of finding 93 that could now be
+answered, and the answer is worse than the argument: the ceiling is not low, it
+is **below zero**.
+
+```
+  one-crate edit, cache off    31.9 ms
+  one-crate edit, cache on     42.1 ms      reused 1/108 objects, 0% of relocations
+  cold link                    30.5 ms
+```
+
+Asking for the cache costs **10.2 ms** on an edit relink, and the edit relink
+is slower than linking from cold either way.
+
+### Where the 10.2 ms goes, now that the record says
+
+The four cache stages are newly named, because every one of them was charged to
+something else: loading and planning to `relocate`, building and storing to no
+stage at all — they run after `emit_ms` stops, and appeared only as
+"unmeasured".
+
+```
+  cache load    0.62      relocate, cache off    5.58
+  cache plan    0.24      relocate, cache on    11.89
+  cache build   0.62                            ------
+  cache store   1.19      the bookkeeping        6.31
+                ----
+                 2.67
+```
+
+**Two thirds of the cost is not the cache's I/O — it is the bookkeeping the
+cache forces on the stage it exists to accelerate.** `apply_relocations` takes
+a flag saying a cache is being built, and under it records each object's
+patched byte ranges; that doubles the stage. So the trade is 10.2 ms spent to
+save at most 5.6 ms, which is the entire relocation stage. **No hit rate makes
+this profitable.** 80% reuse — the best ever recorded (79) — saves 4.5 ms.
+
+### And the hit rate is not a property of the edit
+
+The first pairing of captures for this measurement reported 78% of relocations
+reused. It was wrong, and the way it was wrong is worth keeping: the two
+captures had been recorded into differently-named directories, that path
+travels in `RUSTFLAGS`, rustflags feed the crate metadata hash, and so *every
+rlib in the second build had a different filename*. The harness paired them by
+name, matched only the few that happened to coincide, and alternated a link
+that was not the edit it claimed to be.
+
+With both builds recorded through one fixed path — same rustflags, same
+filenames, only the genuinely-changed inputs differing — the same edit reuses
+**9 of 84 116 relocations**. That is the number finding 88 recorded *before*
+the section-stride padding was added, which says plainly that the padding does
+not survive a 14-input blast radius: touching one crate that everything depends
+on changes fourteen rlibs, and their combined size delta walks straight through
+a 4 KiB stride.
+
+### What this settles
+
+Findings 79 and 88 each concluded that improving the reuse *rate* was not where
+the win was. This is the sharper version: at the current design point the cache
+is a cost centre with no achievable payoff, because it is consulted after
+parsing, resolution, dead-stripping, layout and content assembly have all
+already run, and it makes one of the remaining stages twice as expensive in
+order to be consulted at all.
+
+Padding a recomputed layout is not layout reuse. The next thing built is the
+allocator that consumes the previous placement table — and with it, the
+decision that an incremental output need not be byte-identical to a cold one
+(D8), because a history-dependent allocator cannot be and still do its job.

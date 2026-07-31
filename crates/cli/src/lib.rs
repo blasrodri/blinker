@@ -191,8 +191,17 @@ pub fn run(argv: &[String]) -> Result<Outcome, DriverError> {
                 dead_strip: phases.dead_strip_ms,
                 relocate: phases.relocate_ms,
                 emit: phases.emit_ms,
+                cache: blinker_diagnostics::CacheStages {
+                    load: phases.cache_load_ms,
+                    plan: phases.cache_plan_ms,
+                    build: phases.cache_build_ms,
+                    store: phases.cache_store_ms,
+                },
             },
         );
+        if phases.cache_bytes_read > 0 || phases.cache_bytes_written > 0 {
+            record.set_cache_bytes(phases.cache_bytes_read, phases.cache_bytes_written);
+        }
         if wants_dead_strip(&parsed) {
             record.set_dead_strip(phases.stripped_bytes, phases.revived_atoms);
         }

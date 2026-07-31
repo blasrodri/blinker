@@ -180,3 +180,61 @@ describes, and internally performs what `cc` would have asked `ld` to do.
 - The fallback path is unaffected — it delegates to `cc` and gets all of this
   for free, which is why fallback stays correct while the internal path is
   being built.
+
+---
+
+## D5: An incremental output need not be byte-identical to a cold one
+
+**Date:** after finding 94. **Status:** adopted.
+
+### The question
+
+The next thing to build is a layout allocator that consumes the previous
+placement table: unchanged contributions keep their exact previous addresses,
+changed ones are rewritten in place if they still fit, and otherwise take a
+hole or the end. That allocator is *history-dependent* by construction. Link A,
+edit, relink gives an image whose addresses were chosen partly by A. Linking
+the same final sources from cold chooses them fresh. The two are then
+semantically identical and byte-different.
+
+So either the allocator gives up history — which is to say, is not the
+allocator — or the project gives up an equality it has never actually claimed
+in a test but has assumed throughout.
+
+### What decided it
+
+Three things.
+
+**Nothing depends on it.** Grepping for the claim finds it in exactly one place
+that matters, `image.rs`, and there it means something else and still true:
+*the same inputs produce the same output*. Cold links stay deterministic, which
+is what reproducible builds require and what `LC_UUID` is derived from. No test
+asserts that an incremental link equals a cold one, because none could have —
+until finding 93 there was no durable workload to write it against.
+
+**The alternative is worse than it looks.** Making a cold link reconstruct the
+same layout means deriving every slot from a content-stable identity rather
+than from history — a canonical placement independent of the order links
+happened in. That is buildable, it is what a from-scratch deterministic
+allocator would do, and it is strictly more machinery, more wasted space (every
+slot sized for a worst case nobody has observed), and a much harder invariant
+to hold as the input set changes. It buys an equality that nothing reads.
+
+**The cost of being wrong is bounded and visible.** If byte identity is ever
+needed — a reproducible-build requirement, a distribution checksum — the answer
+is to link that build from cold, which is already the fast, deterministic,
+well-tested path. The incremental path is a developer's inner loop.
+
+### What it commits to
+
+- A **cold** link is deterministic: identical inputs and request produce
+  identical bytes. This is unchanged and stays under test.
+- An **incremental** link produces a Mach-O that is semantically equivalent —
+  same symbols at correct addresses, same behaviour, valid signature and
+  `LC_UUID` for the bytes it actually contains — but may place unchanged
+  content wherever the previous link placed it.
+- The two modes are distinguishable from the record (`mode`), so a build that
+  needs the cold guarantee can ask for it and can tell that it got it.
+- Any test comparing an incremental output to a cold one compares *behaviour*
+  — the program runs, the symbols resolve, a backtrace names the right
+  function — and not bytes.
