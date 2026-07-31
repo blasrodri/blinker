@@ -683,3 +683,63 @@ those reads survives the cost of proving the inputs unchanged.
 - **Tentative (common) symbols** (finding 65), unrelated to the cache but
   found by it.
 - **Dead-stripping.** Output is 2.0x ld-prime's.
+
+## State at the end of this stretch
+
+blinker links C and Rust on Apple Silicon, signs its own output, handles
+`panic=unwind` identically to the system linker, and caches across links.
+
+```
+  ld-prime                     28.4 ms   1.00x
+  blinker, cold                31.3 ms   1.10x
+  blinker, unchanged relink    10.4 ms   0.37x
+```
+
+Cold-link profile, 20 iterations, sd < 0.3 ms per stage:
+
+```
+  read+parse   5.0 ms   resolve  6.4 ms   layout 1.6 ms
+  relocate     7.3 ms   emit+sign 2.2 ms
+```
+
+### The two things left, both milestones rather than tasks
+
+**1. The partial fast path** — the edit-compile case.
+
+The whole-image path (finding 67) fires only when *nothing* changed. When one
+codegen unit changed, the link falls all the way back to the full pipeline at
+~22 ms, even though 46 of 47 objects are provably untouched.
+
+Closing that means relocating the changed object alone and patching its bytes
+into the cached image. The blocker is not the relocation — it is that
+`apply_relocations` needs the whole link state to run: the address map, the
+GOT/stub/TLV tables, section addresses, personality fields, thread-local
+offsets. Reaching it from cache means either caching that state (and finding 41
+warns about what happens when the cached form is less flat than the computation)
+or restructuring the pass to take a narrower context.
+
+The check is already cheap enough — 0.18 ms proves which inputs changed — so
+the payoff is the difference between 22 ms and something near the 10.4 ms the
+unchanged case gets.
+
+**2. Dead-stripping** — finding 70.
+
+The output is 2.02x ld-prime's, and all of it is unreachable code plus the
+unwind, exception and literal data that serves it. Every input object sets
+`MH_SUBSECTIONS_VIA_SYMBOLS`, so cutting sections at symbol boundaries is
+legal; the work is that atoms, not sections, become the unit of layout, which
+touches placement, `AddressMap`, relocation, and the tables that index by
+function address.
+
+### Rules this project runs on, earned rather than assumed
+
+- Measure the premise before writing the code. Three cache designs were killed
+  or reshaped this way (41, 60, 68); each measurement cost minutes.
+- A cache is worth building only when the artifact is flatter than the
+  computation that produced it (59), and it should be checked *before* the
+  expensive work rather than after (67).
+- A null result needs the same proof of provenance as a positive one (58).
+- An instrument needs its own negative control; a counter that reports success
+  while nothing happens is the failure it was added to detect (66).
+- A test proves something only when the failure would produce a different
+  observable value, not merely a different internal state (63, 66, 69).
