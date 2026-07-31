@@ -583,3 +583,65 @@ A `blinker-cache` crate between `blinker-macho` and `blinker-link`, with
 `load_objects` consulting it. The cache directory should default under
 `CARGO_TARGET_DIR` when set, so a `cargo clean` clears it and it never outlives
 the build tree it describes.
+
+## The cache design, as measured (supersedes the struck M4 above)
+
+Three premises were tested before any of it was written, and two of them
+reshaped it. Every number below is measured on a 56-input Rust debug link
+(26.1 ms internal, 1.03 MB output).
+
+| premise | measured | effect |
+|---|---|---|
+| deserialising a parse beats re-parsing | 0.43 ms parse vs 0.75–1.50 ms | **killed** the parse cache (41) |
+| loading patched bytes beats relocating | 0.065 ms vs 7.3 ms — 112× | design confirmed (59) |
+| content-hashing inputs is cheap | 7.28 ms vs 7.3 ms saved | **killed the key**, not the cache (60) |
+| ...hashing only rustc's output | 0.16 ms — 45× | design restored (61) |
+
+### What is stored
+
+`crates/cache`, between `blinker-macho` and `blinker-link`. Per link:
+
+- **patched output section bytes** — the artifact, and the only large thing;
+- **per object**: its input key, the output ranges its bytes occupy, the
+  symbols its relocations resolved against, and the binds and rebases its
+  relocation pass produced;
+- **every defined symbol's address**, sorted by name hash, for diffing.
+
+Not the parse, not the layout, not the symbol table — those are inputs to the
+computation, and finding 41's rule is that a cache only pays when the artifact
+is flatter than the computation that made it.
+
+### The three reuse conditions
+
+An object's bytes are reused only if its input is unchanged, its contribution
+has not moved, and nothing it references has moved. The third is what makes
+this a graph: an untouched object holding a pointer to an edited one is stale
+through no fault of its own. Validating it is a set probe per dependency
+against the addresses that changed since the last link — not a lookup per
+relocation, which would be the work being avoided.
+
+### Two keys, because there are two populations
+
+98.2% of the bytes are toolchain rlibs at content-addressed paths
+(`libstd-4f24f0876fd27385.rlib`) and are keyed on metadata. 1.8% is rustc's own
+codegen output, renamed every build (finding 15), and must be hashed. Anything
+unrecognised is hashed: trusting a path that lied produces a wrong binary,
+while hashing unnecessarily costs microseconds.
+
+### Remaining work, in order
+
+1. **Record during a cold link.** `apply_relocations` already resolves every
+   target; have it accumulate per-object dependency hashes, and slice the
+   binds and rebases it produces by the object that produced them. Write the
+   cache after `assemble`.
+2. **Reuse on rebuild.** After layout, diff the address tables, then copy
+   cached bytes over the reusable objects' ranges and skip them in the
+   relocation loop. Everything else runs as it does today.
+3. **Fall back loudly.** Report reuse in `LinkRecord` (`reused_inputs` exists
+   and has been `null` since M0), and take the cold path on any mismatch.
+
+The ceiling for this shape is the relocate stage: 7.3 ms of 26.1, so ~28%,
+taking blinker from ~1.15× ld-prime to roughly 0.85×. Going below that means
+reusing `resolve` (6.3 ms) and skipping the read of unchanged inputs, which
+needs the symbol table cached too — a later step, and one whose premise should
+be measured the same way before it is built.
