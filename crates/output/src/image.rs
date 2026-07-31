@@ -368,7 +368,13 @@ impl ImageBuilder {
     ) -> Result<Vec<u8>, ImageError> {
         let mut writer = Writer::with_capacity(link_edit_end as usize);
 
-        let header = MachHeader::executable();
+        // The thread-local flag is a property of what was laid out, so it is
+        // decided here rather than baked into the header constant.
+        let has_thread_locals = layout
+            .sections
+            .iter()
+            .any(|s| s.kind == blinker_macho::SectionKind::ThreadLocal);
+        let header = MachHeader::executable().with_thread_local_variables(has_thread_locals);
         header.write(&mut writer);
 
         let mut command_count = 0u32;
@@ -526,7 +532,10 @@ mod tests {
         assert_eq!(read_u32(&image.bytes, 0), MH_MAGIC_64);
         assert_eq!(read_u32(&image.bytes, 4), CPU_TYPE_ARM64);
         assert_eq!(read_u32(&image.bytes, 12), MH_EXECUTE);
-        assert_eq!(read_u32(&image.bytes, 24), EXECUTABLE_FLAGS);
+        // No thread-local sections in a minimal image, so the TLV bit is
+        // absent — the flags are the unconditional base set.
+        assert_eq!(read_u32(&image.bytes, 24), BASE_EXECUTABLE_FLAGS);
+        assert_eq!(read_u32(&image.bytes, 24) & MH_HAS_TLV_DESCRIPTORS, 0);
     }
 
     /// The header's `ncmds` and `sizeofcmds` are reserved during emission and

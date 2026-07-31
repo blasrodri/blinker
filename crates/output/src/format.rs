@@ -38,16 +38,21 @@ pub const MH_PIE: u32 = 0x0020_0000;
 /// The image defines thread-local variable descriptors.
 pub const MH_HAS_TLV_DESCRIPTORS: u32 = 0x0080_0000;
 /// Safe to link into an app extension. Notably **not** set by the toolchain
-/// for a Rust executable, which is why it is absent from [`EXECUTABLE_FLAGS`].
+/// for a Rust executable, which is why it is absent from
+/// [`BASE_EXECUTABLE_FLAGS`].
 pub const MH_APP_EXTENSION_SAFE: u32 = 0x0200_0000;
 
-/// The flag set a real Rust executable carries: `0x00a00085`.
+/// Flags every arm64 executable carries, whatever it contains: `0x00200085`.
 ///
-/// Decomposed from the real header rather than assembled from what seemed
-/// plausible — an earlier version of this constant included
-/// [`MH_APP_EXTENSION_SAFE`] and the byte-for-byte test caught it.
-pub const EXECUTABLE_FLAGS: u32 =
-    MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE | MH_HAS_TLV_DESCRIPTORS;
+/// Decomposed from a real header rather than assembled from what seemed
+/// plausible — an earlier version included [`MH_APP_EXTENSION_SAFE`] and the
+/// byte-for-byte test caught it.
+///
+/// Conditional bits are *not* here. `MH_HAS_TLV_DESCRIPTORS` was originally
+/// folded in, because the sample header came from a Rust binary that has
+/// thread-locals; the builder now adds it from what was actually laid out.
+/// A real Rust executable therefore still comes to `0x00a00085`.
+pub const BASE_EXECUTABLE_FLAGS: u32 = MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE;
 
 // Load command identifiers, in the order a real binary emits them.
 pub const LC_SYMTAB: u32 = 0x2;
@@ -244,8 +249,23 @@ impl MachHeader {
             // Filled in once the load commands have been emitted.
             command_count: 0,
             command_size: 0,
-            flags: EXECUTABLE_FLAGS,
+            flags: BASE_EXECUTABLE_FLAGS,
         }
+    }
+
+    /// Declare that the image defines thread-local variable descriptors.
+    ///
+    /// `MH_HAS_TLV_DESCRIPTORS` is a *property of the image*, not a constant.
+    /// It was originally hardcoded because the reference value was read off a
+    /// real Rust executable, which has thread-locals — so the bit was correct
+    /// for the sample and wrong for anything without them. That is the same
+    /// mistake as `MH_APP_EXTENSION_SAFE` in finding 12: a conditional
+    /// property frozen from one observation.
+    pub fn with_thread_local_variables(mut self, present: bool) -> Self {
+        if present {
+            self.flags |= MH_HAS_TLV_DESCRIPTORS;
+        }
+        self
     }
 
     pub fn write(&self, writer: &mut Writer) {
@@ -285,7 +305,10 @@ mod tests {
     /// The exact 32 bytes a real Rust executable starts with.
     #[test]
     fn header_matches_a_real_binary_byte_for_byte() {
-        let mut header = MachHeader::executable();
+        // The reference binary is a Rust executable, which has thread-locals —
+        // so the header it is compared against must declare them. Constructing
+        // it without that is what the flag being conditional now means.
+        let mut header = MachHeader::executable().with_thread_local_variables(true);
         header.command_count = 17;
         header.command_size = 2104;
 
@@ -315,17 +338,29 @@ mod tests {
     /// The flag set must be exactly what the toolchain emits; a missing MH_PIE
     /// would silently disable address-space randomisation.
     #[test]
+    fn a_header_declares_thread_locals_only_when_they_exist() {
+        // The bit belongs to images that have thread-local descriptors, and to
+        // no others. A C program without TLS carries 0x00200085.
+        let without = MachHeader::executable();
+        assert_eq!(without.flags & MH_HAS_TLV_DESCRIPTORS, 0);
+        assert_eq!(without.flags, 0x0020_0085);
+
+        let with = MachHeader::executable().with_thread_local_variables(true);
+        assert_eq!(with.flags, 0x00a0_0085, "matches a real Rust executable");
+    }
+
+    #[test]
     fn executable_flags_match_the_real_value() {
         // The exact value a real Rust executable carries, and the exact set
         // of bits that composes it. Losing MH_PIE here would silently disable
         // address-space randomisation.
-        assert_eq!(EXECUTABLE_FLAGS, 0x00a0_0085);
+        assert_eq!(BASE_EXECUTABLE_FLAGS | MH_HAS_TLV_DESCRIPTORS, 0x00a0_0085);
         assert_eq!(
-            EXECUTABLE_FLAGS,
-            MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE | MH_HAS_TLV_DESCRIPTORS
+            BASE_EXECUTABLE_FLAGS,
+            MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE
         );
         assert_eq!(
-            EXECUTABLE_FLAGS & MH_APP_EXTENSION_SAFE,
+            BASE_EXECUTABLE_FLAGS & MH_APP_EXTENSION_SAFE,
             0,
             "the toolchain does not set MH_APP_EXTENSION_SAFE"
         );
