@@ -2364,3 +2364,45 @@ Every piece the unwinder touches has now been decoded and compared against
 ld-prime: `__unwind_info` (30, 32), the `__eh_frame` chain (47), CIE
 personalities (52, fixed), FDE ranges (53), and now the LSDA — which is the one
 that is wrong.
+
+## 55. The inline-addend explanation for the LSDA is wrong
+
+Finding 54's leading explanation — that LSDA references are `SUBTRACTOR` pairs
+whose inline addend the generic relocation path drops — was implemented and had
+**no effect whatsoever**. Not a smaller error, not different addresses:
+
+```
+  before the fix:  LSDAs inside 6, outside 350   (first bad one at 0x1000a9e65)
+  after the fix:   LSDAs inside 6, outside 350   (first bad one at 0x1000a9e65)
+```
+
+Byte-identical output means the changed code path never ran for these
+relocations. Whatever patches an FDE's LSDA field, it is not the `SUBTRACTOR`
+pair path.
+
+The change was reverted rather than kept. It touches every `SUBTRACTOR` pair in
+every link, and an unproven modification to the relocation engine is not worth
+carrying on the theory that it might be right somewhere else.
+
+### What the numbers actually say
+
+Six LSDAs are correct and 350 are wrong. That is a far more useful ratio than
+"the first is right" from finding 54 — six correct suggests one object's
+contributions land correctly and every other object's do not, which still
+points at a per-contribution offset, but through some path other than the pair
+handler.
+
+The next step is not another hypothesis. It is to find **which relocation
+actually writes an LSDA field**: take one known-bad FDE, compute its LSDA
+field's offset within its input `__eh_frame` section, and look up what
+relocation exists at that offset — kind, target, addend, pc_relative. That is
+the same "read what the object says" move that finding 51 should have started
+with, and it has not been done for the LSDA.
+
+### Seventh hypothesis, seventh refutation
+
+The pattern is now unambiguous enough to state as a rule for this project: an
+explanation that fits the evidence is worth roughly nothing here until it is
+tested, and the test is almost always cheaper than the implementation. This one
+cost a revert; finding 41's cost nothing because it was tested first. The
+difference between those two outcomes is entirely in the order of operations.
