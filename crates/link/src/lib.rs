@@ -297,18 +297,59 @@ pub fn default_stub_library() -> Option<PathBuf> {
     CACHED.get_or_init(discover_stub_library).clone()
 }
 
+/// Where `xcode-select` records the active developer directory.
+///
+/// `xcode-select -p` prints the target of this symlink and `xcrun` resolves the
+/// SDK beneath it, so reading the link answers the same question without
+/// spawning either.
+const XCODE_SELECT_LINK: &str = "/var/db/xcode_select_link";
+
+/// Where the Command Line Tools install, when Xcode itself is not present.
+const COMMAND_LINE_TOOLS: &str = "/Library/Developer/CommandLineTools";
+
+/// The two layouts an SDK sits in under a developer directory: Xcode's, which
+/// is organised by platform, and the Command Line Tools', which is not.
+const SDK_UNDER_DEVELOPER_DIR: &[&str] = &[
+    "Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk",
+    "SDKs/MacOSX.sdk",
+];
+
 fn discover_stub_library() -> Option<PathBuf> {
-    let stub_in = |sdk: &str| {
-        let path = PathBuf::from(sdk).join("usr/lib/libSystem.tbd");
+    let stub_in = |sdk: &Path| {
+        let path = sdk.join("usr/lib/libSystem.tbd");
         path.exists().then_some(path)
     };
+    let stub_under = |developer: &Path| {
+        SDK_UNDER_DEVELOPER_DIR
+            .iter()
+            .find_map(|suffix| stub_in(&developer.join(suffix)))
+    };
 
+    // The compiler driver sets `SDKROOT` when it knows the answer, so in some
+    // builds it is already in the environment.
     if let Ok(sdk) = std::env::var("SDKROOT") {
-        if let Some(path) = stub_in(&sdk) {
+        if let Some(path) = stub_in(Path::new(&sdk)) {
+            return Some(path);
+        }
+    }
+    if let Ok(developer) = std::env::var("DEVELOPER_DIR") {
+        if let Some(path) = stub_under(Path::new(&developer)) {
+            return Some(path);
+        }
+    }
+    // rustc sets neither, so in a real build this is the one that answers.
+    // Reading a symlink rather than spawning `xcrun` is worth 7.5 ms — 30% of
+    // a link's wall time, spent before its own timers start, which is why it
+    // read as unexplained overhead rather than as a phase.
+    for developer in [Path::new(XCODE_SELECT_LINK), Path::new(COMMAND_LINE_TOOLS)] {
+        if let Some(path) = stub_under(developer) {
             return Some(path);
         }
     }
 
+    // The SDK genuinely does move — between Xcode versions, betas, and the
+    // Command Line Tools — so the authority remains `xcrun`. It is the
+    // fallback rather than the answer.
     let output = std::process::Command::new("xcrun")
         .args(["--show-sdk-path"])
         .output()
@@ -316,7 +357,7 @@ fn discover_stub_library() -> Option<PathBuf> {
     if !output.status.success() {
         return None;
     }
-    stub_in(String::from_utf8_lossy(&output.stdout).trim())
+    stub_in(Path::new(String::from_utf8_lossy(&output.stdout).trim()))
 }
 
 /// An object file and the bytes it was parsed from.
@@ -2059,6 +2100,7 @@ fn load_one(path: &PathBuf, id: Option<ObjectId>) -> Result<Loaded, LinkError> {
 }
 
 fn load_objects(paths: &[PathBuf]) -> Result<Vec<LoadedObject>, LinkError> {
+    let t_all = std::time::Instant::now();
     // Object ids are assigned by position, before anything is read, so that
     // running the reads out of order cannot change them. `is_archive` looks
     // only at the path, so the assignment needs no I/O.
@@ -2133,14 +2175,26 @@ fn load_objects(paths: &[PathBuf]) -> Result<Vec<LoadedObject>, LinkError> {
         }
     }
 
+    eprintln!(
+        "LOAD parallel-phase {:.2} ({} objects, {} archives)",
+        elapsed_ms(t_all),
+        objects.len(),
+        archives.len()
+    );
+    let t_pull = std::time::Instant::now();
     if archives.is_empty() {
         return Ok(objects);
     }
 
     // Pull members in until nothing new is needed.
     let mut extracted: std::collections::HashSet<(usize, u32)> = std::collections::HashSet::new();
+    let mut rounds = 0u32;
+    let mut t_undef = 0.0f64;
     loop {
+        rounds += 1;
+        let t_u = std::time::Instant::now();
         let wanted = undefined_references(&objects);
+        t_undef += elapsed_ms(t_u);
         let mut added = false;
 
         for name in &wanted {
@@ -2169,6 +2223,13 @@ fn load_objects(paths: &[PathBuf]) -> Result<Vec<LoadedObject>, LinkError> {
         }
 
         if !added {
+            eprintln!(
+                "LOAD pull {:.2} ({} rounds, {} members, undefined {:.2})",
+                elapsed_ms(t_pull),
+                rounds,
+                extracted.len(),
+                t_undef
+            );
             return Ok(objects);
         }
     }
