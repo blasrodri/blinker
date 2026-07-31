@@ -3784,3 +3784,50 @@ they are not equally hard:
 stage,** and which stage that is depends on scale. Every measurement that
 justified the current design was taken where `relocate` dominated. It does not
 dominate a real link, and no amount of improving it would have mattered.
+
+## 80. Reserved slack raised the hit rate and did not make the link faster
+
+Finding 79 named four whole-image stages and put `layout` first because the
+machinery already existed, tested and unwired since findings 42–44. Wiring it:
+
+```
+                        reused        relocations   link
+  one crate edited   691/937  ->  728/937   69% -> 80%   148 ms -> 183 ms
+```
+
+The hit rate went up exactly as designed, and the link got **slower** — the
+padding inflates the image, so `emit+sign` pays for what `relocate` saved, and
+`relocate` is only 23% of the link to begin with.
+
+Which is finding 79 restated as a result rather than an analysis: **improving
+the reuse rate cannot help while the reused stage is a fifth of the work.**
+Slack is still the right thing to have — it is what makes a *future*
+incremental layout possible at all, and the hit rate it buys is real — but on
+its own it is a cost, and the honest accounting is that this was the cheap item
+on the list and it bought nothing yet.
+
+### Two production bugs found by getting there
+
+**The cache did not include the linker.** Changing blinker and relinking
+replayed the *previous* build's binary: inputs unchanged, request unchanged,
+whole-image fast path fires. It cost an hour — a correct fix measured as broken
+because the cache was serving output from the build before it — and in a
+release it would mean upgrading the linker silently changes nothing. The key
+now includes the executable's own path, size and mtime.
+
+**Padding is not universally inert.** A deny-list was the wrong shape:
+
+- `__eh_frame` is a chain walked by each record's length field, so a gap is a
+  record header made of zeroes. It links, runs, and dies unwinding.
+- `__thread_vars` is an array of 24-byte descriptors, and dyld checks: *"size
+  (512) of thread-locals section __thread_vars is not a multiple of 24"*.
+- `__got`, `__stubs`, `__thread_ptrs`, `__la_symbol_ptr` and `__mod_init_func`
+  are fixed-stride arrays indexed by position.
+
+Guessing which tolerate a gap is not a judgement a linker should make, so
+padding is now an allow-list: it goes only where it is known to be harmless.
+
+And the first attempt tied slack to *whether a cache was being written*, which
+made a cold link and a cached one lay out differently — breaking the property
+the entire design rests on, that an incremental output is what a cold link
+would have produced. It is a property of the request now, applied to both.
