@@ -103,16 +103,87 @@ def summarise(name, samples, size):
     return median
 
 
+def profile(args, options):
+    """Per-stage medians, from blinker's own record.
+
+    The stage numbers in findings 35 and 36 came from single runs. A single
+    run cannot distinguish a stage from the noise around it, which is the
+    mistake that produced a 1.6x ratio from two unlucky samples — so the
+    breakdown that decides *what a cache should store* is measured the same
+    way as the comparison that decides whether one is worth building.
+    """
+    import json
+    import tempfile
+
+    blinker_args = [str(BLINKER), "--blinker-internal"] + args
+    out_index = blinker_args.index("-o") + 1
+    blinker_args[out_index] = "/tmp/bench_profile"
+
+    stages = {
+        "read+parse": "link_read_and_parse_ms",
+        "resolve": "link_resolve_ms",
+        "layout": "link_layout_ms",
+        "relocate": "link_relocate_ms",
+        "emit+sign": "link_emit_ms",
+    }
+    collected = {name: [] for name in stages}
+    totals = []
+
+    with tempfile.TemporaryDirectory() as scratch:
+        record = os.path.join(scratch, "record.json")
+        cmd = blinker_args + ["--blinker-json-diagnostics", record]
+        for _ in range(options.warmup):
+            run_once(cmd, "/tmp/bench_profile")
+        for _ in range(options.iterations):
+            run_once(cmd, "/tmp/bench_profile")
+            with open(record) as handle:
+                timings = json.load(handle)["timings"]
+            for name, key in stages.items():
+                if timings.get(key) is not None:
+                    collected[name].append(timings[key])
+            if timings.get("internal_link_ms") is not None:
+                totals.append(timings["internal_link_ms"])
+
+    if not totals:
+        sys.exit("no internal-link timings recorded")
+
+    total = statistics.median(totals)
+    print(f"blinker internal link: {total:.1f} ms median "
+          f"({options.iterations} iterations)\n")
+    accounted = 0.0
+    for name in stages:
+        samples = collected[name]
+        if not samples:
+            continue
+        median = statistics.median(samples)
+        accounted += median
+        sd = statistics.stdev(samples) if len(samples) > 1 else 0.0
+        print(f"  {name:<12}{median:6.1f} ms  {median / total * 100:5.1f}%  sd {sd:.1f}")
+
+    gap = total - accounted
+    print(f"\n  {'accounted':<12}{accounted:6.1f} ms  {accounted / total * 100:5.1f}%")
+    print(f"  {'unmeasured':<12}{gap:6.1f} ms  {gap / total * 100:5.1f}%")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("args_file")
     parser.add_argument("--iterations", type=int, default=15)
     parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="report blinker's per-stage medians instead of comparing linkers",
+    )
     options = parser.parse_args()
 
     args = load_args(options.args_file)
     if "-o" not in args:
         sys.exit("captured arguments contain no -o")
+
+    if options.profile:
+        profile(args, options)
+        return
 
     ld = real_ld_command(args)
     if ld is None:

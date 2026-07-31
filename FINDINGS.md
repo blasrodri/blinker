@@ -1443,6 +1443,9 @@ itself a naming bug now that the link is not a fallback.
 
 ## 36. A third of the link was in the gaps between the timers
 
+> **Retracted by finding 40.** The 31% gap was the `xcrun` spawn being charged
+> to untimed work, not repeated traversal. Measured properly it is 4.9%.
+
 Instrumenting the CLI's internal link answered the open question from finding
 35, and corrected finding 35 at the same time:
 
@@ -1630,3 +1633,57 @@ linker on other platforms. It is absent here, so any claim about how blinker
 compares to it would be unfounded. Installing it and adding it to
 `scripts/bench.py` is a worthwhile next step; asserting anything about it now
 would not be.
+
+## 40. The profile, measured properly, and what it says about the cache
+
+Findings 35 and 36 profiled the link from single runs. Re-measured through the
+benchmark harness — 25 iterations, warmup discarded, standard deviations
+reported:
+
+```
+blinker internal link: 30.1 ms median
+
+  read+parse     8.1 ms   27.0%  sd 0.6
+  resolve        8.3 ms   27.6%  sd 0.8
+  layout         1.9 ms    6.5%  sd 0.2
+  relocate       7.6 ms   25.1%  sd 0.9
+  emit+sign      2.7 ms    8.9%  sd 0.3
+
+  accounted     28.6 ms   95.1%
+  unmeasured     1.5 ms    4.9%
+```
+
+Two corrections to what was previously recorded.
+
+**Finding 36's "31% in untimed gaps" was an artifact.** `internal_link_ms` is
+measured from before `LinkRequest::new`, which calls `default_stub_library()`,
+which spawned `xcrun` — 14 ms charged to "work between the timers". The real
+unmeasured remainder is 4.9%, which is process and allocator noise. The
+repeated-traversal story built on that number was chasing something that was
+not there, and the traversal collapse (finding 37) unsurprisingly measured no
+improvement.
+
+**The stage shares are stable and roughly equal.** Three phases —
+`read+parse`, `resolve`, `relocate` — are within 9% of each other and are 80%
+of the link between them. The standard deviations are under 1 ms, so these are
+real distinctions rather than noise, which is more than could be said for any
+earlier version of this table.
+
+### What a cache is worth, on numbers that hold up
+
+Against `ld-prime` at 32.3 ms and blinker at 39.7 ms on the same workload:
+
+| cached through | saved | blinker becomes |
+|---|---|---|
+| parse | 27% | ~29 ms — **ahead of ld-prime** |
+| parse + resolve | 55% | ~18 ms |
+| parse + resolve + relocate | 80% | ~8 ms |
+
+So finding 35's conclusion is now doubly wrong: it said a parse cache could not
+close the gap, on a baseline that was itself mismeasured. A parse cache alone
+is enough to pass ld-prime, and caching through relocation — which is what
+findings 15–18's CGU-keyed design supports — is worth roughly 4×.
+
+That is the first time this project has had a defensible estimate of what M4/M5
+is worth, and it rests on an instrument whose failure modes are documented in
+its own header.
