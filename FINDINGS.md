@@ -1419,11 +1419,21 @@ content hash, never path; rustc's own incremental verdict readable from which
 `ParsedObject`s, but enough of the finished layout and patched section content
 to rebuild an image while touching only the CGUs that changed.
 
-### Also visible: the driver costs more than the link
+### Also visible: the CLI costs roughly twice the library link
 
-The library links in 24.8 ms; the same link through the CLI takes 44.6 ms. The
-~20 ms difference is process start plus `fingerprint_input`, which reads every
-input to hash it — work the link then repeats when it reads the same files to
-parse them. For a cache that must hash inputs anyway, reading them twice is
-pure waste, and merging those two passes is a prerequisite for M4 rather than a
-tidy-up.
+The library links in 24.8 ms; the same link through the CLI reports 48 ms and
+takes 46.5 ms of wall time. Where that difference goes is **not yet
+established**.
+
+My first explanation was that `fingerprint_input` reads every input to hash it
+and the link then reads them all again. That is wrong: `InputFingerprint::probe`
+only calls `metadata()` unless `hash_contents` is set, and the CLI leaves
+`--blinker-strict-fingerprints` off by default, so fingerprinting 27 files is 27
+`stat` calls. It is not the cost.
+
+Recorded as an open question rather than an explanation, because a plausible
+story that has not been measured is exactly what this project keeps punishing.
+The next step is to time the CLI's phases directly rather than infer them —
+the record already carries `argument_parsing_ms` and `input_fingerprinting_ms`,
+and the internal link is currently lumped under `fallback_exec_ms`, which is
+itself a naming bug now that the link is not a fallback.
