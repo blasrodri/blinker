@@ -1529,3 +1529,53 @@ The two code changes are kept: one pass over the relocations is simpler than
 four regardless of speed, and honouring `SDKROOT` before spawning `xcrun` is
 correct because the compiler driver already sets it. Neither is claimed as a
 performance improvement.
+
+## 38. The benchmark was wrong, and blinker is near parity with ld64
+
+Rebuilding the harness (interleaved runs, controlled warmup, verified output,
+reported spread) changed the headline number of this project.
+
+```
+inputs: 27 files, 16.9 MB — 40 iterations after 5 warmup
+
+  ld64         28.3 ms  (min 25.0, max 29.5, sd 1.1, spread 16%)  output  458 KB
+  blinker      31.0 ms  (min 29.4, max 33.9, sd 0.9, spread 14%)  output 1031 KB
+
+  blinker/ld64: 1.10x   output ratio: 2.25x
+```
+
+**Finding 34 reported 1.6×. The real figure is about 1.10×.** That earlier
+number compared blinker's 44.6 ms against an ld64 sample of 27.9 ms — and 27.9
+was near the *fast end* of ld64's distribution while 44.6 was near the slow end
+of blinker's. Two unlucky samples, one ratio, no variance reported, and a
+strategic conclusion drawn from it.
+
+It also shows how much the harness itself mattered: at 15 iterations the spread
+was 27–39% and the ratio read 1.17×; at 40 with more warmup the spread fell to
+14–16% and the ratio settled at 1.10×. The measurement was dominated by its own
+noise until it was built to say so.
+
+### This reverses finding 35's conclusion
+
+Finding 35 argued that a parse cache saving ~30% could not make blinker beat
+ld64, because it would land at ~37 ms against 27.9 ms. On the corrected
+baseline, blinker is at 31.0 ms against 28.3 ms — **2.7 ms behind, not 16.7**.
+A cache saving even 15% would put blinker ahead of the linker it replaces, and
+the M4/M5 work is viable rather than doomed.
+
+The phase percentages in findings 35 and 36 should be re-measured through this
+harness before anything is optimised against them, for the same reason: they
+were produced by the instrument this finding discredits.
+
+### What the harness now refuses to do
+
+It aborts rather than timing a link that failed or produced an implausibly
+small output — the failure mode that made attempt one report a 45% win for two
+crashing programs. And it prints a note when the difference between the two
+linkers is smaller than the observed spread, which it does for this result: at
+1.10× with 14% spread, "blinker is slower" is a statement the data supports
+only weakly.
+
+The remaining honest claim is narrow and worth stating exactly: **blinker links
+this workload in roughly the same time as ld64, while producing an image 2.25×
+larger because it does not dead-strip.**
