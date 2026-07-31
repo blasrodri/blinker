@@ -101,6 +101,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "blinker-differential"
+version = "0.1.0"
+dependencies = [
+ "blinker-layout",
+ "blinker-macho",
+ "blinker-output",
+ "blinker-test-support",
+ "object",
+]
+
+[[package]]
 name = "blinker-layout"
 version = "0.1.0"
 dependencies = [

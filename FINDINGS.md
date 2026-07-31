@@ -532,3 +532,90 @@ $ nm -a /tmp/blinker-out
 
 It is structurally valid, not yet runnable — the export trie, lazy binding and
 synthesised stubs are still missing, and nothing has been through dyld.
+
+## 13. A differential harness calibrated against the wrong target manufactures bugs
+
+The differential suite's first run reported that blinker emitted the wrong dyld
+metadata: it produced `LC_DYLD_INFO_ONLY` where the reference had
+`LC_DYLD_CHAINED_FIXUPS` and `LC_DYLD_EXPORTS_TRIE`. That looked like a
+straightforward, well-evidenced defect — a whole subsystem aimed at the wrong
+mechanism.
+
+blinker was right. The reference was wrong.
+
+The macOS **deployment target** selects the strategy:
+
+| deployment target | dyld metadata |
+|---|---|
+| ≤ 11.x | `LC_DYLD_INFO_ONLY` — classic rebase/bind opcode streams |
+| ≥ 12.0 | `LC_DYLD_CHAINED_FIXUPS` + `LC_DYLD_EXPORTS_TRIE` |
+
+Measured directly:
+
+```
+$ cc -arch arm64 -o out c.c                          # default: macos 26.0
+  -> LC_DYLD_CHAINED_FIXUPS LC_DYLD_EXPORTS_TRIE
+$ cc -arch arm64 -mmacosx-version-min=11.0 -o out c.c
+  -> LC_DYLD_INFO_ONLY
+$ rustc --print deployment-target
+MACOSX_DEPLOYMENT_TARGET=11.0
+```
+
+`cc` defaults to the running OS version. `rustc` defaults to 11.0 — and
+blinker links rustc's output. A real Rust binary confirms it:
+
+```
+$ otool -l target/debug/rstest | grep LC_DYLD
+      cmd LC_DYLD_INFO_ONLY
+```
+
+So the reference link has to be pinned to *rustc's* target, not the driver's
+default. It now is, and the pin is checked against `rustc --print
+deployment-target` rather than hardcoded, so the two cannot drift apart.
+
+### Why this is the important finding
+
+A differential harness is trusted more than a hand-written assertion, because
+it compares against something that was right first. That trust is exactly what
+makes a miscalibrated one dangerous: it does not merely fail to catch bugs, it
+**manufactures** them, and the manufactured ones carry the same authority as
+the real ones. Acting on this report would have meant rewriting a correct
+`dyld_info.rs` to target a mechanism blinker will never encounter.
+
+The general rule this produces: **a differential test's calibration needs its
+own tests.** Three now exist — the same program linked twice must compare
+equal (nothing that legitimately varies leaked into the comparison), two
+different programs must compare unequal (the comparison is not vacuous), and
+the reference's deployment target must equal rustc's (it is measuring the
+right thing). The first two were written from the start. The third was written
+only after the miscalibration was caught, which is the honest order.
+
+## 14. `MH_HAS_TLV_DESCRIPTORS` is conditional, and blinker hardcodes it
+
+With the harness calibrated, one real discrepancy remains in the header:
+
+```
+Rust binary : 0x00a00085
+C at 11.0   : 0x00200085
+difference  : 0x00800000  = MH_HAS_TLV_DESCRIPTORS
+```
+
+blinker's header constant was cross-checked against a real *Rust* executable,
+which uses thread-locals, so the bit is set there correctly. It is not a
+constant, though: it belongs only in an image that actually has thread-local
+variable descriptors. blinker sets it unconditionally, so it is wrong for any
+image without TLS.
+
+This is latent rather than active — blinker's inputs are Rust — but it is the
+same shape as the `MH_APP_EXTENSION_SAFE` error in finding 12: a *conditional*
+property read off one sample and frozen into a constant. Deriving it from the
+presence of `__thread_vars`/`__thread_bss` in the layout is the fix.
+
+### The rest of the gap
+
+With calibration fixed, blinker matches ld64 on 9 of the 13 compared
+properties for a trivial program — identity, load-command order, segment set,
+segment placement, section sizes, dependencies, undefined symbols, local
+symbol count and entry point. What remains is a to-do list rather than a
+surprise: `LC_FUNCTION_STARTS`, `LC_DATA_IN_CODE`, `LC_CODE_SIGNATURE`, and
+`__TEXT,__unwind_info`.
