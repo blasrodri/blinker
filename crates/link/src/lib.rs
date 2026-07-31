@@ -167,9 +167,35 @@ impl LinkRequest {
 
 /// Where the SDK keeps `libSystem`'s stub, if it can be found.
 ///
-/// `xcrun` is asked rather than a path assumed: the SDK moves between Xcode
-/// versions and between Xcode and the Command Line Tools.
+/// # Why this is cached
+///
+/// Asking `xcrun` costs **14 ms** — a third of a 40 ms link, spent spawning a
+/// process to learn a path that cannot change while blinker is running. It was
+/// called from `LinkRequest::new`, so every link paid it, and because it
+/// happened before the link's own timers started it appeared as unexplained
+/// overhead rather than as a phase.
+///
+/// `SDKROOT` is honoured first: the compiler driver sets it, so in a real
+/// build the answer is already in the environment and no process need be
+/// spawned at all. `xcrun` remains the fallback, because the SDK genuinely
+/// does move between Xcode versions and the Command Line Tools.
 pub fn default_stub_library() -> Option<PathBuf> {
+    static CACHED: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    CACHED.get_or_init(discover_stub_library).clone()
+}
+
+fn discover_stub_library() -> Option<PathBuf> {
+    let stub_in = |sdk: &str| {
+        let path = PathBuf::from(sdk).join("usr/lib/libSystem.tbd");
+        path.exists().then_some(path)
+    };
+
+    if let Ok(sdk) = std::env::var("SDKROOT") {
+        if let Some(path) = stub_in(&sdk) {
+            return Some(path);
+        }
+    }
+
     let output = std::process::Command::new("xcrun")
         .args(["--show-sdk-path"])
         .output()
@@ -177,9 +203,7 @@ pub fn default_stub_library() -> Option<PathBuf> {
     if !output.status.success() {
         return None;
     }
-    let sdk = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    let path = PathBuf::from(sdk).join("usr/lib/libSystem.tbd");
-    path.exists().then_some(path)
+    stub_in(String::from_utf8_lossy(&output.stdout).trim())
 }
 
 /// An object file and the bytes it was parsed from.
@@ -315,45 +339,79 @@ fn eh_frame_fde_offsets(
     offsets
 }
 
-/// Symbols used as unwind personality routines.
+/// Everything a single pass over the relocations can decide.
 ///
-/// These need GOT slots like any other indirect reference. `__unwind_info`
-/// records a personality as an image-relative offset to the **slot** holding
-/// its address, not to the function — the unwinder loads through it, exactly
-/// as code does for an imported symbol.
-fn personality_symbols(objects: &[LoadedObject]) -> Vec<TableEntry> {
-    let mut entries = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+/// These four questions used to be four separate walks over every relocation
+/// of every object — plus two more for the output symbol table and the
+/// undefined set. Profiling put that repeated traversal at 31% of the link,
+/// larger than any named stage, so they are answered together.
+///
+/// The order still matters: stubs are only needed for symbols that turned out
+/// to be imports, so the caller supplies that set.
+#[derive(Default)]
+struct RelocationSurvey {
+    got: Vec<TableEntry>,
+    tlv: Vec<TableEntry>,
+    stubs: Vec<String>,
+    personalities: Vec<TableEntry>,
+}
+
+fn survey_relocations(objects: &[LoadedObject], imports: &[String]) -> RelocationSurvey {
+    let imported: std::collections::HashSet<&str> = imports.iter().map(String::as_str).collect();
+    let mut survey = RelocationSurvey::default();
+    let (mut got_seen, mut tlv_seen, mut stub_seen, mut personality_seen) = (
+        std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
+        std::collections::HashSet::new(),
+    );
+
     for object in objects {
-        for section in &object.parsed.sections {
-            if section.name != "__compact_unwind" {
+        // Which sections are `__compact_unwind`, so personality relocations can
+        // be recognised without a second scan.
+        let unwind_sections: std::collections::HashSet<SectionId> = object
+            .parsed
+            .sections
+            .iter()
+            .filter(|s| s.name == "__compact_unwind")
+            .map(|s| s.id)
+            .collect();
+
+        for relocation in &object.parsed.relocations {
+            let RelocationTarget::Symbol(id) = relocation.target else {
                 continue;
+            };
+            let Some(symbol) = object.parsed.symbol(id) else {
+                continue;
+            };
+            let entry = || TableEntry {
+                object: object.parsed.id,
+                name: symbol.name.clone(),
+            };
+
+            if needs_got(relocation.kind) && got_seen.insert(symbol.name.clone()) {
+                survey.got.push(entry());
             }
-            for relocation in object
-                .parsed
-                .relocations
-                .iter()
-                .filter(|r| r.section == section.id)
+            if needs_tlv(relocation.kind) && tlv_seen.insert(symbol.name.clone()) {
+                survey.tlv.push(entry());
+            }
+            if relocation.kind == Arm64RelocationKind::Branch26
+                && imported.contains(symbol.name.as_str())
+                && stub_seen.insert(symbol.name.clone())
             {
-                if relocation.offset % COMPACT_UNWIND_RECORD != CU_PERSONALITY {
-                    continue;
-                }
-                let RelocationTarget::Symbol(id) = relocation.target else {
-                    continue;
-                };
-                let Some(symbol) = object.parsed.symbol(id) else {
-                    continue;
-                };
-                if seen.insert(symbol.name.clone()) {
-                    entries.push(TableEntry {
-                        object: object.parsed.id,
-                        name: symbol.name.clone(),
-                    });
-                }
+                survey.stubs.push(symbol.name.clone());
+            }
+            if unwind_sections.contains(&relocation.section)
+                && relocation.offset % COMPACT_UNWIND_RECORD == CU_PERSONALITY
+                && personality_seen.insert(symbol.name.clone())
+            {
+                survey.personalities.push(entry());
             }
         }
     }
-    entries
+
+    survey.stubs.sort();
+    survey
 }
 
 /// Read the compact unwind records the compiler emitted.
@@ -497,39 +555,6 @@ fn needs_tlv(kind: Arm64RelocationKind) -> bool {
     )
 }
 
-/// Symbols needing a thread-local pointer slot.
-///
-/// Structurally the GOT again, and for the same reason: the instruction needs
-/// a fixed address to load from, and what it loads is decided elsewhere. The
-/// difference is what the slot points at — a TLV *descriptor* the compiler
-/// emitted into `__thread_vars`, rather than the variable itself. Rust's
-/// standard library uses thread-locals freely, so this is unavoidable for Rust
-/// and never comes up in simple C.
-fn tlv_symbols(objects: &[LoadedObject]) -> Vec<TableEntry> {
-    let mut names = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for object in objects {
-        for relocation in &object.parsed.relocations {
-            if !needs_tlv(relocation.kind) {
-                continue;
-            }
-            let RelocationTarget::Symbol(id) = relocation.target else {
-                continue;
-            };
-            let Some(symbol) = object.parsed.symbol(id) else {
-                continue;
-            };
-            if seen.insert(symbol.name.clone()) {
-                names.push(TableEntry {
-                    object: object.parsed.id,
-                    name: symbol.name.clone(),
-                });
-            }
-        }
-    }
-    names
-}
-
 /// One slot of a synthesised pointer table.
 ///
 /// The owning object is carried, not just the name. A thread-local or a
@@ -646,70 +671,6 @@ fn undefined_references(objects: &[LoadedObject]) -> Vec<String> {
     names
 }
 
-/// Symbols an imported-function *call* needs a stub for.
-///
-/// Only branches need one: a `BRANCH26` cannot reach an address dyld will fill
-/// in later, so it targets a stub that loads the bound pointer and jumps. Data
-/// references already go through the GOT and need nothing extra.
-fn stub_symbols(objects: &[LoadedObject], imports: &[String]) -> Vec<String> {
-    let imported: std::collections::HashSet<&str> = imports.iter().map(String::as_str).collect();
-    let mut names = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for object in objects {
-        for relocation in &object.parsed.relocations {
-            if relocation.kind != Arm64RelocationKind::Branch26 {
-                continue;
-            }
-            let RelocationTarget::Symbol(id) = relocation.target else {
-                continue;
-            };
-            let Some(symbol) = object.parsed.symbol(id) else {
-                continue;
-            };
-            if imported.contains(symbol.name.as_str()) && seen.insert(symbol.name.clone()) {
-                names.push(symbol.name.clone());
-            }
-        }
-    }
-    names.sort();
-    names
-}
-
-/// Symbols that need a GOT entry, in a stable order.
-///
-/// A reference to data defined in *another* object goes through the GOT even
-/// within a single executable: the compiler cannot know at compile time
-/// whether the definition will end up in this image or in a dylib, so it emits
-/// the indirect form and leaves the choice to the linker.
-///
-/// This is why the first end-to-end tests passed without a GOT at all — a
-/// global read from the same object is a direct ADRP/ADD, and a call to
-/// another object is a direct branch. Only cross-object *data* takes this path.
-fn got_symbols(objects: &[LoadedObject]) -> Vec<TableEntry> {
-    let mut names = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for object in objects {
-        for relocation in &object.parsed.relocations {
-            if !needs_got(relocation.kind) {
-                continue;
-            }
-            let RelocationTarget::Symbol(id) = relocation.target else {
-                continue;
-            };
-            let Some(symbol) = object.parsed.symbol(id) else {
-                continue;
-            };
-            if seen.insert(symbol.name.clone()) {
-                names.push(TableEntry {
-                    object: object.parsed.id,
-                    name: symbol.name.clone(),
-                });
-            }
-        }
-    }
-    names
-}
-
 /// Link the request into an image.
 pub fn link(request: &LinkRequest) -> Result<Image, LinkError> {
     link_inner(request, &mut LinkTimings::default())
@@ -740,13 +701,14 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     resolve_symbols(&objects, &imports)?;
     timings.resolve_ms = elapsed_ms(step);
 
-    let stubs = stub_symbols(&objects, &imports);
+    let survey = survey_relocations(&objects, &imports);
+    let stubs = survey.stubs;
     // Synthesise `__got` before layout, so it is placed and addressed like any
     // other section rather than appended afterwards. Internal targets and
     // imports share one table: the difference is only how each slot gets its
     // value — a rebase for an address we know, a bind for one dyld supplies.
-    let mut got = got_symbols(&objects);
-    for entry in personality_symbols(&objects) {
+    let mut got = survey.got;
+    for entry in survey.personalities {
         if !got.iter().any(|e| e.name == entry.name) {
             got.push(entry);
         }
@@ -786,7 +748,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
         });
     }
 
-    let tlv = tlv_symbols(&objects);
+    let tlv = survey.tlv;
     if !tlv.is_empty() {
         placements.push(InputPlacement {
             object: SYNTHETIC_OBJECT,

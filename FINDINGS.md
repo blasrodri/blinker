@@ -1486,3 +1486,46 @@ the total rather than on their own. Percentages that sum to 69% are obvious;
 five numbers in isolation are not. The summary now prints both, so the next
 person to read a profile sees the discrepancy without having to add the column
 up by hand.
+
+## 37. Two optimisations, no measurable win, and a benchmark too noisy to tell
+
+Finding 36 attributed 31% of the link to repeated traversal and called it the
+first thing to fix. Two changes followed, and neither is defensible as a win.
+
+**Collapsing four relocation walks into one.** `got_symbols`,
+`personality_symbols`, `tlv_symbols` and `stub_symbols` each walked every
+relocation of every object; they are now one pass. Result: 46.3 ms against a
+46.5 ms baseline. No change.
+
+**Caching the SDK lookup.** `LinkRequest::new` calls `default_stub_library()`,
+which spawns `xcrun --show-sdk-path` — measured at **14 ms**, a third of a
+40 ms link. That looked like the whole missing gap. Result: 44.7 ms, and
+setting `SDKROOT` (which skips the spawn entirely) gave 47.1 ms — *slower*.
+
+Two things were wrong with the second one:
+
+- A `OnceLock` caches within **one process**. blinker is spawned once per link,
+  so an in-process cache can never be hit twice. The change is correct in the
+  library, and worth nothing to the CLI.
+- The numbers do not separate a 14 ms effect from noise, which means they were
+  never going to confirm or refute the hypothesis.
+
+### The real finding is about the benchmark
+
+Across four runs of the same binary on the same inputs: 44.7, 46.3, 46.5,
+47.1 ms — a spread of about 5%. A 14 ms effect on a 46 ms link should be
+impossible to miss, and it was missed, so the harness is not measuring what it
+claims to. Seven iterations of a subprocess with no warmup control, no
+interleaving, and no variance reported is not an instrument; it is an anecdote
+with a decimal point.
+
+**Nothing further should be optimised until the benchmark reports variance and
+interleaves the two linkers.** Every number in finding 34 and 36 carries this
+caveat, including the 27.9 ms vs 44.6 ms comparison that the whole M3 conclusion
+rests on — the *ratio* there is large enough to survive 5% noise, but the phase
+percentages are not.
+
+The two code changes are kept: one pass over the relocations is simpler than
+four regardless of speed, and honouring `SDKROOT` before spawning `xcrun` is
+correct because the compiler driver already sets it. Neither is claimed as a
+performance improvement.
