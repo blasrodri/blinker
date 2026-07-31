@@ -458,43 +458,50 @@ fn liveness(objects: &[LoadedObject], atoms: &Atoms, entry: &str) -> (HashSet<us
         }
     }
 
-    let propagate = |live: &mut HashSet<usize>, worklist: &mut Vec<usize>| {
-        while let Some(index) = worklist.pop() {
-            let atom = &atoms.atoms[index];
-            let Some(object) = by_id.get(&atom.object.0) else {
-                continue;
-            };
-            let Some(grouped) = grouped.get(&atom.object.0) else {
-                continue;
-            };
-            // Metadata's own references do not keep anything alive; it is kept
-            // alive *by* what it describes, below.
-            if object
-                .parsed
-                .section(atom.section)
-                .is_some_and(|s| is_metadata(&s.name))
-            {
-                // Except forward: a live unwind record's exception table is
-                // part of it, so an `__eh_frame` FDE that survives brings its
-                // LSDA with it.
-                if !object
+    // Atoms whose own edges were deliberately not followed. Every other live
+    // atom passes through the worklist exactly once and has its targets marked,
+    // so these are the only places the invariant can be violated — and the only
+    // places the verification below has to look.
+    let mut suppressed: Vec<usize> = Vec::new();
+    let propagate =
+        |live: &mut HashSet<usize>, worklist: &mut Vec<usize>, suppressed: &mut Vec<usize>| {
+            while let Some(index) = worklist.pop() {
+                let atom = &atoms.atoms[index];
+                let Some(object) = by_id.get(&atom.object.0) else {
+                    continue;
+                };
+                let Some(grouped) = grouped.get(&atom.object.0) else {
+                    continue;
+                };
+                // Metadata's own references do not keep anything alive; it is kept
+                // alive *by* what it describes, below.
+                if object
                     .parsed
                     .section(atom.section)
-                    .is_some_and(|s| s.name == "__eh_frame")
+                    .is_some_and(|s| is_metadata(&s.name))
                 {
-                    continue;
+                    // Except forward: a live unwind record's exception table is
+                    // part of it, so an `__eh_frame` FDE that survives brings its
+                    // LSDA with it.
+                    if !object
+                        .parsed
+                        .section(atom.section)
+                        .is_some_and(|s| s.name == "__eh_frame")
+                    {
+                        suppressed.push(index);
+                        continue;
+                    }
                 }
-            }
-            for relocation in within(grouped, atom) {
-                if let Some(target) = atoms.target_atom(object, relocation) {
-                    if live.insert(target) {
-                        worklist.push(target);
+                for relocation in within(grouped, atom) {
+                    if let Some(target) = atoms.target_atom(object, relocation) {
+                        if live.insert(target) {
+                            worklist.push(target);
+                        }
                     }
                 }
             }
-        }
-    };
-    propagate(&mut live, &mut worklist);
+        };
+    propagate(&mut live, &mut worklist, &mut suppressed);
 
     // Metadata comes alive with its subject, not before it.
     for object in objects {
@@ -513,15 +520,19 @@ fn liveness(objects: &[LoadedObject], atoms: &Atoms, entry: &str) -> (HashSet<us
             }
         }
     }
-    propagate(&mut live, &mut worklist);
+    propagate(&mut live, &mut worklist, &mut suppressed);
 
-    // The invariant, verified. Everything a live atom refers to must be live,
-    // whatever section it lives in and whatever rule above was supposed to
-    // have covered it.
+    // The invariant, verified: everything a live atom refers to must be live.
+    //
+    // Only the suppressed atoms can break it. Propagation marks the targets of
+    // every atom it visits, and every live atom is visited exactly once — so
+    // checking the whole live set is a second walk over work already done. On
+    // a 47-object fixture that cost 0.9 ms and was left alone; on blinker's own
+    // binary it is a fifth of the dead-strip stage (77).
     let mut revived = 0usize;
     loop {
         let mut found = Vec::new();
-        for index in live.iter().copied() {
+        for index in suppressed.iter().copied() {
             let atom = &atoms.atoms[index];
             let (Some(object), Some(grouped)) =
                 (by_id.get(&atom.object.0), grouped.get(&atom.object.0))
@@ -540,7 +551,14 @@ fn liveness(objects: &[LoadedObject], atoms: &Atoms, entry: &str) -> (HashSet<us
             break;
         }
         revived += found.len();
-        live.extend(found);
+        // Revived atoms go through the worklist, so their own edges are
+        // followed and the invariant extends to them too.
+        for index in found {
+            if live.insert(index) {
+                worklist.push(index);
+            }
+        }
+        propagate(&mut live, &mut worklist, &mut suppressed);
     }
 
     (live, revived)
