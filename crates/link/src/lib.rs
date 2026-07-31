@@ -40,6 +40,7 @@ use blinker_output::symtab::OutputSymbol;
 use blinker_output::{Bind, Image, ImageBuilder, Rebase, UnwindEntry};
 use blinker_relocations::{apply, Context};
 use blinker_symbols::{SymbolProvider, SymbolTable};
+use reachability::Strip;
 
 pub mod error;
 pub use error::LinkError;
@@ -85,6 +86,17 @@ pub struct LinkTimings {
     /// report the same hit rate, so without this flag no test could tell them
     /// apart — and a fast path that silently stops firing is finding 64 again.
     pub reused_finished_image: bool,
+    /// Time spent deciding what the program can reach. Zero without
+    /// `-dead_strip`.
+    pub dead_strip_ms: f64,
+    /// `__text` bytes the strip removed, as the analysis counts them.
+    pub stripped_bytes: u64,
+    /// Atoms the propagation left dead that something live then referred to.
+    ///
+    /// Reported because it must be zero: a non-zero count is the model failing
+    /// to describe the input, caught by the verification pass rather than by a
+    /// crash in the linked program.
+    pub revived_atoms: u64,
 }
 
 impl std::fmt::Display for LinkTimings {
@@ -133,6 +145,20 @@ impl std::fmt::Display for LinkTimings {
             self.layout_probe_ms,
             pct(self.layout_probe_ms)
         )?;
+        if self.dead_strip_ms > 0.0 {
+            writeln!(
+                f,
+                "  dead-strip  {:7.1} ms  {:5.1}%   {} KB of __text removed{}",
+                self.dead_strip_ms,
+                pct(self.dead_strip_ms),
+                self.stripped_bytes / 1024,
+                if self.revived_atoms > 0 {
+                    format!(", {} revived", self.revived_atoms)
+                } else {
+                    String::new()
+                }
+            )?;
+        }
         writeln!(
             f,
             "  relocate    {:7.1} ms  {:5.1}%",
@@ -187,6 +213,8 @@ pub struct LinkRequest {
     /// a previous run is a link whose result depends on history, and that is
     /// the one thing a correctness test must not tolerate.
     pub cache_path: Option<PathBuf>,
+    /// Whether to discard input nothing reaches.
+    pub dead_strip: bool,
 }
 
 impl LinkRequest {
@@ -198,11 +226,22 @@ impl LinkRequest {
             dylibs: vec![Dylib::lib_system()],
             stub_libraries: default_stub_library().into_iter().collect(),
             cache_path: None,
+            dead_strip: false,
         }
     }
 
     /// Cache this link's relocated output under `path`, and reuse what a
     /// previous link left there.
+    /// Discard code and data nothing reaches.
+    ///
+    /// Off unless asked for, as in `ld`: a link that drops input the user did
+    /// not ask it to drop is one whose output cannot be explained from its
+    /// command line. `-dead_strip` turns it on, which is what rustc passes.
+    pub fn dead_stripped(mut self, on: bool) -> Self {
+        self.dead_strip = on;
+        self
+    }
+
     pub fn cached_at(mut self, path: PathBuf) -> Self {
         self.cache_path = Some(path);
         self
@@ -472,6 +511,7 @@ fn eh_frame_fde_offsets(
     objects: &[LoadedObject],
     image: &Image,
     addresses: &AddressMap,
+    strip: &Strip,
 ) -> HashMap<u64, u32> {
     let mut offsets = HashMap::new();
 
@@ -532,10 +572,17 @@ fn eh_frame_fde_offsets(
 
                 // Zero identifies a CIE; anything else is an FDE whose value is
                 // the distance back to its CIE.
+                // Zero identifies a CIE; anything else is an FDE whose value is
+                // the distance back to its CIE. A record whose bytes were
+                // stripped has no offset to publish, and no live function is
+                // looking for one.
                 if id != 0 {
                     // `PC begin` immediately follows the CIE pointer.
-                    if let Some(function) = targets.get(&(position + 8)) {
-                        offsets.insert(*function, (chunk_offset + position) as u32);
+                    if let (Some(function), Some(placed)) = (
+                        targets.get(&(position + 8)),
+                        strip.remap(object.parsed.id, section.id, position),
+                    ) {
+                        offsets.insert(*function, (chunk_offset + placed) as u32);
                     }
                 }
 
@@ -563,7 +610,11 @@ struct RelocationSurvey {
     personalities: Vec<TableEntry>,
 }
 
-fn survey_relocations(objects: &[LoadedObject], imports: &[String]) -> RelocationSurvey {
+fn survey_relocations(
+    objects: &[LoadedObject],
+    imports: &[String],
+    strip: &Strip,
+) -> RelocationSurvey {
     let imported: std::collections::HashSet<&str> = imports.iter().map(String::as_str).collect();
     let mut survey = RelocationSurvey::default();
     let (mut got_seen, mut tlv_seen, mut stub_seen, mut personality_seen) = (
@@ -585,6 +636,16 @@ fn survey_relocations(objects: &[LoadedObject], imports: &[String]) -> Relocatio
             .collect();
 
         for relocation in &object.parsed.relocations {
+            // A relocation in bytes that were stripped patches nothing, and an
+            // indirection reserved for it would be a slot holding the address
+            // of something no longer in the image — which `fill_got` reports
+            // as an undefined symbol, because that is what it looks like.
+            if strip
+                .remap(object.parsed.id, relocation.section, relocation.offset)
+                .is_none()
+            {
+                continue;
+            }
             let RelocationTarget::Symbol(id) = relocation.target else {
                 continue;
             };
@@ -631,6 +692,7 @@ fn compact_unwind_entries(
     objects: &[LoadedObject],
     image: &Image,
     addresses: &AddressMap,
+    strip: &Strip,
     got_slots: &HashMap<String, u64>,
     fde_offsets: &HashMap<u64, u32>,
 ) -> Vec<UnwindEntry> {
@@ -681,12 +743,25 @@ fn compact_unwind_entries(
                     .map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes")))
                     .unwrap_or(0);
 
+                // This is the one place in the link that reads a *section*
+                // relocation with a meaningful inline offset, so it is also
+                // the one place where stripping has to be undone by hand: the
+                // recorded offset is where the function used to be.
                 let address = match relocation.target {
                     RelocationTarget::Section(id) => {
                         let origin = object.parsed.section(id).map(|s| s.vm_address).unwrap_or(0);
-                        base + inline.saturating_sub(origin)
+                        let Some(offset) =
+                            strip.remap(object.parsed.id, id, inline.saturating_sub(origin))
+                        else {
+                            // The function it describes is gone, so this record
+                            // has nothing to describe. Leaving the field absent
+                            // is what drops the record below.
+                            continue;
+                        };
+                        base + offset
                     }
-                    // For a symbol the inline value is a plain addend.
+                    // For a symbol the inline value is a plain addend, and the
+                    // symbol's own address has already been remapped.
                     RelocationTarget::Symbol(_) => base + inline,
                 };
 
@@ -991,7 +1066,20 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     let step = std::time::Instant::now();
     let objects = load_objects(&request.objects)?;
     timings.read_and_parse_ms = elapsed_ms(step);
-    let mut placements = placements_for(&objects);
+
+    // Decided before anything is placed, because it changes how big every
+    // contribution is. Everything downstream asks it where an input byte went.
+    let step = std::time::Instant::now();
+    let (strip, report) = if request.dead_strip {
+        reachability::plan(&objects, &request.entry_symbol)
+    } else {
+        (Strip::none(), reachability::Report::default())
+    };
+    timings.dead_strip_ms = elapsed_ms(step);
+    timings.stripped_bytes = report.dead_bytes();
+    timings.revived_atoms = report.revived as u64;
+
+    let mut placements = placements_for(&objects, &strip);
 
     if placements.is_empty() {
         return Err(LinkError::NothingToLink);
@@ -1010,7 +1098,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     resolve_symbols(&objects, &imports)?;
     timings.resolve_ms = elapsed_ms(step);
 
-    let survey = survey_relocations(&objects, &imports);
+    let survey = survey_relocations(&objects, &imports, &strip);
     let stubs = survey.stubs;
     // Synthesise `__got` before layout, so it is placed and addressed like any
     // other section rather than appended afterwards. Internal targets and
@@ -1076,7 +1164,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     // `__unwind_info` needs addresses to be built, but its *size* must be known
     // before layout runs. Sized from the record count, which is known now: one
     // entry per record, and the encoder's own size formula.
-    let unwind_size = unwind_table_size(&objects);
+    let unwind_size = unwind_table_size(&objects, &strip);
     if unwind_size > 0 {
         placements.push(InputPlacement {
             object: SYNTHETIC_OBJECT,
@@ -1142,7 +1230,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
 
     // With addresses known, copy content and patch it.
     let step = std::time::Instant::now();
-    let mut addresses = address_map(&objects, &probe);
+    let mut addresses = address_map(&objects, &probe, &strip);
     // Commons have no section of their own in any input, so `address_map` —
     // which walks each symbol's defining section — cannot see them. They are
     // definitions all the same, and every reference resolves here.
@@ -1152,11 +1240,19 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     let got_slots = got_slot_addresses(&got, &probe);
     let stub_slots = stub_addresses(&stubs, &probe);
     let tlv_slots = pointer_slot_addresses(&tlv, &probe, "__thread_ptrs");
-    let mut contents = build_contents(&objects, &probe, &placements)?;
+    let mut contents = build_contents(&objects, &probe, &strip)?;
+    repair_eh_frame(&mut contents, &probe, &objects, &strip);
     fill_got(&mut contents, &probe, &got, &addresses, &imports)?;
     fill_stubs(&mut contents, &probe, &stubs, &got_slots)?;
     fill_pointer_table(&mut contents, &probe, &tlv, &addresses, "__thread_ptrs")?;
-    fill_unwind_info(&mut contents, &probe, &objects, &addresses, &got_slots)?;
+    fill_unwind_info(
+        &mut contents,
+        &probe,
+        &objects,
+        &addresses,
+        &strip,
+        &got_slots,
+    )?;
     // The addresses this link produced, in the form the cache compares. Built
     // before relocation because it is what decides which objects can skip it.
     let current_addresses = request
@@ -1174,7 +1270,10 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     let patched = apply_relocations(
         &objects,
         &probe,
-        &addresses,
+        &Placement {
+            addresses: &addresses,
+            strip: &strip,
+        },
         &IndirectTables {
             got: &got_slots,
             stubs: &stub_slots,
@@ -1208,7 +1307,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
         .map(|o| o.parsed.relocations.len() as u64)
         .sum();
     let contents = patched.contents;
-    let entry_offset = entry_offset(request, &objects, &probe)?;
+    let entry_offset = entry_offset(request, &objects, &probe, &strip)?;
     timings.relocate_ms = elapsed_ms(step);
 
     // Pass two: the same layout, with real bytes.
@@ -1216,7 +1315,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     // The symbol table grows between passes, which changes `LC_SYMTAB`'s
     // contents but not the load commands' *sizes* — so the section addresses
     // the relocations were computed against still hold.
-    let symbols = output_symbols(&objects, &probe)?;
+    let symbols = output_symbols(&objects, &probe, &strip)?;
 
     // Each GOT slot holds an absolute address, and the image is position
     // independent, so dyld must relocate every one of them at load time.
@@ -1552,12 +1651,18 @@ fn resolve_imports(
 /// Computed from the record count rather than by building the table, because
 /// layout needs the size before any address exists. Building it twice would
 /// need addresses that do not exist yet.
-fn unwind_table_size(objects: &[LoadedObject]) -> u64 {
+fn unwind_table_size(objects: &[LoadedObject], strip: &Strip) -> u64 {
     let records: usize = objects
         .iter()
-        .flat_map(|o| o.parsed.sections.iter())
-        .filter(|s| s.name == "__compact_unwind")
-        .map(|s| (s.size / COMPACT_UNWIND_RECORD) as usize)
+        .map(|object| {
+            object
+                .parsed
+                .sections
+                .iter()
+                .filter(|s| s.name == "__compact_unwind")
+                .map(|s| live_unwind_records(object, s, strip))
+                .sum::<usize>()
+        })
         .sum();
     if records == 0 {
         return 0;
@@ -1568,12 +1673,49 @@ fn unwind_table_size(objects: &[LoadedObject]) -> u64 {
     blinker_output::unwind::upper_bound_size(records) as u64
 }
 
+/// How many of a section's compact unwind records describe a function that
+/// survived.
+///
+/// Sizing from the input's record count instead left `__unwind_info` reserved
+/// at 35 KB where 5 KB was used — the largest single thing separating blinker's
+/// stripped output from the system linker's, and invisible because
+/// over-reserving is safe.
+fn live_unwind_records(object: &LoadedObject, section: &InputSection, strip: &Strip) -> usize {
+    let total = (section.size / COMPACT_UNWIND_RECORD) as usize;
+    let mut live = 0;
+    for relocation in object.parsed.relocations_for(section.id) {
+        if relocation.offset % COMPACT_UNWIND_RECORD != CU_FUNCTION {
+            continue;
+        }
+        let survives = match relocation.target {
+            RelocationTarget::Section(id) => {
+                let origin = object.parsed.section(id).map(|s| s.vm_address).unwrap_or(0);
+                let inline = inline_addend(object, relocation) as u64;
+                strip
+                    .remap(object.parsed.id, id, inline.saturating_sub(origin))
+                    .is_some()
+            }
+            RelocationTarget::Symbol(_) => true,
+        };
+        live += usize::from(survives);
+    }
+    // A record with no relocation on its function pointer names nothing and is
+    // dropped anyway, so counting relocations rather than records is the same
+    // number — except when there are none at all, where the section is not
+    // something this understands and the whole of it is reserved for.
+    if live == 0 && !object.parsed.relocations_for(section.id).any(|_| true) {
+        return total;
+    }
+    live.min(total)
+}
+
 /// Build the unwind table and write it into its section.
 fn fill_unwind_info(
     contents: &mut SectionContents,
     image: &Image,
     objects: &[LoadedObject],
     addresses: &AddressMap,
+    strip: &Strip,
     got_slots: &HashMap<String, u64>,
 ) -> Result<(), LinkError> {
     let Some((index, section)) = image
@@ -1586,8 +1728,8 @@ fn fill_unwind_info(
         return Ok(());
     };
 
-    let fde_offsets = eh_frame_fde_offsets(objects, image, addresses);
-    let entries = compact_unwind_entries(objects, image, addresses, got_slots, &fde_offsets);
+    let fde_offsets = eh_frame_fde_offsets(objects, image, addresses, strip);
+    let entries = compact_unwind_entries(objects, image, addresses, strip, got_slots, &fde_offsets);
     let mut table = blinker_output::unwind::build(entries);
 
     if table.len() as u64 > section.size {
@@ -2059,7 +2201,11 @@ fn resolve_symbols(objects: &[LoadedObject], imports: &[String]) -> Result<Symbo
 }
 
 /// Every input section that belongs in the output, in object order.
-fn placements_for(objects: &[LoadedObject]) -> Vec<InputPlacement> {
+///
+/// A section contributes its *stripped* size. Nothing else in layout changes:
+/// the survivors keep their order inside the contribution, so the section is
+/// still one run of bytes — just a shorter one.
+fn placements_for(objects: &[LoadedObject], strip: &Strip) -> Vec<InputPlacement> {
     let mut placements = Vec::new();
     for object in objects {
         for section in &object.parsed.sections {
@@ -2072,7 +2218,7 @@ fn placements_for(objects: &[LoadedObject]) -> Vec<InputPlacement> {
                 segment: section.segment.clone(),
                 name: section.name.clone(),
                 kind: section.kind,
-                size: section.size,
+                size: strip.size_of(object.parsed.id, section.id, section.size),
                 alignment: section.alignment,
             });
         }
@@ -2144,7 +2290,11 @@ fn assemble(request: &LinkRequest, assembly: &Assembly<'_>) -> Result<Image, Lin
 /// invisible outside their object by definition, and the only consumer that
 /// would want them is a debugger, which needs the `N_OSO`/stabs path that is
 /// not implemented.
-fn output_symbols(objects: &[LoadedObject], image: &Image) -> Result<Vec<OutputSymbol>, LinkError> {
+fn output_symbols(
+    objects: &[LoadedObject],
+    image: &Image,
+    strip: &Strip,
+) -> Result<Vec<OutputSymbol>, LinkError> {
     let mut out = Vec::new();
     for object in objects {
         for symbol in &object.parsed.symbols {
@@ -2157,7 +2307,16 @@ fn output_symbols(objects: &[LoadedObject], image: &Image) -> Result<Vec<OutputS
             let Some(input) = object.parsed.section(section_id) else {
                 continue;
             };
-            let offset_in_section = symbol.value.saturating_sub(input.vm_address);
+            // A stripped definition leaves the symbol table with its bytes; an
+            // entry pointing at whatever moved into its place would be worse
+            // than no entry at all.
+            let Some(offset_in_section) = strip.remap(
+                object.parsed.id,
+                section_id,
+                symbol.value.saturating_sub(input.vm_address),
+            ) else {
+                continue;
+            };
             let Some(chunk) = image
                 .layout
                 .sections
@@ -2179,10 +2338,13 @@ fn output_symbols(objects: &[LoadedObject], image: &Image) -> Result<Vec<OutputS
 }
 
 /// Copy each input section's bytes into its output section's buffer.
+///
+/// A stripped section arrives as a list of surviving runs rather than one, and
+/// the gaps between them are simply not copied.
 fn build_contents(
     objects: &[LoadedObject],
     image: &Image,
-    _placements: &[InputPlacement],
+    strip: &Strip,
 ) -> Result<HashMap<usize, Vec<u8>>, LinkError> {
     let mut contents: HashMap<usize, Vec<u8>> = HashMap::new();
 
@@ -2218,24 +2380,116 @@ fn build_contents(
             let Some(file_offset) = input.file_offset else {
                 continue;
             };
-            let start = file_offset as usize;
-            let end = start + input.size as usize;
-            let bytes = object
-                .data
-                .get(start..end)
-                .ok_or(LinkError::SectionOutOfBounds {
-                    object: contribution.object,
-                    section: contribution.section,
-                })?;
-
-            let target = contribution.offset as usize;
-            buffer[target..target + bytes.len()].copy_from_slice(bytes);
+            // One run for a section that kept everything, several for one that
+            // did not.
+            let whole = [reachability::Piece {
+                from: 0,
+                size: input.size,
+                to: 0,
+            }];
+            let pieces = strip
+                .pieces(contribution.object, contribution.section)
+                .unwrap_or(&whole);
+            for piece in pieces {
+                let start = (file_offset + piece.from) as usize;
+                let end = start + piece.size as usize;
+                let bytes = object
+                    .data
+                    .get(start..end)
+                    .ok_or(LinkError::SectionOutOfBounds {
+                        object: contribution.object,
+                        section: contribution.section,
+                    })?;
+                let target = (contribution.offset + piece.to) as usize;
+                buffer[target..target + bytes.len()].copy_from_slice(bytes);
+            }
         }
 
         contents.insert(index, buffer);
     }
 
     Ok(contents)
+}
+
+/// Re-point every `__eh_frame` FDE at its CIE.
+///
+/// An FDE's second word is the distance from that word *back* to the CIE that
+/// describes it. The assembler computed it, and no relocation covers it — so
+/// compaction, which moves records apart, leaves every FDE pointing at
+/// whatever now sits that far behind it. `lldb` reads the result and says so
+/// plainly: "unable to find CIE at 0x1a8 for cie_id = 0xfc".
+///
+/// This is the only field in the link that is self-relative *and* unrelocated,
+/// and it is the reason `__eh_frame` cannot be moved as opaque bytes the way
+/// every other section can.
+fn repair_eh_frame(
+    contents: &mut SectionContents,
+    image: &Image,
+    objects: &[LoadedObject],
+    strip: &Strip,
+) {
+    let Some((index, output)) = image
+        .layout
+        .sections
+        .iter()
+        .enumerate()
+        .find(|(_, s)| s.name == "__eh_frame")
+    else {
+        return;
+    };
+    let Some(buffer) = contents.get_mut(&index) else {
+        return;
+    };
+
+    for object in objects {
+        for section in &object.parsed.sections {
+            if section.name != "__eh_frame" {
+                continue;
+            }
+            // A section that kept every record kept every distance with it.
+            if strip.pieces(object.parsed.id, section.id).is_none() {
+                continue;
+            }
+            let (Some(records), Some(chunk), Some(file_offset)) = (
+                reachability::eh_frame_boundaries(object, section),
+                output.address_of(object.parsed.id, section.id),
+                section.file_offset,
+            ) else {
+                continue;
+            };
+            let base = chunk - output.vm_address;
+
+            for record in records {
+                let Some(placed) = strip.remap(object.parsed.id, section.id, record) else {
+                    continue;
+                };
+                let at = (file_offset + record + 4) as usize;
+                let Some(stored) = object
+                    .data
+                    .get(at..at + 4)
+                    .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
+                else {
+                    continue;
+                };
+                // Zero identifies a CIE, which points at nothing.
+                if stored == 0 {
+                    continue;
+                }
+                // The field holds `here - cie`, measured in the input.
+                let Some(cie) = (record + 4).checked_sub(stored as u64) else {
+                    continue;
+                };
+                let Some(cie_now) = strip.remap(object.parsed.id, section.id, cie) else {
+                    continue;
+                };
+                let repaired = ((placed + 4) - cie_now) as u32;
+                let write_at = (base + placed + 4) as usize;
+                if let Some(slot) = buffer.get_mut(write_at..write_at + 4) {
+                    slot.copy_from_slice(&repaired.to_le_bytes());
+                }
+            }
+        }
+    }
 }
 
 /// Patch every relocation against the addresses layout assigned.
@@ -2394,10 +2648,20 @@ fn dependency_hashes(
     hashes
 }
 
+/// Where the inputs ended up.
+///
+/// The two travel together because they answer halves of one question: the
+/// address map says where a *name* went, and the strip says where a *byte*
+/// went, and a relocation needs both to place its field and find its target.
+struct Placement<'a> {
+    addresses: &'a AddressMap,
+    strip: &'a Strip,
+}
+
 fn apply_relocations(
     objects: &[LoadedObject],
     image: &Image,
-    addresses: &AddressMap,
+    placement: &Placement<'_>,
     tables: &IndirectTables<'_>,
     mut contents: SectionContents,
     // Whether to trace what each object read and produced.
@@ -2410,6 +2674,7 @@ fn apply_relocations(
     reuse: Option<&ReusePlan<'_>>,
 ) -> Result<Patched, LinkError> {
     let mut extra_rebases = Vec::new();
+    let Placement { addresses, strip } = *placement;
     let IndirectTables {
         got: got_slots,
         stubs: stub_slots,
@@ -2522,7 +2787,17 @@ fn apply_relocations(
                 .address_of(object.parsed.id, relocation.section)
                 .expect("just matched");
             let chunk_offset = chunk_address - output_section.vm_address;
-            let place = chunk_address + relocation.offset;
+            // Where the field moved to. `None` means the bytes holding it were
+            // stripped, so there is nothing to patch — and, for a `SUBTRACTOR`,
+            // its partner must be stepped over with it.
+            let Some(field) = strip.remap(object.parsed.id, relocation.section, relocation.offset)
+            else {
+                if relocation.kind == Arm64RelocationKind::Subtractor {
+                    index += 1;
+                }
+                continue;
+            };
+            let place = chunk_address + field;
 
             // `SUBTRACTOR` computes a *difference* between two addresses, so
             // it is meaningless alone: the pair is emitted as SUBTRACTOR (the
@@ -2555,14 +2830,34 @@ fn apply_relocations(
                 // (`ltmpN`), so `minuend - subtrahend` is measured from the
                 // start of the contribution, while the field wants it measured
                 // from the field. The inline value is exactly that gap.
-                let addend = pair.addend + inline_addend(object, pair);
+                //
+                // Which makes the stored gap wrong the moment stripping moves
+                // either end of it, so it is re-measured against where the two
+                // ended up.
+                let anchor = anchor_offset(object, relocation);
+                let correction = anchor
+                    .map(|anchor| {
+                        strip.pair_correction(
+                            object.parsed.id,
+                            relocation.section,
+                            pair.offset,
+                            anchor,
+                        )
+                    })
+                    .unwrap_or(0);
+                let addend = pair.addend + inline_addend(object, pair) + correction;
 
+                let Some(pair_field) =
+                    strip.remap(object.parsed.id, relocation.section, pair.offset)
+                else {
+                    continue;
+                };
                 let Some(buffer) = contents.get_mut(&section_index) else {
                     continue;
                 };
                 blinker_relocations::apply_pair(
                     pair.length,
-                    chunk_offset + pair.offset,
+                    chunk_offset + pair_field,
                     subtrahend,
                     minuend,
                     addend,
@@ -2710,7 +3005,7 @@ fn apply_relocations(
                 }
             }
 
-            let field_offset = chunk_offset + relocation.offset;
+            let field_offset = chunk_offset + field;
             apply(
                 relocation.kind,
                 relocation.length,
@@ -2750,6 +3045,22 @@ fn apply_relocations(
         reused,
         reused_relocations,
     })
+}
+
+/// Where a `SUBTRACTOR`'s subtrahend sits inside the field's own section.
+///
+/// `None` when it is somewhere else — a function start, say, which stripping
+/// moves as a whole and whose distance to the field is not a layout fact.
+fn anchor_offset(object: &LoadedObject, relocation: &InputRelocation) -> Option<u64> {
+    let RelocationTarget::Symbol(id) = relocation.target else {
+        return None;
+    };
+    let symbol = object.parsed.symbol(id)?;
+    if symbol.section != Some(relocation.section) {
+        return None;
+    }
+    let section = object.parsed.section(relocation.section)?;
+    Some(symbol.value.saturating_sub(section.vm_address))
 }
 
 /// The addend a Mach-O relocation stores in the bytes it patches.
@@ -2863,7 +3174,7 @@ impl AddressMap {
 }
 
 /// Compute the output address of every definition.
-fn address_map(objects: &[LoadedObject], image: &Image) -> AddressMap {
+fn address_map(objects: &[LoadedObject], image: &Image, strip: &Strip) -> AddressMap {
     let mut map = AddressMap::default();
 
     for object in objects {
@@ -2890,7 +3201,14 @@ fn address_map(objects: &[LoadedObject], image: &Image) -> AddressMap {
             // space, so the offset within its section has to be recovered
             // first. Using the value directly would be right only when the
             // section begins at zero.
-            let address = chunk + symbol.value.saturating_sub(input.vm_address);
+            let offset = symbol.value.saturating_sub(input.vm_address);
+            // A symbol whose bytes were stripped has no address at all, and
+            // must not get one: an entry here would let a relocation resolve
+            // to bytes that are no longer in the image.
+            let Some(offset) = strip.remap(object.parsed.id, section_id, offset) else {
+                continue;
+            };
+            let address = chunk + offset;
 
             if symbol.visibility == SymbolVisibility::Local {
                 map.local
@@ -2908,6 +3226,7 @@ fn entry_offset(
     request: &LinkRequest,
     objects: &[LoadedObject],
     image: &Image,
+    strip: &Strip,
 ) -> Result<u64, LinkError> {
     for object in objects {
         let Some(symbol) = object
@@ -2928,7 +3247,15 @@ fn entry_offset(
                 object: object.parsed.id,
                 section: section_id,
             })?;
-        let offset_in_section = symbol.value.saturating_sub(input.vm_address);
+        // The entry point is a root, so its bytes are always kept; a `None`
+        // here would mean the root set and the strip disagree.
+        let Some(offset_in_section) = strip.remap(
+            object.parsed.id,
+            section_id,
+            symbol.value.saturating_sub(input.vm_address),
+        ) else {
+            continue;
+        };
 
         for section in &image.layout.sections {
             if let Some(address) = section.address_of(object.parsed.id, section_id) {
@@ -2983,6 +3310,7 @@ fn request_hash(request: &LinkRequest) -> [u8; 32] {
     hasher.update(request.entry_symbol.as_bytes());
     hasher.update(&[0]);
     hasher.update(request.identifier.as_bytes());
+    hasher.update(&[request.dead_strip as u8]);
     for dylib in &request.dylibs {
         hasher.update(&[1]);
         hasher.update(dylib.install_name.as_bytes());

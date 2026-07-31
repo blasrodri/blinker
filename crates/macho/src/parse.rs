@@ -12,7 +12,9 @@
 
 use std::path::{Path, PathBuf};
 
-use object::read::macho::MachOFile64;
+// The raw-struct field accessors (`flags`, `n_desc`) are trait methods, and
+// reading them is the point: these three flags decide what may be discarded.
+use object::read::macho::{MachHeader, MachOFile64, Nlist, Section};
 use object::LittleEndian;
 use object::{
     Object, ObjectSection, ObjectSymbol, RelocationFlags, RelocationTarget as ObjectRelocTarget,
@@ -157,12 +159,20 @@ pub fn parse_object(
     let has_debug_info = sections.iter().any(|s| s.kind == SectionKind::Debug);
     let has_unwind_info = sections.iter().any(|s| s.kind == SectionKind::Unwind);
 
+    // Read from the header rather than inferred. Every object a modern
+    // toolchain produces sets it, which is exactly why it must be checked: a
+    // hand-written or very old object that does not is the one case where
+    // cutting sections at symbol boundaries changes behaviour.
+    let subsections_via_symbols =
+        file.macho_header().flags(LittleEndian) & object::macho::MH_SUBSECTIONS_VIA_SYMBOLS != 0;
+
     Ok(ParsedObject {
         id,
         architecture,
         sections,
         symbols,
         relocations,
+        subsections_via_symbols,
         metadata: ObjectMetadata {
             path: path.to_path_buf(),
             member: member.map(str::to_string),
@@ -240,6 +250,9 @@ fn parse_sections<'d>(
             // `object` reports alignment as a byte count already.
             alignment: section.align().max(1),
             file_offset: section.file_range().map(|(offset, _)| offset),
+            no_dead_strip: section.macho_section().flags(LittleEndian)
+                & object::macho::S_ATTR_NO_DEAD_STRIP
+                != 0,
         });
     }
     Ok(sections)
@@ -329,6 +342,9 @@ fn parse_symbols<'d>(
             visibility,
             section,
             value: symbol.address(),
+            no_dead_strip: symbol.macho_symbol().n_desc(LittleEndian)
+                & object::macho::N_NO_DEAD_STRIP
+                != 0,
         });
     }
     Ok(symbols)

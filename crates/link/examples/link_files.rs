@@ -6,14 +6,18 @@
 //! ```
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    // `-dead_strip` anywhere on the line, as `ld` spells it.
+    let dead_strip = args.iter().any(|a| a == "-dead_strip");
+    args.retain(|a| a != "-dead_strip");
     let Some((output, objects)) = args.split_first() else {
         eprintln!("usage: link_files <output> <object>...");
         std::process::exit(2);
     };
 
     let request = blinker_link::LinkRequest::new(objects.iter().map(Into::into).collect())
-        .identifier(output.rsplit('/').next().unwrap_or("a.out"));
+        .identifier(output.rsplit('/').next().unwrap_or("a.out"))
+        .dead_stripped(dead_strip);
 
     match blinker_link::link_timed(&request) {
         Ok((image, timings)) => {

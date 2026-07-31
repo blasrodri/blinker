@@ -247,7 +247,14 @@ fn internal_link(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "a.out".to_string());
 
-    let mut request = blinker_link::LinkRequest::new(objects).identifier(&identifier);
+    // `-dead_strip` is a linker flag rustc already passes; honouring it is what
+    // makes blinker's output comparable to the system linker's at all.
+    let dead_strip = parsed.args.iter().any(|(_, arg)| {
+        matches!(arg, blinker_arguments::LinkerArg::LinkerFlag(flag) if flag == "-dead_strip")
+    });
+    let mut request = blinker_link::LinkRequest::new(objects)
+        .identifier(&identifier)
+        .dead_stripped(dead_strip);
     // Opt-in for now: the reuse path is new, and a linker that silently
     // depends on state from a previous run is one whose output cannot be
     // reproduced from its inputs alone. `--blinker-cache` turns it on.

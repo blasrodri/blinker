@@ -110,6 +110,9 @@ pub struct InputSymbol {
     /// Value as recorded in the file — an address within `section` for a
     /// definition, a size for a common symbol, and zero for a reference.
     pub value: u64,
+    /// `N_NO_DEAD_STRIP`: this definition is a root, whatever refers to it.
+    #[serde(default)]
+    pub no_dead_strip: bool,
 }
 
 impl InputSymbol {
@@ -193,6 +196,14 @@ pub struct InputSection {
     /// stays small enough to cache — a real link reads 65–200 MB of input, and
     /// holding all of it in the parsed form would defeat the purpose.
     pub file_offset: Option<u64>,
+    /// `S_ATTR_NO_DEAD_STRIP`: this section must be kept whole even when
+    /// nothing reaches it.
+    ///
+    /// Initialiser lists and Objective-C metadata carry it. They are reached by
+    /// the runtime rather than by any relocation, so a reachability analysis
+    /// cannot see the edge and would remove them.
+    #[serde(default)]
+    pub no_dead_strip: bool,
 }
 
 impl InputSection {
@@ -235,6 +246,16 @@ pub struct ParsedObject {
     pub symbols: Vec<InputSymbol>,
     pub relocations: Vec<InputRelocation>,
     pub metadata: ObjectMetadata,
+    /// `MH_SUBSECTIONS_VIA_SYMBOLS`: the compiler asserts that nothing in this
+    /// object refers to anything except through a symbol.
+    ///
+    /// That assertion is what makes it legal to cut a section at its symbol
+    /// boundaries and discard the pieces nothing reaches. Without it the
+    /// object's sections have to be kept whole, because a reference computed
+    /// as "the start of my section plus 40 bytes" would follow the bytes it
+    /// meant only by accident.
+    #[serde(default)]
+    pub subsections_via_symbols: bool,
 }
 
 impl ParsedObject {
@@ -389,6 +410,7 @@ mod tests {
             size: 100,
             alignment: 4,
             file_offset: Some(0),
+            no_dead_strip: false,
         };
         assert_eq!(section.qualified_name(), "__TEXT,__text");
         assert!(section.has_file_bytes());
@@ -405,6 +427,7 @@ mod tests {
             size: 4096,
             alignment: 8,
             file_offset: None,
+            no_dead_strip: false,
         };
         assert!(!bss.has_file_bytes());
     }
@@ -417,6 +440,7 @@ mod tests {
             visibility,
             section: None,
             value: 0,
+            no_dead_strip: false,
         }
     }
 
@@ -464,6 +488,7 @@ mod tests {
                 size: 64,
                 alignment: 4,
                 file_offset: Some(512),
+                no_dead_strip: false,
             }],
             symbols: vec![InputSymbol {
                 id: SymbolId(0),
@@ -472,6 +497,7 @@ mod tests {
                 visibility: SymbolVisibility::Global,
                 section: Some(SectionId(0)),
                 value: 0,
+                no_dead_strip: false,
             }],
             relocations: vec![InputRelocation {
                 id: RelocationId(0),
@@ -483,6 +509,7 @@ mod tests {
                 pc_relative: true,
                 addend: 0,
             }],
+            subsections_via_symbols: true,
             metadata: ObjectMetadata {
                 path: PathBuf::from("/tmp/a.o"),
                 member: None,
