@@ -2170,3 +2170,47 @@ Two attempts at this fix, both aimed at identifying the field, when the field
 was never the problem. The evidence that it was not — a relocation kind whose
 name is literally `POINTER_TO_GOT` — was in the error message the first attempt
 produced.
+
+## 51. `POINTER_TO_GOT` ignores the PC-relative flag, which is the whole bug
+
+One grep, after two turns of building machinery aimed elsewhere:
+
+```rust
+PointerToGot => {
+    let got = context.got.ok_or(...)?;
+    write_scalar(bytes, offset, got, length)
+}
+```
+
+It writes the GOT slot's address **absolutely**. A CIE's personality field is
+encoded `indirect|pcrel|sdata4` — it needs **`got - place`**, as a signed
+32-bit value. `apply()` is never given the relocation's `pc_relative` flag, so
+it cannot tell the two forms apart and always emits the absolute form.
+
+That is exactly the observed corruption. blinker writes a value which, decoded
+as PC-relative by libunwind, lands on `0x10017d873` — odd, therefore not a slot
+address, therefore a segfault when dereferenced.
+
+`InputRelocation` has carried `pc_relative` since the parser was written. The
+relocation engine's other kinds encode PC-relativity in the kind itself
+(`BRANCH26`, `PAGE21` are always relative), so the flag was never plumbed
+through — and `POINTER_TO_GOT` is the one kind that appears in both forms.
+
+### The fix
+
+`Context` gains the flag, or `apply` takes it, and `PointerToGot` writes
+`got.wrapping_sub(place)` when set. Every other kind is unaffected because
+their relativity is implied by the kind.
+
+Worth a test that pins both forms, since the absolute form is presumably in use
+somewhere and would otherwise silently break.
+
+### Three turns, and the answer was one grep away
+
+Finding 48 located the bad value. Finding 49 blamed the personality set and
+built against data known to be absent. Finding 50 built an augmentation parser
+that the relocation kind made unnecessary — and the error message that attempt
+produced *named the relocation kind*. Reading the implementation of the kind
+already known to be involved would have found this immediately, and it is what
+"start by dumping what `apply` computes" should have meant on the first pass
+rather than the fourth.
