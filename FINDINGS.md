@@ -2080,3 +2080,45 @@ When patching a relocation whose field is a CIE personality reference with an
 indirect encoding, target the symbol's GOT slot rather than its address —
 allocating one if it does not already exist, as is already done for
 `GOT_LOAD_PAGE21` and for `__unwind_info`'s personality array.
+
+## 49. The personality fix is inert, because the personality set is empty
+
+Finding 48 identified the bug exactly: a CIE's personality is encoded
+`DW_EH_PE_indirect` and must name a GOT slot, and blinker writes the function's
+address. The fix routes any `__eh_frame` relocation targeting a *known
+personality symbol* through the GOT.
+
+It changed nothing. The personality still resolves to the same odd address.
+
+The reason is already written down, four findings earlier. Finding 31:
+
+> In DWARF mode the personality and the LSDA live in the CIE and FDE
+> respectively, not in the compact record — so there are no personality or LSDA
+> *relocations* to find in `__compact_unwind`.
+
+blinker's personality set is collected from `__compact_unwind`, and in DWARF
+mode that section contains none. The set is empty, so the new branch never
+fires. I built a mechanism keyed on information this project had already
+recorded as absent.
+
+### What identifying the personality actually requires
+
+The personality is named only by the CIE's own augmentation data, so finding it
+means doing what the decoder in finding 48 does — inside the linker:
+
+1. Walk `__eh_frame`'s records to find each CIE.
+2. Parse its augmentation string; if it contains `P`, read the encoding byte.
+3. The field that follows is the personality reference; the relocation at that
+   offset names the symbol.
+4. If the encoding has `DW_EH_PE_indirect`, patch with the symbol's GOT slot.
+
+The CFI walker for step 1 already exists — `eh_frame_fde_offsets` walks exactly
+these records to find FDE boundaries. What is missing is augmentation parsing,
+which the throwaway script in finding 48 does in about thirty lines.
+
+### On leaving the code in
+
+The inert branch is kept rather than reverted: it is the correct handling once
+the set is populated, and removing it would mean writing it again. But it is
+**not a fix**, and the tests do not claim it is — `panic=unwind` still faults,
+and nothing new passes because of this change.

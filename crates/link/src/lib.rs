@@ -707,6 +707,11 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     // other section rather than appended afterwards. Internal targets and
     // imports share one table: the difference is only how each slot gets its
     // value — a rebase for an address we know, a bind for one dyld supplies.
+    let personality_names: Vec<String> = survey
+        .personalities
+        .iter()
+        .map(|e| e.name.clone())
+        .collect();
     let mut got = survey.got;
     for entry in survey.personalities {
         if !got.iter().any(|e| e.name == entry.name) {
@@ -804,6 +809,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
             stubs: &stub_slots,
             tlv: &tlv_slots,
             imports: &imports,
+            personalities: &personality_names,
         },
         contents,
     )?;
@@ -1533,6 +1539,14 @@ struct IndirectTables<'a> {
     stubs: &'a HashMap<String, u64>,
     tlv: &'a HashMap<String, u64>,
     imports: &'a [String],
+    /// Unwind personality routines, which `__eh_frame` references *indirectly*.
+    ///
+    /// A CIE's augmentation encodes its personality with `DW_EH_PE_indirect`:
+    /// the stored value is the address of a slot holding the routine's address,
+    /// not the routine. Resolving it to the symbol like any other reference
+    /// wrote a function address where libunwind expected a pointer slot, and it
+    /// segfaulted dereferencing it (finding 48).
+    personalities: &'a [String],
 }
 
 /// Patched content, plus the fixups dyld must apply at load time.
@@ -1564,7 +1578,24 @@ fn apply_relocations(
         stubs: stub_slots,
         tlv: tlv_slots,
         imports,
+        personalities,
     } = *tables;
+
+    // A reference from `__eh_frame` to a personality routine must name that
+    // routine's GOT slot.
+    let indirect_personality = |object: &LoadedObject, target: RelocationTarget, section: &str| {
+        if section != "__eh_frame" {
+            return None;
+        }
+        let RelocationTarget::Symbol(id) = target else {
+            return None;
+        };
+        let symbol = object.parsed.symbol(id)?;
+        if !personalities.contains(&symbol.name) {
+            return None;
+        }
+        got_slots.get(&symbol.name).copied()
+    };
     let mut extra_binds = Vec::new();
     for object in objects {
         // Indexed rather than iterated: `SUBTRACTOR` is one half of a pair and
@@ -1611,7 +1642,11 @@ fn apply_relocations(
                 index += 1;
 
                 let subtrahend = target_address(object, image, addresses, relocation.target)?;
-                let minuend = target_address(object, image, addresses, pair.target)?;
+                let minuend = match indirect_personality(object, pair.target, &output_section.name)
+                {
+                    Some(slot) => slot,
+                    None => target_address(object, image, addresses, pair.target)?,
+                };
 
                 let Some(buffer) = contents.get_mut(&section_index) else {
                     continue;
@@ -1716,6 +1751,27 @@ fn apply_relocations(
             } else {
                 None
             };
+
+            if let Some(slot) =
+                indirect_personality(object, relocation.target, &output_section.name)
+            {
+                let Some(buffer) = contents.get_mut(&section_index) else {
+                    continue;
+                };
+                apply(
+                    relocation.kind,
+                    relocation.length,
+                    chunk_offset + relocation.offset,
+                    Context::direct(place, slot, relocation.addend),
+                    buffer,
+                )
+                .map_err(|source| LinkError::Relocation {
+                    object: object.parsed.id,
+                    kind: relocation.kind,
+                    source: Box::new(source),
+                })?;
+                continue;
+            }
 
             let target = match (stub, got.or(tlv)) {
                 (Some(address), _) => address,
