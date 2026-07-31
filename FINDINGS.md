@@ -4556,4 +4556,4 @@ order to be consulted at all.
 Padding a recomputed layout is not layout reuse. The next thing built is the
 allocator that consumes the previous placement table — and with it, the
 decision that an incremental output need not be byte-identical to a cold one
-(D8), because a history-dependent allocator cannot be and still do its job.
+(D5), because a history-dependent allocator cannot be and still do its job.

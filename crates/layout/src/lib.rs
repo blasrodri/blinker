@@ -36,6 +36,9 @@ use blinker_macho::{ObjectId, SectionId, SectionKind};
 mod placement;
 pub use placement::{OutputRegionId, RegionPlacement};
 
+mod reuse;
+pub use reuse::{ContributionKey, FreeSpace, PreviousLayout, PreviousSection, PreviousSlot};
+
 /// arm64 macOS page size. Segments begin on a multiple of this.
 pub const PAGE_SIZE: u64 = 0x4000;
 
@@ -461,6 +464,46 @@ pub fn compute_layout_with_slop(
     header_reservation: u64,
     slop: Slop,
 ) -> Layout {
+    compute(inputs, header_reservation, slop, None, &|_| {
+        ContributionKey(0)
+    })
+}
+
+/// Lay out an edit on top of the layout a previous link produced.
+///
+/// Every contribution whose key appears in `previous`, whose output section is
+/// unchanged and whose size still fits its recorded capacity keeps the exact
+/// offset it had. Everything else is allocated into the room left over — a
+/// hole where something was removed or shrank, or the end of the section.
+///
+/// `key_of` supplies the identity that survives a relink. The layout crate
+/// deliberately does not know how to compute one: it would have only
+/// [`ObjectId`] to work from, which is assigned by input order and archive
+/// extraction round and therefore names a different object between two links
+/// as soon as an archive member stops being pulled in.
+///
+/// This is the mechanism finding 94 said was missing. Reserving slack and
+/// recomputing produced a layout that matched the previous one when the edit
+/// was small and silently did not when it was not: nine of eighty-four
+/// thousand relocations survived a fourteen-rlib edit. An address is kept here
+/// because it is read back, not because the arithmetic came out the same.
+pub fn compute_layout_reusing(
+    inputs: &[InputPlacement],
+    header_reservation: u64,
+    slop: Slop,
+    previous: &PreviousLayout,
+    key_of: &dyn Fn(&InputPlacement) -> ContributionKey,
+) -> Layout {
+    compute(inputs, header_reservation, slop, Some(previous), key_of)
+}
+
+fn compute(
+    inputs: &[InputPlacement],
+    header_reservation: u64,
+    slop: Slop,
+    previous: Option<&PreviousLayout>,
+    key_of: &dyn Fn(&InputPlacement) -> ContributionKey,
+) -> Layout {
     // Group inputs by output section, preserving input order within each group
     // so the layout is deterministic and reproducible.
     let mut groups: BTreeMap<(usize, usize, String, String), Vec<&InputPlacement>> =
@@ -492,25 +535,83 @@ pub fn compute_layout_with_slop(
             Slop::NONE
         };
         let zero_filled = kind == SectionKind::Bss;
+        let qualified = format!("{segment},{name}");
 
-        let mut offset = 0u64;
+        // Retained placement goes only where padding does, and for the same
+        // reason: a hole left by something removed is a gap, and a gap in
+        // `__eh_frame` is a record header made of zeroes. Sections whose shape
+        // means something are repacked from the start every time, which costs
+        // them their addresses and keeps them correct.
+        let retained = previous.filter(|_| may_be_padded(&name));
+
         let mut alignment = 1u64;
         let mut contributions = Vec::with_capacity(members.len());
+        let size;
 
-        for member in members {
-            let member_alignment = member.alignment.max(1);
-            alignment = alignment.max(member_alignment);
-            offset = align_up(offset, member_alignment);
-            contributions.push(Contribution {
-                object: member.object,
-                section: member.section,
-                offset,
-                size: member.size,
-            });
-            // The contribution keeps its declared size; the padding sits after
-            // it, so nothing downstream can tell the difference until an edit
-            // needs the room.
-            offset += slop.slot_for(member.size);
+        if let Some(previous) = retained {
+            // Where each member is staying, if it is.
+            let kept: Vec<Option<u64>> = members
+                .iter()
+                .map(|member| previous.slot(key_of(member), &qualified, member.size))
+                .collect();
+
+            let mut occupied: Vec<(u64, u64)> = members
+                .iter()
+                .zip(&kept)
+                .filter_map(|(member, offset)| {
+                    let offset = (*offset)?;
+                    // The whole reservation is occupied, not just the bytes in
+                    // use: a kept contribution must keep room to grow, or the
+                    // next edit moves it and every relocation pointing at it.
+                    let capacity = previous
+                        .capacity(key_of(member))
+                        .unwrap_or(member.size)
+                        .max(member.size);
+                    Some((offset, offset + capacity))
+                })
+                .collect();
+
+            let extent = previous.section(&qualified).map_or(0, |s| s.reserved);
+            let mut space = FreeSpace::new(&mut occupied, extent);
+
+            for (member, kept) in members.iter().zip(&kept) {
+                let member_alignment = member.alignment.max(1);
+                alignment = alignment.max(member_alignment);
+                let offset = match kept {
+                    Some(offset) => *offset,
+                    // A new or outgrown contribution takes a reservation, not
+                    // just its size, so that *its* next edit can stay put too.
+                    None => space.take(slop.slot_for(member.size), member_alignment),
+                };
+                contributions.push(Contribution {
+                    object: member.object,
+                    section: member.section,
+                    offset,
+                    size: member.size,
+                });
+            }
+            // Placement order is offset order everywhere else; an allocator
+            // that fills holes does not produce them in that order.
+            contributions.sort_unstable_by_key(|c| c.offset);
+            size = space.extent();
+        } else {
+            let mut offset = 0u64;
+            for member in members {
+                let member_alignment = member.alignment.max(1);
+                alignment = alignment.max(member_alignment);
+                offset = align_up(offset, member_alignment);
+                contributions.push(Contribution {
+                    object: member.object,
+                    section: member.section,
+                    offset,
+                    size: member.size,
+                });
+                // The contribution keeps its declared size; the padding sits
+                // after it, so nothing downstream can tell the difference
+                // until an edit needs the room.
+                offset += slop.slot_for(member.size);
+            }
+            size = offset;
         }
 
         segment_members
@@ -525,13 +626,19 @@ pub fn compute_layout_with_slop(
             // are known.
             vm_address: 0,
             file_offset: (!zero_filled).then_some(0),
-            size: offset,
+            size,
             alignment,
             contributions,
         });
     }
 
-    let segments = assign_addresses(&mut sections, &segment_members, header_reservation, slop);
+    let segments = assign_addresses(
+        &mut sections,
+        &segment_members,
+        header_reservation,
+        slop,
+        previous,
+    );
     let file_size = segments
         .iter()
         .map(|s| s.file_offset + s.file_size)
@@ -587,6 +694,7 @@ fn assign_addresses(
     segment_members: &BTreeMap<String, Vec<usize>>,
     header_reservation: u64,
     slop: Slop,
+    previous: Option<&PreviousLayout>,
 ) -> Vec<OutputSegment> {
     let mut segments = Vec::new();
 
@@ -623,6 +731,22 @@ fn assign_addresses(
         for &index in members {
             let section = &mut sections[index];
             cursor = align_up(cursor, section.alignment.max(1));
+
+            // A section that was somewhere before goes back there, provided
+            // the sections ahead of it have not already grown into the space.
+            // Keeping an offset within the segment rather than an absolute
+            // address is what makes this survive the segment itself moving:
+            // if `__TEXT` grew, `__DATA` starts elsewhere and its sections
+            // keep their relative positions instead of nothing keeping
+            // anything.
+            if let Some(retained) = previous.and_then(|p| p.section(&section.qualified_name())) {
+                if let Some(base) = retained.vm_address.checked_sub(segment_vm_start) {
+                    if base >= cursor && section.size <= retained.reserved {
+                        cursor = base;
+                    }
+                }
+            }
+
             section.vm_address = segment_vm_start + cursor;
             section.file_offset = if section.is_zero_filled() {
                 None
