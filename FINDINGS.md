@@ -1294,3 +1294,41 @@ and are being handled by the generic relocation path.
 That is a narrower and better-posed question than the one this section started
 with, and the evidence for it is that every layer above has been checked
 against ld64 and agrees.
+
+## 33. The `__eh_frame` hypothesis was wrong, and the measurement was cheap
+
+The previous section ended with a hypothesis: that FDE pointer fields might
+resolve to absolute addresses, which cannot be rebased because `__TEXT` is
+read-only, leaving them stale after ASLR slide — the same shape as finding 25,
+one layer down. It was plausible, it explained the symptom, and it was wrong.
+
+Counting the relocations in a real Rust object's `__TEXT,__eh_frame`:
+
+```
+address  pcrel length extern type  symbolnum
+0000001c 0     3      1      1     3          ← SUBTRACTOR
+0000001c 0     3      1      0     4          ← UNSIGNED
+```
+
+Two relocations at the same offset: a **SUBTRACTOR pair**, computing a
+difference rather than an address. Differences are slide-independent by
+construction, so there is nothing for a rebase to fix and nothing stale. The
+pair path already handles these (finding 24, item 2).
+
+The same dump also confirms, incidentally, that the FDE's `PC begin` sits at
+`FDE start + 8` — the CIE occupies `0x00..0x14`, the FDE begins at `0x14`, and
+`0x1c` is exactly eight bytes in. The offset the parser assumes is the offset
+the object uses.
+
+So `__eh_frame`'s contents are relocated correctly, its index from
+`__unwind_info` is correct and matches ld64 value for value, and
+`panic=unwind` still faults. The cause is somewhere neither of those, and the
+next investigation should start by *finding* it rather than proposing it.
+
+**The point worth keeping:** the hypothesis cost one command to refute. Acting
+on it — auditing rebase coverage for `__TEXT`, adding machinery to rebase
+read-only pointers — would have cost hours and produced nothing, because the
+premise was false. This project has now had two hypotheses that survived
+reasoning and died to a single measurement (the other being the dyld strategy
+in finding 13). Both times the measurement was available before the reasoning
+started.
