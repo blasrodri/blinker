@@ -26,13 +26,13 @@
 //! depends only on section sizes and alignments, which the patching does not
 //! change, so the two passes agree by construction.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use blinker_layout::InputPlacement;
 use blinker_macho::{
     parse_object, Arm64RelocationKind, InputRelocation, InputSection, ObjectId, ParsedObject,
-    RelocationLength, RelocationTarget, SectionId, SectionKind, SymbolVisibility,
+    RelocationLength, RelocationTarget, SectionId, SectionKind, SymbolId, SymbolVisibility,
 };
 use blinker_output::image::Dylib;
 use blinker_output::symtab::OutputSymbol;
@@ -121,6 +121,13 @@ pub struct LinkRequest {
     pub dylibs: Vec<Dylib>,
     /// `.tbd` stubs describing what the dylibs export.
     pub stub_libraries: Vec<PathBuf>,
+    /// Where the incremental cache lives, when one is wanted.
+    ///
+    /// `None` disables the cache entirely, which is what every test that is
+    /// not *about* the cache should use: a link that silently reads state from
+    /// a previous run is a link whose result depends on history, and that is
+    /// the one thing a correctness test must not tolerate.
+    pub cache_path: Option<PathBuf>,
 }
 
 impl LinkRequest {
@@ -131,7 +138,15 @@ impl LinkRequest {
             identifier: "a.out".to_string(),
             dylibs: vec![Dylib::lib_system()],
             stub_libraries: default_stub_library().into_iter().collect(),
+            cache_path: None,
         }
+    }
+
+    /// Cache this link's relocated output under `path`, and reuse what a
+    /// previous link left there.
+    pub fn cached_at(mut self, path: PathBuf) -> Self {
+        self.cache_path = Some(path);
+        self
     }
 
     pub fn identifier(mut self, identifier: &str) -> Self {
@@ -972,7 +987,24 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
             personalities: &eh_personality_fields,
         },
         contents,
+        request.cache_path.is_some(),
     )?;
+    if let Some(path) = &request.cache_path {
+        let cache = build_cache(
+            &objects,
+            &probe,
+            &addresses,
+            &got_slots,
+            &stub_slots,
+            &tlv_slots,
+            &patched.contents,
+            &patched,
+        );
+        // A cache that cannot be written is not an error: the link succeeded,
+        // and the only consequence is that the next one is cold.
+        let _ = blinker_cache::store(path, &cache);
+    }
+
     let contents = patched.contents;
     let entry_offset = entry_offset(request, &objects, &probe)?;
     timings.relocate_ms = elapsed_ms(step);
@@ -1008,6 +1040,144 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     timings.emit_ms = elapsed_ms(step);
     timings.total_ms = elapsed_ms(overall);
     image
+}
+
+/// Assemble the record a later link can reuse.
+///
+/// Built after relocation, from what that pass already produced: the patched
+/// bytes, each object's fixups, and the addresses every object read. Nothing
+/// here is computed for the cache's sake alone except the input keys and the
+/// hashing of names, which is why writing a cache costs a fraction of using
+/// one.
+#[allow(clippy::too_many_arguments)]
+fn build_cache(
+    objects: &[LoadedObject],
+    image: &Image,
+    addresses: &AddressMap,
+    got_slots: &HashMap<String, u64>,
+    stub_slots: &HashMap<String, u64>,
+    tlv_slots: &HashMap<String, u64>,
+    contents: &SectionContents,
+    patched: &Patched,
+) -> blinker_cache::LinkCache {
+    // Input keys, one probe per distinct file. Archive members share their
+    // archive's path and therefore its key: an rlib is proven unchanged once,
+    // not once per member pulled out of it.
+    let mut keys: HashMap<&Path, Option<blinker_cache::InputKey>> = HashMap::new();
+
+    let entries = patched
+        .records
+        .iter()
+        .filter_map(|record| {
+            let object = objects.iter().find(|o| o.parsed.id == record.object)?;
+            let path = object.parsed.metadata.path.as_path();
+            let key = keys
+                .entry(path)
+                .or_insert_with(|| blinker_cache::InputKey::probe(path))
+                .clone()?;
+            Some(blinker_cache::Entry {
+                key,
+                ranges: object_ranges(image, record.object),
+                deps: record.deps.clone(),
+                binds: patched.binds[record.binds.clone()]
+                    .iter()
+                    .map(|bind| blinker_cache::CachedBind {
+                        segment: bind.segment,
+                        offset: bind.offset,
+                        symbol: bind.symbol.clone(),
+                        library_ordinal: bind.library_ordinal,
+                        addend: bind.addend,
+                    })
+                    .collect(),
+                rebases: patched.rebases[record.rebases.clone()]
+                    .iter()
+                    .map(|rebase| blinker_cache::CachedRebase {
+                        segment: rebase.segment,
+                        offset: rebase.offset,
+                    })
+                    .collect(),
+            })
+        })
+        .collect();
+
+    let mut sections: Vec<_> = contents
+        .iter()
+        .map(|(index, bytes)| (*index as u32, bytes.clone()))
+        .collect();
+    sections.sort_unstable_by_key(|(index, _)| *index);
+
+    blinker_cache::LinkCache {
+        entries,
+        addresses: address_table(addresses, got_slots, stub_slots, tlv_slots),
+        sections,
+    }
+}
+
+/// Where one object's bytes sit in the output, in cache terms.
+fn object_ranges(image: &Image, object: ObjectId) -> Vec<blinker_cache::Range> {
+    let mut ranges: Vec<_> = image
+        .layout
+        .sections
+        .iter()
+        .enumerate()
+        .flat_map(|(index, section)| {
+            section
+                .contributions
+                .iter()
+                .filter(move |c| c.object == object)
+                .map(move |c| blinker_cache::Range {
+                    section: index as u32,
+                    start: c.offset,
+                    len: c.size,
+                })
+        })
+        .collect();
+    // Sorted so that comparing two links compares placement, not the order
+    // the layout happened to visit sections in.
+    ranges.sort_unstable_by_key(|r| (r.section, r.start));
+    ranges
+}
+
+/// Every address a relocation could have read, in one sorted table.
+///
+/// The indirect tables are included alongside the symbols because they move
+/// independently of them: inserting a GOT entry shifts every slot after it
+/// while leaving every symbol address untouched, and an entry whose bytes
+/// reference the shifted slot must not look unchanged.
+fn address_table(
+    addresses: &AddressMap,
+    got_slots: &HashMap<String, u64>,
+    stub_slots: &HashMap<String, u64>,
+    tlv_slots: &HashMap<String, u64>,
+) -> Vec<(blinker_cache::NameHash, u64)> {
+    use blinker_cache::{dep_hash, Table, GLOBAL};
+    let mut table: Vec<_> =
+        addresses
+            .global
+            .iter()
+            .map(|(name, address)| (dep_hash(GLOBAL, Table::Symbol, name), *address))
+            .chain(addresses.local.iter().map(|((object, name), address)| {
+                (dep_hash(*object, Table::Symbol, name), *address)
+            }))
+            .chain(indirect_entries(got_slots, Table::Got))
+            .chain(indirect_entries(stub_slots, Table::Stub))
+            .chain(indirect_entries(tlv_slots, Table::ThreadLocal))
+            .collect();
+    table.sort_unstable();
+    table.dedup();
+    table
+}
+
+fn indirect_entries(
+    slots: &HashMap<String, u64>,
+    table: blinker_cache::Table,
+) -> impl Iterator<Item = (blinker_cache::NameHash, u64)> + '_ {
+    slots.iter().map(move |(name, address)| {
+        (
+            blinker_cache::dep_hash(blinker_cache::GLOBAL, table, name),
+            *address,
+        )
+    })
 }
 
 fn elapsed_ms(start: std::time::Instant) -> f64 {
@@ -1724,6 +1894,85 @@ struct Patched {
     /// panic metadata are full of them, and the result was a `SIGSEGV` inside
     /// `std::rt::lang_start_internal` — the first code to walk one.
     rebases: Vec<Rebase>,
+    /// What each object read and produced, for the cache.
+    records: Vec<ObjectRecord>,
+}
+
+/// One object's trace through the relocation pass.
+///
+/// The fixups are ranges into `Patched`'s flat vectors rather than copies: the
+/// link needs them flat to encode, and the cache needs them attributed, and
+/// slicing serves both without duplicating either.
+struct ObjectRecord {
+    object: ObjectId,
+    deps: Vec<blinker_cache::NameHash>,
+    binds: std::ops::Range<usize>,
+    rebases: std::ops::Range<usize>,
+}
+
+/// Note that a relocation reads an address, without resolving it.
+///
+/// Both the symbol and *which table it is read from* are recorded: a symbol,
+/// its GOT slot, its stub and its thread-local slot are four addresses that
+/// move independently, and a GOT entry inserted ahead of this one shifts the
+/// slot while leaving the symbol exactly where it was.
+fn note_reference(
+    referenced: &mut HashSet<(u32, u8)>,
+    relocation: &blinker_macho::InputRelocation,
+) {
+    let RelocationTarget::Symbol(id) = relocation.target else {
+        // A section target resolves within this object, so its address is
+        // already covered by the entry's own ranges.
+        return;
+    };
+    // The symbol's own address is read whenever the indirect one is not, and
+    // which of the two applies depends on whether the symbol turned out to be
+    // imported — known here only for some kinds. Recording both is correct and
+    // costs one extra hash.
+    referenced.insert((id.0, blinker_cache::Table::Symbol as u8));
+    let indirect = if needs_got(relocation.kind) {
+        blinker_cache::Table::Got
+    } else if needs_tlv(relocation.kind) {
+        blinker_cache::Table::ThreadLocal
+    } else if relocation.kind == Arm64RelocationKind::Branch26 {
+        blinker_cache::Table::Stub
+    } else {
+        return;
+    };
+    referenced.insert((id.0, indirect as u8));
+}
+
+/// Turn noted references into the hashes the cache compares.
+///
+/// The scope must mirror `AddressMap::lookup` exactly: a name this object
+/// defines locally is a different address from a global of the same name, and
+/// resolving one against the other is the bug finding 57 traced through the
+/// `__eh_frame` LSDAs.
+fn dependency_hashes(
+    object: &LoadedObject,
+    addresses: &AddressMap,
+    referenced: &HashSet<(u32, u8)>,
+) -> Vec<blinker_cache::NameHash> {
+    let mut hashes: Vec<_> = referenced
+        .iter()
+        .filter_map(|(symbol, table)| {
+            let name = &object.parsed.symbol(SymbolId(*symbol))?.name;
+            let table = match table {
+                1 => blinker_cache::Table::Got,
+                2 => blinker_cache::Table::Stub,
+                3 => blinker_cache::Table::ThreadLocal,
+                _ => blinker_cache::Table::Symbol,
+            };
+            Some(blinker_cache::dep_hash(
+                addresses.scope_of(object.parsed.id, name),
+                table,
+                name,
+            ))
+        })
+        .collect();
+    hashes.sort_unstable();
+    hashes.dedup();
+    hashes
 }
 
 fn apply_relocations(
@@ -1732,6 +1981,12 @@ fn apply_relocations(
     addresses: &AddressMap,
     tables: &IndirectTables<'_>,
     mut contents: SectionContents,
+    // Whether to trace what each object read and produced.
+    //
+    // Off by default because it is not free: noting references and hashing
+    // their names costs 1.9 ms on a 27.6 ms link — worth paying to *write* a
+    // cache, and pure waste on a link that will not.
+    record: bool,
 ) -> Result<Patched, LinkError> {
     let mut extra_rebases = Vec::new();
     let IndirectTables {
@@ -1761,7 +2016,21 @@ fn apply_relocations(
             got_slots.get(&symbol.name).copied()
         };
     let mut extra_binds = Vec::new();
+    let mut records: Vec<ObjectRecord> = Vec::new();
     for object in objects {
+        // Where this object's fixups start. Binds and rebases are produced as
+        // a side effect of relocating, so an object whose bytes are later
+        // reused from the cache must carry its own away with it — and the
+        // cheapest way to attribute them is to remember where its run began
+        // rather than to thread a second collection through every push site.
+        let bind_start = extra_binds.len();
+        let rebase_start = extra_rebases.len();
+        // Addresses this object read, deduplicated by (symbol, table) so the
+        // hashing below is proportional to distinct references rather than to
+        // relocations — an object typically has several times more of the
+        // latter.
+        let mut referenced: HashSet<(u32, u8)> = HashSet::new();
+
         // Indexed rather than iterated: `SUBTRACTOR` is one half of a pair and
         // needs the relocation that follows it, so the loop has to be able to
         // consume two entries at once.
@@ -1784,6 +2053,14 @@ fn apply_relocations(
                 continue;
             };
 
+            // Recorded before any branch, so no relocation kind can be added
+            // later that reads an address without declaring it. Over-recording
+            // only costs an unnecessary rebuild; under-recording reuses bytes
+            // that are wrong.
+            if record {
+                note_reference(&mut referenced, relocation);
+            }
+
             let chunk_address = output_section
                 .address_of(object.parsed.id, relocation.section)
                 .expect("just matched");
@@ -1805,6 +2082,9 @@ fn apply_relocations(
                 };
                 index += 1;
 
+                if record {
+                    note_reference(&mut referenced, pair);
+                }
                 let subtrahend = target_address(object, image, addresses, relocation.target)?;
                 let minuend = match indirect_personality(object, pair) {
                     Some(slot) => slot,
@@ -1994,11 +2274,22 @@ fn apply_relocations(
                 source: Box::new(source),
             })?;
         }
+
+        if !record {
+            continue;
+        }
+        records.push(ObjectRecord {
+            object: object.parsed.id,
+            deps: dependency_hashes(object, addresses, &referenced),
+            binds: bind_start..extra_binds.len(),
+            rebases: rebase_start..extra_rebases.len(),
+        });
     }
     Ok(Patched {
         contents,
         binds: extra_binds,
         rebases: extra_rebases,
+        records,
     })
 }
 
@@ -2090,6 +2381,18 @@ struct AddressMap {
 }
 
 impl AddressMap {
+    /// The scope in which `lookup` would find `name` from `object`.
+    ///
+    /// Paired with `lookup` so the cache hashes the address the linker would
+    /// actually have read, rather than one that merely shares its name.
+    fn scope_of(&self, object: ObjectId, name: &str) -> u32 {
+        if self.local.contains_key(&(object.0, name.to_string())) {
+            object.0
+        } else {
+            blinker_cache::GLOBAL
+        }
+    }
+
     fn lookup(&self, object: ObjectId, name: &str) -> Option<u64> {
         // A local definition in this object shadows a global of the same name,
         // which is what "local" means.

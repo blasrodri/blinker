@@ -2658,3 +2658,56 @@ This also explains why finding 60's number looked so much like a coincidence.
 It is not one: both quantities scale with the same 17 MB, so hashing everything
 was always going to land near the cost of relocating everything. The ratio only
 moves once the key stops touching bytes that cannot have changed.
+
+## 62. Writing the cache costs 1.9 ms, so it must not run when nothing reads it
+
+The recording pass — noting which addresses each object read, and hashing their
+names — is not free:
+
+```
+  relocate, recording off   7.4 ms   (25.3 ms link)
+  relocate, recording on    9.2 ms   (27.6 ms link)
+```
+
+1.9 ms, about 25% on top of the stage. That is a fine price for producing an
+artifact worth 7.3 ms on the next link, and pure waste on a link that will not
+write one — which is every link in the test suite and every link with no cache
+configured.
+
+It was measured only because the profile was re-run after wiring, and the first
+version had no flag: the cost was being paid unconditionally. A stage that gets
+1.9 ms slower is invisible without a before-and-after, and the "before" existed
+only because finding 40 had already established the baseline properly.
+
+Recording is now gated on a cache path actually being requested, and the
+profile is back to 7.4 ms.
+
+### What the number implies for the design
+
+The recording cost scales with distinct references, and the saving scales with
+relocations. Their ratio is what makes the cache worth writing even on a link
+that never gets reused, provided reuse happens more than about a quarter of the
+time — which for an edit-compile-run loop it overwhelmingly does.
+
+## 63. A negative control found a test that could not fail
+
+The five cache tests all passed on the first run, which is a reason to check
+them rather than to trust them. Deliberately breaking the linker three ways:
+
+```
+  record no dependencies         -> deps test FAILED        (has teeth)
+  cache unrelocated bytes        -> bytes test FAILED       (has teeth)
+  give every entry every range   -> ranges test passed      (does not)
+```
+
+The third was a real hole. The range test swept for overlaps by comparing each
+claim with the next one *in the order they were recorded*, so when both entries
+claimed the identical set of ranges, the two copies of each range were never
+adjacent and never compared. Sorting before the sweep fixed it, and the control
+then failed as it should.
+
+This is the same lesson as finding 58 from the other direction. There, a null
+result was believed without checking that the code ran; here, a passing test
+was nearly believed without checking that it could fail. Both are the same
+missing step — **confirm the experiment can produce the other answer** — and it
+costs one deliberate break.

@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+blinker-cache = { workspace = true }
 blinker-archive = { workspace = true }
 blinker-layout = { workspace = true }
 blinker-macho = { workspace = true }
@@ -14,4 +15,5 @@ blinker-symbols = { workspace = true }
 blinker-tbd = { workspace = true }
 
 [dev-dependencies]
+blinker-cache = { workspace = true }
 blinker-test-support = { workspace = true }

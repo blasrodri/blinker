@@ -25,10 +25,9 @@
 //!
 //! An object's patched bytes are reusable only if all three hold:
 //!
-//! 1. **its input is unchanged** — by content hash, never by path. rustc's
-//!    object filenames carry a per-build session component that changes every
-//!    build (finding 15), so a path-keyed cache has a 0% hit rate by
-//!    construction;
+//! 1. **its input is unchanged** — by [`InputKey`], which hashes rustc's own
+//!    objects and trusts the path of a content-addressed toolchain rlib.
+//!    Hashing everything costs exactly what the cache saves (findings 60, 61);
 //! 2. **its contribution has not moved** — same output section, same offset,
 //!    same length. Layout slop (finding 43) is what usually makes this true
 //!    after an edit, and when the slop is outgrown this is the condition that
@@ -66,18 +65,61 @@ pub const SCHEMA: u32 = 1;
 
 const MAGIC: &[u8; 8] = b"BLNKCAC\x01";
 
-/// A symbol name reduced to a hash.
-///
-/// Names are the bulk of a link's memory and most of them are Rust mangled
-/// symbols hundreds of bytes long. The cache never needs to *read* a name back,
-/// only to tell whether the set of addresses changed, so it stores 8 bytes
-/// instead of the string.
+/// One address's identity, reduced to a hash. See [`dep_hash`].
 pub type NameHash = u64;
 
+/// Which table an address was read from.
+///
+/// A symbol can have up to four distinct addresses in one link — itself, its
+/// GOT slot, its stub, and its thread-local pointer slot — and they move
+/// independently. Adding an entry to the GOT shifts every slot after it while
+/// leaving every symbol address untouched, so a dependency recorded without
+/// this distinction would be checked against the wrong number and report "no
+/// change" for bytes that are now wrong.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Table {
+    /// The symbol's own address.
+    Symbol = 0,
+    Got = 1,
+    Stub = 2,
+    ThreadLocal = 3,
+}
+
+/// The scope of a name that is defined per object rather than link-wide.
+///
+/// Local symbols are keyed by `(object, name)` because two objects may
+/// legitimately define the same local name — every Rust object defines its own
+/// `GCC_except_table1` and its own `ltmpN` (finding 57). Hashing such a name
+/// alone would merge them into one dependency, and a change to either would
+/// then look like a change to both.
+pub const GLOBAL: u32 = u32::MAX;
+
 /// Hash a symbol name into the form the cache stores.
+///
+/// Names are the bulk of a link's memory and most of them are Rust mangled
+/// symbols hundreds of bytes long. The cache never needs to *read* a name
+/// back, only to tell whether the set of addresses changed, so it stores 8
+/// bytes instead of the string.
 pub fn name_hash(name: &str) -> NameHash {
-    let bytes = blake3::hash(name.as_bytes());
-    u64::from_le_bytes(bytes.as_bytes()[..8].try_into().expect("8 bytes"))
+    dep_hash(GLOBAL, Table::Symbol, name)
+}
+
+/// Hash one address's identity: which name, in which scope, from which table.
+///
+/// All three matter, and the hash must mirror the linker's own lookup exactly.
+/// Where the linker would find a local definition, this must scope to that
+/// object; where it would fall through to the global map, this must not.
+pub fn dep_hash(scope: u32, table: Table, name: &str) -> NameHash {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&scope.to_le_bytes());
+    hasher.update(&[table as u8]);
+    hasher.update(name.as_bytes());
+    u64::from_le_bytes(
+        hasher.finalize().as_bytes()[..8]
+            .try_into()
+            .expect("8 bytes"),
+    )
 }
 
 /// Where one object's patched bytes live in an output section.
@@ -193,10 +235,10 @@ fn path_is_content_addressed(path: &Path) -> bool {
 }
 
 /// One object's cached contribution to the link.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
-    /// BLAKE3 of the input file. Condition 1.
-    pub content_hash: [u8; 32],
+    /// How this input is proven unchanged. Condition 1.
+    pub key: InputKey,
     /// Where this object's bytes sit in the output. Condition 2.
     pub ranges: Vec<Range>,
     /// Name hashes this object's relocations resolved against, sorted and
@@ -271,11 +313,11 @@ impl Entry {
     /// ranges a handful of integers, and only then the dependency scan.
     pub fn is_reusable(
         &self,
-        content_hash: &[u8; 32],
+        key: &InputKey,
         ranges: &[Range],
         changed: &std::collections::HashSet<NameHash>,
     ) -> bool {
-        if &self.content_hash != content_hash || self.ranges != ranges {
+        if &self.key != key || self.ranges != ranges {
             return false;
         }
         // `changed` is small after an ordinary edit and `deps` is large, so the
@@ -333,7 +375,25 @@ fn encode(cache: &LinkCache) -> Vec<u8> {
 
     out.u32(cache.entries.len() as u32);
     for entry in &cache.entries {
-        out.bytes_raw(&entry.content_hash);
+        match &entry.key {
+            InputKey::Content(hash) => {
+                out.u32(0);
+                out.bytes_raw(hash);
+            }
+            InputKey::Metadata {
+                path,
+                modified_nanos,
+                size,
+            } => {
+                out.u32(1);
+                let path = path.to_string_lossy();
+                out.u32(path.len() as u32);
+                out.bytes_raw(path.as_bytes());
+                out.u64((*modified_nanos >> 64) as u64);
+                out.u64(*modified_nanos as u64);
+                out.u64(*size);
+            }
+        }
         out.u32(entry.ranges.len() as u32);
         for range in &entry.ranges {
             out.u32(range.section);
@@ -383,9 +443,27 @@ fn decode(bytes: &[u8]) -> Option<LinkCache> {
 
     let mut entries = Vec::new();
     for _ in 0..input.u32()? {
+        let key = match input.u32()? {
+            0 => InputKey::Content(input.bytes_raw(32)?.try_into().ok()?),
+            1 => {
+                let length = input.u32()? as usize;
+                let path = std::str::from_utf8(input.bytes_raw(length)?).ok()?;
+                let high = input.u64()? as u128;
+                let low = input.u64()? as u128;
+                InputKey::Metadata {
+                    path: PathBuf::from(path),
+                    modified_nanos: (high << 64) | low,
+                    size: input.u64()?,
+                }
+            }
+            _ => return None,
+        };
         let mut entry = Entry {
-            content_hash: input.bytes_raw(32)?.try_into().ok()?,
-            ..Entry::default()
+            key,
+            ranges: Vec::new(),
+            deps: Vec::new(),
+            binds: Vec::new(),
+            rebases: Vec::new(),
         };
         for _ in 0..input.u32()? {
             entry.ranges.push(Range {
@@ -460,7 +538,7 @@ mod tests {
     fn sample() -> LinkCache {
         LinkCache {
             entries: vec![Entry {
-                content_hash: [7u8; 32],
+                key: InputKey::Content([7u8; 32]),
                 ranges: vec![Range {
                     section: 1,
                     start: 0x40,
@@ -531,14 +609,22 @@ mod tests {
     fn an_unchanged_entry_is_reusable() {
         let cache = sample();
         let entry = &cache.entries[0];
-        assert!(entry.is_reusable(&[7u8; 32], &entry.ranges, &HashSet::new()));
+        assert!(entry.is_reusable(
+            &InputKey::Content([7u8; 32]),
+            &entry.ranges,
+            &HashSet::new()
+        ));
     }
 
     #[test]
     fn a_changed_input_makes_its_entry_unreusable() {
         let cache = sample();
         let entry = &cache.entries[0];
-        assert!(!entry.is_reusable(&[9u8; 32], &entry.ranges, &HashSet::new()));
+        assert!(!entry.is_reusable(
+            &InputKey::Content([9u8; 32]),
+            &entry.ranges,
+            &HashSet::new()
+        ));
     }
 
     /// Condition 2: the same bytes at a different offset are the wrong bytes,
@@ -551,7 +637,7 @@ mod tests {
             start: 0x80,
             ..entry.ranges[0].clone()
         }];
-        assert!(!entry.is_reusable(&[7u8; 32], &moved, &HashSet::new()));
+        assert!(!entry.is_reusable(&InputKey::Content([7u8; 32]), &moved, &HashSet::new()));
     }
 
     /// Condition 3, and the one an isolated per-file cache would get wrong:
@@ -562,7 +648,7 @@ mod tests {
         let cache = sample();
         let entry = &cache.entries[0];
         let changed = HashSet::from([name_hash("_puts")]);
-        assert!(!entry.is_reusable(&[7u8; 32], &entry.ranges, &changed));
+        assert!(!entry.is_reusable(&InputKey::Content([7u8; 32]), &entry.ranges, &changed));
     }
 
     #[test]
@@ -570,7 +656,7 @@ mod tests {
         let cache = sample();
         let entry = &cache.entries[0];
         let changed = HashSet::from([name_hash("_something_else")]);
-        assert!(entry.is_reusable(&[7u8; 32], &entry.ranges, &changed));
+        assert!(entry.is_reusable(&InputKey::Content([7u8; 32]), &entry.ranges, &changed));
     }
 
     #[test]
@@ -736,5 +822,54 @@ mod input_key_tests {
     #[test]
     fn a_missing_input_probes_as_none_rather_than_failing() {
         assert_eq!(InputKey::probe(Path::new("/nonexistent/a.o")), None);
+    }
+}
+
+#[cfg(test)]
+mod dep_hash_tests {
+    use super::*;
+
+    /// The four addresses a symbol can have move independently: adding a GOT
+    /// entry shifts every slot after it and no symbol at all.
+    #[test]
+    fn each_table_gives_a_symbol_a_distinct_identity() {
+        let hashes = [Table::Symbol, Table::Got, Table::Stub, Table::ThreadLocal]
+            .map(|table| dep_hash(GLOBAL, table, "_main"));
+        let mut unique = hashes.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), 4, "two tables collided: {hashes:?}");
+    }
+
+    /// Finding 57: every Rust object defines its own `GCC_except_table1`.
+    /// Merging them would make a change to one look like a change to all.
+    #[test]
+    fn the_same_local_name_in_two_objects_is_two_dependencies() {
+        assert_ne!(
+            dep_hash(3, Table::Symbol, "GCC_except_table1"),
+            dep_hash(8, Table::Symbol, "GCC_except_table1"),
+        );
+    }
+
+    /// A local definition and a global of the same name are different
+    /// addresses, and `AddressMap::lookup` picks the local one. The hash has to
+    /// make the same distinction or it would check the wrong address.
+    #[test]
+    fn a_scoped_name_is_distinct_from_the_global_of_the_same_name() {
+        assert_ne!(
+            dep_hash(3, Table::Symbol, "_helper"),
+            dep_hash(GLOBAL, Table::Symbol, "_helper"),
+        );
+    }
+
+    #[test]
+    fn name_hash_is_the_global_symbol_case() {
+        assert_eq!(name_hash("_main"), dep_hash(GLOBAL, Table::Symbol, "_main"));
+    }
+
+    #[test]
+    fn hashing_is_stable_across_calls() {
+        assert_eq!(name_hash("_main"), name_hash("_main"));
+        assert_ne!(name_hash("_main"), name_hash("_other"));
     }
 }
