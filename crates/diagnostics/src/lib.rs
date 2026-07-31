@@ -97,6 +97,16 @@ pub struct Counters {
     pub total_relocations: Option<u64>,
     pub bytes_read: u64,
     pub bytes_written: Option<u64>,
+    /// `__text` bytes dead-stripping removed. `None` when it did not run.
+    pub stripped_bytes: Option<u64>,
+    /// Atoms the reachability propagation left dead that something live then
+    /// referred to.
+    ///
+    /// Must be zero. It is reported rather than asserted because the
+    /// verification pass that produces it *repairs* the mistake — a non-zero
+    /// count is a link that is correct and a model that is incomplete, and
+    /// the only way to notice is for the number to be visible.
+    pub revived_atoms: Option<u64>,
 }
 
 /// The complete record of one invocation.
@@ -252,6 +262,12 @@ impl LinkRecord {
         Some(out)
     }
 
+    /// Record what dead-stripping removed, and whether its model held.
+    pub fn set_dead_strip(&mut self, stripped_bytes: u64, revived: u64) {
+        self.counters.stripped_bytes = Some(stripped_bytes);
+        self.counters.revived_atoms = Some(revived);
+    }
+
     /// The concise human-readable summary shown on a normal successful link.
     pub fn to_summary(&self) -> String {
         let mode = match self.mode {
@@ -278,6 +294,18 @@ impl LinkRecord {
                 _ => String::new(),
             };
             s.push_str(&format!("\n  reused: {reused}/{total} objects{share}"));
+        }
+        if let Some(stripped) = self.counters.stripped_bytes {
+            s.push_str(&format!(
+                "\n  dead-stripped: {} KB of __text",
+                stripped / 1024
+            ));
+            if self.counters.revived_atoms.is_some_and(|n| n > 0) {
+                s.push_str(&format!(
+                    " ({} atoms revived)",
+                    self.counters.revived_atoms.unwrap_or(0)
+                ));
+            }
         }
         if !self.unrecognized_arguments.is_empty() {
             s.push_str(&format!(

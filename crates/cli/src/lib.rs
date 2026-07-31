@@ -180,6 +180,9 @@ pub fn run(argv: &[String]) -> Result<Outcome, DriverError> {
             phases.relocate_ms,
             phases.emit_ms,
         );
+        if wants_dead_strip(&parsed) {
+            record.set_dead_strip(phases.stripped_bytes, phases.revived_atoms);
+        }
         if options.incremental_cache {
             record.set_reuse(
                 phases.reused_objects,
@@ -222,6 +225,17 @@ pub fn run(argv: &[String]) -> Result<Outcome, DriverError> {
     Ok(Outcome { exit_code, record })
 }
 
+/// Whether the command line asked for unreachable input to be discarded.
+///
+/// `-dead_strip` is a linker flag rustc already passes on every macOS link;
+/// honouring it is what makes blinker's output comparable to the system
+/// linker's at all.
+fn wants_dead_strip(parsed: &ParsedInvocation) -> bool {
+    parsed.args.iter().any(|(_, arg)| {
+        matches!(arg, blinker_arguments::LinkerArg::LinkerFlag(flag) if flag == "-dead_strip")
+    })
+}
+
 /// Perform the link with blinker's own linker.
 ///
 /// Only object files are accepted so far. An archive or a dylib on the command
@@ -247,14 +261,9 @@ fn internal_link(
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "a.out".to_string());
 
-    // `-dead_strip` is a linker flag rustc already passes; honouring it is what
-    // makes blinker's output comparable to the system linker's at all.
-    let dead_strip = parsed.args.iter().any(|(_, arg)| {
-        matches!(arg, blinker_arguments::LinkerArg::LinkerFlag(flag) if flag == "-dead_strip")
-    });
     let mut request = blinker_link::LinkRequest::new(objects)
         .identifier(&identifier)
-        .dead_stripped(dead_strip);
+        .dead_stripped(wants_dead_strip(parsed));
     // Opt-in for now: the reuse path is new, and a linker that silently
     // depends on state from a previous run is one whose output cannot be
     // reproduced from its inputs alone. `--blinker-cache` turns it on.

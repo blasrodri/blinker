@@ -141,6 +141,91 @@ fn main() {
     assert_eq!(stripped.stdout, "a 3\nb 2\nc 1\n");
 }
 
+/// Nothing may have to be revived.
+///
+/// The propagation is supposed to guarantee that no live atom refers to a dead
+/// one, and a verification pass at the end checks it and *repairs* what it
+/// finds. That repair is what makes an incomplete model produce a correct
+/// binary — and therefore what would hide it. The count is the only evidence,
+/// so it is asserted rather than watched.
+///
+/// A Rust link is where this can say anything: it is the only fixture with
+/// `__eh_frame`, exception tables, thread-locals and 47 objects' worth of
+/// cross-references.
+#[test]
+fn the_reachability_model_needs_no_repairs_on_a_rust_link() {
+    let scratch = Scratch::dir("strip-rust-revived").expect("scratch");
+    scratch
+        .write(
+            "Cargo.toml",
+            "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .expect("manifest");
+    scratch
+        .write(
+            "src/main.rs",
+            "use std::collections::HashMap;\n\
+             fn main() {\n\
+             \x20   let mut m = HashMap::new();\n\
+             \x20   m.insert(\"k\", vec![1u8, 2, 3]);\n\
+             \x20   println!(\"{:?}\", m.get(\"k\"));\n\
+             }\n",
+        )
+        .expect("source");
+
+    let blinker = workspace_binary("blinker");
+    let records = scratch.join("records");
+    let output = Command::new("cargo")
+        .arg("build")
+        .arg("--offline")
+        .current_dir(scratch.path())
+        .env(
+            "RUSTFLAGS",
+            format!(
+                "-C linker={} -C link-arg=--blinker-internal \
+                 -C link-arg=--blinker-record-invocation -C link-arg={}",
+                blinker.display(),
+                records.display()
+            ),
+        )
+        .env("CARGO_TARGET_DIR", scratch.join("target"))
+        .output()
+        .expect("cargo runs");
+    assert!(
+        output.status.success(),
+        "cargo build failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let record = std::fs::read_dir(&records)
+        .expect("a records directory")
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|e| e == "json"))
+        .expect("an invocation was recorded");
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(record).expect("readable"))
+            .expect("the record is JSON");
+
+    // The counter has to exist, or asserting it is zero proves nothing: an
+    // absent field and a zero one both read as "no repairs" to a careless
+    // comparison.
+    assert!(
+        json["counters"]["revived_atoms"].is_number(),
+        "the link did not report a dead-strip at all: {}",
+        json["counters"]
+    );
+    assert_eq!(
+        json["counters"]["revived_atoms"], 0,
+        "the reachability model missed edges the verification pass had to repair"
+    );
+    assert!(
+        json["counters"]["stripped_bytes"].as_u64().unwrap_or(0) > 100_000,
+        "barely anything was stripped: {}",
+        json["counters"]
+    );
+}
+
 /// And it must actually remove something, or the tests above are checking a
 /// linker that quietly did nothing.
 ///
