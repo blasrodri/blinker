@@ -740,17 +740,24 @@ objects and skips **100%** of the relocations:
 
 Per-object reuse covers it. What remained to win was part of 3.1 ms out of 16.1.
 
+### Performance work here is done, on this workload
+
+Every remaining item in the profile is ~1 ms on a ~25 ms link whose run-to-run
+spread is wider than that, and two changes of exactly that size delivered
+nothing measurable (76). Further gains need a different workload to measure
+against, or a structural change — not another line of the profile.
+
 ### Where a link's time goes now
 
 ```
   read+parse   5.4 ms   34%     resolve 1.0    layout 0.6
-  dead-strip   2.8 ms   17%     relocate 3.1   emit 0.8
+  dead-strip   2.5 ms   15%     relocate 3.1   emit 0.8
 ```
 
-`read+parse` is the largest stage, and finding 41 already established that
-deserialising a parsed object is not faster than parsing it — so the next win
-there is not a cache. `dead-strip` is new and unoptimised. Neither is scoped
-yet, and neither should be until measured.
+Both have been opened up (76). `read+parse`'s sequential member pull gave up
+one change worth 12 MB of peak memory and one that was reverted; `dead-strip`
+is three-quarters reachability propagation, half of which is the verification
+pass that must stay. Nothing left is worth its risk at this size.
 
 ### Rules this project runs on, earned rather than assumed
 

@@ -3549,3 +3549,33 @@ profile.
 **A profile says where time is spent; only an A/B says what removing it is
 worth.** Two changes here were built on profile numbers of 1.2 ms and 1.0 ms,
 and between them they bought no measurable time at all.
+
+### Where the profile ran out
+
+Dead-stripping is the newest stage and the only one never examined from
+inside, so it was profiled before assuming anything about it:
+
+```
+  dead-strip   2.5 ms
+    Atoms::build   0.40 ms      7599 atoms
+    liveness       1.85 ms
+    Strip::build   0.08 ms
+    report         0.08 ms
+```
+
+`liveness` is three quarters of it, and roughly half of `liveness` is the
+verification pass — a second walk over every live atom's relocations,
+confirming that nothing live points at anything dead. Making the propagation
+establish that invariant by construction would remove it, worth about 0.9 ms.
+
+**It was not built.** 0.9 ms is the same size as the two changes above, which
+between them delivered nothing measurable, and the pass being removed is the
+one that turns a hole in the reachability model from a corrupt binary into a
+number (72). Trading a correctness guarantee for a gain the previous two
+measurements say will not appear is a bad trade twice over.
+
+That is the state of the profile: **nothing identified is above the noise
+floor.** The link is at parity with the system linker, and every remaining item
+is ~1 ms on a ~25 ms job with a run-to-run spread wider than that. Further
+work here needs either a different workload to measure against, or a
+structural change rather than another line of the profile.
