@@ -52,6 +52,9 @@ use blinker_relocations::{apply, Context};
 use blinker_symbols::{SymbolProvider, SymbolTable};
 use reachability::Strip;
 
+mod hashing;
+use hashing::FastMap;
+
 pub mod error;
 pub use error::LinkError;
 
@@ -1677,12 +1680,13 @@ fn build_cache(
     // archive's path and therefore its key: an rlib is proven unchanged once,
     // not once per member pulled out of it.
     let mut keys: HashMap<&Path, Option<blinker_cache::InputKey>> = HashMap::new();
+    let index_of = ObjectIndex::build(objects);
 
     let entries = patched
         .records
         .iter()
         .filter_map(|record| {
-            let object = objects.iter().find(|o| o.parsed.id == record.object)?;
+            let object = index_of.get(record.object)?;
             let path = object.parsed.metadata.path.as_path();
             let key = keys
                 .entry(path)
@@ -2908,6 +2912,39 @@ fn object_mtime(path: &std::path::Path) -> u64 {
         .unwrap_or(0)
 }
 
+/// Objects by id, so finding one is an index rather than a search.
+///
+/// The same shape as `Placed`, for the same reason (finding 77): a lookup
+/// written as `objects.iter().find(...)` inside a loop over contributions is
+/// quadratic, and a Rust link has ~900 objects and several thousand
+/// contributions. It is invisible on a fixture with twelve objects, which is
+/// exactly how the first one survived.
+///
+/// Ids are assigned by position and are dense, so this is a `Vec` rather than
+/// a map — no hashing, and the gaps a sparse id space would leave cost one
+/// `None` each.
+struct ObjectIndex<'a> {
+    by_id: Vec<Option<&'a LoadedObject>>,
+}
+
+impl<'a> ObjectIndex<'a> {
+    fn build(objects: &'a [LoadedObject]) -> Self {
+        let highest = objects
+            .iter()
+            .map(|object| object.parsed.id.0 as usize)
+            .max();
+        let mut by_id = vec![None; highest.map_or(0, |n| n + 1)];
+        for object in objects {
+            by_id[object.parsed.id.0 as usize] = Some(object);
+        }
+        ObjectIndex { by_id }
+    }
+
+    fn get(&self, id: ObjectId) -> Option<&'a LoadedObject> {
+        self.by_id.get(id.0 as usize).copied().flatten()
+    }
+}
+
 /// Copy each input section's bytes into its output section's buffer.
 ///
 /// A stripped section arrives as a list of surviving runs rather than one, and
@@ -2918,6 +2955,7 @@ fn build_contents(
     strip: &Strip,
 ) -> Result<HashMap<usize, Vec<u8>>, LinkError> {
     let mut contents: HashMap<usize, Vec<u8>> = HashMap::new();
+    let index_of = ObjectIndex::build(objects);
 
     for (index, section) in image.layout.sections.iter().enumerate() {
         if section.is_zero_filled() {
@@ -2931,9 +2969,8 @@ fn build_contents(
             if contribution.object == SYNTHETIC_OBJECT {
                 continue;
             }
-            let object = objects
-                .iter()
-                .find(|o| o.parsed.id == contribution.object)
+            let object = index_of
+                .get(contribution.object)
                 .ok_or(LinkError::MissingObject {
                     object: contribution.object,
                 })?;
@@ -3234,12 +3271,12 @@ fn dependency_hashes(
 struct Placed {
     /// `(object, section)` -> the output section's index, and the address the
     /// chunk starts at.
-    chunks: HashMap<(u32, u32), (usize, u64)>,
+    chunks: FastMap<(u32, u32), (usize, u64)>,
 }
 
 impl Placed {
     fn index(image: &Image) -> Placed {
-        let mut chunks = HashMap::new();
+        let mut chunks = FastMap::default();
         for (index, section) in image.layout.sections.iter().enumerate() {
             for contribution in &section.contributions {
                 chunks.insert(

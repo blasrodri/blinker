@@ -223,7 +223,7 @@ pub(crate) struct Atoms {
     atoms: Vec<Atom>,
     /// `(object, section)` -> that section's atoms, as a range of indices into
     /// `atoms`, ascending by offset.
-    by_section: HashMap<(u32, u32), std::ops::Range<usize>>,
+    by_section: crate::hashing::FastMap<(u32, u32), std::ops::Range<usize>>,
     /// Sections kept whole because a reference into their middle would not
     /// survive their atoms being moved.
     opaque: HashSet<(u32, u32)>,
@@ -238,7 +238,7 @@ pub(crate) struct Atoms {
 impl Atoms {
     pub(crate) fn build(objects: &[LoadedObject]) -> Atoms {
         let mut atoms: Vec<Atom> = Vec::new();
-        let mut by_section = HashMap::new();
+        let mut by_section = crate::hashing::FastMap::default();
 
         for object in objects {
             for section in &object.parsed.sections {
@@ -700,7 +700,7 @@ struct Compacted {
 /// the relocation path to one failed hash probe.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Strip {
-    sections: HashMap<(u32, u32), Compacted>,
+    sections: crate::hashing::FastMap<(u32, u32), Compacted>,
 }
 
 /// The alignment an atom actually had, which compaction must not weaken.
@@ -782,7 +782,7 @@ impl Strip {
 
     /// Build the map from a liveness result.
     fn build(objects: &[LoadedObject], atoms: &Atoms, live: &HashSet<usize>) -> Strip {
-        let mut sections = HashMap::new();
+        let mut sections = crate::hashing::FastMap::default();
         for object in objects {
             for section in &object.parsed.sections {
                 let key = (object.parsed.id.0, section.id.0);

@@ -4218,3 +4218,69 @@ when possible … avoid moving unchanged content" — *reuse* it, not recompute 
 with padding and hope the result matches. Place the changed object's sections
 into a hole or at the end and leave every other address exactly as it was. That
 is a different mechanism from the one built here, and it is the next one.
+
+## 89. The profile, and what four turns of reasoning had missed
+
+Everything above was reasoned from stage timers. Stage timers say *when* the
+time goes, not *what* spends it, and after three findings in a row that
+corrected an inferred priority it was worth getting the other view.
+
+`cargo flamegraph` uses `dtrace` on macOS and needs root, which this project
+does not ask for. `sample` needs nothing — but it needs a target that outlives
+a 44 ms link, so `crates/link/examples/relink_loop.rs` links the same inputs
+for a fixed duration and `sample` profiles that.
+
+Self time, 10 seconds of continuous linking:
+
+```
+  2259  sha256::compress256                  the code signature
+  1897  thread_start                         thread overhead
+  1642  read                                 \
+   908  open                                  |  file I/O: 2831
+   281  close                                /
+  1136  SipHasher::write        (blinker_link)
+   626  memcmp
+   466  malloc  +  453 free                  919 in the allocator
+   351  memmove  +  292 memset
+   282  reachability::Strip::remap
+   239  reachability::plan
+   167  yaml_rust2::scanner::fetch_plain_scalar
+```
+
+Four things here that no amount of staring at stage timers would have shown:
+
+- **Signing is the single largest cost in the linker.** SHA-256 over every
+  page of the image, recomputed in full every link. It is not "part of emit",
+  it *is* emit.
+- **File I/O is second**: `read` + `open` + `close` together outweigh it. This
+  is the daemon's target, and the profile says so more clearly than the stage
+  timer did.
+- **SipHash is still 1136 samples after this session's fix**, which covered the
+  three `(object, section)` maps. The rest are keyed by symbol *name* —
+  `HashSet<String>`, `HashMap<&str, _>` — and the comment in `hashing.rs`
+  saying names should keep the default hasher was written from caution, not
+  measurement. It is wrong.
+- **The `.tbd` stub's YAML is parsed on every link.** 167 samples inside a
+  scanner that reads the same SDK file to the same answer every time.
+
+And what the profile says is *not* worth chasing: `Strip::remap` and
+`reachability::plan`, the two functions the plan had spent three turns aiming
+at, are 282 and 239 samples — together under a fifth of signing.
+
+**Two changes made before the profile existed, and what they were worth:**
+
+```
+  ObjectIndex (removing a quadratic scan)   +1.4 ms   (sd 2.8 — noise)
+  FastHasher on the (object, section) maps  -2.5 ms   (5.3%)
+```
+
+The quadratic scan was real — `build_contents` searched all objects for every
+contribution — and fixing it changed nothing measurable, because this workload
+has 105 objects rather than the 900 the shape needs to bite. Kept as an
+asymptotic fix and reported as the zero it measured, not as the win it looked
+like.
+
+**The rule.** Three findings in a row (87, 88, and this one) corrected a
+priority that had been inferred rather than measured, and each inference was
+reasonable. The stage timer was the best instrument available and it was still
+pointing at the wrong stage. Getting a second instrument cost twenty minutes.
