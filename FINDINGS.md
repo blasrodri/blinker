@@ -1904,3 +1904,48 @@ The cache design rests on four numbers, three of which are now in hand:
 The last one now has a tool. Running it across a realistic sequence of agent
 edits is the remaining prerequisite, and the only one left before the cache can
 be built against evidence rather than intuition.
+
+## 45. A one-constant edit leaves 98% of codegen units untouched, inside budget
+
+Running the classifier over a sequence of edits to a four-module Rust binary
+(48 codegen units, most of them from `libstd`):
+
+```
+edit: change a constant (x * 2 -> x * 3)
+  48 codegen units
+    unchanged     47  (98%)
+    body           1  (2%)
+  max growth +0.0%   over 5% slop budget: 0
+```
+
+**47 of 48 codegen units byte-identical, and the one that changed grew by
+nothing at all** — a body edit that fits its existing space exactly. For this
+edit the cache would hit 98% of contributions and patch the last one in place
+without touching layout.
+
+That is the strongest evidence yet for the incremental design, and it is the
+shape the whole project assumed but had never checked: the overwhelming
+majority of a build's object code is `libstd` and dependencies that no source
+edit touches.
+
+### Caveat: this is two data points, not a distribution
+
+The sequence was meant to cover five edit classes. Three of them never ran —
+the shell harness split its edit descriptions on `:`, and three of the `sed`
+expressions contain colons, so the labels corrupted the expressions and the
+later generations built nothing. The tool behaved correctly on the runs that
+executed; the *driver* was broken, and the empty "0 codegen units" output is
+what exposed it.
+
+Worth recording rather than quietly rerunning, because it is the same failure
+as the first benchmark (finding 34): a harness that reports a number for work
+that did not happen. The difference is that this one reported `0 codegen units`
+instead of a plausible-looking percentage, so it could not be believed by
+accident. Output that fails loudly is worth designing for.
+
+### What is still needed
+
+A driver that applies edits from separate files rather than inline `sed`, over
+a longer and more varied sequence, on a project with real dependencies. Then
+the last of the cache's four numbers — how often an edit exceeds its slop — has
+a distribution behind it instead of a single reassuring sample.
