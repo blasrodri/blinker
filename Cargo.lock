@@ -125,6 +125,7 @@ dependencies = [
 name = "blinker-link"
 version = "0.1.0"
 dependencies = [
+ "blinker-archive",
  "blinker-layout",
  "blinker-macho",
  "blinker-output",

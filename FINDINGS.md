@@ -908,3 +908,59 @@ $ echo $?                       # identical to ld64's output and status
 all imported functions through stubs — plus `___stack_chk_guard`, an imported
 *data* symbol through the GOT. The stack protector is what pulls in that last
 case, and no smaller test reaches it.
+
+## 24. Linking Rust is a queue of distinct walls, not one big one
+
+Pointing the driver at a `println!`-and-exit Rust program produced five
+failures in a row, each precise and each a different missing feature. Worth
+recording because the *shape* is the useful part: none of them were subtle, and
+none were visible from linking C.
+
+1. **`.rlib` archives.** rustc passes the whole sysroot as archives.
+   `Unsupported Mach-O header` — blinker was trying to parse an archive as an
+   object. Archives are not simply expanded either: `libstd.rlib` holds
+   hundreds of members, and pulling them all in would produce a binary tens of
+   megabytes larger than it should be. A member enters the link only when it
+   defines a symbol something already in the link needs, and pulling it in can
+   create new undefined symbols — so extraction is a loop to a fixed point.
+
+2. **`ARM64_RELOC_SUBTRACTOR`.** A *paired* relocation: SUBTRACTOR (the value
+   subtracted) immediately followed by UNSIGNED (the value subtracted from).
+   Meaningless alone. Relative pointers in unwind and exception tables are
+   built this way, so Rust hits it immediately and simple C never does. The
+   relocation loop had to become index-based to consume two entries at once.
+
+3. **`ARM64_RELOC_TLVP_*`.** Thread-local access, structurally the GOT again —
+   a pointer table the instruction loads from — but pointing at a TLV
+   *descriptor* rather than the variable.
+
+4. **A data reference to an imported symbol.** A TLV descriptor's first word
+   points at `__tlv_bootstrap`, which lives in libdyld. A pointer-sized field
+   whose target is an import cannot be patched at all: the address does not
+   exist until load. The field stays zero and a bind entry tells dyld where to
+   write. Until this, binds were only ever emitted for GOT slots.
+
+5. **`SG_READ_ONLY`.** dyld *refuses to load* an image whose `__DATA_CONST`
+   segment lacks the flag — "__DATA_CONST segment missing SG_READ_ONLY flag".
+   The emitter had a comment deferring it as an optimisation. It is not an
+   optimisation; it is a load requirement.
+
+After all five, an 8.5 MB Rust executable links and dyld gets as far as
+thread-local setup before rejecting it:
+
+```
+malformed thread-local, offset=0x1007F9ED0 is larger than total size=0x0
+```
+
+which is the next real piece of work: a TLV descriptor's third word is an
+**offset into the thread-local block**, not an address, and the block's total
+size has to be computed from `__thread_data` + `__thread_bss` and recorded.
+blinker is currently writing absolute addresses into a region it has declared
+to be zero bytes long.
+
+### The useful part
+
+Each wall was found by running the thing, took one measurement to identify, and
+had an unambiguous fix. None would have been found by more unit tests of the
+stages in isolation, because every stage was individually correct — what was
+missing was a case none of them had ever been handed.

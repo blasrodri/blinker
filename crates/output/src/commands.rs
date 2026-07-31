@@ -74,12 +74,22 @@ pub fn write_segment(writer: &mut Writer, segment: &OutputSegment, sections: &[O
         .u32(segment.max_protection.0)
         .u32(segment.init_protection.0)
         .u32(members.len() as u32)
-        // `flags`; SG_READ_ONLY for __DATA_CONST is deferred until the
-        // read-only-after-binding path is implemented.
-        .u32(0);
+        .u32(segment_flags(&segment.name));
 
     for section in members {
         write_section(writer, section, &segment.name);
+    }
+}
+
+/// Segment flags.
+///
+/// `__DATA_CONST` must carry `SG_READ_ONLY`; dyld rejects the image outright
+/// without it, which is a load failure rather than a warning.
+fn segment_flags(name: &str) -> u32 {
+    if name == "__DATA_CONST" {
+        SG_READ_ONLY
+    } else {
+        0
     }
 }
 

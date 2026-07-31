@@ -136,6 +136,47 @@ fn is_linker_internal(section: &InputSection) -> bool {
         || section.name == "__compact_unwind"
 }
 
+/// Section id of the synthesised `__thread_ptrs`.
+const TLV_SECTION: SectionId = SectionId(2);
+
+/// Relocation kinds that reach their target through a thread-local pointer.
+fn needs_tlv(kind: Arm64RelocationKind) -> bool {
+    matches!(
+        kind,
+        Arm64RelocationKind::TlvpLoadPage21 | Arm64RelocationKind::TlvpLoadPageOff12
+    )
+}
+
+/// Symbols needing a thread-local pointer slot.
+///
+/// Structurally the GOT again, and for the same reason: the instruction needs
+/// a fixed address to load from, and what it loads is decided elsewhere. The
+/// difference is what the slot points at — a TLV *descriptor* the compiler
+/// emitted into `__thread_vars`, rather than the variable itself. Rust's
+/// standard library uses thread-locals freely, so this is unavoidable for Rust
+/// and never comes up in simple C.
+fn tlv_symbols(objects: &[LoadedObject]) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for object in objects {
+        for relocation in &object.parsed.relocations {
+            if !needs_tlv(relocation.kind) {
+                continue;
+            }
+            let RelocationTarget::Symbol(id) = relocation.target else {
+                continue;
+            };
+            let Some(symbol) = object.parsed.symbol(id) else {
+                continue;
+            };
+            if seen.insert(symbol.name.clone()) {
+                names.push(symbol.name.clone());
+            }
+        }
+    }
+    names
+}
+
 /// Section id of the synthesised `__stubs`.
 const STUBS_SECTION: SectionId = SectionId(1);
 
@@ -341,6 +382,18 @@ pub fn link(request: &LinkRequest) -> Result<Image, LinkError> {
             alignment: 4,
         });
     }
+    let tlv = tlv_symbols(&objects);
+    if !tlv.is_empty() {
+        placements.push(InputPlacement {
+            object: SYNTHETIC_OBJECT,
+            section: TLV_SECTION,
+            segment: "__DATA".into(),
+            name: "__thread_ptrs".into(),
+            kind: SectionKind::ThreadLocal,
+            size: tlv.len() as u64 * GOT_ENTRY_SIZE,
+            alignment: 8,
+        });
+    }
     if !got.is_empty() {
         placements.push(InputPlacement {
             object: SYNTHETIC_OBJECT,
@@ -366,17 +419,24 @@ pub fn link(request: &LinkRequest) -> Result<Image, LinkError> {
     let addresses = address_map(&objects, &probe);
     let got_slots = got_slot_addresses(&got, &probe);
     let stub_slots = stub_addresses(&stubs, &probe);
+    let tlv_slots = pointer_slot_addresses(&tlv, &probe, "__thread_ptrs");
     let mut contents = build_contents(&objects, &probe, &placements)?;
     fill_got(&mut contents, &probe, &got, &addresses, &imports)?;
     fill_stubs(&mut contents, &probe, &stubs, &got_slots)?;
-    let contents = apply_relocations(
+    fill_pointer_table(&mut contents, &probe, &tlv, &addresses, "__thread_ptrs")?;
+    let patched = apply_relocations(
         &objects,
         &probe,
         &addresses,
-        &got_slots,
-        &stub_slots,
+        &IndirectTables {
+            got: &got_slots,
+            stubs: &stub_slots,
+            tlv: &tlv_slots,
+            imports: &imports,
+        },
         contents,
     )?;
+    let contents = patched.contents;
     let entry_offset = entry_offset(request, &objects, &probe)?;
 
     // Pass two: the same layout, with real bytes.
@@ -390,7 +450,8 @@ pub fn link(request: &LinkRequest) -> Result<Image, LinkError> {
     // independent, so dyld must relocate every one of them at load time.
     // A slot whose value we know is rebased; a slot dyld fills is bound.
     let rebases = got_rebases(&probe, &got, &imports);
-    let binds = got_binds(&probe, &got, &imports);
+    let mut binds = got_binds(&probe, &got, &imports);
+    binds.extend(patched.binds);
 
     assemble(
         request,
@@ -515,17 +576,68 @@ fn got_binds(image: &Image, got: &[String], imports: &[String]) -> Vec<Bind> {
 
 /// Address of each GOT slot, in the order the symbols were collected.
 fn got_slot_addresses(got: &[String], image: &Image) -> HashMap<String, u64> {
+    pointer_slot_addresses(got, image, "__got")
+}
+
+/// Address of each slot in a synthesised pointer table.
+fn pointer_slot_addresses(
+    names: &[String],
+    image: &Image,
+    section_name: &str,
+) -> HashMap<String, u64> {
     let mut slots = HashMap::new();
-    let Some(section) = image.layout.sections.iter().find(|s| s.name == "__got") else {
+    let Some(section) = image
+        .layout
+        .sections
+        .iter()
+        .find(|s| s.name == section_name)
+    else {
         return slots;
     };
-    for (index, name) in got.iter().enumerate() {
+    for (index, name) in names.iter().enumerate() {
         slots.insert(
             name.clone(),
             section.vm_address + index as u64 * GOT_ENTRY_SIZE,
         );
     }
     slots
+}
+
+/// Fill a synthesised pointer table with the addresses its slots point at.
+///
+/// A slot whose target is not defined in this image is left zero: dyld fills
+/// it, and writing a wrong value would be worse than writing none.
+fn fill_pointer_table(
+    contents: &mut HashMap<usize, Vec<u8>>,
+    image: &Image,
+    names: &[String],
+    addresses: &AddressMap,
+    section_name: &str,
+) -> Result<(), LinkError> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let Some((index, _)) = image
+        .layout
+        .sections
+        .iter()
+        .enumerate()
+        .find(|(_, s)| s.name == section_name)
+    else {
+        return Ok(());
+    };
+    let buffer = contents
+        .entry(index)
+        .or_insert_with(|| vec![0u8; names.len() * GOT_ENTRY_SIZE as usize]);
+
+    for (slot, name) in names.iter().enumerate() {
+        let Some(address) = addresses.lookup(SYNTHETIC_OBJECT, name) else {
+            continue;
+        };
+        let start = slot * GOT_ENTRY_SIZE as usize;
+        buffer[start..start + 8].copy_from_slice(&address.to_le_bytes());
+    }
+    Ok(())
 }
 
 /// Write each GOT slot's initial value: the address of the symbol it points at.
@@ -595,18 +707,97 @@ fn got_rebases(image: &Image, got: &[String], imports: &[String]) -> Vec<Rebase>
         .collect()
 }
 
+/// Whether a path is an archive rather than a single object.
+///
+/// By extension, not by content: `lib.rmeta` inside an `.rlib` is a *genuine*
+/// Mach-O object holding crate metadata (finding 9), so sniffing magic numbers
+/// misclassifies in the other direction too. The toolchain names these files
+/// consistently, and the name is the reliable signal.
+fn is_archive(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("a") | Some("rlib")
+    )
+}
+
+/// Load the inputs, extracting from archives only what the link needs.
+///
+/// # Why archives are not simply expanded
+///
+/// `libstd.rlib` holds hundreds of objects. Linking all of them would work and
+/// produce a binary tens of megabytes larger than it should be, full of code
+/// nothing calls. The rule every linker follows instead: a member is pulled in
+/// only when it defines a symbol something already in the link needs — and
+/// pulling it in can create new undefined symbols, so the process repeats to a
+/// fixed point.
+///
+/// Order matters within a pass and between passes, which is why this is a loop
+/// rather than a single sweep.
 fn load_objects(paths: &[PathBuf]) -> Result<Vec<LoadedObject>, LinkError> {
-    let mut objects = Vec::with_capacity(paths.len());
-    for (index, path) in paths.iter().enumerate() {
+    let mut objects: Vec<LoadedObject> = Vec::new();
+    let mut next_id = 0u32;
+
+    // Archives are indexed but not extracted; objects go in directly.
+    let mut archives: Vec<(PathBuf, blinker_archive::ArchiveIndex, Vec<u8>)> = Vec::new();
+
+    for path in paths {
         let data = std::fs::read(path).map_err(|source| LinkError::Read {
             path: path.clone(),
             source,
         })?;
-        let parsed = parse_object(&data, path, None, ObjectId(index as u32))
+
+        if is_archive(path) {
+            let index = blinker_archive::index_archive(&data, path)
+                .map_err(|source| LinkError::Archive(Box::new(source)))?;
+            archives.push((path.clone(), index, data));
+            continue;
+        }
+
+        let parsed = parse_object(&data, path, None, ObjectId(next_id))
             .map_err(|source| LinkError::Parse(Box::new(source)))?;
+        next_id += 1;
         objects.push(LoadedObject { parsed, data });
     }
-    Ok(objects)
+
+    if archives.is_empty() {
+        return Ok(objects);
+    }
+
+    // Pull members in until nothing new is needed.
+    let mut extracted: std::collections::HashSet<(usize, u32)> = std::collections::HashSet::new();
+    loop {
+        let wanted = undefined_references(&objects);
+        let mut added = false;
+
+        for name in &wanted {
+            for (archive_index, (path, index, data)) in archives.iter().enumerate() {
+                let Some(member_id) = index.member_defining(name) else {
+                    continue;
+                };
+                if !extracted.insert((archive_index, member_id.0)) {
+                    continue; // already in the link
+                }
+                let Some(member) = index.member(member_id) else {
+                    continue;
+                };
+                let bytes = blinker_archive::member_data(data, member, path)
+                    .map_err(|source| LinkError::Archive(Box::new(source)))?;
+                let parsed = parse_object(bytes, path, Some(&member.name), ObjectId(next_id))
+                    .map_err(|source| LinkError::Parse(Box::new(source)))?;
+                next_id += 1;
+                objects.push(LoadedObject {
+                    parsed,
+                    data: bytes.to_vec(),
+                });
+                added = true;
+                break;
+            }
+        }
+
+        if !added {
+            return Ok(objects);
+        }
+    }
 }
 
 /// Build the global symbol table and check it is complete.
@@ -830,16 +1021,50 @@ fn build_contents(
 }
 
 /// Patch every relocation against the addresses layout assigned.
+/// Section content keyed by output-section index.
+type SectionContents = HashMap<usize, Vec<u8>>;
+
+/// The indirection tables a relocation may need to reach its target.
+///
+/// Grouped because they travel together and are consulted by the same rules:
+/// which one applies is decided by the relocation's kind, not by the caller.
+struct IndirectTables<'a> {
+    got: &'a HashMap<String, u64>,
+    stubs: &'a HashMap<String, u64>,
+    tlv: &'a HashMap<String, u64>,
+    imports: &'a [String],
+}
+
+/// Patched content, plus binds for locations dyld must fill.
+struct Patched {
+    contents: SectionContents,
+    binds: Vec<Bind>,
+}
+
 fn apply_relocations(
     objects: &[LoadedObject],
     image: &Image,
     addresses: &AddressMap,
-    got_slots: &HashMap<String, u64>,
-    stub_slots: &HashMap<String, u64>,
-    mut contents: HashMap<usize, Vec<u8>>,
-) -> Result<HashMap<usize, Vec<u8>>, LinkError> {
+    tables: &IndirectTables<'_>,
+    mut contents: SectionContents,
+) -> Result<Patched, LinkError> {
+    let IndirectTables {
+        got: got_slots,
+        stubs: stub_slots,
+        tlv: tlv_slots,
+        imports,
+    } = *tables;
+    let mut extra_binds = Vec::new();
     for object in objects {
-        for relocation in &object.parsed.relocations {
+        // Indexed rather than iterated: `SUBTRACTOR` is one half of a pair and
+        // needs the relocation that follows it, so the loop has to be able to
+        // consume two entries at once.
+        let relocations = &object.parsed.relocations;
+        let mut index = 0;
+        while index < relocations.len() {
+            let relocation = &relocations[index];
+            index += 1;
+
             // Where the patched field lives in the output.
             let Some((section_index, output_section)) = image
                 .layout
@@ -859,6 +1084,44 @@ fn apply_relocations(
             let chunk_offset = chunk_address - output_section.vm_address;
             let place = chunk_address + relocation.offset;
 
+            // `SUBTRACTOR` computes a *difference* between two addresses, so
+            // it is meaningless alone: the pair is emitted as SUBTRACTOR (the
+            // value being subtracted) immediately followed by UNSIGNED (the
+            // value being subtracted from). Relative pointers in unwind and
+            // exception tables are built this way, which is why Rust hits it
+            // and simple C does not.
+            if relocation.kind == Arm64RelocationKind::Subtractor {
+                let Some(pair) = relocations.get(index) else {
+                    return Err(LinkError::UnpairedSubtractor {
+                        object: object.parsed.id,
+                        offset: relocation.offset,
+                    });
+                };
+                index += 1;
+
+                let subtrahend = target_address(object, image, addresses, relocation.target)?;
+                let minuend = target_address(object, image, addresses, pair.target)?;
+
+                let Some(buffer) = contents.get_mut(&section_index) else {
+                    continue;
+                };
+                blinker_relocations::apply_pair(
+                    pair.length,
+                    chunk_offset + pair.offset,
+                    subtrahend,
+                    minuend,
+                    pair.addend,
+                    place,
+                    buffer,
+                )
+                .map_err(|source| LinkError::Relocation {
+                    object: object.parsed.id,
+                    kind: relocation.kind,
+                    source: Box::new(source),
+                })?;
+                continue;
+            }
+
             // GOT-based kinds are patched with the address of the *slot*, not
             // of the symbol; the symbol's address is what the slot contains.
             let got = if needs_got(relocation.kind) {
@@ -867,6 +1130,19 @@ fn apply_relocations(
                         .parsed
                         .symbol(id)
                         .and_then(|s| got_slots.get(&s.name))
+                        .copied(),
+                    RelocationTarget::Section(_) => None,
+                }
+            } else {
+                None
+            };
+
+            let tlv = if needs_tlv(relocation.kind) {
+                match relocation.target {
+                    RelocationTarget::Symbol(id) => object
+                        .parsed
+                        .symbol(id)
+                        .and_then(|s| tlv_slots.get(&s.name))
                         .copied(),
                     RelocationTarget::Section(_) => None,
                 }
@@ -890,7 +1166,37 @@ fn apply_relocations(
                 None
             };
 
-            let target = match (stub, got) {
+            // A pointer-sized data reference to an imported symbol cannot be
+            // patched at all: the address does not exist until dyld supplies
+            // it. The field stays zero and a bind entry tells dyld where to
+            // write. TLV descriptors are built this way — their first word is
+            // a pointer to `__tlv_bootstrap`, which lives in libdyld.
+            if relocation.kind == Arm64RelocationKind::Unsigned {
+                if let RelocationTarget::Symbol(id) = relocation.target {
+                    if let Some(symbol) = object.parsed.symbol(id) {
+                        if imports.contains(&symbol.name) {
+                            if let Some((segment_index, segment)) = image
+                                .layout
+                                .segments
+                                .iter()
+                                .enumerate()
+                                .find(|(_, seg)| seg.name == output_section.segment)
+                            {
+                                extra_binds.push(Bind {
+                                    segment: segment_index as u8,
+                                    offset: place - segment.vm_address,
+                                    symbol: symbol.name.clone(),
+                                    library_ordinal: 1,
+                                    addend: relocation.addend,
+                                });
+                            }
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            let target = match (stub, got.or(tlv)) {
                 (Some(address), _) => address,
                 // A GOT-based reference to an *imported* symbol has no address
                 // of its own — that is the point of importing it. The
@@ -917,7 +1223,7 @@ fn apply_relocations(
                     target,
                     addend: relocation.addend,
                     got,
-                    tlv: None,
+                    tlv,
                 },
                 buffer,
             )
@@ -928,7 +1234,10 @@ fn apply_relocations(
             })?;
         }
     }
-    Ok(contents)
+    Ok(Patched {
+        contents,
+        binds: extra_binds,
+    })
 }
 
 /// The output address a relocation refers to.

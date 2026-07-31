@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+blinker-archive = { workspace = true }
 blinker-layout = { workspace = true }
 blinker-macho = { workspace = true }
 blinker-output = { workspace = true }

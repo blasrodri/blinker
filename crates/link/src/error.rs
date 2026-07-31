@@ -20,6 +20,8 @@ pub enum LinkError {
     /// Boxed because `ParseError` carries a path and detail string, and an
     /// unboxed variant would make every `LinkError` that large.
     Parse(Box<blinker_macho::ParseError>),
+    /// An archive could not be read or indexed.
+    Archive(Box<blinker_archive::ArchiveError>),
     /// Symbols referenced but never defined.
     UndefinedSymbols {
         names: Vec<String>,
@@ -49,6 +51,11 @@ pub enum LinkError {
         object: ObjectId,
         section: SectionId,
     },
+    /// A `SUBTRACTOR` with no relocation after it to pair with.
+    UnpairedSubtractor {
+        object: ObjectId,
+        offset: u64,
+    },
     Relocation {
         object: ObjectId,
         kind: Arm64RelocationKind,
@@ -67,6 +74,7 @@ impl std::fmt::Display for LinkError {
                 write!(f, "cannot write {}: {source}", path.display())
             }
             LinkError::Parse(source) => write!(f, "{source}"),
+            LinkError::Archive(source) => write!(f, "{source}"),
             LinkError::UndefinedSymbols { names } => {
                 write!(f, "undefined symbols:")?;
                 for name in names {
@@ -93,6 +101,11 @@ impl std::fmt::Display for LinkError {
                 f,
                 "object {} declares section {} outside the file",
                 object.0, section.0
+            ),
+            LinkError::UnpairedSubtractor { object, offset } => write!(
+                f,
+                "object {}: ARM64_RELOC_SUBTRACTOR at {offset:#x} has no paired relocation",
+                object.0
             ),
             LinkError::Relocation {
                 object,

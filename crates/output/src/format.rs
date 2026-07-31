@@ -56,6 +56,14 @@ pub const LC_LOAD_DYLIB: u32 = 0xc;
 pub const LC_LOAD_DYLINKER: u32 = 0xe;
 pub const LC_UUID: u32 = 0x1b;
 pub const LC_SEGMENT_64: u32 = 0x19;
+
+/// `SG_READ_ONLY`: the segment is made read-only after its fixups are applied.
+///
+/// Not decorative. dyld *refuses to load* an image whose `__DATA_CONST` lacks
+/// it: "__DATA_CONST segment missing SG_READ_ONLY flag". The segment exists
+/// precisely so that pointers dyld has to write once can be protected
+/// afterwards, and an unflagged one means the linker did not understand that.
+pub const SG_READ_ONLY: u32 = 0x10;
 pub const LC_CODE_SIGNATURE: u32 = 0x1d;
 pub const LC_FUNCTION_STARTS: u32 = 0x26;
 pub const LC_DATA_IN_CODE: u32 = 0x29;
