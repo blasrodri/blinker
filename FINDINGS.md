@@ -1252,3 +1252,45 @@ slots, inline compact-unwind addends, and now DWARF-mode encodings. A linker is
 largely a program for translating between coordinate spaces, and every one of
 these was a place where two spaces coincided in the simple case and diverged in
 the real one.
+
+## 32. The FDE's function comes from a relocation, not from decoding DWARF
+
+Filling the DWARF-mode encodings needs, for each function, the offset of its
+FDE within the output `__eh_frame`. Two things are required: where each record
+begins, and which function it covers.
+
+Boundaries are easy — every CFI record starts with its own length, and a zero
+length terminates the section. A record whose second word is zero is a CIE;
+anything else is an FDE, and that word is the distance back to its CIE.
+
+The function is where it looks hard. An FDE's `PC begin` field is encoded
+according to its CIE's augmentation string, so the textbook approach is to
+parse the augmentation, learn the pointer encoding, and decode accordingly.
+None of that is necessary here: in a **relocatable** object that field carries
+a relocation, so the target is already available from the relocation list, in
+the same form the rest of the linker consumes. Decoding the DWARF encoding
+would be re-deriving something the object states outright.
+
+The result matches ld64 value for value:
+
+```
+blinker  funcOff 0x96c  enc 0x03000014
+blinker  funcOff 0x994  enc 0x03000048
+ld64     funcOff 0x8f4  enc 0x03000014
+ld64     funcOff 0x91c  enc 0x03000048
+```
+
+All 1408 DWARF-mode entries now carry a real offset, where every one of them
+previously carried zero.
+
+### Still crashing, and now the search has moved
+
+`panic=unwind` still faults. What changed is *where the problem must be*: the
+index into `__eh_frame` is now demonstrably correct, so the remaining fault is
+in the `__eh_frame` **contents** — most likely the relocations applied to the
+FDEs' own pointer fields, which are PC-relative under most CIE augmentations
+and are being handled by the generic relocation path.
+
+That is a narrower and better-posed question than the one this section started
+with, and the evidence for it is that every layer above has been checked
+against ld64 and agrees.

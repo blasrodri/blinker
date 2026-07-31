@@ -149,6 +149,106 @@ const CU_ENCODING: u64 = 12;
 const CU_PERSONALITY: u64 = 16;
 const CU_LSDA: u64 = 24;
 
+/// `UNWIND_ARM64_MODE_MASK` and the DWARF mode value.
+const UNWIND_MODE_MASK: u32 = 0x0f00_0000;
+const UNWIND_MODE_DWARF: u32 = 0x0300_0000;
+/// Low 24 bits of a DWARF-mode encoding hold the FDE offset.
+const UNWIND_DWARF_OFFSET_MASK: u32 = 0x00ff_ffff;
+
+/// Map each function to the offset of its FDE within the output `__eh_frame`.
+///
+/// # Why the records are walked but not decoded
+///
+/// A DWARF-mode compact unwind encoding is a *pointer*: its low 24 bits are
+/// the offset of the function's FDE in `__eh_frame`, and the unwinder follows
+/// it to the real description. Producing those offsets needs to know where
+/// each FDE begins and which function it covers.
+///
+/// Finding the boundaries needs only the length field every record starts
+/// with. Finding the *function* would normally mean decoding the CIE's
+/// augmentation string to learn how the FDE's `PC begin` field is encoded —
+/// but in a relocatable object that field carries a **relocation**, so the
+/// answer is already available from the relocation list, in the same form the
+/// rest of the linker uses. Decoding DWARF pointer encodings here would be
+/// re-deriving something the object already states.
+fn eh_frame_fde_offsets(
+    objects: &[LoadedObject],
+    image: &Image,
+    addresses: &AddressMap,
+) -> HashMap<u64, u32> {
+    let mut offsets = HashMap::new();
+
+    let Some(output) = image
+        .layout
+        .sections
+        .iter()
+        .find(|s| s.name == "__eh_frame")
+    else {
+        return offsets;
+    };
+
+    for object in objects {
+        for section in &object.parsed.sections {
+            if section.name != "__eh_frame" {
+                continue;
+            }
+            let Some(file_offset) = section.file_offset else {
+                continue;
+            };
+            // Where this object's records begin within the output section.
+            let Some(chunk) = output.address_of(object.parsed.id, section.id) else {
+                continue;
+            };
+            let chunk_offset = chunk - output.vm_address;
+
+            // Relocations in this section, by offset.
+            let mut targets: HashMap<u64, u64> = HashMap::new();
+            for relocation in object
+                .parsed
+                .relocations
+                .iter()
+                .filter(|r| r.section == section.id)
+            {
+                if let Ok(address) = target_address(object, image, addresses, relocation.target) {
+                    targets.insert(relocation.offset, address);
+                }
+            }
+
+            let mut position = 0u64;
+            while position + 8 <= section.size {
+                let at = (file_offset + position) as usize;
+                let Some(length_bytes) = object.data.get(at..at + 4) else {
+                    break;
+                };
+                let length = u32::from_le_bytes(length_bytes.try_into().expect("4 bytes")) as u64;
+                // A zero length terminates the section.
+                if length == 0 {
+                    break;
+                }
+                let record_size = 4 + length;
+
+                let id = object
+                    .data
+                    .get(at + 4..at + 8)
+                    .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
+                    .unwrap_or(0);
+
+                // Zero identifies a CIE; anything else is an FDE whose value is
+                // the distance back to its CIE.
+                if id != 0 {
+                    // `PC begin` immediately follows the CIE pointer.
+                    if let Some(function) = targets.get(&(position + 8)) {
+                        offsets.insert(*function, (chunk_offset + position) as u32);
+                    }
+                }
+
+                position += record_size;
+            }
+        }
+    }
+    offsets
+}
+
 /// Symbols used as unwind personality routines.
 ///
 /// These need GOT slots like any other indirect reference. `__unwind_info`
@@ -201,6 +301,7 @@ fn compact_unwind_entries(
     image: &Image,
     addresses: &AddressMap,
     got_slots: &HashMap<String, u64>,
+    fde_offsets: &HashMap<u64, u32>,
 ) -> Vec<UnwindEntry> {
     let Some(text) = image.layout.segment("__TEXT") else {
         return Vec::new();
@@ -291,6 +392,16 @@ fn compact_unwind_entries(
                     continue;
                 };
                 let _length = read_u32(CU_LENGTH);
+
+                // A DWARF-mode encoding must carry the offset of this
+                // function's FDE. Without it the unwinder follows a zero and
+                // reads the start of `__eh_frame` for every function.
+                let encoding = if encoding & UNWIND_MODE_MASK == UNWIND_MODE_DWARF {
+                    let fde = fde_offsets.get(function).copied().unwrap_or(0);
+                    (encoding & !UNWIND_DWARF_OFFSET_MASK) | (fde & UNWIND_DWARF_OFFSET_MASK)
+                } else {
+                    encoding
+                };
 
                 entries.push(UnwindEntry {
                     function_offset: (function - image_base) as u32,
@@ -756,7 +867,8 @@ fn fill_unwind_info(
         return Ok(());
     };
 
-    let entries = compact_unwind_entries(objects, image, addresses, got_slots);
+    let fde_offsets = eh_frame_fde_offsets(objects, image, addresses);
+    let entries = compact_unwind_entries(objects, image, addresses, got_slots, &fde_offsets);
     let mut table = blinker_output::unwind::build(entries);
 
     if table.len() as u64 > section.size {
