@@ -305,6 +305,20 @@ pub fn write_source_version(writer: &mut Writer, version: u64) {
         .u64(version);
 }
 
+/// Emit `LC_CODE_SIGNATURE`.
+///
+/// A `linkedit_data_command` pointing at the signature blob. It must be
+/// emitted *before* the signature is computed, because the load commands are
+/// inside the region the signature covers — a command added afterwards would
+/// invalidate every page hash.
+pub fn write_code_signature(writer: &mut Writer, link_edit: &LinkEditLayout) {
+    writer
+        .u32(LC_CODE_SIGNATURE)
+        .u32(sizes::LINKEDIT_DATA as u32)
+        .u32(link_edit.code_signature_offset)
+        .u32(link_edit.code_signature_size);
+}
+
 /// Emit `LC_MAIN`.
 ///
 /// `entry_offset` is a **file offset**, not a virtual address — the difference

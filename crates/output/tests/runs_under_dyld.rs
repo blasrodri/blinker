@@ -12,6 +12,12 @@
 //! `cmdsize`, or a missing signature all produce a process that dies rather
 //! than one that returns the wrong number.
 //!
+//! # Signing is blinker's own
+//!
+//! The image is signed by `blinker-output` itself, not by `codesign`. That is
+//! what makes "it runs" a statement about blinker rather than about the system
+//! tool that fixed up its output afterwards.
+//!
 //! # Why the program calls nothing
 //!
 //! `main` returning 42 needs no imports of blinker's own. The kernel maps the
@@ -107,42 +113,28 @@ fn write_executable(tag: &str, image: &Image) -> Scratch {
     scratch
 }
 
-/// Apply an ad-hoc signature with the system tool.
-///
-/// Every arm64 macOS binary must be signed — the kernel refuses to execute an
-/// unsigned one outright, so this is not optional the way it is on x86_64.
-/// blinker has to do this itself eventually (spec §26); using `codesign` here
-/// keeps the walking skeleton to one unknown at a time. What this test proves
-/// is that the *Mach-O* is correct; signing is verified separately once it is
-/// implemented internally.
-fn sign_ad_hoc(path: &std::path::Path) -> Result<(), String> {
+/// Ask the system whether it accepts the signature blinker produced.
+fn verify_signature(path: &std::path::Path) -> Result<(), String> {
     let output = Command::new("codesign")
-        .args(["-s", "-", "-f"])
+        .arg("-v")
         .arg(path)
         .output()
         .map_err(|e| format!("cannot run codesign: {e}"))?;
     if !output.status.success() {
-        return Err(format!(
-            "codesign rejected the image: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
     }
     Ok(())
 }
 
 /// The whole point: the program runs and returns what it was built to return.
+///
+/// Nothing external touches the image between assembly and execution — no
+/// `codesign`, no `install_name_tool`. What the builder emitted is what the
+/// kernel loaded.
 #[test]
 fn a_blinker_linked_program_runs_and_returns_its_exit_status() {
     let image = build_program();
     let executable = write_executable("skeleton", &image);
-
-    if let Err(error) = sign_ad_hoc(executable.path()) {
-        panic!(
-            "the image could not be signed, so it cannot be run: {error}\n\
-             This usually means the Mach-O itself is malformed — codesign \
-             parses load commands and refuses what it cannot walk."
-        );
-    }
 
     let output = Command::new(executable.path())
         .output()
@@ -157,36 +149,57 @@ fn a_blinker_linked_program_runs_and_returns_its_exit_status() {
     );
 }
 
-/// The signature step must be the *only* thing standing between the emitted
-/// image and a runnable one.
+/// The system's own verifier must accept the signature blinker computed.
 ///
-/// If `codesign` cannot parse what blinker emits, the failure is in the
-/// Mach-O, not in the signing — and this separates those two so the walking
-/// skeleton's failure message points at the right half.
+/// Running proves the kernel accepted it; `codesign -v` additionally checks
+/// the blob's internal structure, so a signature that happened to satisfy the
+/// loader while being malformed is caught here.
 #[test]
-fn the_emitted_image_is_well_formed_enough_for_codesign_to_parse() {
+fn the_system_verifier_accepts_blinkers_signature() {
     let image = build_program();
-    let executable = write_executable("signable", &image);
-    sign_ad_hoc(executable.path()).expect("codesign parses and signs the image");
+    let executable = write_executable("verify", &image);
+    verify_signature(executable.path()).expect("codesign -v accepts the signature");
 }
 
-/// An unsigned image must be *rejected*, not silently run.
+/// Corrupting one byte of code must make the image unrunnable.
 ///
-/// This pins the reason signing is mandatory rather than incidental: without
-/// it there is no program, and a future change that drops the signing step
-/// should fail loudly here rather than mysteriously in the test above.
+/// Without this, every test above could pass with a signature nothing checks —
+/// the hashes could be zeros and the program would still run if the kernel
+/// were ignoring them. Flipping a byte inside the signed region proves the
+/// signature is load-bearing.
 #[test]
-fn an_unsigned_image_is_refused_by_the_kernel() {
+fn a_single_corrupted_code_byte_invalidates_the_image() {
     let image = build_program();
-    let executable = write_executable("unsigned", &image);
+    let entry = image
+        .layout
+        .sections
+        .iter()
+        .find(|s| s.name == "__text")
+        .and_then(|s| s.file_offset)
+        .expect("__text laid out") as usize;
 
-    let result = Command::new(executable.path()).output();
-    match result {
-        Err(_) => {} // refused before exec — expected
+    let mut corrupted = image.bytes.clone();
+    corrupted[entry] ^= 0xff;
+
+    let scratch = Scratch::file("corrupt", &corrupted).expect("writable");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+    }
+
+    assert!(
+        verify_signature(scratch.path()).is_err(),
+        "codesign accepted an image whose code had been modified"
+    );
+
+    match Command::new(scratch.path()).output() {
+        Err(_) => {} // refused before exec
         Ok(output) => assert_ne!(
             output.status.code(),
             Some(EXPECTED_STATUS),
-            "an unsigned arm64 image ran successfully, which should be impossible"
+            "a corrupted image ran successfully — the signature is not being checked"
         ),
     }
 }

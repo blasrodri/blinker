@@ -712,3 +712,73 @@ measurements above are that signal being read.
 
 This is what makes finding 15 load-bearing: the signal is only usable once the
 comparison is keyed on CGU identity instead of path.
+
+## 19. Ad-hoc signing is part of linking on Apple Silicon, and two of its constants are counter-intuitive
+
+On arm64 macOS the kernel does not warn about an unsigned image, it kills the
+process before any of its code runs. Measured on blinker's own output:
+
+```
+unsigned          → exit 137   (128 + 9, SIGKILL)
+ad-hoc signed     → exit 42    (what the program computes)
+one byte flipped  → exit 137   "code or signature have been modified"
+```
+
+So a linker that cannot sign cannot produce a program here. This is not a
+post-processing step that can be left to `codesign`; `ld64` does it inline and
+so must blinker.
+
+The structure was read out of a real signature rather than from headers, and
+the page hashes recomputed independently to confirm what they cover:
+
+```
+SuperBlob (0xfade0cc0)
+  ├─ slot 0x00000  CodeDirectory (0xfade0c02)   SHA-256 per page + special slots
+  ├─ slot 0x00002  Requirements  (0xfade0c01)   an empty set, 12 bytes
+  └─ slot 0x10000  CMS signature (0xfade0b01)   empty — that is what ad-hoc means
+```
+
+Two things would have been got wrong by reasoning from the format's shape:
+
+- **The blobs are big-endian**, inside a file that is little-endian
+  everywhere else.
+- **The signing page is 16 KiB, not 4 KiB.** The `CodeDirectory` field is
+  `pageSize = 14`, a log2. Assuming the familiar 4 KiB yields four times the
+  slots and an image the kernel refuses, with no diagnostic pointing at the
+  page size.
+
+The special slots are also indexed *backwards* from the code hashes: the 32
+bytes immediately before them are slot −1, the 32 before that slot −2. Slot −2
+holds the requirements hash and slot −1 is zeroed because there is no
+Info.plist — so having requirements at all forces an empty info slot to exist
+as padding.
+
+### The size has to be exact before any bytes exist
+
+The signature covers the file up to where it begins, and `LC_CODE_SIGNATURE`
+points at that offset — a load command *inside* the hashed region. So the
+signature's size must be computed before the image is emitted, and a one-byte
+error moves `code_limit`, changing every page hash. `signature_size` and `sign`
+are therefore checked against each other for a range of image sizes, rather
+than trusting that they agree.
+
+## 20. Signing turned a latent layout bug into a corrupted header
+
+Enabling signing broke the degenerate case: an image with no sections came out
+with `ncmds = 3222068986` and `otool` reporting `load command 0 extends past
+end of load commands`.
+
+`__LINKEDIT`'s file offset was computed as the maximum end of the mapped
+segments — and an image with no sections has none, so the fallback was zero.
+Nothing had noticed, because the emitter only ever *padded* forward to that
+offset, and padding to zero is a no-op. Signing truncates to it, so the same
+wrong number that had been harmless now cut the header and load commands off
+the front of the file.
+
+Two things follow. `__LINKEDIT` now starts past the header and load commands
+whether or not anything else was laid out. And the truncation is guarded by an
+explicit error rather than an assumption, because the failure mode when it is
+wrong is a file too corrupt to diagnose from.
+
+The empty-image test that caught this looked like completeness padding when it
+was written. It was the only test that ran the degenerate shape end to end.

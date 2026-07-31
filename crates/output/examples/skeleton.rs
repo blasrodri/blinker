@@ -47,6 +47,16 @@ fn assemble(entry_offset: u64, code: &[u8]) -> Image {
 }
 
 fn main() {
+    // `--empty` emits the degenerate image with no sections, which is a legal
+    // shape and a useful one to inspect when layout edge cases misbehave.
+    if std::env::args().any(|a| a == "--empty") {
+        let image = ImageBuilder::new().build().expect("empty image builds");
+        let path = std::env::args().nth(1).expect("path");
+        std::fs::write(&path, &image.bytes).expect("writable");
+        println!("wrote empty image {} ({} bytes)", path, image.bytes.len());
+        return;
+    }
+
     let path = std::env::args().nth(1).unwrap_or_else(|| {
         eprintln!("usage: skeleton <output-path>");
         std::process::exit(2);

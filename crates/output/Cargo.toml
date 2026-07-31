@@ -8,5 +8,7 @@ license.workspace = true
 blinker-layout = { workspace = true }
 blinker-macho = { workspace = true }
 
+sha2 = { workspace = true }
+
 [dev-dependencies]
 blinker-test-support = { workspace = true }

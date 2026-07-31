@@ -25,6 +25,7 @@ use blinker_layout::{align_up, compute_layout, InputPlacement, Layout, PAGE_SIZE
 use crate::commands::{self, LinkEditLayout};
 use crate::dyld_info::{encode_bind, encode_rebase, Bind, Rebase};
 use crate::format::*;
+use crate::signature::{sign, signature_size, SignatureRequest};
 use crate::symtab::{SymbolTable, SymbolTableBuilder};
 
 /// A dynamic library the image loads.
@@ -68,6 +69,12 @@ pub struct ImageBuilder {
     min_os: (u16, u8, u8),
     sdk: (u16, u8, u8),
     uuid: [u8; 16],
+    /// The identifier embedded in the ad-hoc signature.
+    ///
+    /// `codesign` derives this from the output file's name. blinker does not
+    /// know its own output path here, so the caller sets it; the default is
+    /// what an unnamed link produces.
+    identifier: String,
 }
 
 #[derive(Debug)]
@@ -84,6 +91,15 @@ pub enum ImageError {
     },
     /// Content was supplied for a section index that does not exist.
     UnknownSection { section: usize },
+    /// The signature would have been written over emitted content.
+    ///
+    /// Unreachable if `__LINKEDIT` is placed correctly, which is exactly why
+    /// it is checked: the failure mode when it is not is a file whose header
+    /// has been overwritten, and that is unreadable rather than diagnosable.
+    SignatureOverlapsContent {
+        signature_start: u64,
+        content_end: u64,
+    },
     /// The emitted load commands did not fit the reservation layout made.
     ///
     /// Only reachable if the size prediction and the emitter disagree, which
@@ -105,6 +121,13 @@ impl std::fmt::Display for ImageError {
             ImageError::UnknownSection { section } => {
                 write!(f, "content supplied for unknown section index {section}")
             }
+            ImageError::SignatureOverlapsContent {
+                signature_start,
+                content_end,
+            } => write!(
+                f,
+                "the signature would start at {signature_start:#x}, inside content ending at {content_end:#x}"
+            ),
             ImageError::CommandsOverflowedReservation { reserved, emitted } => write!(
                 f,
                 "load commands need {emitted} bytes but only {reserved} were reserved"
@@ -138,7 +161,16 @@ impl ImageBuilder {
             // Zero until content hashing is implemented; a real UUID is
             // derived from the image's own bytes, which is a later step.
             uuid: [0; 16],
+            identifier: "a.out".to_string(),
         }
+    }
+
+    /// Set the identifier embedded in the ad-hoc signature.
+    ///
+    /// Conventionally the output file's base name, matching `codesign`.
+    pub fn identifier(&mut self, identifier: &str) -> &mut Self {
+        self.identifier = identifier.to_string();
+        self
     }
 
     pub fn input(&mut self, placement: InputPlacement) -> &mut Self {
@@ -221,14 +253,22 @@ impl ImageBuilder {
 
         // __LINKEDIT sits above every mapped segment; its contents are laid
         // out here because they did not exist during layout.
+        //
+        // The `max(reservation)` is not belt-and-braces: an image with no
+        // sections at all has no mapped segment to sit above, and falling back
+        // to zero put `__LINKEDIT` — and therefore the signature — on top of
+        // the header and load commands. That produced a file whose `ncmds`
+        // read as 3222068986. `__LINKEDIT` must always begin past the commands,
+        // whether or not anything else was laid out.
         let link_edit_start = layout
             .segments
             .iter()
             .filter(|s| s.name != "__LINKEDIT" && s.name != "__PAGEZERO")
             .map(|s| s.file_offset + s.file_size)
             .max()
-            .map(|end| align_up(end, PAGE_SIZE))
-            .unwrap_or(0);
+            .unwrap_or(0)
+            .max(reservation);
+        let link_edit_start = align_up(link_edit_start, PAGE_SIZE);
 
         let mut link_edit = LinkEditLayout::default();
         let mut cursor = link_edit_start;
@@ -252,9 +292,27 @@ impl ImageBuilder {
         link_edit.string_size = symbols.strings_size() as u32;
         cursor += symbols.strings_size() as u64;
 
-        let link_edit_end = align_up(cursor, PAGE_SIZE);
+        // The signature goes last, and covers everything before it. Its size
+        // has to be known now, before any bytes exist, because it determines
+        // where `__LINKEDIT` ends — and that value goes into a load command
+        // that the signature itself hashes.
+        let signature_start = align_up(cursor, 16);
+        let text_segment = layout.segment("__TEXT");
+        let request = SignatureRequest {
+            identifier: self.identifier.clone(),
+            code_limit: signature_start,
+            exec_segment_base: text_segment.map(|s| s.file_offset).unwrap_or(0),
+            exec_segment_limit: text_segment.map(|s| s.file_size).unwrap_or(0),
+        };
+        let signature_len = signature_size(&request);
+        link_edit.code_signature_offset = signature_start as u32;
+        link_edit.code_signature_size = signature_len as u32;
 
-        let bytes = self.emit(
+        // No page padding: `__LINKEDIT` ends exactly where the signature does,
+        // which is what ld64 emits and what keeps `code_limit` honest.
+        let link_edit_end = signature_start + signature_len as u64;
+
+        let mut bytes = self.emit(
             &layout,
             &symbols,
             &link_edit,
@@ -264,6 +322,22 @@ impl ImageBuilder {
             link_edit_end,
             reservation,
         )?;
+
+        // Sign last. Everything the signature covers is now final, including
+        // the LC_CODE_SIGNATURE command that points at where it is about to go.
+        // Truncation removes only the space reserved for the signature. If
+        // `signature_start` ever landed inside real content this would silently
+        // corrupt the image, so it is checked rather than assumed.
+        if (signature_start as usize) < link_edit_start as usize {
+            return Err(ImageError::SignatureOverlapsContent {
+                signature_start,
+                content_end: link_edit_start,
+            });
+        }
+        bytes.truncate(signature_start as usize);
+        let blob = sign(&bytes, &request);
+        debug_assert_eq!(blob.len(), signature_len);
+        bytes.extend_from_slice(&blob);
 
         Ok(Image {
             bytes,
@@ -342,6 +416,9 @@ impl ImageBuilder {
             );
             command_count += 1;
         }
+
+        commands::write_code_signature(&mut writer, link_edit);
+        command_count += 1;
 
         let command_size = writer.len() - commands_start;
 
