@@ -32,7 +32,8 @@ use std::path::{Path, PathBuf};
 use blinker_layout::InputPlacement;
 use blinker_macho::{
     parse_object, Arm64RelocationKind, InputRelocation, InputSection, ObjectId, ParsedObject,
-    RelocationLength, RelocationTarget, SectionId, SectionKind, SymbolId, SymbolVisibility,
+    RelocationLength, RelocationTarget, SectionId, SectionKind, SymbolId, SymbolStrength,
+    SymbolVisibility,
 };
 use blinker_output::image::Dylib;
 use blinker_output::symtab::OutputSymbol;
@@ -820,6 +821,99 @@ const SYNTHETIC_OBJECT: ObjectId = ObjectId(u32::MAX);
 /// Section id of the synthesised `__got`.
 const GOT_SECTION: SectionId = SectionId(0);
 
+/// Section id of the synthesised `__common`.
+const COMMON_SECTION: SectionId = SectionId(4);
+
+/// A tentative definition, and the storage it needs.
+struct Common {
+    name: String,
+    size: u64,
+    alignment: u32,
+}
+
+/// Tentative definitions that no object defines outright.
+///
+/// C's `int arr[64];` at file scope is a *tentative* definition: every
+/// translation unit that declares it emits a common symbol carrying the size,
+/// and the linker allocates one shared object of the largest size requested.
+/// A real definition anywhere — `int arr[64] = {0};` — wins outright, and the
+/// commons become references to it.
+///
+/// Sorted by name so the section's contents do not depend on object order.
+fn common_symbols(objects: &[LoadedObject]) -> Vec<Common> {
+    let defined: HashSet<&str> = objects
+        .iter()
+        .flat_map(|o| &o.parsed.symbols)
+        .filter(|s| s.strength != SymbolStrength::Common && s.strength.is_definition())
+        .map(|s| s.name.as_str())
+        .collect();
+
+    let mut wanted: HashMap<&str, Common> = HashMap::new();
+    for symbol in objects.iter().flat_map(|o| &o.parsed.symbols) {
+        if symbol.strength != SymbolStrength::Common || defined.contains(symbol.name.as_str()) {
+            continue;
+        }
+        // `value` holds the size for a common symbol, not an address. Two
+        // translation units may ask for different sizes of the same name; the
+        // largest wins, which is what makes a mismatched declaration merely
+        // wasteful rather than a buffer overrun.
+        let entry = wanted.entry(symbol.name.as_str()).or_insert(Common {
+            name: symbol.name.clone(),
+            size: 0,
+            alignment: 0,
+        });
+        entry.size = entry.size.max(symbol.value);
+        entry.alignment = entry.alignment.max(natural_alignment(symbol.value));
+    }
+
+    let mut commons: Vec<Common> = wanted.into_values().collect();
+    commons.sort_by(|a, b| a.name.cmp(&b.name));
+    commons
+}
+
+/// The alignment a common symbol of this size is entitled to.
+///
+/// Mach-O keeps the requested alignment in `n_desc`, which the parser does not
+/// carry. Deriving it from the size is what `ld` does when the field is absent
+/// and is never *less* aligned than the object needs: a 256-byte array gets
+/// 8-byte alignment, a single `int` gets 4.
+fn natural_alignment(size: u64) -> u32 {
+    match size {
+        0..=1 => 1,
+        2..=3 => 2,
+        4..=7 => 4,
+        _ => 8,
+    }
+}
+
+/// Where each common symbol landed, once `__common` has an address.
+fn common_addresses(commons: &[Common], image: &Image) -> Vec<(String, u64)> {
+    let Some(section) = image.layout.sections.iter().find(|s| s.name == "__common") else {
+        return Vec::new();
+    };
+    let mut at = section.vm_address;
+    commons
+        .iter()
+        .map(|common| {
+            at = at.next_multiple_of(common.alignment.max(1) as u64);
+            let address = at;
+            at += common.size;
+            (common.name.clone(), address)
+        })
+        .collect()
+}
+
+/// The size `__common` must reserve, laid out the same way as above.
+fn common_section_size(commons: &[Common]) -> (u64, u32) {
+    let mut size = 0u64;
+    let mut alignment = 1u32;
+    for common in commons {
+        alignment = alignment.max(common.alignment);
+        size = size.next_multiple_of(common.alignment.max(1) as u64) + common.size;
+    }
+    (size, alignment)
+}
+
 /// Bytes per GOT entry: one 64-bit pointer.
 const GOT_ENTRY_SIZE: u64 = 8;
 
@@ -995,6 +1089,21 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
             alignment: 8,
         });
     }
+    // Tentative definitions need real storage, and its size must be known
+    // before layout like any other section's.
+    let commons = common_symbols(&objects);
+    let (common_size, common_alignment) = common_section_size(&commons);
+    if common_size > 0 {
+        placements.push(InputPlacement {
+            object: SYNTHETIC_OBJECT,
+            section: COMMON_SECTION,
+            segment: "__DATA".into(),
+            name: "__common".into(),
+            kind: SectionKind::Bss,
+            size: common_size,
+            alignment: common_alignment as u64,
+        });
+    }
     if !got.is_empty() {
         placements.push(InputPlacement {
             object: SYNTHETIC_OBJECT,
@@ -1021,7 +1130,13 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
 
     // With addresses known, copy content and patch it.
     let step = std::time::Instant::now();
-    let addresses = address_map(&objects, &probe);
+    let mut addresses = address_map(&objects, &probe);
+    // Commons have no section of their own in any input, so `address_map` —
+    // which walks each symbol's defining section — cannot see them. They are
+    // definitions all the same, and every reference resolves here.
+    for (name, address) in common_addresses(&commons, &probe) {
+        addresses.global.insert(name, address);
+    }
     let got_slots = got_slot_addresses(&got, &probe);
     let stub_slots = stub_addresses(&stubs, &probe);
     let tlv_slots = pointer_slot_addresses(&tlv, &probe, "__thread_ptrs");

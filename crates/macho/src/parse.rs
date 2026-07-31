@@ -254,23 +254,43 @@ fn parse_symbols<'d>(
     check_count(raw.len(), "symbols", path)?;
 
     let mut symbols = Vec::with_capacity(raw.len());
+    /// Whether an `nlist` entry is a tentative definition.
+    ///
+    /// Mach-O encodes one as `N_UNDF | N_EXT` with a non-zero `n_value`
+    /// holding the object's *size* rather than an address. There is no
+    /// separate type for it, which is why `object`'s `is_common` — written
+    /// against formats that have one — reports false here and the symbol
+    /// arrives looking like a plain undefined reference.
+    fn is_common<'a>(symbol: &impl object::ObjectSymbol<'a>) -> bool {
+        symbol.is_undefined() && symbol.is_global() && symbol.address() != 0
+    }
+
     for (index, symbol) in raw.iter().enumerate() {
         let name = symbol.name().map_err(|e| ParseError::Malformed {
             path: path.to_path_buf(),
             detail: format!("symbol {index} has an unreadable name: {e}"),
         })?;
 
-        // Order matters: a symbol can be both undefined and weak, and the
-        // undefined case must be decided first or a weak reference would be
+        // Order matters twice over.
+        //
+        // A *common* symbol is encoded as `N_UNDF | N_EXT` with a non-zero
+        // `n_value` holding its size — it looks undefined and is not, so it
+        // has to be decided first or C's tentative definitions (`int arr[64];`
+        // with no initialiser) link as undefined references. That is exactly
+        // what happened, and it went unnoticed because Rust never emits them
+        // (finding 65).
+        //
+        // Then, among the rest, a symbol can be both undefined and weak, and
+        // the undefined case must come first or a weak reference would be
         // misread as a weak definition.
-        let strength = if symbol.is_undefined() {
+        let strength = if is_common(symbol) {
+            SymbolStrength::Common
+        } else if symbol.is_undefined() {
             if symbol.is_weak() {
                 SymbolStrength::WeakUndefined
             } else {
                 SymbolStrength::Undefined
             }
-        } else if symbol.is_common() {
-            SymbolStrength::Common
         } else if symbol.is_weak() {
             SymbolStrength::Weak
         } else {

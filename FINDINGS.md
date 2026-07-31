@@ -2780,6 +2780,60 @@ Rust never emits these, which is why nothing had hit it before, and C code that
 does is common enough that this is a real gap rather than a curiosity. Recorded
 where it was found rather than fixed in passing.
 
+### Fixed
+
+Two parts, and the first was not where it looked.
+
+`object`'s `is_common()` returns **false** for a Mach-O common symbol. The
+format has no distinct type for one: it is `N_UNDF | N_EXT` with a non-zero
+`n_value` holding the size, which is the same encoding as an undefined
+reference plus a number. A trait method written against formats that *do* have
+a type for it cannot see that, so the test is now made directly — undefined,
+external, non-zero value — and it has to run *before* `is_undefined()`, which
+would otherwise claim the symbol first.
+
+Then the storage: commons are collected across all objects, deduplicated by
+name at the largest size requested, dropped entirely if any object defines the
+name outright, and placed in a synthesised zero-filled `__DATA,__common`
+section sized before layout like `__got` and `__stubs`. `address_map` cannot
+see them — it walks each symbol's defining section and a common has none — so
+their addresses are inserted after layout.
+
+Matches ld-prime on shared commons, mismatched sizes, and a real definition
+overriding both.
+
+## 69. Two of the six new tests could not fail
+
+The common-symbol tests all passed on the first run, so both obvious
+breakages were tried against them:
+
+```
+  allocate the last size seen instead of the largest  ->  all 6 passed
+  let commons shadow a real definition                ->  all 6 passed
+```
+
+Neither was caught, for the same reason in different clothes: **the wrong
+answer and the right answer were the same number.**
+
+- The size test wrote 256 integers and read one back. An undersized allocation
+  still writes somewhere and still reads back what it wrote — `__common` had
+  slack after it, so the overrun was invisible. It needs a *canary*: a second
+  common that the section's name ordering places immediately after, which the
+  overrun destroys.
+- The override test linked three objects and checked the final answer, which is
+  42 whether the references resolve to the real object or to freshly zeroed
+  common storage. It needs the initialiser to be **observed** — read `111` out
+  of the definition before anything writes to it.
+
+Both now fail under their controls.
+
+This is the third time in this session that a negative control has found a
+hollow test (63, 66, this). The pattern across all three is worth stating: a
+test proves something only when the failure it is written against would produce
+a *different observable value* — not merely a different internal state. Writing
+the assertion first and the breakage second is what makes that hard to see, and
+running the breakage is what makes it obvious.
+
 ## 66. The counter added to detect a dead cache reported a dead cache as healthy
 
 Finding 64's conclusion was that a cache needs its hit rate surfaced, because a
