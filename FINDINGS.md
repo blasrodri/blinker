@@ -619,3 +619,96 @@ segment placement, section sizes, dependencies, undefined symbols, local
 symbol count and entry point. What remains is a to-do list rather than a
 surprise: `LC_FUNCTION_STARTS`, `LC_DATA_IN_CODE`, `LC_CODE_SIGNATURE`, and
 `__TEXT,__unwind_info`.
+
+## 15. Object file paths are not stable across builds, so a path-keyed cache misses every time
+
+Measuring rustc's incremental output required comparing object files between
+builds. The first attempt reported that **every** object file changed on
+**every** edit — 13 of 13, for a one-character change. That was the
+measurement, not the compiler:
+
+```
+gen0: edittest-e3ba9c90af78615f.0iyf66cnpo8vwk1rztk4nxg1f.14oibsx.rcgu.o
+gen1: edittest-e3ba9c90af78615f.0iyf66cnpo8vwk1rztk4nxg1f.0q0qm9y.rcgu.o
+                                 └── CGU identity: stable ──┘ └ session ┘
+```
+
+The filename has three variable components. The second identifies the codegen
+unit and is **stable across builds**. The third is a per-build session id that
+changes every single time, even when nothing was edited.
+
+**Consequence for M4:** a cache keyed on input path has a 0% hit rate. Not a
+low rate — zero, always, by construction. The key must be the CGU identity or
+the file's content hash. blinker already fingerprints by content, so the fix is
+to key on that rather than on the path recorded in `argv`.
+
+## 16. Monomorphization does not fan out across codegen units in debug builds
+
+The concern: editing a generic function's body invalidates every
+instantiation, so one source edit becomes N symbol changes, where N is the
+number of concrete types it is used at. If true, it would be the single
+largest threat to incremental patching of Rust.
+
+Measured instead of assumed. A generic instantiated at four concrete types
+across four separate modules:
+
+```
+$ nm -jU *.rcgu.o | grep generic_scale
+__RINv…11lib_generic13generic_scaledEB4_    (f64)
+__RINv…11lib_generic13generic_scalehEB4_    (u8)
+__RINv…11lib_generic13generic_scalemEB4_    (u32)
+__RINv…11lib_generic13generic_scalexEB4_    (i64)
+```
+
+All four live in **one** CGU — the one where the generic is *defined*, not
+where it is used. Editing its body changed 1 CGU of 15, the same as editing a
+non-generic function. Cross-crate, with a downstream crate instantiating at
+four types the defining crate never uses, the answer was the same: 1 CGU.
+
+The mechanism is `-Zshare-generics`, which is on by default in debug builds —
+instantiations are shared and placed with the definition. Debug builds are
+exactly the agentic-edit case, so this lands on the favourable side.
+
+**Not yet measured:** release builds, where share-generics is off and the
+fanout should reappear. Recorded as a known gap rather than assumed benign.
+
+## 17. Symbol names cannot classify an edit, because Rust's mangling omits signatures
+
+The natural way to bucket an edit — compare the old and new symbol tables — does
+not work. Measured deltas in the one CGU each edit touched:
+
+| edit | symbols added/removed | `__text` size |
+|---|---|---|
+| body edit, non-generic | +0 / −0 | 660 → 696 (**+36**) |
+| additive (new function) | +2 / −0 | 660 → 792 (+132) |
+| **signature change** `f(a,b)` → `f(a,b,c)` | **+0 / −0** | 660 → 712 (+52) |
+| **struct layout change** (new field) | +0 / −1 (a temp label) | 660 → 660 (+0) |
+
+The two cascading edits are the two that a symbol-name diff calls *identical*.
+Rust's v0 mangling for a non-generic free function encodes its **path**, not
+its type signature, so changing the signature leaves the mangled name
+untouched. A struct gaining a field changes no exported name at all.
+
+So tiers 1 and 3 are indistinguishable by symbol comparison. Classification has
+to come from the set of changed CGUs plus reference analysis, not from names.
+
+Also note the first row: a body edit that added `+ 0` grew `__text` by **36
+bytes**. "Same signature, same or near-same size" is not automatic even for the
+easiest case — the slop budget for in-place patching has to be measured against
+real edits rather than assumed small.
+
+## 18. rustc's incremental verdict is already on the filesystem
+
+The appealing idea is to consume rustc's own per-item dependency fingerprints
+rather than re-deriving them by diffing object files. The literal version means
+reading `target/debug/incremental/**/dep-graph.bin`, which is an unstable
+internal format with no compatibility guarantee.
+
+It is not necessary. With incremental compilation on, rustc **reuses the object
+file for any CGU it determined was unchanged**. So "which `.rcgu.o` files have
+new content" *is* the compiler's own answer to "what changed", already
+materialized, through a stable interface — files on disk. The one-CGU-changed
+measurements above are that signal being read.
+
+This is what makes finding 15 load-bearing: the signal is only usable once the
+comparison is keyed on CGU identity instead of path.
