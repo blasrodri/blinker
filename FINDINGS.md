@@ -1857,3 +1857,50 @@ to be rare for the body edits that dominate an agent's edit loop.
 What remains unmeasured is the *distribution over a real workload* rather than
 eight hand-written edits — how often an agent's changes exceed 5%. That needs
 the telemetry harness, and it is the last unknown before the cache is buildable.
+
+## 44. 89% of codegen units are untouched by a one-function edit
+
+`scripts/edit-class.py` classifies an edit by comparing two builds' object
+files, keyed on the stable codegen-unit component of the filename (finding 15).
+On a one-function change to a small Rust binary — replacing `n * 2` with a
+branch:
+
+```
+  9 codegen units
+    unchanged      8  (89%)
+    additive       1  (11%)
+
+  max growth +172.2%   over 5% slop budget: 1
+```
+
+**Eight of nine codegen units were byte-identical.** That is the cache's hit
+rate for this edit, and it is the first direct evidence that the incremental
+premise holds at all: the overwhelming majority of a build's object code does
+not change when one function does.
+
+The one that did change blew through the slop budget at +172%, and the reason
+matters: that codegen unit is *tiny*. A branch costing ~90 bytes (finding 43)
+is 2.5% of a 3.6 KB contribution and 172% of a 50-byte one. **Slop as a flat
+percentage is wrong for small contributions** — it needs a floor, something like
+`max(5%, 128 bytes)`, or small units need to be merged before padding.
+
+It was also classified `additive` rather than `body`, because the branch
+introduced new symbols — a panic landing pad. That is worth knowing: in Rust,
+adding a branch to a function is frequently *not* a pure body edit at the
+object level, which makes the "bodies patch in place" bucket narrower than the
+source-level intuition suggests.
+
+### What is now measured, and what is left
+
+The cache design rests on four numbers, three of which are now in hand:
+
+| question | answer | finding |
+|---|---|---|
+| can parses be cached? | no — parsing beats deserialising | 41 |
+| do addresses stay put across an edit? | no — everything after it moves | 42 |
+| how much slop does an edit need? | 0.4–2.5% of a contribution, floor needed | 43, 44 |
+| how often does a real edit exceed it? | **unmeasured** — needs many edits | — |
+
+The last one now has a tool. Running it across a realistic sequence of agent
+edits is the remaining prerequisite, and the only one left before the cache can
+be built against evidence rather than intuition.
