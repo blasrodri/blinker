@@ -27,6 +27,7 @@ use crate::dyld_info::{encode_bind, encode_rebase, Bind, Rebase};
 use crate::format::*;
 use crate::signature::{sign, signature_size, SignatureRequest};
 use crate::symtab::{SymbolTable, SymbolTableBuilder};
+use sha2::{Digest, Sha256};
 
 /// A dynamic library the image loads.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,8 +166,9 @@ impl ImageBuilder {
             entry_offset: 0,
             min_os: (11, 0, 0),
             sdk: (26, 5, 0),
-            // Zero until content hashing is implemented; a real UUID is
-            // derived from the image's own bytes, which is a later step.
+            // Overwritten in `build` with a hash of the image's own bytes.
+            // Left zero here so the emitted command has the right shape while
+            // the bytes that determine its value are still being produced.
             uuid: [0; 16],
             identifier: "a.out".to_string(),
         }
@@ -356,7 +358,7 @@ impl ImageBuilder {
         // which is what ld64 emits and what keeps `code_limit` honest.
         let link_edit_end = signature_start + signature_len as u64;
 
-        let mut bytes = self.emit(
+        let (mut bytes, uuid_offset) = self.emit(
             &layout,
             &symbols,
             &link_edit,
@@ -379,6 +381,17 @@ impl ImageBuilder {
             });
         }
         bytes.truncate(signature_start as usize);
+
+        // Before signing, and after truncation: the signature hashes the UUID,
+        // so stamping it afterwards would invalidate every page hash covering
+        // the load commands, and hashing the reserved signature space would
+        // fold uninitialised bytes into the image's identity.
+        let uuid = content_uuid(&bytes);
+        bytes
+            .get_mut(uuid_offset..uuid_offset + 16)
+            .expect("the UUID command was emitted within the header")
+            .copy_from_slice(&uuid);
+
         if self.sign {
             let blob = sign(&bytes, &request);
             debug_assert_eq!(blob.len(), signature_len);
@@ -407,7 +420,8 @@ impl ImageBuilder {
         link_edit_start: u64,
         link_edit_end: u64,
         reservation: u64,
-    ) -> Result<Vec<u8>, ImageError> {
+        // The bytes, and the file offset of the `LC_UUID` payload within them.
+    ) -> Result<(Vec<u8>, usize), ImageError> {
         let mut writer = Writer::with_capacity(link_edit_end as usize);
 
         // The thread-local flag is a property of what was laid out, so it is
@@ -453,6 +467,10 @@ impl ImageBuilder {
         command_count += 1;
         commands::write_load_dylinker(&mut writer, DYLD_PATH);
         command_count += 1;
+        // Where the 16 payload bytes land, so `build` can hash the finished
+        // image and write the result back over them. The command header is two
+        // `u32`s, so the payload starts eight bytes in.
+        let uuid_offset = writer.len() + 8;
         commands::write_uuid(&mut writer, self.uuid);
         command_count += 1;
         commands::write_build_version(&mut writer, PLATFORM_MACOS, self.min_os, self.sdk);
@@ -522,8 +540,45 @@ impl ImageBuilder {
         writer.bytes(&symbols.strings);
         writer.pad_to(link_edit_end as usize);
 
-        Ok(writer.finish())
+        Ok((writer.finish(), uuid_offset))
     }
+}
+
+/// The image's identity: a hash of its own bytes.
+///
+/// # Why it cannot stay zero
+///
+/// blinker emitted `LC_UUID` as sixteen zero bytes, so *every* binary it
+/// produced claimed the same identity. That is not a cosmetic gap. macOS looks
+/// up debug information by UUID — Spotlight indexes `.dSYM` bundles by the
+/// UUID of the binary they describe — so a directory holding two blinker
+/// outputs is a directory where the debugger can answer a question about one
+/// program using the symbols of another. Observed exactly that way: the same
+/// executable symbolicated its backtrace correctly when alone in a directory
+/// and incorrectly when a sibling blinker binary was present, with no change
+/// to either file.
+///
+/// # What it is
+///
+/// A SHA-256 of the image up to the signature, truncated to sixteen bytes,
+/// stamped with the RFC 4122 variant and a version nibble of 5 — the encoding
+/// that means "a hash of a name" rather than a random or time-based value,
+/// which is what this is. `ld` does the same with MD5.
+///
+/// Deriving it from content rather than from a counter or a clock keeps the
+/// link deterministic: the same inputs still produce a byte-identical output,
+/// which several tests depend on and which the cache depends on absolutely.
+///
+/// The UUID field itself is zero while it is hashed, so the hash covers a
+/// well-defined image rather than one that includes a partial copy of its own
+/// digest.
+fn content_uuid(bytes: &[u8]) -> [u8; 16] {
+    let digest = Sha256::digest(bytes);
+    let mut uuid = [0u8; 16];
+    uuid.copy_from_slice(&digest[..16]);
+    uuid[6] = (uuid[6] & 0x0f) | 0x50;
+    uuid[8] = (uuid[8] & 0x3f) | 0x80;
+    uuid
 }
 
 impl Default for ImageBuilder {

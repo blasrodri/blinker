@@ -3945,3 +3945,106 @@ showing up in a third place.
 this looked worth had already been fixed by making the surrounding loop
 cheaper, and the remainder is an allocation problem that no number of threads
 addresses.
+
+## 84. Dropping local symbols did not lose names, it invented them
+
+The output symbol table carried only non-local definitions. The comment
+justifying it argued locals are "invisible outside their object by definition,
+and the only consumer that would want them is a debugger". Both halves are
+wrong, and the error compounds.
+
+Most Rust functions are local. Anything not `pub`, plus nearly every
+monomorphisation pulled out of `std`, is a local symbol — 543 of them in a
+hello-world, against 289 externals. And the consumer is not a debugger; it is
+the panicking program itself, symbolicating its own backtrace from its own
+symbol table.
+
+The failure is not a missing name, because a symbolicator resolves an address
+to the nearest symbol *at or below* it. Removing the locals does not remove
+the answer. It moves the answer to whatever global happens to precede the
+frame, and prints it with no mark of uncertainty:
+
+```
+  ld-prime                        blinker
+  1: hello::deep                  5: hello::main
+  2: hello::deep                  6: hello::main
+  3: hello::deep                  7: hello::main
+  4: hello::deep                  8: std::rt::lang_start::<()>
+  5: hello::middle
+```
+
+Four frames in `deep` and one in `middle`, reported as three in `main`. In a
+second run the same frames came out as `core::fmt::rt::Argument::new_display`.
+The backtrace is well-formed, plausible, and describes a call stack that never
+existed — a silent mislink reached through the symbol table rather than
+through a relocation.
+
+Two details the fix depends on:
+
+- **Assembler temporaries must still be dropped.** Mach-O reserves the `L`
+  prefix for them, and they are emitted in bulk to anchor section starts. A
+  section-anchor label sits at the exact address a real function begins, so
+  emitting them makes the backtrace *worse* than dropping the locals did. `ld`
+  applies the same rule; a binary it links contains no `L` symbol at all.
+- **`n_sect` is read.** Every symbol was emitted claiming section 1, which
+  made data symbols look like stray text.
+
+Cost, measured interleaved against the unchanged linker on the same 60-input
+link: **+6.5 ms on 38.7** (±1 ms; a variant ordering measured 5.8 and 7.3 for
+identical code, which is the width of the noise), and **+8.7% output size**.
+The size is not a regression but a correction: the output was 0.94x ld's
+because it was missing what ld emits, and is now 1.03x.
+
+## 85. Every image blinker produced claimed the same identity
+
+Found while chasing 84, and the reason it took two hours rather than ten
+minutes: after emitting the locals, the *same executable* symbolicated
+correctly in one directory and incorrectly in another. Byte-identical file,
+`cmp`-verified. Copying it to an empty directory fixed it; copying a sibling
+blinker binary in broke it again.
+
+`LC_UUID` was sixteen zero bytes, with a comment saying a real UUID was "a
+later step":
+
+```
+  hello-ld    UUID: 7F8C9E98-AD31-360A-A8B2-6FE70BB9C2E4
+  hello-bl2   UUID: 00000000-0000-0000-0000-000000000000
+  hello-bl3   UUID: 00000000-0000-0000-0000-000000000000
+  fixture     UUID: 00000000-0000-0000-0000-000000000000
+```
+
+macOS resolves debug information *by* UUID — Spotlight indexes `.dSYM` bundles
+under the UUID of the binary they describe — so every blinker output was a
+candidate answer for every question about any other. The observed effect was a
+backtrace symbolicated from another program's debug information, which is why
+the wrong names looked arbitrary rather than merely shifted.
+
+The final proof was one command, two binaries from the same linker with the
+same symbol table, in the same directory:
+
+```
+  hello-u1   (content-derived UUID)   1: hello::deep
+  hello-bl3  (zero UUID)              1: std::rt::lang_start::<()>
+```
+
+It is now a SHA-256 of the image up to the signature, truncated to sixteen
+bytes and stamped with the RFC 4122 variant and version-5 nibble. Derived from
+content rather than from a clock or a counter because determinism is
+load-bearing here: byte-identical output is what the cache is built on. It is
+stamped after truncation and before signing — the signature covers the UUID,
+so a later stamp invalidates every page hash over the load commands, and an
+earlier one would fold the reserved signature space into the image's identity.
+
+**What this cost, methodologically.** The end-to-end reproduction is
+environment-dependent: it needs a `.dSYM` next to the binary, which `rustc`
+produces directly and `cargo`'s dev profile does not. The kept test asserts
+the property that has no environment in it — two different programs get two
+different non-zero UUIDs — and the doc comment carries the observation. A test
+that needs Spotlight to have indexed a directory is a test that fails for
+reasons unrelated to the linker.
+
+**The rule this is an instance of.** Both 84 and 85 were features whose
+absence was recorded in a code comment as a deliberate deferral. Neither
+comment was wrong about the deferral; both were wrong about the consequence.
+"Not implemented yet" and "produces confidently incorrect output" are not the
+same state, and only one of them is safe to leave alone.
