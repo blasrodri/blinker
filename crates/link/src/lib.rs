@@ -2598,13 +2598,41 @@ fn assemble(request: &LinkRequest, assembly: &Assembly<'_>) -> Result<Image, Lin
     builder.build().map_err(LinkError::Emit)
 }
 
-/// The output symbol table: every non-local definition, at the address layout
-/// gave it.
+/// A name the assembler invented for its own use, which does not belong in the
+/// output.
 ///
-/// Locals are dropped rather than emitted with a wrong address. They are
-/// invisible outside their object by definition, and the only consumer that
-/// would want them is a debugger, which needs the `N_OSO`/stabs path that is
-/// not implemented.
+/// Mach-O reserves the `L` prefix for temporary labels — `ltmp0`, `Lloh4`,
+/// `l_.str` — and the assembler emits them in bulk to anchor section starts
+/// and literals. They outnumber real symbols, they are meaningless outside the
+/// object that made them, and emitting them makes a backtrace *worse*: a
+/// section-anchor label sits at the exact address a real function starts, so
+/// the symbolicator ties for nearest-match and can name the frame `ltmp0`.
+///
+/// The prefix is unambiguous because every C and Rust symbol reaching the
+/// linker carries a leading underscore, so a static named `ltmp` arrives as
+/// `_ltmp`. `ld` applies the same rule; a binary it links contains no `L`
+/// symbol at all.
+fn is_temporary_label(name: &str) -> bool {
+    name.starts_with('L') || name.starts_with('l')
+}
+
+/// The output symbol table: every definition, at the address layout gave it.
+///
+/// # Locals are not optional
+///
+/// They were dropped once, on the reasoning that a local is invisible outside
+/// its object and only a debugger would want it. Both halves are wrong, and
+/// the second is the dangerous one. Most Rust functions are local — anything
+/// not `pub`, plus nearly every monomorphisation out of `std` — and the
+/// consumer is not a debugger but the panicking program itself, symbolicating
+/// its own backtrace from its own symbol table.
+///
+/// A symbolicator resolves an address to the nearest symbol at or below it, so
+/// omitting the locals does not omit the answer. It moves the answer to
+/// whatever global happens to precede the frame, and prints that with no mark
+/// of uncertainty. `crates/cli/tests/backtraces_name_the_right_function.rs`
+/// has the observed output: four frames inside a private recursive function
+/// reported as `core::fmt::rt::Argument::new_display`.
 fn output_symbols(
     objects: &[LoadedObject],
     placed: &Placed,
@@ -2613,7 +2641,7 @@ fn output_symbols(
     let mut out = Vec::new();
     for object in objects {
         for symbol in &object.parsed.symbols {
-            if !symbol.strength.is_definition() || symbol.visibility == SymbolVisibility::Local {
+            if !symbol.strength.is_definition() || is_temporary_label(&symbol.name) {
                 continue;
             }
             let Some(section_id) = symbol.section else {
@@ -2632,18 +2660,37 @@ fn output_symbols(
             ) else {
                 continue;
             };
-            let Some(chunk) = placed.address(object.parsed.id, section_id) else {
+            let Some((output_section, chunk)) = placed.chunk(object.parsed.id, section_id) else {
                 continue;
             };
-            out.push(OutputSymbol::exported(
-                &symbol.name,
-                1,
-                chunk + offset_in_section,
-            ));
+            // `n_sect` is one-based, and it is read: a debugger checks the
+            // symbol's section against the address's before trusting the pair.
+            // Every symbol claiming section 1 made data symbols look like
+            // stray text.
+            let Ok(number) = u8::try_from(output_section + 1) else {
+                continue;
+            };
+            let address = chunk + offset_in_section;
+            out.push(match symbol.visibility {
+                SymbolVisibility::Local => OutputSymbol::local(&symbol.name, number, address),
+                SymbolVisibility::Global => OutputSymbol::exported(&symbol.name, number, address),
+                SymbolVisibility::PrivateExternal => {
+                    let mut exported = OutputSymbol::exported(&symbol.name, number, address);
+                    exported.private_external = true;
+                    exported
+                }
+            });
         }
     }
-    // Deterministic order regardless of how the objects were traversed.
-    out.sort_by(|a, b| a.name.cmp(&b.name));
+    // Deterministic order regardless of how the objects were traversed. Locals
+    // may share a name across objects, so the name alone no longer orders the
+    // table — address and section break the tie.
+    out.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then(a.value.cmp(&b.value))
+            .then(a.section.cmp(&b.section))
+    });
     Ok(out)
 }
 
