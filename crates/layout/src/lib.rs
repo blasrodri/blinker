@@ -248,10 +248,24 @@ const SECTION_ORDER: &[(&str, &[&str])] = &[
         "__DATA",
         &[
             "__data",
+            // The thread-local sections must end up **adjacent**, in this
+            // order. dyld treats `__thread_data` followed by `__thread_bss` as
+            // one block that it copies per thread, and a descriptor's offset
+            // is relative to the start of that block. Leaving `__thread_bss`
+            // out of this table sorted it to the end of the segment, behind
+            // `__bss`, `__common` and everything unrecognised — so every
+            // offset into the block was wrong by however much sat between
+            // them, and panicking (which touches a thread-local panic count)
+            // died on a wild address.
+            "__thread_ptrs",
             "__thread_vars",
             "__thread_data",
-            "__bss",
+            // Zero-filled sections carry no file bytes, so they come last;
+            // `__thread_bss` is first among them to stay next to
+            // `__thread_data`.
+            "__thread_bss",
             "__common",
+            "__bss",
         ],
     ),
 ];
@@ -261,6 +275,14 @@ const SECTION_ORDER: &[(&str, &[&str])] = &[
 /// Mostly identity, with the remappings the toolchain performs. Returning
 /// `None` means the section is deliberately not carried into the output.
 pub fn output_segment_for(segment: &str, name: &str, kind: SectionKind) -> Option<&'static str> {
+    // Bitcode and the recorded command line are inputs to further tooling, not
+    // parts of the image. ld64 drops them; carrying them through put
+    // `__bitcode` and `__cmdline` in the middle of `__DATA`, between sections
+    // that have to be adjacent.
+    if segment == "__LLVM" {
+        return None;
+    }
+
     match kind {
         // Debug data stays in the object files; the executable references it
         // through N_OSO debug-map stabs instead. Verified: a real Rust binary
@@ -276,7 +298,11 @@ pub fn output_segment_for(segment: &str, name: &str, kind: SectionKind) -> Optio
             _ => Some("__TEXT"),
         },
         SectionKind::Data => match name {
-            "__const" => Some("__DATA_CONST"),
+            // Both hold pointers dyld writes once and never again, which is
+            // exactly what __DATA_CONST is for. Leaving `__got` in `__DATA`
+            // also sorted it behind the zero-filled sections, putting a
+            // section with file content after ones that have none.
+            "__const" | "__got" => Some("__DATA_CONST"),
             _ => Some("__DATA"),
         },
         SectionKind::Other => Some("__DATA"),

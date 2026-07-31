@@ -1032,3 +1032,61 @@ types are `__thread_data` = `0x11`, `__thread_bss` = `0x12`, `__thread_vars` =
 block**, not its address. The block is copied per thread, so an address there
 is meaningless. Confirmed by reading a real descriptor, whose third word was
 `0x38` where blinker was writing a full `0x1_0000_0000`-based address.
+
+## 27. `__LINKEDIT` opcode streams must be 8-byte aligned, and dyld fails silently when they are not
+
+`dyld_info` on a blinker-linked Rust binary refused to read it at all:
+
+```
+mis-aligned LINKEDIT content 'bind opcodes'
+```
+
+The rebase stream is an arbitrary number of bytes, and the bind stream was
+written immediately after it, so it began wherever that happened to end. dyld
+reads these through pointer-sized loads and rejects a misaligned stream —
+**every bind in it is then simply never applied**, with no diagnostic at
+runtime. The failure surfaces as a crash at the first use of anything that
+needed binding, arbitrarily far from the linker.
+
+This is the third alignment rule in this format to bite (after 8-byte load
+commands in finding 12 and the symbol table's own alignment), and the second
+to fail *silently* rather than loudly.
+
+## 28. Section order is load-bearing for thread-locals
+
+`__thread_bss` and `__thread_ptrs` were absent from the layout's section-order
+table, so they sorted to `usize::MAX` — the end of `__DATA`, behind `__bss`,
+`__common`, and every unrecognised section. The emitted order was:
+
+```
+__thread_vars __thread_data __bss __common __bitcode __cmdline __got __thread_bss
+```
+
+dyld treats `__thread_data` followed by `__thread_bss` as **one contiguous
+block** that it copies per thread, and a descriptor's offset is relative to the
+start of it. With unrelated sections in between, every offset into the block
+was wrong by however much sat between them.
+
+Two related defects fell out of the same inspection:
+
+- `__LLVM,__bitcode` and `__LLVM,__cmdline` were being carried into the image.
+  They are inputs to further tooling, not parts of a program; ld64 drops them.
+  Here they were sitting in the middle of `__DATA`, between sections required
+  to be adjacent.
+- `__got` was landing in `__DATA` and, being unranked, sorted *after* the
+  zero-filled sections — a section with file content placed after ones with
+  none. It belongs in `__DATA_CONST` with `__const`: both hold pointers dyld
+  writes once and never again.
+
+### Still failing: panics
+
+With all of the above fixed, a panicking Rust program still dies in
+`std::panicking::panic_count::increase`, which is a thread-local access, before
+any message is printed. `-C panic=abort` fails identically, which rules
+unwinding *out* — this is not the missing `__unwind_info`. Something about the
+thread-local path remains wrong, and the descriptors and fixup streams now look
+structurally correct, so the next step is comparing the per-thread block byte
+for byte against ld64's rather than reasoning about it.
+
+Recorded rather than guessed at: non-panicking Rust programs link and run
+correctly, and that is the honest boundary of what works.

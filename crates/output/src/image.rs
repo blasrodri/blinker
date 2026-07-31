@@ -273,10 +273,18 @@ impl ImageBuilder {
         let mut link_edit = LinkEditLayout::default();
         let mut cursor = link_edit_start;
 
+        // Each opcode stream must start 8-byte aligned. dyld reads them
+        // through pointer-sized loads, and an unaligned start makes it reject
+        // the whole stream — `dyld_info` reports "mis-aligned LINKEDIT content
+        // 'bind opcodes'" and every bind in it is silently never applied. The
+        // symptom is a crash on the first use of anything that needed binding,
+        // nowhere near the linker.
+        cursor = align_up(cursor, 8);
         link_edit.rebase_offset = cursor as u32;
         link_edit.rebase_size = rebase_stream.len() as u32;
         cursor += rebase_stream.len() as u64;
 
+        cursor = align_up(cursor, 8);
         link_edit.bind_offset = cursor as u32;
         link_edit.bind_size = bind_stream.len() as u32;
         cursor += bind_stream.len() as u64;
@@ -455,6 +463,11 @@ impl ImageBuilder {
         // __LINKEDIT content, in the order the offsets were assigned.
         writer.pad_to(link_edit.rebase_offset as usize);
         writer.bytes(rebase_stream);
+        // Padded to the offset the layout assigned rather than written back to
+        // back: the two streams are independently aligned, so appending the
+        // bind stream directly would put it wherever the rebase stream
+        // happened to end.
+        writer.pad_to(link_edit.bind_offset as usize);
         writer.bytes(bind_stream);
         writer.pad_to(link_edit.symbol_offset as usize);
         symbols.write_entries(&mut writer);
