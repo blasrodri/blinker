@@ -1063,8 +1063,22 @@ pub fn link(request: &LinkRequest) -> Result<Image, LinkError> {
 fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image, LinkError> {
     let overall = std::time::Instant::now();
 
+    // The stub library's export list is a pure function of a file on disk —
+    // it depends on nothing the objects produce — and parsing it costs 5.6 ms
+    // of YAML for `libSystem.B.tbd` alone: a quarter of the link, spent
+    // answering "which of these names does the system provide?".
+    //
+    // So it runs *alongside* reading the objects rather than after them, and
+    // costs whatever it costs beyond the 5.7 ms that read already takes. No
+    // cache, and therefore no new state whose staleness could change an
+    // output.
     let step = std::time::Instant::now();
-    let objects = load_objects(&request.objects)?;
+    let (objects, exported) = std::thread::scope(|scope| {
+        let stub = scope.spawn(|| request.dynamic_symbols());
+        let objects = load_objects(&request.objects);
+        (objects, stub.join().expect("the stub reader did not panic"))
+    });
+    let objects = objects?;
     timings.read_and_parse_ms = elapsed_ms(step);
 
     // Decided before anything is placed, because it changes how big every
@@ -1090,7 +1104,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     // chance at it. Checking first reported `_printf` as undefined in a
     // program that links against libSystem.
     let step = std::time::Instant::now();
-    let imports = resolve_imports(&objects, request)?;
+    let imports = resolve_imports(&objects, exported)?;
 
     // Resolution runs for its diagnostics: it is what turns a genuinely
     // missing definition into a named error rather than a relocation against
@@ -1618,14 +1632,14 @@ fn elapsed_ms(start: std::time::Instant) -> f64 {
 /// Undefined references, checked against what `libSystem` actually exports.
 fn resolve_imports(
     objects: &[LoadedObject],
-    request: &LinkRequest,
+    exported: Option<BTreeSet<String>>,
 ) -> Result<Vec<String>, LinkError> {
     let undefined = undefined_references(objects);
     if undefined.is_empty() {
         return Ok(Vec::new());
     }
 
-    let Some(available) = request.dynamic_symbols() else {
+    let Some(available) = exported else {
         // No stub library was supplied, so nothing can be imported and every
         // undefined reference is an error.
         return Err(LinkError::UndefinedSymbols { names: undefined });
