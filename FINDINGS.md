@@ -2264,3 +2264,47 @@ which decides whether the unwinder believes the frame is covered at all.
 `panic=unwind` still does not work. But it has gone from "segfault in a CIE
 parser" to "the unwinder ran and could not find a handler", and each of those
 is a different and much smaller problem.
+
+## 53. The FDEs are correct too, so the remaining suspect is the LSDA
+
+Decoding the first FDEs from both linkers' output, resolving each PC-begin
+through its CIE's `R` encoding:
+
+```
+blinker:   __text 0x100000900..0x10008d87c
+  FDE@0x14  pc=0x100000988 range=0x28  IN __text
+  FDE@0x48  pc=0x1000009e4 range=0x20  IN __text
+  FDE@0x94  pc=0x100000a50 range=0x4c  IN __text
+
+ld-prime:  __text 0x100000888..0x10003507c
+  FDE@0x14  pc=0x1000008f4 range=0x28  IN __text
+  FDE@0x48  pc=0x10000091c range=0x20  IN __text
+  FDE@0x94  pc=0x10000093c range=0x4c  IN __text
+```
+
+Same offsets, same ranges, every PC inside `__text`. The FDE table is right.
+
+So of the pieces the unwinder touches, these are now verified against ld-prime:
+`__unwind_info`'s index and DWARF offsets (findings 30, 32), the `__eh_frame`
+record chain (47), CIE personality pointers (52), and FDE address ranges
+(here). Phase 1 still fails.
+
+**The remaining candidate is the LSDA** — the language-specific data area that
+phase 1 reads to decide whether a frame has a handler. It lives in the FDE's
+augmentation data, encoded per the CIE's `L` byte, and points into
+`__gcc_except_tab`. A wrong LSDA pointer is exactly a phase-1 failure: the
+unwinder finds the frame and the personality, calls it, and the personality
+cannot locate its action table.
+
+The check is the one that worked for the personality: decode the FDE's
+augmentation, resolve the LSDA pointer, and compare it against ld-prime's and
+against `__gcc_except_tab`'s bounds. If it lands outside that section, the
+relocation patching it is wrong in the same way `POINTER_TO_GOT` was.
+
+### Method note
+
+Four of the five verified pieces were confirmed by decoding both linkers'
+output and comparing, rather than by reasoning about the format. That approach
+has now found two real bugs (52, and the section ordering in 28) and cleared
+four suspects, at roughly one script each. It is the only technique in this
+project with a positive record.
