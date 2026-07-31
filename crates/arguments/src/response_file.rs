@@ -184,35 +184,17 @@ fn tokenize(contents: &str, path: &Path) -> Result<Vec<String>, ResponseFileErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use blinker_test_support::Scratch;
 
-    /// Minimal scratch directory helper; removed on drop.
-    struct TempDir(PathBuf);
-
-    impl TempDir {
-        fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "blinker-rsp-{tag}-{}-{:?}",
-                std::process::id(),
-                std::thread::current().id()
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            TempDir(dir)
-        }
-
-        fn write(&self, name: &str, contents: &str) -> PathBuf {
-            let path = self.0.join(name);
-            let mut f = std::fs::File::create(&path).unwrap();
-            f.write_all(contents.as_bytes()).unwrap();
-            path
-        }
+    /// Create a scratch directory, panicking on failure — these tests have
+    /// nothing useful to say if the filesystem is unavailable.
+    fn scratch(tag: &str) -> Scratch {
+        Scratch::dir(tag).expect("scratch directory")
     }
 
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
+    /// Write a response file into `dir` and return its path.
+    fn write(dir: &Scratch, name: &str, contents: &str) -> PathBuf {
+        Scratch::write(dir, name, contents).expect("writable")
     }
 
     fn tok(s: &str) -> Vec<String> {
@@ -280,8 +262,8 @@ mod tests {
 
     #[test]
     fn expands_in_place_preserving_surrounding_order() {
-        let dir = TempDir::new("order");
-        let rsp = dir.write("args.rsp", "b.o c.o");
+        let dir = scratch("order");
+        let rsp = write(&dir, "args.rsp", "b.o c.o");
         let argv = vec![
             "a.o".to_string(),
             format!("@{}", rsp.display()),
@@ -295,9 +277,9 @@ mod tests {
 
     #[test]
     fn expands_nested_response_files() {
-        let dir = TempDir::new("nested");
-        let inner = dir.write("inner.rsp", "c.o d.o");
-        let outer = dir.write("outer.rsp", &format!("b.o @{} e.o", inner.display()));
+        let dir = scratch("nested");
+        let inner = write(&dir, "inner.rsp", "c.o d.o");
+        let outer = write(&dir, "outer.rsp", &format!("b.o @{} e.o", inner.display()));
         let argv = vec![format!("@{}", outer.display())];
         assert_eq!(
             expand_response_files(&argv).unwrap(),
@@ -307,8 +289,8 @@ mod tests {
 
     #[test]
     fn detects_self_referential_cycle() {
-        let dir = TempDir::new("cycle");
-        let path = dir.0.join("self.rsp");
+        let dir = scratch("cycle");
+        let path = dir.join("self.rsp");
         std::fs::write(&path, format!("@{}", path.display())).unwrap();
         let err = expand_response_files(&[format!("@{}", path.display())]).unwrap_err();
         assert!(matches!(err, ResponseFileError::Cycle { .. }));
@@ -316,9 +298,9 @@ mod tests {
 
     #[test]
     fn detects_mutual_cycle() {
-        let dir = TempDir::new("mutual");
-        let a = dir.0.join("a.rsp");
-        let b = dir.0.join("b.rsp");
+        let dir = scratch("mutual");
+        let a = dir.join("a.rsp");
+        let b = dir.join("b.rsp");
         std::fs::write(&a, format!("@{}", b.display())).unwrap();
         std::fs::write(&b, format!("@{}", a.display())).unwrap();
         let err = expand_response_files(&[format!("@{}", a.display())]).unwrap_err();
@@ -328,8 +310,8 @@ mod tests {
     #[test]
     fn same_file_referenced_twice_in_sequence_is_not_a_cycle() {
         // Two sibling references are legal; only a containment chain is a cycle.
-        let dir = TempDir::new("siblings");
-        let rsp = dir.write("shared.rsp", "x.o");
+        let dir = scratch("siblings");
+        let rsp = write(&dir, "shared.rsp", "x.o");
         let argv = vec![format!("@{}", rsp.display()), format!("@{}", rsp.display())];
         assert_eq!(expand_response_files(&argv).unwrap(), vec!["x.o", "x.o"]);
     }
@@ -347,8 +329,9 @@ mod tests {
 
     #[test]
     fn handles_realistic_quoted_paths_with_spaces() {
-        let dir = TempDir::new("paths");
-        let rsp = dir.write(
+        let dir = scratch("paths");
+        let rsp = write(
+            &dir,
             "args.rsp",
             "'/Users/me/My Projects/a.o'\n\"/Users/me/My Projects/b.rlib\"\n-lSystem",
         );

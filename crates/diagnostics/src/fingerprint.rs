@@ -110,33 +110,16 @@ pub fn fingerprint_input(paths: &[&Path], hash_contents: bool) -> Vec<InputFinge
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use blinker_test_support::Scratch;
 
-    struct TempFile(PathBuf);
-
-    impl TempFile {
-        fn new(tag: &str, contents: &[u8]) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "blinker-fp-{tag}-{}-{:?}",
-                std::process::id(),
-                std::thread::current().id()
-            ));
-            let mut f = std::fs::File::create(&path).unwrap();
-            f.write_all(contents).unwrap();
-            TempFile(path)
-        }
-    }
-
-    impl Drop for TempFile {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
+    fn temp_file(tag: &str, contents: &[u8]) -> Scratch {
+        Scratch::file(tag, contents).unwrap()
     }
 
     #[test]
     fn records_size_and_mtime_on_the_fast_path() {
-        let file = TempFile::new("size", b"hello world");
-        let fp = InputFingerprint::probe(&file.0, false);
+        let file = temp_file("size", b"hello world");
+        let fp = InputFingerprint::probe(file.path(), false);
         assert_eq!(fp.file_size, 11);
         assert!(fp.modified_time_ns.is_some());
         assert!(!fp.missing);
@@ -146,14 +129,17 @@ mod tests {
     fn fast_path_does_not_hash() {
         // Hashing every input on every invocation would defeat the purpose of
         // having a fast path at all.
-        let file = TempFile::new("nohash", b"hello");
-        assert_eq!(InputFingerprint::probe(&file.0, false).content_hash, None);
+        let file = temp_file("nohash", b"hello");
+        assert_eq!(
+            InputFingerprint::probe(file.path(), false).content_hash,
+            None
+        );
     }
 
     #[test]
     fn verification_path_produces_a_stable_blake3_hash() {
-        let file = TempFile::new("hash", b"hello world");
-        let fp = InputFingerprint::probe(&file.0, true);
+        let file = temp_file("hash", b"hello world");
+        let fp = InputFingerprint::probe(file.path(), true);
         // Known BLAKE3 of "hello world" — pins the algorithm, not just that
         // *some* hash was produced.
         assert_eq!(
@@ -164,21 +150,21 @@ mod tests {
 
     #[test]
     fn identical_contents_hash_identically_across_paths() {
-        let a = TempFile::new("dup-a", b"same bytes");
-        let b = TempFile::new("dup-b", b"same bytes");
+        let a = temp_file("dup-a", b"same bytes");
+        let b = temp_file("dup-b", b"same bytes");
         assert_eq!(
-            InputFingerprint::probe(&a.0, true).content_hash,
-            InputFingerprint::probe(&b.0, true).content_hash
+            InputFingerprint::probe(a.path(), true).content_hash,
+            InputFingerprint::probe(b.path(), true).content_hash
         );
     }
 
     #[test]
     fn differing_contents_hash_differently() {
-        let a = TempFile::new("diff-a", b"contents one");
-        let b = TempFile::new("diff-b", b"contents two");
+        let a = temp_file("diff-a", b"contents one");
+        let b = temp_file("diff-b", b"contents two");
         assert_ne!(
-            InputFingerprint::probe(&a.0, true).content_hash,
-            InputFingerprint::probe(&b.0, true).content_hash
+            InputFingerprint::probe(a.path(), true).content_hash,
+            InputFingerprint::probe(b.path(), true).content_hash
         );
     }
 
@@ -186,8 +172,8 @@ mod tests {
     fn empty_file_is_present_not_missing() {
         // Zero-length is a legitimate state and must not be confused with an
         // absent file — they lead to different invalidation decisions later.
-        let file = TempFile::new("empty", b"");
-        let fp = InputFingerprint::probe(&file.0, true);
+        let file = temp_file("empty", b"");
+        let fp = InputFingerprint::probe(file.path(), true);
         assert!(!fp.missing);
         assert_eq!(fp.file_size, 0);
         assert!(fp.content_hash.is_some());
@@ -203,9 +189,9 @@ mod tests {
 
     #[test]
     fn batch_fingerprinting_preserves_order_including_missing_entries() {
-        let file = TempFile::new("batch", b"data");
+        let file = temp_file("batch", b"data");
         let missing = Path::new("/nonexistent/blinker/y.o");
-        let fps = fingerprint_input(&[&file.0, missing], false);
+        let fps = fingerprint_input(&[file.path(), missing], false);
         assert_eq!(fps.len(), 2);
         assert!(!fps[0].missing);
         assert!(fps[1].missing);

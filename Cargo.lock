@@ -67,6 +67,7 @@ dependencies = [
 name = "blinker-arguments"
 version = "0.1.0"
 dependencies = [
+ "blinker-test-support",
  "serde",
 ]
 
@@ -94,6 +95,7 @@ name = "blinker-diagnostics"
 version = "0.1.0"
 dependencies = [
  "blake3",
+ "blinker-test-support",
  "serde",
  "serde_json",
 ]
@@ -123,6 +125,7 @@ version = "0.1.0"
 dependencies = [
  "blinker-layout",
  "blinker-macho",
+ "blinker-test-support",
 ]
 
 [[package]]
@@ -130,6 +133,7 @@ name = "blinker-relocations"
 version = "0.1.0"
 dependencies = [
  "blinker-macho",
+ "blinker-test-support",
 ]
 
 [[package]]

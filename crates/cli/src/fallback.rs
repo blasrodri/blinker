@@ -154,40 +154,17 @@ pub fn execute(linker: &Path, argv: &[String]) -> Result<i32, FallbackError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use blinker_test_support::Scratch;
 
-    struct TempExe(PathBuf);
-
-    impl TempExe {
-        /// Write an executable shell script to a unique temp path.
-        fn new(tag: &str, script: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "blinker-fb-{tag}-{}-{:?}",
-                std::process::id(),
-                std::thread::current().id()
-            ));
-            let mut f = std::fs::File::create(&path).unwrap();
-            f.write_all(script.as_bytes()).unwrap();
-            drop(f);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
-            TempExe(path)
-        }
-    }
-
-    impl Drop for TempExe {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
-        }
+    /// Write an executable shell script to a unique temp path.
+    fn temp_exe(tag: &str, script: &str) -> Scratch {
+        Scratch::executable(tag, script).unwrap()
     }
 
     #[test]
     fn explicit_path_takes_precedence() {
-        let exe = TempExe::new("explicit", "#!/bin/sh\nexit 0\n");
-        assert_eq!(discover(Some(&exe.0)).unwrap(), exe.0);
+        let exe = temp_exe("explicit", "#!/bin/sh\nexit 0\n");
+        assert_eq!(discover(Some(exe.path())).unwrap(), exe.path());
     }
 
     #[test]
@@ -200,16 +177,14 @@ mod tests {
 
     #[test]
     fn non_executable_file_is_rejected() {
-        let path = std::env::temp_dir().join(format!("blinker-noexec-{}", std::process::id()));
-        std::fs::write(&path, b"not executable").unwrap();
+        let file = Scratch::file("noexec", b"not executable").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
         }
-        let err = discover(Some(&path)).unwrap_err();
+        let err = discover(Some(file.path())).unwrap_err();
         assert!(matches!(err, FallbackError::NotExecutable(_)));
-        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -227,26 +202,26 @@ mod tests {
 
     #[test]
     fn propagates_a_successful_exit_code() {
-        let exe = TempExe::new("ok", "#!/bin/sh\nexit 0\n");
-        assert_eq!(execute(&exe.0, &[]).unwrap(), 0);
+        let exe = temp_exe("ok", "#!/bin/sh\nexit 0\n");
+        assert_eq!(execute(exe.path(), &[]).unwrap(), 0);
     }
 
     #[test]
     fn propagates_a_failing_exit_code_verbatim() {
         // ld64 exit codes carry meaning; collapsing them to a generic 1 would
         // hide why a link failed.
-        let exe = TempExe::new("fail", "#!/bin/sh\nexit 42\n");
-        assert_eq!(execute(&exe.0, &[]).unwrap(), 42);
+        let exe = temp_exe("fail", "#!/bin/sh\nexit 42\n");
+        assert_eq!(execute(exe.path(), &[]).unwrap(), 42);
     }
 
     #[test]
     fn forwards_arguments_to_the_child() {
-        let exe = TempExe::new(
+        let exe = temp_exe(
             "args",
             "#!/bin/sh\n[ \"$1\" = \"-o\" ] && [ \"$2\" = \"out\" ] && exit 7\nexit 1\n",
         );
         let argv = vec!["-o".to_string(), "out".to_string()];
-        assert_eq!(execute(&exe.0, &argv).unwrap(), 7);
+        assert_eq!(execute(exe.path(), &argv).unwrap(), 7);
     }
 
     #[test]

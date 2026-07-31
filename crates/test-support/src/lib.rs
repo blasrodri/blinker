@@ -5,47 +5,16 @@
 //! acceptance bar is "representative Rust projects build through the wrapper",
 //! and that cannot be checked with unit tests over synthetic argv.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub mod fixture;
+pub mod scratch;
+
 pub use fixture::{
     catalog, BuildCommand, FixtureBuild, FixtureKind, Network, RustFixture, HEAVY_GENERICS_MAIN,
     MINIMAL_MAIN, MULTI_MODULE_MAIN,
 };
-
-/// A scratch directory that removes itself on drop.
-pub struct TempDir(PathBuf);
-
-impl TempDir {
-    /// Create a uniquely named scratch directory.
-    ///
-    /// The name combines pid and thread id so concurrent tests — including
-    /// `cargo test`'s default parallel harness — cannot collide.
-    pub fn new(tag: &str) -> std::io::Result<Self> {
-        let path = std::env::temp_dir().join(format!(
-            "blinker-test-{tag}-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path)?;
-        Ok(TempDir(path))
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.0
-    }
-
-    pub fn join(&self, rel: impl AsRef<Path>) -> PathBuf {
-        self.0.join(rel)
-    }
-}
-
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+pub use scratch::{unique_path, Scratch};
 
 /// Absolute path to a binary built by this workspace.
 ///

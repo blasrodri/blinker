@@ -89,35 +89,10 @@ pub fn redirect_output(argv: &[String], output: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use blinker_test_support::Scratch;
 
-    struct Scratch(PathBuf);
-
-    impl Scratch {
-        fn new(tag: &str) -> Self {
-            let path = std::env::temp_dir().join(format!(
-                "blinker-arch-{tag}-{}-{:?}",
-                std::process::id(),
-                std::thread::current().id()
-            ));
-            let _ = std::fs::remove_dir_all(&path);
-            std::fs::create_dir_all(&path).unwrap();
-            Scratch(path)
-        }
-
-        fn file(&self, rel: &str, contents: &[u8]) -> PathBuf {
-            let path = self.0.join(rel);
-            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            let mut f = std::fs::File::create(&path).unwrap();
-            f.write_all(contents).unwrap();
-            path
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
+    fn scratch(tag: &str) -> Scratch {
+        Scratch::dir(tag).unwrap()
     }
 
     fn fingerprints(paths: &[&Path]) -> Vec<InputFingerprint> {
@@ -129,9 +104,9 @@ mod tests {
 
     #[test]
     fn copies_inputs_and_records_their_archived_paths() {
-        let scratch = Scratch::new("copy");
-        let a = scratch.file("a.o", b"object a");
-        let dest = scratch.0.join("archive");
+        let scratch = scratch("copy");
+        let a = scratch.write("a.o", b"object a").unwrap();
+        let dest = scratch.join("archive");
 
         let mut inputs = fingerprints(&[&a]);
         let mapping = archive_inputs(&mut inputs, &dest).unwrap();
@@ -147,10 +122,10 @@ mod tests {
     /// would silently overwrite them.
     #[test]
     fn identically_named_inputs_do_not_collide_in_the_archive() {
-        let scratch = Scratch::new("collide");
-        let first = scratch.file("one/symbols.o", b"first");
-        let second = scratch.file("two/symbols.o", b"second");
-        let dest = scratch.0.join("archive");
+        let scratch = scratch("collide");
+        let first = scratch.write("one/symbols.o", b"first").unwrap();
+        let second = scratch.write("two/symbols.o", b"second").unwrap();
+        let dest = scratch.join("archive");
 
         let mut inputs = fingerprints(&[&first, &second]);
         archive_inputs(&mut inputs, &dest).unwrap();
@@ -164,9 +139,9 @@ mod tests {
 
     #[test]
     fn missing_inputs_are_skipped_without_failing_the_archive() {
-        let scratch = Scratch::new("missing");
-        let real = scratch.file("real.o", b"data");
-        let dest = scratch.0.join("archive");
+        let scratch = scratch("missing");
+        let real = scratch.write("real.o", b"data").unwrap();
+        let dest = scratch.join("archive");
 
         let mut inputs = fingerprints(&[&real, Path::new("/nonexistent/blinker/x.o")]);
         let mapping = archive_inputs(&mut inputs, &dest).unwrap();

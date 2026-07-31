@@ -306,43 +306,22 @@ mod tests {
             .starts_with("unknown-"));
     }
 
+    use blinker_test_support::Scratch;
+
     /// Scratch directory for record-file fixtures.
-    struct Scratch(PathBuf);
-
-    impl Scratch {
-        fn new(tag: &str) -> Self {
-            let dir = std::env::temp_dir().join(format!(
-                "blinker-drv-{tag}-{}-{:?}",
-                std::process::id(),
-                std::thread::current().id()
-            ));
-            let _ = std::fs::remove_dir_all(&dir);
-            std::fs::create_dir_all(&dir).unwrap();
-            Scratch(dir)
-        }
-
-        fn write(&self, name: &str, contents: &[u8]) -> PathBuf {
-            let path = self.0.join(name);
-            std::fs::write(&path, contents).unwrap();
-            path
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
+    fn scratch(tag: &str) -> Scratch {
+        Scratch::dir(tag).unwrap()
     }
 
     #[test]
     fn replay_prefers_the_archived_argument_vector() {
         // The whole point of archiving: the verbatim `argv` points into a temp
         // directory rustc has already deleted, so `replay_argv` must win.
-        let scratch = Scratch::new("prefer");
+        let scratch = scratch("prefer");
         let mut record = LinkRecord::delegated();
         record.argv = vec!["/deleted/tmp/a.o".into(), "-o".into(), "out".into()];
         record.replay_argv = Some(vec!["/archive/0000-a.o".into(), "-o".into(), "out".into()]);
-        let path = scratch.0.join("rec.json");
+        let path = scratch.join("rec.json");
         record.write_json(&path).unwrap();
 
         let (argv, _scratch) = prepare_replay(&path).unwrap();
@@ -351,10 +330,10 @@ mod tests {
 
     #[test]
     fn replay_falls_back_to_verbatim_argv_when_not_archived() {
-        let scratch = Scratch::new("fallback");
+        let scratch = scratch("fallback");
         let mut record = LinkRecord::delegated();
         record.argv = vec!["a.o".into()];
-        let path = scratch.0.join("rec.json");
+        let path = scratch.join("rec.json");
         record.write_json(&path).unwrap();
 
         let (argv, _scratch) = prepare_replay(&path).unwrap();
@@ -365,10 +344,10 @@ mod tests {
     fn replay_redirects_output_away_from_the_original_artifact() {
         // Replaying is a diagnostic action; it must not be able to clobber a
         // real build tree.
-        let scratch = Scratch::new("redirect");
+        let scratch = scratch("redirect");
         let mut record = LinkRecord::delegated();
         record.argv = vec!["a.o".into(), "-o".into(), "/real/artifact".into()];
-        let path = scratch.0.join("rec.json");
+        let path = scratch.join("rec.json");
         record.write_json(&path).unwrap();
 
         let (argv, _scratch) = prepare_replay(&path).unwrap();
@@ -381,14 +360,14 @@ mod tests {
     fn replaying_a_malformed_record_is_an_error_not_an_empty_link() {
         // Treating a bad record as "no arguments" would silently produce a
         // meaningless link instead of reporting the problem.
-        let scratch = Scratch::new("malformed");
+        let scratch = scratch("malformed");
         for (name, contents) in [
             ("bad.json", &b"not json at all"[..]),
             ("noargv.json", br#"{"mode":"delegated"}"#),
             ("wrongtype.json", br#"{"argv":[1,2,3]}"#),
             ("notarray.json", br#"{"argv":"a.o"}"#),
         ] {
-            let path = scratch.write(name, contents);
+            let path = scratch.write(name, contents).unwrap();
             assert!(
                 matches!(prepare_replay(&path), Err(DriverError::Replay { .. })),
                 "{name} should have failed to replay"

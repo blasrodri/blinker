@@ -11,34 +11,12 @@ use blinker_macho::{ObjectId, SectionId, SectionKind};
 use blinker_output::image::Dylib;
 use blinker_output::symtab::OutputSymbol;
 use blinker_output::{Image, ImageBuilder};
-use std::path::PathBuf;
+use blinker_test_support::Scratch;
 use std::process::Command;
 
-/// A scratch file that removes itself.
-struct Artifact(PathBuf);
-
-impl Artifact {
-    fn write(tag: &str, bytes: &[u8]) -> Self {
-        // A plain counter, not the thread id: `{:?}` on a ThreadId renders as
-        // `ThreadId(6)`, and the parentheses break otool's path handling —
-        // it reports "can't open file" against a name truncated at the paren.
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("blinker-image-{tag}-{}-{seq}", std::process::id()));
-        std::fs::write(&path, bytes).expect("writable");
-        Artifact(path)
-    }
-
-    fn path(&self) -> &PathBuf {
-        &self.0
-    }
-}
-
-impl Drop for Artifact {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
+/// Write an image to a scratch file for a tool to inspect.
+fn artifact(tag: &str, bytes: &[u8]) -> Scratch {
+    Scratch::file(tag, bytes).expect("writable")
 }
 
 fn section(index: u32, segment: &str, name: &str, kind: SectionKind, size: u64) -> InputPlacement {
@@ -96,8 +74,8 @@ fn run(program: &str, args: &[&str]) -> (bool, String, String) {
 #[test]
 fn otool_recognises_the_header() {
     let image = sample_image();
-    let artifact = Artifact::write("header", &image.bytes);
-    let (ok, stdout, stderr) = run("otool", &["-h", &artifact.path().to_string_lossy()]);
+    let artifact = artifact("header", &image.bytes);
+    let (ok, stdout, stderr) = run("otool", &["-h", &artifact.as_str()]);
 
     assert!(ok, "otool -h failed: {stderr}");
     assert!(
@@ -114,8 +92,8 @@ fn otool_recognises_the_header() {
 #[test]
 fn otool_walks_every_load_command() {
     let image = sample_image();
-    let artifact = Artifact::write("commands", &image.bytes);
-    let (ok, stdout, stderr) = run("otool", &["-l", &artifact.path().to_string_lossy()]);
+    let artifact = artifact("commands", &image.bytes);
+    let (ok, stdout, stderr) = run("otool", &["-l", &artifact.as_str()]);
 
     assert!(ok, "otool -l failed: {stderr}");
     assert!(
@@ -155,8 +133,8 @@ fn otool_walks_every_load_command() {
 #[test]
 fn otool_reports_the_addresses_layout_assigned() {
     let image = sample_image();
-    let artifact = Artifact::write("segments", &image.bytes);
-    let (_, stdout, _) = run("otool", &["-l", &artifact.path().to_string_lossy()]);
+    let artifact = artifact("segments", &image.bytes);
+    let (_, stdout, _) = run("otool", &["-l", &artifact.as_str()]);
 
     // __PAGEZERO guards the low 4 GiB, and __TEXT starts immediately above.
     assert!(stdout.contains("__PAGEZERO"), "no __PAGEZERO:\n{stdout}");
@@ -175,8 +153,8 @@ fn otool_reports_the_addresses_layout_assigned() {
 #[test]
 fn nm_reads_back_the_symbols_we_wrote() {
     let image = sample_image();
-    let artifact = Artifact::write("symbols", &image.bytes);
-    let (ok, stdout, stderr) = run("nm", &["-a", &artifact.path().to_string_lossy()]);
+    let artifact = artifact("symbols", &image.bytes);
+    let (ok, stdout, stderr) = run("nm", &["-a", &artifact.as_str()]);
 
     assert!(ok, "nm failed: {stderr}\n{stdout}");
     for symbol in ["_main", "_helper", "_exit", "_malloc"] {
@@ -192,8 +170,8 @@ fn nm_reads_back_the_symbols_we_wrote() {
 #[test]
 fn nm_classifies_undefined_symbols_correctly() {
     let image = sample_image();
-    let artifact = Artifact::write("undef", &image.bytes);
-    let (ok, stdout, stderr) = run("nm", &["-u", &artifact.path().to_string_lossy()]);
+    let artifact = artifact("undef", &image.bytes);
+    let (ok, stdout, stderr) = run("nm", &["-u", &artifact.as_str()]);
 
     assert!(ok, "nm -u failed: {stderr}");
     assert!(stdout.contains("_exit"), "_exit not undefined:\n{stdout}");
@@ -211,8 +189,8 @@ fn nm_classifies_undefined_symbols_correctly() {
 #[test]
 fn otool_reports_the_linked_library() {
     let image = sample_image();
-    let artifact = Artifact::write("dylib", &image.bytes);
-    let (ok, stdout, _) = run("otool", &["-L", &artifact.path().to_string_lossy()]);
+    let artifact = artifact("dylib", &image.bytes);
+    let (ok, stdout, _) = run("otool", &["-L", &artifact.as_str()]);
 
     assert!(ok, "otool -L failed");
     assert!(
@@ -225,8 +203,8 @@ fn otool_reports_the_linked_library() {
 #[test]
 fn otool_reports_sections_with_their_sizes() {
     let image = sample_image();
-    let artifact = Artifact::write("sections", &image.bytes);
-    let (_, stdout, _) = run("otool", &["-l", &artifact.path().to_string_lossy()]);
+    let artifact = artifact("sections", &image.bytes);
+    let (_, stdout, _) = run("otool", &["-l", &artifact.as_str()]);
 
     assert!(stdout.contains("sectname __text"), "no __text:\n{stdout}");
     assert!(stdout.contains("sectname __data"), "no __data:\n{stdout}");
@@ -242,8 +220,8 @@ fn otool_reports_sections_with_their_sizes() {
 #[test]
 fn even_an_empty_image_is_well_formed() {
     let image = ImageBuilder::new().build().expect("builds");
-    let artifact = Artifact::write("empty", &image.bytes);
-    let (ok, stdout, stderr) = run("otool", &["-l", &artifact.path().to_string_lossy()]);
+    let artifact = artifact("empty", &image.bytes);
+    let (ok, stdout, stderr) = run("otool", &["-l", &artifact.as_str()]);
 
     assert!(ok, "otool rejected an empty image: {stderr}");
     assert!(stdout.contains("LC_SEGMENT_64"));

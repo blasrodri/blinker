@@ -12,7 +12,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::TempDir;
+use crate::Scratch;
 
 /// How a fixture is built.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,7 +42,7 @@ pub enum Network {
 
 /// A generated Rust project on disk.
 pub struct RustFixture {
-    dir: TempDir,
+    dir: Scratch,
     tag: String,
     build_command: BuildCommand,
     network: Network,
@@ -89,7 +89,7 @@ impl RustFixture {
     /// Start an empty fixture. Files are added with [`RustFixture::file`].
     pub fn new(tag: &str) -> std::io::Result<Self> {
         Ok(RustFixture {
-            dir: TempDir::new(tag)?,
+            dir: Scratch::dir(tag)?,
             tag: tag.to_string(),
             build_command: BuildCommand::Build,
             network: Network::NotNeeded,

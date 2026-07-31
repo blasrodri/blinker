@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 blinker-layout = { workspace = true }
 blinker-macho = { workspace = true }
+
+[dev-dependencies]
+blinker-test-support = { workspace = true }

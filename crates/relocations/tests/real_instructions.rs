@@ -12,6 +12,7 @@
 //! time.
 
 use blinker_relocations::encode;
+use blinker_test_support::Scratch;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::OnceLock;
@@ -27,15 +28,13 @@ fn linked_text_section() -> Option<&'static (Vec<u8>, u64, u64)> {
 }
 
 fn build_fixture() -> Option<(Vec<u8>, u64, u64)> {
-    let dir = std::env::temp_dir().join(format!("blinker-reloc-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).ok()?;
+    let dir = Scratch::dir("reloc").ok()?;
 
-    let source = dir.join("t.c");
     // Enough globals and calls to force ADRP/ADD pairs and BL branches.
-    std::fs::write(
-        &source,
-        r#"
+    let source = dir
+        .write(
+            "t.c",
+            r#"
 #include <stdio.h>
 static const char message[] = "relocation fixture";
 static int counter = 0;
@@ -46,8 +45,8 @@ int main(void) {
     return 0;
 }
 "#,
-    )
-    .ok()?;
+        )
+        .ok()?;
 
     let binary = dir.join("t");
     let status = Command::new("cc")
@@ -65,7 +64,7 @@ int main(void) {
     let start = file_offset as usize;
     let bytes = data.get(start..start + size as usize)?.to_vec();
 
-    let _ = std::fs::remove_dir_all(&dir);
+    drop(dir); // removes the scratch directory
     Some((bytes, vm_address, size))
 }
 

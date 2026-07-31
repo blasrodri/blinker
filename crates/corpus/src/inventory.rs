@@ -226,10 +226,7 @@ mod tests {
     fn an_empty_directory_is_an_error_not_an_empty_report() {
         // Silently reporting "0 arguments observed" would look like a clean
         // result rather than a missing input.
-        let dir = std::env::temp_dir().join(format!("blinker-inv-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        assert!(Inventory::from_records_dir(&dir).is_err());
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = blinker_test_support::Scratch::dir("inv").unwrap();
+        assert!(Inventory::from_records_dir(dir.path()).is_err());
     }
 }

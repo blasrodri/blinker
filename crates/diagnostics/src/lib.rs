@@ -265,11 +265,9 @@ mod tests {
 
     #[test]
     fn write_json_creates_missing_parent_directories() {
-        let dir = std::env::temp_dir().join(format!("blinker-diag-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let dir = blinker_test_support::Scratch::dir("diag").unwrap();
         let path = dir.join("nested/deeper/record.json");
         LinkRecord::delegated().write_json(&path).unwrap();
         assert!(path.exists());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

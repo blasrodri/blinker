@@ -6,3 +6,6 @@ license.workspace = true
 
 [dependencies]
 serde = { workspace = true }
+
+[dev-dependencies]
+blinker-test-support = { workspace = true }
