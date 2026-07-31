@@ -77,6 +77,7 @@ version = "0.1.0"
 dependencies = [
  "blinker-arguments",
  "blinker-diagnostics",
+ "blinker-link",
  "blinker-test-support",
  "serde_json",
 ]

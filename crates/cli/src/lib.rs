@@ -37,6 +37,10 @@ pub enum DriverError {
     ResponseFile(blinker_arguments::ResponseFileError),
     Fallback(fallback::FallbackError),
     Io(std::io::Error),
+    /// The internal link failed.
+    Link {
+        detail: String,
+    },
     /// A recorded invocation could not be read back.
     Replay {
         path: PathBuf,
@@ -51,6 +55,7 @@ impl std::fmt::Display for DriverError {
             DriverError::ResponseFile(e) => write!(f, "{e}"),
             DriverError::Fallback(e) => write!(f, "{e}"),
             DriverError::Io(e) => write!(f, "{e}"),
+            DriverError::Link { detail } => write!(f, "{detail}"),
             DriverError::Replay { path, detail } => {
                 write!(f, "cannot replay {}: {detail}", path.display())
             }
@@ -156,13 +161,27 @@ pub fn run(argv: &[String]) -> Result<Outcome, DriverError> {
         );
     }
 
-    let linker = fallback::discover(options.fallback_linker.as_deref())?;
-    if options.verbosity == Verbosity::Verbose {
-        eprintln!("blinker: delegating to {}", linker.display());
-    }
-
+    // The internal link, when asked for. A failure is reported rather than
+    // silently delegated: an internal path that quietly falls back looks
+    // identical to one that works, and the difference is the whole project.
     let exec_started = Instant::now();
-    let exit_code = fallback::execute(&linker, &parsed.argv)?;
+    let exit_code = if options.internal_link {
+        if options.verbosity == Verbosity::Verbose {
+            eprintln!("blinker: linking internally");
+        }
+        internal_link(&parsed).map_err(|e| DriverError::Link {
+            detail: e.to_string(),
+        })?;
+        record.mode = blinker_diagnostics::LinkMode::Cold;
+        record.fallback_reason = None;
+        0
+    } else {
+        let linker = fallback::discover(options.fallback_linker.as_deref())?;
+        if options.verbosity == Verbosity::Verbose {
+            eprintln!("blinker: delegating to {}", linker.display());
+        }
+        fallback::execute(&linker, &parsed.argv)?
+    };
     record.set_timing_fallback_exec(exec_started.elapsed());
 
     // The replay scratch directory must outlive the link that writes into it;
@@ -185,6 +204,32 @@ pub fn run(argv: &[String]) -> Result<Outcome, DriverError> {
     }
 
     Ok(Outcome { exit_code, record })
+}
+
+/// Perform the link with blinker's own linker.
+///
+/// Only object files are accepted so far. An archive or a dylib on the command
+/// line is refused with a message naming it, rather than dropped — a link that
+/// silently ignores an input produces a binary missing whatever was in it.
+fn internal_link(parsed: &ParsedInvocation) -> Result<(), blinker_link::LinkError> {
+    let output = parsed
+        .output_path()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("a.out"));
+
+    let objects: Vec<PathBuf> = parsed
+        .input_paths()
+        .into_iter()
+        .map(Path::to_path_buf)
+        .collect();
+
+    let identifier = output
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "a.out".to_string());
+
+    let request = blinker_link::LinkRequest::new(objects).identifier(&identifier);
+    blinker_link::link_to_file(&request, &output).map(|_| ())
 }
 
 /// Build a unique filename for a recorded invocation.
