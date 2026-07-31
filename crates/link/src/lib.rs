@@ -155,7 +155,7 @@ fn needs_tlv(kind: Arm64RelocationKind) -> bool {
 /// emitted into `__thread_vars`, rather than the variable itself. Rust's
 /// standard library uses thread-locals freely, so this is unavoidable for Rust
 /// and never comes up in simple C.
-fn tlv_symbols(objects: &[LoadedObject]) -> Vec<String> {
+fn tlv_symbols(objects: &[LoadedObject]) -> Vec<TableEntry> {
     let mut names = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for object in objects {
@@ -170,11 +170,28 @@ fn tlv_symbols(objects: &[LoadedObject]) -> Vec<String> {
                 continue;
             };
             if seen.insert(symbol.name.clone()) {
-                names.push(symbol.name.clone());
+                names.push(TableEntry {
+                    object: object.parsed.id,
+                    name: symbol.name.clone(),
+                });
             }
         }
     }
     names
+}
+
+/// One slot of a synthesised pointer table.
+///
+/// The owning object is carried, not just the name. A thread-local or a
+/// GOT target may be a **local** symbol, and locals are keyed per object
+/// because two objects may legitimately define the same local name. Looking
+/// one up under the linker's own synthetic object id finds nothing, and the
+/// slot was then left zero — which is a null descriptor pointer, and a crash
+/// on first use rather than a link error.
+#[derive(Debug, Clone)]
+struct TableEntry {
+    object: ObjectId,
+    name: String,
 }
 
 /// Section id of the synthesised `__stubs`.
@@ -318,7 +335,7 @@ fn stub_symbols(objects: &[LoadedObject], imports: &[String]) -> Vec<String> {
 /// This is why the first end-to-end tests passed without a GOT at all — a
 /// global read from the same object is a direct ADRP/ADD, and a call to
 /// another object is a direct branch. Only cross-object *data* takes this path.
-fn got_symbols(objects: &[LoadedObject]) -> Vec<String> {
+fn got_symbols(objects: &[LoadedObject]) -> Vec<TableEntry> {
     let mut names = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for object in objects {
@@ -333,7 +350,10 @@ fn got_symbols(objects: &[LoadedObject]) -> Vec<String> {
                 continue;
             };
             if seen.insert(symbol.name.clone()) {
-                names.push(symbol.name.clone());
+                names.push(TableEntry {
+                    object: object.parsed.id,
+                    name: symbol.name.clone(),
+                });
             }
         }
     }
@@ -367,8 +387,11 @@ pub fn link(request: &LinkRequest) -> Result<Image, LinkError> {
     // value — a rebase for an address we know, a bind for one dyld supplies.
     let mut got = got_symbols(&objects);
     for name in &imports {
-        if !got.contains(name) {
-            got.push(name.clone());
+        if !got.iter().any(|e| &e.name == name) {
+            got.push(TableEntry {
+                object: SYNTHETIC_OBJECT,
+                name: name.clone(),
+            });
         }
     }
     if !stubs.is_empty() {
@@ -548,7 +571,7 @@ fn fill_stubs(
 }
 
 /// Bind entries: one per GOT slot dyld has to fill.
-fn got_binds(image: &Image, got: &[String], imports: &[String]) -> Vec<Bind> {
+fn got_binds(image: &Image, got: &[TableEntry], imports: &[String]) -> Vec<Bind> {
     let Some(section) = image.layout.sections.iter().find(|s| s.name == "__got") else {
         return Vec::new();
     };
@@ -564,11 +587,11 @@ fn got_binds(image: &Image, got: &[String], imports: &[String]) -> Vec<Bind> {
     let base = section.vm_address - segment.vm_address;
     got.iter()
         .enumerate()
-        .filter(|(_, name)| imports.contains(name))
-        .map(|(slot, name)| Bind {
+        .filter(|(_, entry)| imports.contains(&entry.name))
+        .map(|(slot, entry)| Bind {
             segment: segment_index as u8,
             offset: base + slot as u64 * GOT_ENTRY_SIZE,
-            symbol: name.clone(),
+            symbol: entry.name.clone(),
             // One-based; the only library in the list is libSystem.
             library_ordinal: 1,
             addend: 0,
@@ -577,13 +600,13 @@ fn got_binds(image: &Image, got: &[String], imports: &[String]) -> Vec<Bind> {
 }
 
 /// Address of each GOT slot, in the order the symbols were collected.
-fn got_slot_addresses(got: &[String], image: &Image) -> HashMap<String, u64> {
+fn got_slot_addresses(got: &[TableEntry], image: &Image) -> HashMap<String, u64> {
     pointer_slot_addresses(got, image, "__got")
 }
 
 /// Address of each slot in a synthesised pointer table.
 fn pointer_slot_addresses(
-    names: &[String],
+    names: &[TableEntry],
     image: &Image,
     section_name: &str,
 ) -> HashMap<String, u64> {
@@ -596,9 +619,9 @@ fn pointer_slot_addresses(
     else {
         return slots;
     };
-    for (index, name) in names.iter().enumerate() {
+    for (index, entry) in names.iter().enumerate() {
         slots.insert(
-            name.clone(),
+            entry.name.clone(),
             section.vm_address + index as u64 * GOT_ENTRY_SIZE,
         );
     }
@@ -612,7 +635,7 @@ fn pointer_slot_addresses(
 fn fill_pointer_table(
     contents: &mut HashMap<usize, Vec<u8>>,
     image: &Image,
-    names: &[String],
+    names: &[TableEntry],
     addresses: &AddressMap,
     section_name: &str,
 ) -> Result<(), LinkError> {
@@ -632,8 +655,10 @@ fn fill_pointer_table(
         .entry(index)
         .or_insert_with(|| vec![0u8; names.len() * GOT_ENTRY_SIZE as usize]);
 
-    for (slot, name) in names.iter().enumerate() {
-        let Some(address) = addresses.lookup(SYNTHETIC_OBJECT, name) else {
+    for (slot, entry) in names.iter().enumerate() {
+        // Looked up against the object that *referenced* it, so a local
+        // definition is visible.
+        let Some(address) = addresses.lookup(entry.object, &entry.name) else {
             continue;
         };
         let start = slot * GOT_ENTRY_SIZE as usize;
@@ -646,7 +671,7 @@ fn fill_pointer_table(
 fn fill_got(
     contents: &mut HashMap<usize, Vec<u8>>,
     image: &Image,
-    got: &[String],
+    got: &[TableEntry],
     addresses: &AddressMap,
     imports: &[String],
 ) -> Result<(), LinkError> {
@@ -666,7 +691,8 @@ fn fill_got(
         .entry(index)
         .or_insert_with(|| vec![0u8; got.len() * 8]);
 
-    for (slot, name) in got.iter().enumerate() {
+    for (slot, entry) in got.iter().enumerate() {
+        let name = &entry.name;
         if imports.contains(name) {
             // dyld writes this slot at load time; it starts as zero.
             continue;
@@ -717,7 +743,7 @@ fn pointer_table_rebases(image: &Image, section_name: &str, count: usize) -> Vec
 }
 
 /// One rebase entry per GOT slot.
-fn got_rebases(image: &Image, got: &[String], imports: &[String]) -> Vec<Rebase> {
+fn got_rebases(image: &Image, got: &[TableEntry], imports: &[String]) -> Vec<Rebase> {
     let Some(section) = image.layout.sections.iter().find(|s| s.name == "__got") else {
         return Vec::new();
     };
@@ -735,7 +761,7 @@ fn got_rebases(image: &Image, got: &[String], imports: &[String]) -> Vec<Rebase>
         .enumerate()
         // An imported slot is bound, not rebased: rebasing it would add the
         // load bias to a value dyld is about to overwrite.
-        .filter(|(_, name)| !imports.contains(name))
+        .filter(|(_, entry)| !imports.contains(&entry.name))
         .map(|(slot, _)| Rebase {
             segment: segment_index as u8,
             offset: base + slot as u64 * GOT_ENTRY_SIZE,

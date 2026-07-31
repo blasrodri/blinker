@@ -13,7 +13,24 @@ use blinker_test_support::{workspace_binary, Scratch};
 use std::process::Command;
 
 /// Build a single-file Rust binary with blinker as the linker, and run it.
-fn build_and_run(tag: &str, main_rs: &str) -> (Option<i32>, String, String) {
+/// How a run finished.
+///
+/// A process killed by a signal has **no exit code** — `ExitStatus::code()`
+/// returns `None`, and the familiar 134 a shell reports is its own encoding of
+/// `128 + SIGABRT`. An aborting panic is a signal death, so the two have to be
+/// distinguished rather than conflated.
+#[derive(Debug, PartialEq, Eq)]
+enum RunResult {
+    Exited(i32),
+    Signalled(i32),
+}
+
+fn build_and_run(tag: &str, main_rs: &str) -> (RunResult, String, String) {
+    build_and_run_with(tag, main_rs, "")
+}
+
+/// As above, with extra `RUSTFLAGS`.
+fn build_and_run_with(tag: &str, main_rs: &str, extra_flags: &str) -> (RunResult, String, String) {
     let scratch = Scratch::dir(tag).expect("scratch");
     scratch
         .write(
@@ -33,7 +50,7 @@ fn build_and_run(tag: &str, main_rs: &str) -> (Option<i32>, String, String) {
         .env(
             "RUSTFLAGS",
             format!(
-                "-C linker={} -C link-arg=--blinker-internal",
+                "-C linker={} -C link-arg=--blinker-internal {extra_flags}",
                 blinker.display()
             ),
         )
@@ -49,8 +66,15 @@ fn build_and_run(tag: &str, main_rs: &str) -> (Option<i32>, String, String) {
 
     let binary = scratch.join("target/debug/fixture");
     let run = Command::new(&binary).output().expect("the program runs");
+    let result = match run.status.code() {
+        Some(code) => RunResult::Exited(code),
+        None => {
+            use std::os::unix::process::ExitStatusExt;
+            RunResult::Signalled(run.status.signal().expect("exited or signalled"))
+        }
+    };
     (
-        run.status.code(),
+        result,
         String::from_utf8_lossy(&run.stdout).into_owned(),
         String::from_utf8_lossy(&run.stderr).into_owned(),
     )
@@ -63,7 +87,7 @@ fn build_and_run(tag: &str, main_rs: &str) -> (Option<i32>, String, String) {
 #[test]
 fn a_minimal_rust_program_links_and_runs() {
     let (status, _, stderr) = build_and_run("rust-min", "fn main() { std::process::exit(11); }\n");
-    assert_eq!(status, Some(11), "stderr: {stderr}");
+    assert_eq!(status, RunResult::Exited(11), "stderr: {stderr}");
 }
 
 /// `println!` brings in formatting, stdout locking and thread-locals.
@@ -73,7 +97,7 @@ fn a_rust_program_that_prints_produces_the_right_output() {
         "rust-print",
         "fn main() { println!(\"rust via blinker\"); std::process::exit(7); }\n",
     );
-    assert_eq!(status, Some(7), "stderr: {stderr}");
+    assert_eq!(status, RunResult::Exited(7), "stderr: {stderr}");
     assert_eq!(stdout, "rust via blinker\n");
 }
 
@@ -100,7 +124,35 @@ fn main() {
 }
 "#;
     let (status, stdout, stderr) = build_and_run("rust-collections", source);
-    assert_eq!(status, Some(8), "stderr: {stderr}");
+    assert_eq!(status, RunResult::Exited(8), "stderr: {stderr}");
     assert!(stdout.contains("8 distinct"), "stdout: {stdout}");
     assert!(stdout.contains("joined: 1-2-3-4-5"), "stdout: {stdout}");
+}
+
+/// A panic under `-C panic=abort` must report and abort, exactly as ld64's
+/// output does.
+///
+/// The panic path is thick: it takes a thread-local panic count, formats a
+/// message, and calls the panic hook. Reaching the abort means the
+/// thread-local machinery — descriptors, the pointer table, its rebases, and
+/// the block offsets — is all correct.
+///
+/// `panic=unwind` (the default) is *not* covered here, and does not yet work:
+/// `__TEXT,__unwind_info` is still not synthesised from the input objects'
+/// `__compact_unwind`, so the unwinder has no tables to walk. That is a known
+/// gap, recorded rather than hidden behind a passing test.
+#[test]
+fn a_panicking_program_reports_and_aborts_under_panic_abort() {
+    let (status, _, stderr) = build_and_run_with(
+        "rust-panic-abort",
+        "fn main() { println!(\"before\"); panic!(\"boom\"); }\n",
+        "-C panic=abort",
+    );
+
+    // SIGABRT (6), as an aborting panic should — not an exit code.
+    assert_eq!(status, RunResult::Signalled(6), "stderr: {stderr}");
+    assert!(
+        stderr.contains("panicked at") && stderr.contains("boom"),
+        "the panic message did not reach stderr: {stderr}"
+    );
 }

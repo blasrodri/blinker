@@ -1090,3 +1090,65 @@ for byte against ld64's rather than reasoning about it.
 
 Recorded rather than guessed at: non-panicking Rust programs link and run
 correctly, and that is the honest boundary of what works.
+
+## 29. A synthesised pointer table cannot be filled by a global symbol lookup
+
+Several slots of `__thread_ptrs` were written as **zero**:
+
+```
+__thread_ptrs:
+  00000000 00000000   ← null descriptor pointer
+  000c8fd0 00000001
+  00000000 00000000   ← null
+  000c8fe8 00000001
+```
+
+A thread-local access loads the descriptor address from its slot and calls
+through the descriptor's first word. A zero slot is a null dereference on first
+use — which is exactly where `panic_count::increase` died.
+
+The cause: the fill routine looked each symbol up as
+`addresses.lookup(SYNTHETIC_OBJECT, name)`. Local symbols are keyed **per
+object**, because two objects may legitimately define the same local name, so
+a lookup under the linker's own synthetic id sees only globals. Thread-locals
+inside `libstd` are frequently local, and every one of those got a zero slot.
+
+The fix is to carry the *referencing object* alongside the name in the table,
+and look up against that — so a local definition is visible from the object
+that referenced it. The same defect was present in the GOT and fixed with it;
+it had simply not been reached, because the C tests only ever put globals
+there.
+
+This is the third instance of one root confusion in this project: **a symbol
+name alone is not a key.** Findings 21 and 25 were the same mistake in
+different clothing.
+
+### Result
+
+The panic path now works end to end under `-C panic=abort`:
+
+```
+before
+thread 'main' panicked at src/main.rs:1:33:
+boom
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+```
+
+terminating with `SIGABRT`, matching ld64 exactly. Reaching the abort means
+the whole thread-local mechanism is correct: descriptors, the pointer table,
+its rebases, and the block-relative offsets.
+
+`-C panic=unwind` — the default — still crashes *after* printing the message,
+in the unwinder. That is the genuine `__unwind_info` gap: blinker drops the
+input objects' `__LD,__compact_unwind` and never synthesises
+`__TEXT,__unwind_info`, so there are no tables for the unwinder to walk.
+Known, recorded, and not hidden behind a passing test.
+
+### A test that asserted the wrong thing
+
+The first version of the regression test asserted `status.code() == Some(134)`
+and failed against behaviour that was already correct. A process killed by a
+signal has **no exit code** — `code()` returns `None`, and the 134 a shell
+prints is the shell's own `128 + SIGABRT` encoding. The test now distinguishes
+`Exited(n)` from `Signalled(n)`, which is a distinction the platform makes and
+the test had quietly collapsed.
