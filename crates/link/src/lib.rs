@@ -56,7 +56,9 @@ use blinker_symbols::{SymbolProvider, SymbolTable};
 use reachability::Strip;
 
 mod hashing;
+mod identity;
 use hashing::FastMap;
+pub use identity::ContributionKeys;
 
 pub mod error;
 pub use error::LinkError;
