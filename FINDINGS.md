@@ -6030,3 +6030,40 @@ zero: the QoS class (109), the survey's allocations (115), the atom owner
 storage (123), and this. Each had a mechanism that sounded decisive. What they
 share is that the mechanism was real and the *path it sat on* was not the one
 being paid for.
+
+## 127. The first thing the session remembers that is not an input
+
+Everything the session held until now was something it had *read*: parsed
+objects, archive indexes, the SDK's exports, the previous cache. `Atoms`' work
+of splitting each section into independently-strippable pieces is the first
+thing it holds that it *computed*.
+
+The rule for what may go in: **a pure function of one object and nothing else**.
+Atom boundaries qualify — where a section divides depends on that object's own
+symbols and relocations, on `subsections_via_symbols`, and on the section's
+flags. It does not depend on the layout, the strip, the imports, or on any other
+input. So a boundary computed for a parse is valid for exactly as long as that
+parse is.
+
+Keying is by the identity of the `Arc<ParsedObject>` — its pointer — which is
+exact in both directions: the same parse gives the same key, and a re-read input
+gets a fresh allocation and therefore a miss. That is only sound because the
+entry *holds the `Arc`*: without it the allocation could be freed and its
+address handed to the next parse, and one object's derived facts would be served
+for another's. A dangling-pointer bug that never dereferences a pointer.
+
+Entries for parses a link did not use are dropped at the end of the strip, and
+the `Arc`s with them. Otherwise a resident linker's memory grows with every
+rebuild rather than with the program being linked.
+
+### Not measured
+
+Load average was between 8 and 21 while this was written, with `ld64` itself
+spreading 164% and touching 108 ms. There is no number to report. The change is
+in on correctness alone: the suite is green and the output is byte-identical to
+the same three hashes every change today was checked against.
+
+This is the third "kept, unmeasured" entry (123, 125). What makes it acceptable
+is that it is a *mechanism*, not an optimisation: the value is that the next
+four things — grouped relocations, opacity, personality fields, per-object
+survey contributions — now have somewhere to go.

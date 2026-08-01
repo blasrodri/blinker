@@ -244,14 +244,22 @@ impl<'a> Atoms<'a> {
     /// Split three ways because the three are incremental to different degrees:
     /// boundaries are a pure function of one object, owners need the global
     /// atom numbering, and opacity is a scan of every relocation in the link.
-    pub(crate) fn build(objects: &'a [LoadedObject], parts: &mut [f64; 3]) -> Atoms<'a> {
+    pub(crate) fn build(
+        objects: &'a [LoadedObject],
+        parts: &mut [f64; 3],
+        session: &mut crate::session::Session,
+    ) -> Atoms<'a> {
         let step = std::time::Instant::now();
         let mut atoms: Vec<Atom> = Vec::new();
         let mut by_section = crate::hashing::FastMap::default();
 
         for object in objects {
             for section in &object.parsed.sections {
-                let Some(offsets) = boundaries(object, section) else {
+                // Held across links: a pure function of this object, and 67 of
+                // 69 inputs are the same parse as last time.
+                let Some(offsets) = session
+                    .boundaries(&object.parsed, section.id.0, || boundaries(object, section))
+                else {
                     continue;
                 };
                 let start = atoms.len();
@@ -950,11 +958,15 @@ pub(crate) struct StripTimings {
 }
 
 /// Decide what a link keeps.
-pub(crate) fn plan(objects: &[LoadedObject], entry: &str) -> (Strip, Report, StripTimings) {
+pub(crate) fn plan(
+    objects: &[LoadedObject],
+    entry: &str,
+    session: &mut crate::session::Session,
+) -> (Strip, Report, StripTimings) {
     let mut timings = StripTimings::default();
     let step = std::time::Instant::now();
     let mut parts = [0.0f64; 3];
-    let atoms = Atoms::build(objects, &mut parts);
+    let atoms = Atoms::build(objects, &mut parts, session);
     timings.atoms_ms = step.elapsed().as_secs_f64() * 1000.0;
 
     let step = std::time::Instant::now();
@@ -973,7 +985,7 @@ pub(crate) fn plan(objects: &[LoadedObject], entry: &str) -> (Strip, Report, Str
 
 /// Report what analysis alone can say, without changing any output.
 pub(crate) fn analyse(objects: &[LoadedObject], entry: &str) -> Report {
-    plan(objects, entry).1
+    plan(objects, entry, &mut crate::session::Session::default()).1
 }
 
 /// The `__text` numbers, which are what can be compared against another linker.

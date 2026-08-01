@@ -1580,7 +1580,7 @@ fn link_inner(
     // contribution is. Everything downstream asks it where an input byte went.
     let step = std::time::Instant::now();
     let (strip, report, strip_timings) = if request.dead_strip {
-        reachability::plan(&objects, &request.entry_symbol)
+        reachability::plan(&objects, &request.entry_symbol, session)
     } else {
         (
             Strip::none(),
@@ -1588,6 +1588,15 @@ fn link_inner(
             reachability::StripTimings::default(),
         )
     };
+    // Derived facts about parses this link did not use are dropped here, and
+    // with them the `Arc`s holding those parses alive. Without it a resident
+    // linker's memory grows with every rebuild instead of with the program.
+    let live_parses: crate::hashing::FastMap<usize, ()> = objects
+        .iter()
+        .map(|o| (std::sync::Arc::as_ptr(&o.parsed) as usize, ()))
+        .collect();
+    session.forget_unused_memos(&live_parses);
+
     timings.dead_strip_ms = elapsed_ms(step);
     timings.atoms_ms = strip_timings.atoms_ms;
     timings.liveness_ms = strip_timings.liveness_ms;

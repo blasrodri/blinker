@@ -40,6 +40,14 @@ use blinker_macho::ParsedObject;
 use crate::hashing::FastMap;
 use crate::mapping::Backing;
 
+/// What has been worked out about one held parse.
+struct Memo {
+    /// Held so the pointer this is keyed by cannot be reused. See `memo`.
+    _parse: Arc<ParsedObject>,
+    /// Atom boundaries by section id; `None` for a section that is not split.
+    boundaries: FastMap<u32, Option<Arc<Vec<u64>>>>,
+}
+
 /// One input, as this process last saw it.
 enum Entry {
     Object(Arc<ParsedObject>, Arc<Backing>),
@@ -141,6 +149,20 @@ pub struct Session {
     /// what each object read is the case that turns on it: pure cost to a
     /// process that is about to exit, and 2.8 ms a link to one that is not.
     resident: bool,
+    /// Facts derived from one parsed object, held for as long as that parse is.
+    ///
+    /// Keyed by the identity of the `Arc<ParsedObject>` itself — its pointer —
+    /// which is exact in both directions: the same parse gives the same key, and
+    /// a re-parsed input gets a fresh allocation and therefore a miss. The `Arc`
+    /// is *held inside the entry* so the allocation cannot be freed and its
+    /// address handed to the next parse, which would serve one object's derived
+    /// facts for another's.
+    ///
+    /// Everything in here must be a pure function of the object alone. Atom
+    /// boundaries are: where a section divides into independently-strippable
+    /// pieces depends on that object's symbols and relocations and on nothing
+    /// else in the link.
+    memo: FastMap<usize, Memo>,
     /// The cache this session's last link produced, and the path it belongs to.
     ///
     /// The cache file is a *restart* mechanism: it exists so a cold process can
@@ -468,6 +490,36 @@ impl Session {
     /// should ask here rather than probe it a second time.
     pub fn key_for(&self, path: &Path) -> Option<blinker_cache::InputKey> {
         self.entries.get(path).map(|(key, _)| key.clone())
+    }
+
+    /// This object's atom boundaries for `section`, computing them once.
+    ///
+    /// `compute` is called only on a miss. It must be a pure function of the
+    /// object — see `memo`.
+    pub fn boundaries(
+        &mut self,
+        parse: &Arc<ParsedObject>,
+        section: u32,
+        compute: impl FnOnce() -> Option<Vec<u64>>,
+    ) -> Option<Arc<Vec<u64>>> {
+        let key = Arc::as_ptr(parse) as usize;
+        let memo = self.memo.entry(key).or_insert_with(|| Memo {
+            _parse: Arc::clone(parse),
+            boundaries: FastMap::default(),
+        });
+        memo.boundaries
+            .entry(section)
+            .or_insert_with(|| compute().map(Arc::new))
+            .clone()
+    }
+
+    /// Drop derived facts about parses this link did not use.
+    ///
+    /// Without this the memo holds every object any link ever saw, and holds
+    /// their `Arc`s alive with it — a resident linker's memory would grow with
+    /// every rebuild rather than with the program being linked.
+    pub fn forget_unused_memos(&mut self, used: &FastMap<usize, ()>) {
+        self.memo.retain(|key, _| used.contains_key(key));
     }
 
     /// Take the cache held for `path`, if this session produced one.
