@@ -140,6 +140,8 @@ def main():
     parser.add_argument("--out", default=str(REPO / "target" / "workloads"))
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument("--relocations", action="store_true",
+                        help="also reuse per-object relocations, to read the hit rate")
     parser.add_argument("--no-cache", action="store_true",
                         help="relink without the incremental cache, for comparison")
     parser.add_argument("--keep", action="store_true",
@@ -197,7 +199,8 @@ def main():
         argv[argv.index("-o") + 1] = str(output)
         cmd = [str(BLINKER), "--blinker-internal"]
         if not options.no_cache:
-            cmd.append("--blinker-cache")
+            cmd.append("--blinker-cache-relocations"
+                       if options.relocations else "--blinker-cache")
         cmd += ["--blinker-json-diagnostics", str(record)] + argv
 
         walls, records = [], []

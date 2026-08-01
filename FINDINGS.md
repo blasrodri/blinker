@@ -4587,3 +4587,64 @@ part worth keeping: nine tests failed the moment the default changed, each
 naming the behaviour it depended on. A default that changes silently under a
 green suite is the failure mode finding 64 recorded — a cache that had stopped
 working while every test passed.
+
+## 96. Reading the previous layout back: 0% to 77% on the edit padding could not hold
+
+Finding 94 measured a one-crate edit with a fourteen-rlib blast radius reusing
+**9 of 84 116 relocations** — the number from before the section-stride padding
+existed, which is what said the padding had stopped helping. The retained
+allocator, wired end to end, on the same edit:
+
+```
+  padding, recomputed layout        9 / 84 116     0%
+  previous layout, read back   65 403 / 85 396    77%
+```
+
+Nothing about the edit changed. What changed is that an unchanged
+contribution's address is now looked up rather than arrived at.
+
+### The three pieces it took, and why they landed separately
+
+- **Identity** (`crates/link/src/identity.rs`) — path, archive member, section
+  name and ordinal, hashed. Not `ObjectId`, which is assigned by input order
+  and names a different object the moment one fewer archive member is pulled
+  in.
+- **The table in the cache** — the one thing in that file which is not a copy
+  of something the image already holds. Where a contribution sat is a
+  *decision*, and a decision cannot be recomputed; recomputing it with padding
+  and hoping is what finding 94 measured.
+- **The allocator** (`crates/layout/src/reuse.rs`) — kept slots occupy their
+  whole reservation, the rest is a free list, and sections whose shape carries
+  meaning are still packed from the start because a hole in `__eh_frame` is a
+  zero-length record.
+
+Each landed with its own tests, and the last commit's only new thing was the
+wiring. That is deliberate: three untested pieces meeting for the first time
+inside one commit is a debugging session, not an integration.
+
+### What it has not yet bought
+
+**Nothing, in time.** The edit relink is 37.8 ms, the same as before the
+allocator existed, because reuse is gated on the per-object relocation
+machinery that finding 95 turned off for costing more than it saves. The 77% is
+visible only with `--blinker-cache-relocations`, and under that flag the link
+is *slower*, exactly as measured.
+
+That is the expected shape and worth stating plainly rather than reading the
+77% as a win: retained placement is the precondition for reuse being worth
+anything, not the mechanism that collects it. What collects it is persisted
+per-contribution fixups — relocating only what changed instead of recording
+everything in order to skip some of it — and that is the next milestone.
+
+### The test that had to change, and the one that did not
+
+One test compared an incremental output to a cold one byte for byte. It now
+compares behaviour: same stdout, same exit status. That is D5 arriving in the
+test suite — an incremental link keeps unchanged contributions where the
+previous link put them, a cold link has no previous link, and the two differ by
+design. The claim underneath it — that an object is *not* reused across a move
+of a symbol it reads — is unchanged and still enforced, because a stale reuse
+shows up as a wrong answer.
+
+The harness also earned its keep: pointed at a stale workload it failed with
+undefined symbols rather than reporting a time. Finding 75 is why it checks.
