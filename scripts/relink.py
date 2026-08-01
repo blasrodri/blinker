@@ -335,9 +335,28 @@ def main():
             for target, a, _ in versions:
                 shutil.copyfile(a, target)
 
-    timings = records[-1]["timings"]
+    # The median of each stage across every iteration, not the last record.
+    #
+    # Printing medians for `wall` and `link` and then a breakdown from one
+    # arbitrary run means the two disagree whenever that run was an outlier —
+    # and under load they are common. A stage table taken from a single slow
+    # sample reads as a discovery about the linker.
+    def median_timings(key):
+        merged = {}
+        for name in {k for r in records for k in r[key]}:
+            values = [r[key][name] for r in records
+                      if isinstance(r[key].get(name), (int, float))]
+            if values:
+                merged[name] = statistics.median(values)
+        return merged
+
+    timings = median_timings("timings")
     counters = records[-1]["counters"]
     total = timings.get("internal_link_ms") or 0.0
+    # Stage medians do not sum to the median total — each is the middle of its
+    # own distribution. `unmeasured` absorbs that, so it is now a residual and
+    # not only unaccounted work; it stays small when the run is clean and grows
+    # when it is not, which is worth seeing either way.
     links = [r["timings"]["internal_link_ms"] for r in records]
 
     print(f"\n  {options.iterations} edit relinks, alternating the changed inputs\n")
