@@ -232,6 +232,14 @@ pub fn run_in(
                 },
             },
         );
+        record.set_session(
+            phases.inputs_held,
+            phases.inputs_read,
+            phases.replayed_extraction,
+            phases.held_resolution,
+            phases.interface_changes,
+            phases.first_interface_change.as_deref(),
+        );
         if phases.contributions_retained > 0 || phases.contributions_moved > 0 {
             record.set_placement(
                 phases.contributions_retained,

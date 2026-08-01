@@ -52,6 +52,20 @@ pub fn blinker_relink_touch() -> u64 {
 }
 """
 
+# A body-only edit: a *private* function, so nothing the crate exports changes.
+# This is the ordinary developer change — an implementation detail — and the
+# one the session's interface rule is for. `pub` and non-`pub` are two
+# different experiments and the difference is not cosmetic: adding an exported
+# name changes the archive's symbol table, and no amount of held state can know
+# the extraction order still holds.
+TOUCH_PRIVATE = """
+#[allow(dead_code)]
+#[inline(never)]
+fn blinker_relink_touch_private() -> u64 {
+    0x9e37_79b9_7f4a_7c15
+}
+"""
+
 
 def fail(message):
     sys.exit(f"relink: {message}")
@@ -140,6 +154,8 @@ def main():
     parser.add_argument("--out", default=str(REPO / "target" / "workloads"))
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument("--body-only", action="store_true",
+                        help="edit a private item, so no exported symbol changes")
     parser.add_argument("--daemon", action="store_true",
                         help="link through a resident linker, if one is running")
     parser.add_argument("--relocations", action="store_true",
@@ -167,7 +183,8 @@ def main():
     original = source.read_bytes()
     print(f"  editing {source.relative_to(project)} and rebuilding")
     try:
-        source.write_bytes(original + TOUCH.encode())
+        touch = TOUCH_PRIVATE if options.body_only else TOUCH
+        source.write_bytes(original + touch.encode())
         capture(edited_name, project, manifest["profile"], options.out)
     finally:
         source.write_bytes(original)
@@ -273,6 +290,17 @@ def main():
             verdict = "the invariant holds" if stale == 0 else "INVARIANT BROKEN"
             print(f"  of those, {stale} belonged to inputs that did not change"
                   f" — {verdict}")
+
+    held = counters.get("inputs_held")
+    if held is not None:
+        print(f"  session: {held} inputs held, {counters.get('inputs_read')} read;"
+              f" extraction {'replayed' if counters.get('replayed_extraction') else 'recomputed'},"
+              f" resolution {'held' if counters.get('held_resolution') else 'redone'}")
+        changes = counters.get("interface_changes")
+        if changes:
+            import os as _os
+            first = counters.get("first_interface_change") or ""
+            print(f"           {changes} interface(s) moved, first: {_os.path.basename(first)}")
 
     reused = counters.get("reused_inputs")
     if reused is not None:

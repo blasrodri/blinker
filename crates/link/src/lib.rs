@@ -181,6 +181,13 @@ pub struct LinkTimings {
     /// for a one-shot link, which holds nothing.
     pub inputs_held: u64,
     pub inputs_read: u64,
+    /// Whether the archive extraction order was replayed rather than computed.
+    pub replayed_extraction: bool,
+    /// Whether symbol resolution was held rather than redone.
+    pub held_resolution: bool,
+    /// Inputs whose symbol interface moved, and the first one that did.
+    pub interface_changes: u64,
+    pub first_interface_change: Option<PathBuf>,
 }
 
 impl std::fmt::Display for LinkTimings {
@@ -1399,7 +1406,7 @@ fn link_inner(
     let step = std::time::Instant::now();
     session.begin(&request.objects);
     let held_stubs = session.stub_exports(&request.stub_libraries);
-    let (objects, exported, stub_ms) = std::thread::scope(|scope| {
+    let (objects, exported, stubs_were_parsed, stub_ms) = std::thread::scope(|scope| {
         let held = held_stubs.clone();
         let stub = scope.spawn(move || {
             let started = std::time::Instant::now();
@@ -1408,17 +1415,22 @@ fn link_inner(
             // hidden behind reading the objects, and therefore worth nothing
             // to cache until the objects stop being read either. Both stop
             // here at once.
-            let exported = match held {
-                Some(held) => Some(held),
-                None => request.dynamic_symbols().map(std::sync::Arc::new),
+            // `fresh` says whether this had to be parsed, which decides
+            // whether the session should be told. Storing unconditionally
+            // marked the SDK as re-read on every link, and resolution — which
+            // is only valid against the exports it was computed from — was
+            // therefore never held.
+            let (exported, fresh) = match held {
+                Some(held) => (Some(held), false),
+                None => (request.dynamic_symbols().map(std::sync::Arc::new), true),
             };
-            (exported, elapsed_ms(started))
+            (exported, fresh, elapsed_ms(started))
         });
         let objects = load_objects(&request.objects, session);
-        let (exported, stub_ms) = stub.join().expect("the stub reader did not panic");
-        (objects, exported, stub_ms)
+        let (exported, fresh, stub_ms) = stub.join().expect("the stub reader did not panic");
+        (objects, exported, fresh, stub_ms)
     });
-    if let Some(exported) = &exported {
+    if let (Some(exported), true) = (&exported, stubs_were_parsed) {
         session.store_stub_exports(&request.stub_libraries, std::sync::Arc::clone(exported));
     }
     let exported = exported.map(|e| (*e).clone());
@@ -1455,12 +1467,22 @@ fn link_inner(
     // chance at it. Checking first reported `_printf` as undefined in a
     // program that links against libSystem.
     let step = std::time::Instant::now();
-    let imports = resolve_imports(&objects, exported)?;
-
-    // Resolution runs for its diagnostics: it is what turns a genuinely
-    // missing definition into a named error rather than a relocation against
-    // zero.
-    resolve_symbols(&objects, &imports)?;
+    // Held when no input's symbol interface moved and the SDK's exports are
+    // the ones this answer was computed against. Both questions resolution
+    // asks — which undefined names a dylib provides, and whether any is left
+    // over — read names and strengths and nothing else.
+    let imports = match session.imports() {
+        Some(held) => held.to_vec(),
+        None => {
+            let imports = resolve_imports(&objects, exported)?;
+            // Resolution runs for its diagnostics: it is what turns a
+            // genuinely missing definition into a named error rather than a
+            // relocation against zero.
+            resolve_symbols(&objects, &imports)?;
+            session.store_imports(&imports);
+            imports
+        }
+    };
     timings.resolve_ms = elapsed_ms(step);
 
     let sub = std::time::Instant::now();
@@ -4436,6 +4458,12 @@ pub fn link_to_file_in(
     let (held, read) = session.counts();
     timings.inputs_held = held as u64;
     timings.inputs_read = read as u64;
+    let (replayed, resolution) = session.reused();
+    timings.replayed_extraction = replayed;
+    timings.held_resolution = resolution;
+    let (changes, first) = session.interface_changes();
+    timings.interface_changes = changes;
+    timings.first_interface_change = first.map(Path::to_path_buf);
     write_output(&image.bytes, output)?;
     Ok(timings)
 }

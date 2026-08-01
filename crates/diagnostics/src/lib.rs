@@ -199,6 +199,15 @@ pub struct Counters {
     pub contributions_moved: Option<u64>,
     /// Of those, the ones whose input had not changed. Meant to be zero.
     pub contributions_moved_unchanged: Option<u64>,
+    /// What a resident linker reused: inputs served from memory, inputs it had
+    /// to read, and whether the two derived answers still held.
+    pub inputs_held: Option<u64>,
+    pub inputs_read: Option<u64>,
+    pub replayed_extraction: Option<bool>,
+    pub held_resolution: Option<bool>,
+    /// Inputs whose symbol interface moved, and the first one that did.
+    pub interface_changes: Option<u64>,
+    pub first_interface_change: Option<String>,
     pub cache_bytes_read: Option<u64>,
     pub cache_bytes_written: Option<u64>,
     /// `__text` bytes dead-stripping removed. `None` when it did not run.
@@ -327,6 +336,27 @@ impl LinkRecord {
         self.counters.contributions_retained = Some(retained);
         self.counters.contributions_moved = Some(moved);
         self.counters.contributions_moved_unchanged = Some(moved_unchanged);
+    }
+
+    /// Record what a resident session reused.
+    pub fn set_session(
+        &mut self,
+        held: u64,
+        read: u64,
+        extraction: bool,
+        resolution: bool,
+        interface_changes: u64,
+        first_change: Option<&std::path::Path>,
+    ) {
+        if held == 0 && read == 0 {
+            return;
+        }
+        self.counters.inputs_held = Some(held);
+        self.counters.inputs_read = Some(read);
+        self.counters.replayed_extraction = Some(extraction);
+        self.counters.held_resolution = Some(resolution);
+        self.counters.interface_changes = Some(interface_changes);
+        self.counters.first_interface_change = first_change.map(|p| p.display().to_string());
     }
 
     /// Record what the cache moved, as bytes.

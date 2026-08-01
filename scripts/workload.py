@@ -226,11 +226,6 @@ def main():
     )
     parser.add_argument("--out", default=str(REPO / "target" / "workloads"))
     parser.add_argument("--profile", choices=["debug", "release"], default="release")
-    parser.add_argument(
-        "--keep-build",
-        action="store_true",
-        help="keep the cargo target directory (gigabytes) instead of removing it",
-    )
     options = parser.parse_args()
 
     if not BLINKER.exists():
@@ -253,7 +248,16 @@ def main():
     # is per-workload and does not travel in rustflags, so it may stay put.
     staging = Path(options.out) / ".capture"
     shutil.rmtree(staging, ignore_errors=True)
-    build = destination / "build"
+    # One build directory across captures, and deliberately *not* cleared.
+    #
+    # A capture that builds from scratch re-emits every rlib in the project,
+    # and rustc's codegen units come out in a different order — so two captures
+    # of a one-line edit differ in thirteen crates the edit never touched. That
+    # is not what a developer's edit loop does: cargo recompiles the edited
+    # crate and its dependents and leaves the rest alone. Sharing the directory
+    # makes the second capture an incremental rebuild, which is the thing being
+    # measured.
+    build = Path(options.out) / ".build"
     capture(Path(options.project).resolve(), staging, linker, build, options.profile)
 
     records = destination / "records"
@@ -285,8 +289,7 @@ def main():
     }
     (destination / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
-    if not options.keep_build:
-        shutil.rmtree(build, ignore_errors=True)
+    # The build directory is shared and outlives this capture; see above.
 
     print(f"\n  {options.name}: {files} files, {objects} objects, "
           f"{size / 1024 / 1024:.1f} MB")

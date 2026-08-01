@@ -111,10 +111,43 @@ pub struct Session {
     /// common case rather than a corner: an edit that changes nothing else
     /// still changes something.
     interfaces: FastMap<PathBuf, u64>,
+    /// Each archive's symbol index as last read. Compared rather than trusted:
+    /// it is what decides which member defines a name.
+    /// Each archive's symbol table as last read: name to defining member, and
+    /// nothing else.
+    ///
+    /// Not the whole `ArchiveIndex`. That carries every member's offset and
+    /// size, which move whenever any member's *content* changes — so comparing
+    /// it rejected every edit, which is correct and useless. What the frontier
+    /// asks an archive is "which member defines this name", and that is this
+    /// table.
+    indexes: FastMap<PathBuf, Vec<(String, blinker_archive::MemberId)>>,
     /// Whether any input's interface differs from the one held for it.
     interfaces_changed: bool,
+    /// How many inputs' interfaces moved, and the first one that did.
+    ///
+    /// A boolean says the replay was refused; this says by whom. Three of this
+    /// session's wrong turns were inferences about which input was to blame.
+    interface_changes: u64,
+    first_interface_change: Option<PathBuf>,
+    /// The imports the last link resolved, and whether the stub exports behind
+    /// them were re-read.
+    ///
+    /// Resolution asks two questions — which undefined names a dylib provides,
+    /// and whether any is left over — and both read nothing but names and
+    /// strengths. That is precisely what [`interface_digest`] covers, so the
+    /// answer stands whenever no interface moved *and* the SDK's exports are
+    /// the ones it was computed against.
+    imports: Option<Vec<String>>,
+    stubs_reparsed: bool,
     hits: usize,
     misses: usize,
+    /// What this link was able to reuse, for the record rather than for the
+    /// linker. Every rule here is a claim about when an answer still holds,
+    /// and a claim nobody can see the effect of is a claim nobody checks —
+    /// three of this session's wrong turns were exactly that.
+    replayed_extraction: bool,
+    held_resolution: bool,
 }
 
 /// What the SDK's `.tbd` stubs say the system exports.
@@ -127,12 +160,19 @@ impl Session {
             self.entries.clear();
             self.members.clear();
             self.interfaces.clear();
+            self.indexes.clear();
             self.extraction = None;
+            self.imports = None;
             self.inputs = inputs.to_vec();
         }
         self.hits = 0;
         self.misses = 0;
         self.interfaces_changed = false;
+        self.interface_changes = 0;
+        self.first_interface_change = None;
+        self.stubs_reparsed = false;
+        self.replayed_extraction = false;
+        self.held_resolution = false;
     }
 
     /// The entry for `path`, if this process has it and it is still current.
@@ -227,7 +267,7 @@ impl Session {
     ) {
         // A member's interface is noted under a path of its own, so two
         // members of one archive cannot overwrite each other's digest.
-        let named = archive.join(format!("({member})"));
+        let named = member_path(archive, member);
         self.note_interface(&named, parsed);
         self.members
             .insert((archive.to_path_buf(), member), (Arc::clone(parsed), range));
@@ -246,6 +286,25 @@ impl Session {
         // Storing an archive means it was just read, which means its previous
         // contents are gone and so is anything parsed out of them.
         self.members.retain(|(archive, _), _| archive != path);
+        // The archive's *index* is one of the frontier's two inputs: it decides
+        // which member defines a name. If it moved, no replay can be trusted;
+        // if it did not, the replay is still on the hook for the other input —
+        // the interfaces of the members it names — which `member_interface_is`
+        // checks as each one is parsed.
+        //
+        // The counters caught this being wrong: `extraction replayed` on a link
+        // that had re-read eleven archives, back when neither input was
+        // checked. Nothing failed, because none of the eleven had changed a
+        // symbol — the bug was invisible, waiting for the edit that added one.
+        if self.indexes.get(path) != Some(&index.symbol_map) {
+            self.interfaces_changed = true;
+            self.interface_changes += 1;
+            if self.first_interface_change.is_none() {
+                self.first_interface_change = Some(path.to_path_buf());
+            }
+        }
+        self.indexes
+            .insert(path.to_path_buf(), index.symbol_map.clone());
         self.entries.insert(
             path.to_path_buf(),
             (key, Entry::Archive(index.clone(), Arc::clone(data))),
@@ -266,8 +325,25 @@ impl Session {
         Some(Arc::clone(exports))
     }
 
+    /// The imports the last link resolved, if they must still be the same.
+    pub fn imports(&mut self) -> Option<&[String]> {
+        if self.interfaces_changed || self.stubs_reparsed || self.imports.is_none() {
+            return None;
+        }
+        self.held_resolution = true;
+        self.imports.as_deref()
+    }
+
+    /// Remember what resolution decided.
+    pub fn store_imports(&mut self, imports: &[String]) {
+        self.imports = Some(imports.to_vec());
+    }
+
     /// Remember the SDK's exports.
     pub fn store_stub_exports(&mut self, stubs: &[PathBuf], exports: Arc<StubExports>) {
+        // Re-reading the SDK means the set of importable names may have moved,
+        // and resolution's answer with it.
+        self.stubs_reparsed = true;
         let mut recorded = Vec::with_capacity(stubs.len());
         for path in stubs {
             let Some(key) = blinker_cache::InputKey::probe(path) else {
@@ -284,8 +360,32 @@ impl Session {
     /// changed. A re-read object whose defined and undefined names are what
     /// they were cannot make any archive want a different member, because
     /// those two sets are the frontier's only input.
-    pub fn extraction(&self) -> Option<&[(usize, u32)]> {
-        (!self.interfaces_changed).then_some(self.extraction.as_deref())?
+    pub fn extraction(&mut self) -> Option<&[(usize, u32)]> {
+        if self.interfaces_changed || self.extraction.is_none() {
+            return None;
+        }
+        self.replayed_extraction = true;
+        self.extraction.as_deref()
+    }
+
+    /// Whether a freshly parsed member's interface is the one held for it.
+    ///
+    /// The second half of the replay's safety argument, and the half that can
+    /// only be checked *during* the replay: a member's interface is not known
+    /// until it is parsed, and parsing it is what the plan decides. So the plan
+    /// is followed optimistically and abandoned the moment a member comes back
+    /// different — before anything downstream has seen the result.
+    pub fn member_interface_is(&self, archive: &Path, member: u32, parsed: &ParsedObject) -> bool {
+        let named = member_path(archive, member);
+        self.interfaces.get(&named) == Some(&interface_digest(parsed))
+    }
+
+    /// Discard a replay that turned out not to hold, so this link recomputes
+    /// and the next one is not offered the same wrong answer.
+    pub fn abandon_extraction(&mut self) {
+        self.extraction = None;
+        self.replayed_extraction = false;
+        self.interfaces_changed = true;
     }
 
     /// Note an input's symbol interface, and whether it moved.
@@ -295,7 +395,13 @@ impl Session {
             Some(previous) if previous == digest => {}
             // Absent as well as different: an input this process has not seen
             // before could define anything, so the frontier has to run.
-            _ => self.interfaces_changed = true,
+            _ => {
+                self.interfaces_changed = true;
+                self.interface_changes += 1;
+                if self.first_interface_change.is_none() {
+                    self.first_interface_change = Some(path.to_path_buf());
+                }
+            }
         }
     }
 
@@ -308,6 +414,24 @@ impl Session {
     pub fn counts(&self) -> (usize, usize) {
         (self.hits, self.misses)
     }
+
+    /// Whether the extraction order and the resolution were reused.
+    pub fn reused(&self) -> (bool, bool) {
+        (self.replayed_extraction, self.held_resolution)
+    }
+
+    /// How many interfaces moved, and the first one that did.
+    pub fn interface_changes(&self) -> (u64, Option<&Path>) {
+        (
+            self.interface_changes,
+            self.first_interface_change.as_deref(),
+        )
+    }
+}
+
+/// A member's identity as a path, so it cannot collide with its archive's.
+fn member_path(archive: &Path, member: u32) -> PathBuf {
+    archive.join(format!("({member})"))
 }
 
 /// A digest of what an object defines and what it leaves undefined.
@@ -322,6 +446,15 @@ fn interface_digest(parsed: &ParsedObject) -> u64 {
     // rather than a sequential hash for exactly that reason.
     let mut total = 0u64;
     for symbol in &parsed.symbols {
+        // Locals are excluded, and that is the whole point rather than an
+        // optimisation. A local cannot satisfy another object's reference and
+        // cannot be referenced from outside, so it is invisible to the
+        // frontier — but it is exactly what an ordinary edit adds and removes.
+        // Counting them made every edit look like an interface change, which
+        // is correct and answers a different question than the one being asked.
+        if symbol.visibility == blinker_macho::SymbolVisibility::Local {
+            continue;
+        }
         let mut hasher = crate::hashing::FastHasher::default();
         symbol.name.hash(&mut hasher);
         symbol.strength.is_definition().hash(&mut hasher);
