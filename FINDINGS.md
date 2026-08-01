@@ -4692,3 +4692,64 @@ condition as "unchanged size". The fix is one of two things and not a third:
 What it is **not** is more padding chosen to make today's number go green.
 That is finding 94 again, and the counter that just caught this is the thing
 that would catch it.
+
+## 98. Finding 97's explanation was wrong, and the counter is what said so
+
+Finding 97 read the 48 moved-but-unchanged contributions and concluded
+dead-stripping had changed their live size: an unchanged object keeping more of
+itself, outgrowing a slot sized from last link's smaller live set. It was a
+good story, it matched a prediction made before the allocator existed, and it
+was wrong.
+
+The fix it implied — reserving capacity against each contribution's full
+unstripped size — was built, and moved the number from 48 to 43. That is the
+shape of a wrong hypothesis: an expensive change (image size in proportion to
+everything dead-stripping removes) buying almost nothing.
+
+So the movers were asked where they lived, instead of being reasoned about:
+
+```
+  93  __TEXT,__eh_frame   fits=true
+  33  __TEXT,__literal8   fits=true
+   3  __TEXT,__literal16  fits=true
+```
+
+**Every single one fits its slot.** Capacity was never the problem. Not one of
+them is in a section the allocator is willing to retain at all, because
+`may_be_padded` — an allow-list written to answer *"may this section carry
+padding"* — had quietly become the answer to a second question it was never
+asked: *"may a contribution here keep its address"*.
+
+Those are not the same question. A literal pool is referenced by relocations
+naming addresses, so a gap between literals is never read and never walked —
+exactly the property `__const` and `__cstring` have, and exactly not the
+property `__got` has, where position *is* the index. The literal sections were
+excluded by an omission, not a decision.
+
+```
+  placement, before   557/689 kept, 48 unchanged movers
+  placement, after    591/689 kept, 31 unchanged movers
+```
+
+### What is left, and why it is different
+
+Every remaining mover is `__eh_frame`, and that one is not an oversight.
+`__eh_frame` is a chain walked by the length each record begins with; a hole in
+it is a record header made of zeroes, and a binary with one links, runs, and
+dies at the first unwind. It cannot be hole-filled, so it cannot be retained by
+this allocator — retention *creates* holes the moment something ahead of it
+shrinks. Making its contributions keep their addresses needs the section
+rebuilt as a chain rather than allocated as space, which is a different
+mechanism and belongs with the unwind work.
+
+### The rule
+
+**A predicted cause and a measured one are not the same evidence, even when the
+prediction was good.** The liveness explanation came from a careful review of
+the architecture, it was written down before the code existed, and finding 97
+adopted it on sight because the number arrived exactly where it had been
+foretold. Fifteen lines of "print what moved and whether it fit" refuted it in
+one run.
+
+The counter earned its keep twice over: once by catching a failure the 77% hit
+rate had averaged away, and once by refusing the story told about it.

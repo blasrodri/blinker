@@ -24,6 +24,12 @@ fn key_of(input: &InputPlacement) -> ContributionKey {
     ContributionKey(u64::from(input.object.0) << 32 | u64::from(input.section.0))
 }
 
+/// These tests are about placement, not about dead-stripping: a contribution
+/// occupies what it declares, so it needs no room reserved beyond the slop.
+fn no_extra_room(_: &InputPlacement) -> u64 {
+    0
+}
+
 fn contribution(object: u32, name: &str, kind: SectionKind, size: u64) -> InputPlacement {
     InputPlacement {
         object: ObjectId(object),
@@ -79,6 +85,7 @@ fn a_neighbour_growing_does_not_move_anything_else() {
         Slop::DEFAULT,
         &previous,
         &key_of,
+        &no_extra_room,
     );
 
     for object in [0, 2, 3] {
@@ -122,6 +129,7 @@ fn one_that_outgrows_its_slot_moves_alone() {
         Slop::DEFAULT,
         &previous,
         &key_of,
+        &no_extra_room,
     );
 
     assert_ne!(
@@ -150,6 +158,7 @@ fn growth_inside_the_reservation_keeps_the_address() {
         Slop::DEFAULT,
         &previous,
         &key_of,
+        &no_extra_room,
     );
 
     for object in 0..4 {
@@ -181,7 +190,14 @@ fn a_removed_contribution_leaves_room_for_a_new_one() {
     inputs.remove(1);
     inputs.push(contribution(4, "__text", SectionKind::Code, 2000));
 
-    let second = compute_layout_reusing(&inputs, 0x1000, Slop::DEFAULT, &previous, &key_of);
+    let second = compute_layout_reusing(
+        &inputs,
+        0x1000,
+        Slop::DEFAULT,
+        &previous,
+        &key_of,
+        &no_extra_room,
+    );
 
     assert_eq!(
         address_of(&first, 1),
@@ -217,7 +233,14 @@ fn a_section_that_cannot_hold_holes_is_packed_from_the_start() {
     let previous = record(&first);
     let mut inputs = unwind([400, 800, 1200]);
     inputs.remove(1);
-    let second = compute_layout_reusing(&inputs, 0x1000, Slop::DEFAULT, &previous, &key_of);
+    let second = compute_layout_reusing(
+        &inputs,
+        0x1000,
+        Slop::DEFAULT,
+        &previous,
+        &key_of,
+        &no_extra_room,
+    );
 
     let section = second
         .sections
@@ -247,6 +270,7 @@ fn relaying_out_unchanged_inputs_reproduces_the_layout() {
         Slop::DEFAULT,
         &previous,
         &key_of,
+        &no_extra_room,
     );
     assert_eq!(
         first, second,
@@ -288,6 +312,7 @@ fn growth_from_liveness_moves_an_input_that_did_not_change() {
         Slop::DEFAULT,
         &previous,
         &key_of,
+        &no_extra_room,
     );
 
     assert_ne!(

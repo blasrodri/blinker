@@ -24,6 +24,15 @@
 /// never derived here. See [`ImageBuilder::reusing_layout`].
 pub type PlacementKeys = std::collections::HashMap<(u32, u32), ContributionKey>;
 
+/// How much room each contribution needs reserved, by `(object, section)`.
+///
+/// Separate from the size in [`InputPlacement`], which is what the
+/// contribution *occupies*. Under dead-stripping an object's occupied size is
+/// decided by what reaches it, so it can grow next link without its file
+/// changing; reserving against its full size is what keeps that from moving an
+/// input nobody edited.
+pub type PlacementReservations = std::collections::HashMap<(u32, u32), u64>;
+
 use blinker_layout::{
     align_up, compute_layout_reusing, compute_layout_with_slop, ContributionKey, InputPlacement,
     Layout, PreviousLayout, Slop, PAGE_SIZE,
@@ -84,6 +93,7 @@ pub struct ImageBuilder {
     /// it. Both or neither: a table without keys cannot be matched against
     /// anything, and keys without a table have nothing to match.
     previous: Option<(PreviousLayout, PlacementKeys)>,
+    reservations: PlacementReservations,
     /// Whether to compute the ad-hoc signature. See [`ImageBuilder::unsigned`].
     sign: bool,
     /// The identifier embedded in the ad-hoc signature.
@@ -168,6 +178,7 @@ impl ImageBuilder {
         ImageBuilder {
             slop: Slop::NONE,
             previous: None,
+            reservations: PlacementReservations::new(),
             sign: true,
             inputs: Vec::new(),
             contents: Vec::new(),
@@ -264,6 +275,12 @@ impl ImageBuilder {
         self
     }
 
+    /// Room to reserve per contribution, over and above what it occupies.
+    pub fn reserving(&mut self, reservations: PlacementReservations) -> &mut Self {
+        self.reservations = reservations;
+        self
+    }
+
     pub fn slop(&mut self, slop: Slop) -> &mut Self {
         self.slop = slop;
         self
@@ -279,13 +296,23 @@ impl ImageBuilder {
     pub fn build(mut self) -> Result<Image, ImageError> {
         // Pass one: discover the shape with a nominal reservation.
         let lay_out = |reservation: u64| match &self.previous {
-            Some((previous, keys)) => {
-                compute_layout_reusing(&self.inputs, reservation, self.slop, previous, &|input| {
+            Some((previous, keys)) => compute_layout_reusing(
+                &self.inputs,
+                reservation,
+                self.slop,
+                previous,
+                &|input| {
                     keys.get(&(input.object.0, input.section.0))
                         .copied()
                         .unwrap_or(ContributionKey(0))
-                })
-            }
+                },
+                &|input| {
+                    self.reservations
+                        .get(&(input.object.0, input.section.0))
+                        .copied()
+                        .unwrap_or(0)
+                },
+            ),
             None => compute_layout_with_slop(&self.inputs, reservation, self.slop),
         };
 

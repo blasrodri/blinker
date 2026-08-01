@@ -464,9 +464,14 @@ pub fn compute_layout_with_slop(
     header_reservation: u64,
     slop: Slop,
 ) -> Layout {
-    compute(inputs, header_reservation, slop, None, &|_| {
-        ContributionKey(0)
-    })
+    compute(
+        inputs,
+        header_reservation,
+        slop,
+        None,
+        &|_| ContributionKey(0),
+        &|input| slop.slot_for(input.size),
+    )
 }
 
 /// Lay out an edit on top of the layout a previous link produced.
@@ -493,8 +498,16 @@ pub fn compute_layout_reusing(
     slop: Slop,
     previous: &PreviousLayout,
     key_of: &dyn Fn(&InputPlacement) -> ContributionKey,
+    reserve_of: &dyn Fn(&InputPlacement) -> u64,
 ) -> Layout {
-    compute(inputs, header_reservation, slop, Some(previous), key_of)
+    compute(
+        inputs,
+        header_reservation,
+        slop,
+        Some(previous),
+        key_of,
+        reserve_of,
+    )
 }
 
 fn compute(
@@ -503,6 +516,13 @@ fn compute(
     slop: Slop,
     previous: Option<&PreviousLayout>,
     key_of: &dyn Fn(&InputPlacement) -> ContributionKey,
+    // How much room a contribution needs *reserved*, as against how much it
+    // currently occupies. The two differ under dead-stripping: what survives
+    // is a property of what reaches it, so an object nobody edited can keep
+    // more of itself next link and outgrow a slot sized from this one
+    // (finding 97). Reserving against what it could become is what stops that
+    // from moving an input that did not change.
+    reserve_of: &dyn Fn(&InputPlacement) -> u64,
 ) -> Layout {
     // Group inputs by output section, preserving input order within each group
     // so the layout is deterministic and reproducible.
@@ -581,7 +601,18 @@ fn compute(
                     Some(offset) => *offset,
                     // A new or outgrown contribution takes a reservation, not
                     // just its size, so that *its* next edit can stay put too.
-                    None => space.take(slop.slot_for(member.size), member_alignment),
+                    None => {
+                        // `slop` was already narrowed to NONE for a section
+                        // that cannot hold a gap; the reservation has to obey
+                        // the same rule, or it reintroduces one by the back
+                        // door. A padded `__eh_frame` links, runs, and dies at
+                        // the first unwind.
+                        let room = match slop.floor {
+                            0 => member.size,
+                            _ => reserve_of(member).max(slop.slot_for(member.size)),
+                        };
+                        space.take(room, member_alignment)
+                    }
                 };
                 contributions.push(Contribution {
                     object: member.object,
@@ -674,7 +705,25 @@ fn compute(
 fn may_be_padded(name: &str) -> bool {
     matches!(
         name,
-        "__text" | "__const" | "__cstring" | "__gcc_except_tab" | "__data" | "__bss"
+        "__text"
+            | "__const"
+            | "__cstring"
+            | "__gcc_except_tab"
+            | "__data"
+            | "__bss"
+            // Literal pools. Every reference to one is a relocation naming an
+            // address, so a gap between literals is never read and never
+            // walked — the same property `__const` and `__cstring` have, and
+            // not the property `__got` has, where position *is* the index.
+            //
+            // They were left out because this list was written to answer "may
+            // this section carry padding", and it is now also answering "may a
+            // contribution here keep its address". Under that second question
+            // the omission cost 36 of 129 moved contributions belonging to
+            // files that had not changed.
+            | "__literal8"
+            | "__literal16"
+            | "__literal4"
     )
 }
 

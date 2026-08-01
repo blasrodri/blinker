@@ -1517,6 +1517,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
         .as_ref()
         .map(|cache| cache.inputs.clone())
         .unwrap_or_default();
+    let reservations = request.cache_path.as_ref().map(|_| full_sizes(&objects));
     let previous_layout = previous_cache
         .as_ref()
         .filter(|cache| cache.request == request_hash(request))
@@ -1528,6 +1529,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
         &Assembly {
             placements: &placements,
             previous: previous_layout.as_ref(),
+            reservations: reservations.as_ref(),
             ..Assembly::default()
         },
     )?;
@@ -1667,6 +1669,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
             entry_offset,
             final_pass: true,
             previous: previous_layout.as_ref(),
+            reservations: reservations.as_ref(),
         },
     );
     timings.emit_ms = elapsed_ms(step);
@@ -2753,11 +2756,32 @@ struct Assembly<'a> {
     /// commands, and sizing them against a layout the real pass will not
     /// produce is how a reservation comes to be wrong.
     previous: Option<&'a (blinker_layout::PreviousLayout, PlacementKeys)>,
+    /// Room to reserve per contribution. See [`full_sizes`].
+    reservations: Option<&'a blinker_output::PlacementReservations>,
 }
 
 /// Contribution identities in the form the output crate accepts: a plain map,
 /// because that crate must not be able to reach an `ObjectId` through it.
 type PlacementKeys = std::collections::HashMap<(u32, u32), blinker_layout::ContributionKey>;
+
+/// Room to reserve per contribution: its size *before* dead-stripping.
+///
+/// A contribution occupies what survived stripping, and what survives is
+/// decided by what reaches it — so an object whose file nobody touched can
+/// keep more of itself on the next link and outgrow a slot sized from this
+/// one. Reserving against the unstripped size is what stops that from moving
+/// an input that did not change (finding 97). It costs image size in
+/// proportion to what stripping removes, which is why it is reserved and not
+/// occupied: the bytes are never written, only skipped over.
+fn full_sizes(objects: &[LoadedObject]) -> blinker_output::PlacementReservations {
+    let mut sizes = blinker_output::PlacementReservations::new();
+    for object in objects {
+        for section in &object.parsed.sections {
+            sizes.insert((object.parsed.id.0, section.id.0), section.size);
+        }
+    }
+    sizes
+}
 
 fn assemble(request: &LinkRequest, assembly: &Assembly<'_>) -> Result<Image, LinkError> {
     let Assembly {
@@ -2769,6 +2793,7 @@ fn assemble(request: &LinkRequest, assembly: &Assembly<'_>) -> Result<Image, Lin
         entry_offset,
         final_pass: _,
         previous: _,
+        reservations: _,
     } = *assembly;
     let mut builder = ImageBuilder::new();
     if !assembly.final_pass {
@@ -2781,6 +2806,9 @@ fn assemble(request: &LinkRequest, assembly: &Assembly<'_>) -> Result<Image, Lin
     // next link to help, so it pays nothing.
     if let Some((previous, keys)) = assembly.previous {
         builder.reusing_layout(previous.clone(), keys.clone());
+        if let Some(reservations) = assembly.reservations {
+            builder.reserving(reservations.clone());
+        }
     }
     if request.stable_layout {
         builder.slop(blinker_layout::Slop::DEFAULT);
