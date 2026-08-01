@@ -91,6 +91,10 @@ pub struct PhaseTimings {
     pub link_prepare_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link_accounting_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_address_table_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_address_diff_ms: Option<f64>,
     pub link_relocate_ms: Option<f64>,
     pub link_emit_ms: Option<f64>,
     /// What the cache cost, as against what it saved.
@@ -152,6 +156,10 @@ pub struct LinkStages {
     /// Work that belonged to no stage: preparation, and the invariant counter.
     pub prepare: f64,
     pub accounting: f64,
+    pub address_table: f64,
+    pub address_diff: f64,
+    pub changed_addresses: u64,
+    pub total_addresses: u64,
     /// Output symbols and the debug map.
     pub symbols: f64,
     /// Surveying relocations for indirect slots.
@@ -219,6 +227,12 @@ pub struct Counters {
     /// What a resident linker reused: inputs served from memory, inputs it had
     /// to read, and whether the two derived answers still held.
     pub inputs_held: Option<u64>,
+    /// Addresses this link changed, and how many there are. The size of the
+    /// blast radius in the units relocation cares about.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changed_addresses: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_addresses: Option<u64>,
     pub inputs_read: Option<u64>,
     pub replayed_extraction: Option<bool>,
     pub held_resolution: Option<bool>,
@@ -269,6 +283,22 @@ pub struct LinkRecord {
 impl LinkRecord {
     /// Start a record for a delegated (M0) link.
     pub fn delegated() -> Self {
+        // A seam for `scripts/relink.py`; the constant below is what it edits.
+        //
+        // It exists because there is no other way to write a *body* edit in
+        // Rust from outside the source. Appending an item — even a private one
+        // — repartitions the crate's codegen units, and rustc then renames
+        // symbols wholesale: an appended private function measured 8498 of 6877
+        // addresses changed, against 252 for adding a `pub fn`. An appended
+        // dead item measured the opposite failure, 0 of 6842, because
+        // dead-strip removed it again.
+        //
+        // Changing a literal inside a function that already exists adds no
+        // item, moves no partition, and renames nothing. That is the edit a
+        // developer makes, and this is the only shape of it a script can
+        // produce. `delegated` is on every invocation's path, so the code is
+        // live and dead-strip keeps it.
+        std::hint::black_box(relink_seam(0x0000_0000_0000_0000));
         LinkRecord {
             schema_version: schema::VERSION,
             mode: LinkMode::Delegated,
@@ -316,6 +346,10 @@ impl LinkRecord {
             strip_breakdown,
             prepare,
             accounting,
+            address_table,
+            address_diff,
+            changed_addresses,
+            total_addresses,
         } = stages;
         self.timings.internal_link_ms = Some(as_ms(total));
         self.timings.link_read_and_parse_ms = Some(read_and_parse);
@@ -334,6 +368,12 @@ impl LinkRecord {
             self.timings.link_emit_sign_ms = Some(emit_breakdown[5]);
         }
         self.timings.link_prepare_ms = (prepare > 0.0).then_some(prepare);
+        self.timings.link_address_table_ms = (address_table > 0.0).then_some(address_table);
+        self.timings.link_address_diff_ms = (address_diff > 0.0).then_some(address_diff);
+        if total_addresses > 0 {
+            self.counters.changed_addresses = Some(changed_addresses);
+            self.counters.total_addresses = Some(total_addresses);
+        }
         self.timings.link_accounting_ms = (accounting > 0.0).then_some(accounting);
         if strip_breakdown.iter().any(|v| *v > 0.0) {
             self.timings.link_atoms_ms = Some(strip_breakdown[0]);
@@ -463,6 +503,8 @@ impl LinkRecord {
             ("  strip-build", self.timings.link_strip_build_ms),
             ("prepare", self.timings.link_prepare_ms),
             ("accounting", self.timings.link_accounting_ms),
+            ("address-table", self.timings.link_address_table_ms),
+            ("address-diff", self.timings.link_address_diff_ms),
             ("layout", self.timings.link_layout_ms),
             ("relocate", self.timings.link_relocate_ms),
             ("emit+sign", self.timings.link_emit_ms),
@@ -704,4 +746,19 @@ mod reuse_tests {
         assert!(parse(&record)["counters"]["reused_inputs"].is_null());
         assert!(!record.to_summary().contains("reused"));
     }
+}
+
+/// The body `scripts/relink.py` edits; see `LinkRecord::delegated`.
+///
+/// Deliberately arithmetic with no purpose: it must compile to real
+/// instructions, be reachable, and mean nothing, so that perturbing it changes
+/// the program's bytes and not its behaviour.
+#[doc(hidden)]
+#[inline(never)]
+pub fn relink_seam(value: u64) -> u64 {
+    let mut x = value ^ 0x9e37_79b9_7f4a_7c15;
+    for i in 0..3u64 {
+        x = x.wrapping_mul(0x2545_f491_4f6c_dd1d).rotate_left(17) ^ i;
+    }
+    x
 }

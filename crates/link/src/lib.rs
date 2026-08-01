@@ -144,6 +144,15 @@ pub struct LinkTimings {
     pub cache_load_ms: f64,
     /// Whether the previous cache came from this process rather than from disk.
     pub cache_held: bool,
+    /// Building the symbol-address table, and diffing it against the previous
+    /// link's. This is the precondition for skipping relocation work, so it is
+    /// measured before anything is built on top of it: if deciding what to skip
+    /// costs what doing it costs, there is nothing here.
+    pub address_table_ms: f64,
+    pub address_diff_ms: f64,
+    /// How many addresses this link changed, out of how many there are.
+    pub changed_addresses: u64,
+    pub total_addresses: u64,
     pub cache_plan_ms: f64,
     pub cache_build_ms: f64,
     pub cache_store_ms: f64,
@@ -1760,13 +1769,30 @@ fn link_inner(
     // The addresses this link produced, in the form the cache compares. Built
     // before relocation because it is what decides which objects can skip it —
     // and not built at all when nothing will ask.
-    let current_addresses = request.cache_path.as_ref().map(|_| {
-        if reuse_relocations {
-            address_table(&addresses, &got_slots, &stub_slots, &tlv_slots)
-        } else {
-            Vec::new()
+    let table_step = std::time::Instant::now();
+    let current_addresses = request
+        .cache_path
+        .as_ref()
+        .map(|_| address_table(&addresses, &got_slots, &stub_slots, &tlv_slots));
+    timings.address_table_ms = elapsed_ms(table_step);
+
+    // How much of the program's addressing actually moved. Not used to decide
+    // anything yet — measured first, because "skip the objects that read no
+    // changed address" is only worth building if finding out which those are is
+    // cheaper than relocating them.
+    let diff_step = std::time::Instant::now();
+    if let (Some(previous), Some(current)) = (previous_cache.as_ref(), current_addresses.as_ref()) {
+        if !previous.addresses.is_empty() {
+            let changed = blinker_cache::LinkCache {
+                addresses: current.clone(),
+                ..blinker_cache::LinkCache::default()
+            }
+            .changed_addresses(previous);
+            timings.changed_addresses = changed.len() as u64;
+            timings.total_addresses = current.len() as u64;
         }
-    });
+    }
+    timings.address_diff_ms = elapsed_ms(diff_step);
 
     let previous = previous_cache.filter(|_| reuse_relocations);
 

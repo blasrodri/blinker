@@ -5387,3 +5387,81 @@ There is no big item left, which is the point: every remaining stage recomputes
 a global answer that barely changed. `relocate` applies 87,545 relocations to
 produce an output in which 1060 of 1063 contributions sit where they already
 sat. That is the next thing, and it is the last structural one.
+
+## 111. Appending an item to a Rust file is not a body edit
+
+`scripts/relink.py --body-only` claimed to measure the ordinary developer
+change: edit a function, relink. It appended a private function to a source
+file. Three variants were tried, and the address blast radius each produced —
+how many of the link's symbol addresses moved — says they are three different
+experiments, none of them the intended one:
+
+```
+  appended `#[allow(dead_code)] fn`         0 of 6842 changed   (0.00%)
+  appended `pub fn`                       252 of 6877 changed   (3.66%)
+  appended `#[used]`-kept private fn     8498 of 6877 changed   (123%)
+```
+
+The first is deleted again by dead-strip, so the edit never reaches the output:
+the harness was timing an edit that does nothing. The third is the opposite —
+adding an item repartitions rustc's codegen units, and symbols get renamed
+across the whole crate, an edit *larger* than adding a public function. (Over
+100% because the old and new name sets barely overlap.)
+
+**Appending an item to a Rust file is not a body edit, whatever the item is.**
+A body edit modifies code that already exists, adds no item, moves no codegen
+unit boundary, and renames nothing.
+
+There is no way to write one from outside the source, so the source now
+contains a seam: `blinker_diagnostics::relink_seam`, a live function on every
+invocation's path, whose one literal the harness rewrites. That measures:
+
+```
+  literal changed inside an existing function   24 of 6879 changed   (0.35%)
+```
+
+**0.35%.** That is the real shape of the problem an incremental linker is for,
+and it is an order of magnitude smaller than the best previous estimate.
+
+## 112. An ordinary edit renames a fifth of a crate's global symbols, and none of them matter
+
+With the fixture fixed, the true body edit was *slower* than the fake one:
+`read_and_parse` 1.27 ms to 5.60, extraction recomputed, resolution redone. The
+session refused to replay because both changed rlibs reported a changed symbol
+interface — on an edit that changes one integer literal.
+
+Diffing the two rlibs says why. 29 of 134 global symbols differ, and all 29 look
+like this:
+
+```
+  _anon.ed7a2420ca2a47dccd3066b2a97f7049.4.llvm.16877640159684202088
+```
+
+LLVM promotes an internal constant that needs an address to a module-level
+symbol and gives it a name nobody chose. The trailing component is a hash of
+*the module*, so changing one line renames every one of them.
+
+No other crate can reference such a name — it is unpredictable by construction —
+so renaming them cannot change which archive member satisfies anybody's
+reference. They are excluded from the interface digest and from the archive
+symbol-table comparison, for the same reason local symbols already were: they
+are invisible to the extraction frontier, and they are exactly what an ordinary
+edit churns.
+
+```
+                       before   after
+  read_and_parse       5.60 ms   1.27 ms
+  extraction          recomputed  replayed
+  resolution          redone      held
+  link                25.8 ms    19.6 ms
+```
+
+### The rule
+
+Both of this session's two largest wins came from the same place: a *name* that
+changes for reasons that have nothing to do with meaning. Finding 106 was
+codegen-unit ordering; this is LLVM's module hash. An incremental linker is a
+machine for deciding what changed, and it is only as good as its notion of
+sameness — which means every identity it compares has to be checked against the
+question being asked, not against byte equality. Byte equality is always
+available and it is almost always the wrong test.

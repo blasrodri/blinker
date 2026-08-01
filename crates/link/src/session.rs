@@ -311,15 +311,15 @@ impl Session {
         // that had re-read eleven archives, back when neither input was
         // checked. Nothing failed, because none of the eleven had changed a
         // symbol — the bug was invisible, waiting for the edit that added one.
-        if self.indexes.get(path) != Some(&index.symbol_map) {
+        let symbol_map = external_symbol_map(&index.symbol_map);
+        if self.indexes.get(path) != Some(&symbol_map) {
             self.interfaces_changed = true;
             self.interface_changes += 1;
             if self.first_interface_change.is_none() {
                 self.first_interface_change = Some(path.to_path_buf());
             }
         }
-        self.indexes
-            .insert(path.to_path_buf(), index.symbol_map.clone());
+        self.indexes.insert(path.to_path_buf(), symbol_map);
         self.entries.insert(
             path.to_path_buf(),
             (key, Entry::Archive(index.clone(), Arc::clone(data))),
@@ -486,6 +486,45 @@ fn member_path(archive: &Path, member: u32) -> PathBuf {
 /// Names only. Addresses, sizes, section contents and relocations are all
 /// invisible here by design: they are what an edit changes, and none of them
 /// can change which archive member defines a name.
+/// Whether a name is one LLVM invented and made unique per module.
+///
+/// LLVM promotes an internal constant that must be addressable to a module-level
+/// symbol, and gives it a name nobody chose:
+/// `_anon.ed7a2420ca2a47dccd3066b2a97f7049.4.llvm.16877640159684202088`. The
+/// trailing component is a hash of *the module*, so editing one line of one
+/// function renames every such symbol in the crate.
+///
+/// This is why an ordinary body edit looked like an interface change. Editing a
+/// single literal in `blinker-diagnostics` renamed 29 of the rlib's 134 global
+/// symbols — none of which any other crate could name, because the names are
+/// unpredictable by construction. The extraction frontier was refusing to
+/// replay because a set of symbols changed that no consumer outside the crate
+/// can reference.
+///
+/// The exclusion is sound for the same reason the local exclusion above is:
+/// nothing outside this object's own crate can refer to one, so renaming them
+/// cannot change which archive member satisfies anybody's reference. The
+/// definition and every reference to it live in the same rlib and are recompiled
+/// together, so they are renamed consistently or not at all.
+fn is_module_unique(name: &str) -> bool {
+    name.contains(".llvm.")
+}
+
+/// An archive's symbol table, less the names only its own crate can use.
+///
+/// What the frontier asks an archive is "which member defines this name", and
+/// it only ever asks about names some *other* input left undefined. A
+/// module-unique name can have no such reference, so its entry is noise that
+/// changes on every edit. See `is_module_unique`.
+fn external_symbol_map(
+    map: &[(String, blinker_archive::MemberId)],
+) -> Vec<(String, blinker_archive::MemberId)> {
+    map.iter()
+        .filter(|(name, _)| !is_module_unique(name))
+        .cloned()
+        .collect()
+}
+
 fn interface_digest(parsed: &ParsedObject) -> u64 {
     use std::hash::{Hash, Hasher};
     // Order-independent, because a re-parse may list symbols in a different
@@ -500,6 +539,10 @@ fn interface_digest(parsed: &ParsedObject) -> u64 {
         // Counting them made every edit look like an interface change, which
         // is correct and answers a different question than the one being asked.
         if symbol.visibility == blinker_macho::SymbolVisibility::Local {
+            continue;
+        }
+        // And names LLVM made unique per module; see `is_module_unique`.
+        if is_module_unique(&symbol.name) {
             continue;
         }
         let mut hasher = crate::hashing::FastHasher::default();

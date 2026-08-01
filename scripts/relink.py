@@ -67,19 +67,41 @@ pub fn blinker_relink_touch() -> u64 {
 }
 """
 
-# A body-only edit: a *private* function, so nothing the crate exports changes.
-# This is the ordinary developer change — an implementation detail — and the
-# one the session's interface rule is for. `pub` and non-`pub` are two
-# different experiments and the difference is not cosmetic: adding an exported
-# name changes the archive's symbol table, and no amount of held state can know
-# the extraction order still holds.
-TOUCH_PRIVATE = """
-#[allow(dead_code)]
-#[inline(never)]
-fn blinker_relink_touch_private() -> u64 {
-    0x9e37_79b9_7f4a_7c15
-}
-"""
+# A body-only edit: the constant inside an existing, live function.
+#
+# Two earlier versions of this were both wrong, in opposite directions, and both
+# looked plausible:
+#
+#   appended `#[allow(dead_code)] fn`      0 of 6842 addresses changed
+#   appended `#[used]`-kept private fn  8498 of 6877 addresses changed
+#   appended `pub fn` (TOUCH, above)     252 of 6877 addresses changed
+#
+# The first was deleted again by dead-strip, so the edit never reached the
+# output. The second repartitioned rustc's codegen units, which renames symbols
+# across the whole crate — an edit far *larger* than adding a public function.
+# Appending an item to a Rust file is not a body edit, whatever the item is.
+#
+# So this edits a body in place: `blinker_diagnostics::relink_seam` exists in
+# the source for exactly this purpose, and what changes is one literal inside
+# it. No item is added, no partition moves, no symbol is renamed.
+SEAM = "std::hint::black_box(relink_seam("
+SEAM_FILE = "crates/diagnostics/src/lib.rs"
+
+
+def body_edit(project):
+    """Rewrite the seam constant, returning (path, original bytes, edited bytes)."""
+    path = project / SEAM_FILE
+    text = path.read_text()
+    at = text.find(SEAM)
+    if at < 0:
+        fail(f"{SEAM_FILE} has no relink seam — see LinkRecord::delegated")
+    start = at + len(SEAM)
+    end = text.index(")", start)
+    edited = text[:start] + "0x0000_0000_0000_0001" + text[end:]
+    if edited == text:
+        fail("the seam was already edited; the pair would measure nothing")
+    return path, text, edited
+
 
 
 def fail(message):
@@ -143,15 +165,21 @@ def capture_pair(options, project, source, profile, descriptor):
     pairs the edit against a different program.
     """
     edited = Path(options.out) / f"{options.workload}-edited"
-    original = source.read_bytes()
-    print(f"  capturing the pair: {source.relative_to(project)}, unedited then edited")
+    if options.body_only:
+        # In place, in the seam: see the comment above `SEAM`.
+        target, before, after = body_edit(project)
+        what = f"{target.relative_to(project)} (seam)"
+    else:
+        target, before = source, source.read_text()
+        after = before + TOUCH
+        what = str(source.relative_to(project))
+    print(f"  capturing the pair: {what}, unedited then edited")
     capture(options.workload, project, profile, options.out)
     try:
-        touch = TOUCH_PRIVATE if options.body_only else TOUCH
-        source.write_bytes(original + touch.encode())
+        target.write_text(after)
         capture(edited.name, project, profile, options.out)
     finally:
-        source.write_bytes(original)
+        target.write_text(before)
     (edited / "pair.json").write_text(json.dumps(descriptor, indent=2) + "\n")
     return edited
 
@@ -329,7 +357,7 @@ def main():
                   "address_map", "contents", "synthetic", "apply"}
     for name in ["read_and_parse", "stub_parse", "resolve", "layout", "dead_strip",
                  "atoms", "liveness", "strip_build",
-                 "prepare", "accounting", "relocate", "emit", "emit_layout", "emit_contents",
+                 "prepare", "accounting", "address_table", "address_diff", "relocate", "emit", "emit_layout", "emit_contents",
                  "emit_linkedit", "emit_assemble", "emit_uuid", "emit_sign",
                  "address_map", "contents", "synthetic", "apply", "symbols", "survey",
                  "cache_load", "cache_plan",
@@ -374,6 +402,12 @@ def main():
             import os as _os
             first = counters.get("first_interface_change") or ""
             print(f"           {changes} interface(s) moved, first: {_os.path.basename(first)}")
+
+    changed_addr = counters.get("changed_addresses")
+    if changed_addr is not None:
+        total_addr = counters.get("total_addresses") or 1
+        print(f"  addresses: {changed_addr}/{total_addr} changed"
+              f" ({changed_addr / total_addr * 100:.2f}%)")
 
     reused = counters.get("reused_inputs")
     if reused is not None:
