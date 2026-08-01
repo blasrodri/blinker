@@ -205,6 +205,7 @@ pub fn run_in(
                 resolve: phases.resolve_ms,
                 layout: phases.layout_probe_ms,
                 dead_strip: phases.dead_strip_ms,
+                strip_breakdown: [phases.atoms_ms, phases.liveness_ms, phases.strip_build_ms],
                 relocate: phases.relocate_ms,
                 emit: phases.emit_ms,
                 stub_parse: phases.stub_parse_ms,

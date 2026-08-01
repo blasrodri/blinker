@@ -832,12 +832,37 @@ impl Strip {
     }
 }
 
+/// How the three halves of dead-stripping divide its cost.
+///
+/// They are not equally incremental and the difference decides what is worth
+/// building. `Atoms::build` reads one object at a time and reads nothing else,
+/// so a session that holds the object can hold its atoms; `liveness` is a
+/// traversal of the whole graph and cannot be split that way. Measuring them
+/// separately is how that choice gets made on evidence instead of on which one
+/// sounds heavier.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct StripTimings {
+    pub atoms_ms: f64,
+    pub liveness_ms: f64,
+    pub build_ms: f64,
+}
+
 /// Decide what a link keeps.
-pub(crate) fn plan(objects: &[LoadedObject], entry: &str) -> (Strip, Report) {
+pub(crate) fn plan(objects: &[LoadedObject], entry: &str) -> (Strip, Report, StripTimings) {
+    let mut timings = StripTimings::default();
+    let step = std::time::Instant::now();
     let atoms = Atoms::build(objects);
+    timings.atoms_ms = step.elapsed().as_secs_f64() * 1000.0;
+
+    let step = std::time::Instant::now();
     let (live, revived) = liveness(objects, &atoms, entry);
+    timings.liveness_ms = step.elapsed().as_secs_f64() * 1000.0;
+
+    let step = std::time::Instant::now();
     let strip = Strip::build(objects, &atoms, &live);
-    (strip, report(objects, &atoms, &live, revived))
+    timings.build_ms = step.elapsed().as_secs_f64() * 1000.0;
+
+    (strip, report(objects, &atoms, &live, revived), timings)
 }
 
 /// Report what analysis alone can say, without changing any output.

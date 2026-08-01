@@ -110,6 +110,12 @@ pub struct LinkTimings {
     /// Time spent deciding what the program can reach. Zero without
     /// `-dead_strip`.
     pub dead_strip_ms: f64,
+    /// Splitting the strip into its three halves, which are incremental to very
+    /// different degrees — see `reachability::StripTimings`. All three are
+    /// inside `dead_strip_ms`.
+    pub atoms_ms: f64,
+    pub liveness_ms: f64,
+    pub strip_build_ms: f64,
     /// `__text` bytes the strip removed, as the analysis counts them.
     pub stripped_bytes: u64,
     /// Atoms the propagation left dead that something live then referred to.
@@ -1447,12 +1453,19 @@ fn link_inner(
     // Decided before anything is placed, because it changes how big every
     // contribution is. Everything downstream asks it where an input byte went.
     let step = std::time::Instant::now();
-    let (strip, report) = if request.dead_strip {
+    let (strip, report, strip_timings) = if request.dead_strip {
         reachability::plan(&objects, &request.entry_symbol)
     } else {
-        (Strip::none(), reachability::Report::default())
+        (
+            Strip::none(),
+            reachability::Report::default(),
+            reachability::StripTimings::default(),
+        )
     };
     timings.dead_strip_ms = elapsed_ms(step);
+    timings.atoms_ms = strip_timings.atoms_ms;
+    timings.liveness_ms = strip_timings.liveness_ms;
+    timings.strip_build_ms = strip_timings.build_ms;
     timings.stripped_bytes = report.dead_bytes();
     timings.revived_atoms = report.revived as u64;
 

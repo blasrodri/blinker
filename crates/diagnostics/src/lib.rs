@@ -79,6 +79,13 @@ pub struct PhaseTimings {
     /// record showed five stages summing to well under the link's own total
     /// and nothing saying where the rest went.
     pub link_dead_strip_ms: Option<f64>,
+    /// The three halves of the strip, all inside `link_dead_strip_ms`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_atoms_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_liveness_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_strip_build_ms: Option<f64>,
     pub link_relocate_ms: Option<f64>,
     pub link_emit_ms: Option<f64>,
     /// What the cache cost, as against what it saved.
@@ -135,6 +142,8 @@ pub struct LinkStages {
     pub emit_breakdown: [f64; 6],
     /// Inside `relocate`, in order: address map, contents, synthetic, apply.
     pub relocate_breakdown: [f64; 4],
+    /// Inside `dead_strip`, in order: atoms, liveness, strip build.
+    pub strip_breakdown: [f64; 3],
     /// Output symbols and the debug map.
     pub symbols: f64,
     /// Surveying relocations for indirect slots.
@@ -296,6 +305,7 @@ impl LinkRecord {
             relocate_breakdown,
             symbols,
             survey,
+            strip_breakdown,
         } = stages;
         self.timings.internal_link_ms = Some(as_ms(total));
         self.timings.link_read_and_parse_ms = Some(read_and_parse);
@@ -312,6 +322,11 @@ impl LinkRecord {
             self.timings.link_emit_assemble_ms = Some(emit_breakdown[3]);
             self.timings.link_emit_uuid_ms = Some(emit_breakdown[4]);
             self.timings.link_emit_sign_ms = Some(emit_breakdown[5]);
+        }
+        if strip_breakdown.iter().any(|v| *v > 0.0) {
+            self.timings.link_atoms_ms = Some(strip_breakdown[0]);
+            self.timings.link_liveness_ms = Some(strip_breakdown[1]);
+            self.timings.link_strip_build_ms = Some(strip_breakdown[2]);
         }
         if relocate_breakdown.iter().any(|v| *v > 0.0) {
             self.timings.link_address_map_ms = Some(relocate_breakdown[0]);
@@ -431,6 +446,9 @@ impl LinkRecord {
             ("read+parse", self.timings.link_read_and_parse_ms),
             ("resolve", self.timings.link_resolve_ms),
             ("dead-strip", self.timings.link_dead_strip_ms),
+            ("  atoms", self.timings.link_atoms_ms),
+            ("  liveness", self.timings.link_liveness_ms),
+            ("  strip-build", self.timings.link_strip_build_ms),
             ("layout", self.timings.link_layout_ms),
             ("relocate", self.timings.link_relocate_ms),
             ("emit+sign", self.timings.link_emit_ms),
