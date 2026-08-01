@@ -67,7 +67,13 @@ impl ContributionKeys {
     pub(crate) fn build(objects: &[LoadedObject]) -> ContributionKeys {
         let mut keys = FastMap::default();
         for object in objects {
-            let input = input_identity(&object.parsed.metadata);
+            // The path this link read it from, not the one baked into a shared
+            // parse. Content reuse (finding 145) hands the same parse back
+            // under a new name, and taking the name from the parse would make
+            // a contribution's identity depend on whether the session happened
+            // to be holding it — so a warm link and a cold one would disagree
+            // about what the same bytes are called.
+            let input = input_identity(object.path.as_ref(), &object.parsed.metadata);
             for (ordinal, section) in numbered_sections(&object.parsed) {
                 keys.insert(
                     (object.parsed.id.0, section.id.0),
@@ -128,9 +134,9 @@ fn numbered_sections(
 /// An archive member is its archive's path *and* its member name: the path
 /// alone names an rlib holding two hundred objects, and keying on it would
 /// give every one of them the same identity.
-fn input_identity(metadata: &blinker_macho::ObjectMetadata) -> u64 {
+fn input_identity(path: &std::path::Path, metadata: &blinker_macho::ObjectMetadata) -> u64 {
     let mut hasher = FastHasher::default();
-    metadata.path.hash(&mut hasher);
+    path.hash(&mut hasher);
     match &metadata.member {
         Some(member) => {
             1u8.hash(&mut hasher);
@@ -196,7 +202,7 @@ mod tests {
     /// earlier version of this helper recomputed the hash itself, which would
     /// have kept passing had the real one changed underneath it.
     fn key(object: &ParsedObject, section: u32) -> ContributionKey {
-        let input = input_identity(&object.metadata);
+        let input = input_identity(&object.metadata.path.clone(), &object.metadata);
         let (ordinal, section) = numbered_sections(object)
             .find(|(_, s)| s.id.0 == section)
             .expect("the section exists");

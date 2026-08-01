@@ -177,6 +177,25 @@ pub struct Session {
     /// boundaries are: where a section divides into independently-strippable
     /// pieces depends on that object's symbols and relocations and on nothing
     /// else in the link.
+    /// Parses by the *content* of the file they came from.
+    ///
+    /// rustc renames every object of a recompiled crate on every debug build
+    /// while leaving the bytes identical — 132 of rust-analyzer's 341 inputs
+    /// (finding 144). Keyed by path, all of those are misses; keyed by
+    /// content, they are hits, and `InputKey::probe` already hashed them
+    /// because rustc's paths are not evidence of what is in them.
+    ///
+    /// Only whole objects. An `.rlib` path *is* content-addressed — it carries
+    /// a 16-hex-digit hash — so an archive that is renamed genuinely changed.
+    by_content: FastMap<[u8; 32], (Arc<ParsedObject>, Arc<Backing>)>,
+    /// Contents this link touched, so the next one can drop the rest.
+    ///
+    /// `by_content` cannot be pruned by the input *list*, because the whole
+    /// point is to survive a link whose paths all changed. It is pruned by
+    /// use instead — the same rule as `forget_unused_memos`, and for the same
+    /// reason: without it a resident linker's memory grows with every build
+    /// rather than with the program.
+    used_content: crate::hashing::FastSet<[u8; 32]>,
     memo: FastMap<usize, Memo>,
     /// Each object's reachability digest, as the last link computed it.
     ///
@@ -217,6 +236,8 @@ pub struct Session {
     stubs_reparsed: bool,
     hits: usize,
     misses: usize,
+    /// Inputs served by content after their path missed. See `by_content`.
+    content_hits: usize,
     /// What this link was able to reuse, for the record rather than for the
     /// linker. Every rule here is a claim about when an answer still holds,
     /// and a claim nobody can see the effect of is a claim nobody checks —
@@ -268,8 +289,13 @@ impl Session {
             self.imports = None;
             self.inputs = inputs.to_vec();
         }
+        // Contents the previous link never looked at are dropped now, so a
+        // parse survives exactly as long as something keeps linking it.
+        let used = std::mem::take(&mut self.used_content);
+        self.by_content.retain(|hash, _| used.contains(hash));
         self.hits = 0;
         self.misses = 0;
+        self.content_hits = 0;
         self.interfaces_changed = false;
         self.interface_changes = 0;
         self.first_interface_change = None;
@@ -301,10 +327,38 @@ impl Session {
 
     /// A parsed object for `path`, or `None` to parse it.
     pub fn object(&mut self, path: &Path) -> Option<(Arc<ParsedObject>, Arc<Backing>)> {
-        match self.current(path)? {
-            Entry::Object(parsed, backing) => Some((Arc::clone(parsed), Arc::clone(backing))),
-            Entry::Archive(..) => None,
+        if let Some((blinker_cache::InputKey::Content(hash), _)) = self.entries.get(path) {
+            let hash = *hash;
+            self.used_content.insert(hash);
         }
+        if let Some(entry) = self.current(path) {
+            return match entry {
+                Entry::Object(parsed, backing) => Some((Arc::clone(parsed), Arc::clone(backing))),
+                Entry::Archive(..) => None,
+            };
+        }
+        // Missed by path — which for one of rustc's objects means very little,
+        // because it renames them all on every build. `current` has just
+        // probed this file, and for a path that is not evidence that probe is
+        // a hash of its bytes, so asking the content index costs nothing more
+        // than the lookup.
+        let blinker_cache::InputKey::Content(hash) = blinker_cache::InputKey::probe(path)? else {
+            return None;
+        };
+        let (parsed, backing) = self.by_content.get(&hash)?;
+        let (parsed, backing) = (Arc::clone(parsed), Arc::clone(backing));
+        self.used_content.insert(hash);
+        // Filed under its new name too, so the next link finds it by path and
+        // the entry is dropped with the input list when it stops being linked.
+        self.entries.insert(
+            path.to_path_buf(),
+            (
+                blinker_cache::InputKey::Content(hash),
+                Entry::Object(Arc::clone(&parsed), Arc::clone(&backing)),
+            ),
+        );
+        self.content_hits += 1;
+        Some((parsed, backing))
     }
 
     /// An indexed archive for `path`, or `None` to index it.
@@ -338,6 +392,11 @@ impl Session {
             return;
         };
         self.note_interface(path, parsed);
+        if let blinker_cache::InputKey::Content(hash) = &key {
+            self.used_content.insert(*hash);
+            self.by_content
+                .insert(*hash, (Arc::clone(parsed), Arc::clone(data)));
+        }
         self.entries.insert(
             path.to_path_buf(),
             (key, Entry::Object(Arc::clone(parsed), Arc::clone(data))),
@@ -514,8 +573,19 @@ impl Session {
     }
 
     /// Inputs served from memory, and inputs that had to be read.
+    ///
+    /// A content hit was counted as a miss when its path was looked up, so it
+    /// moves across: it was served from memory, which is what this reports.
     pub fn counts(&self) -> (usize, usize) {
-        (self.hits, self.misses)
+        (
+            self.hits + self.content_hits,
+            self.misses.saturating_sub(self.content_hits),
+        )
+    }
+
+    /// Of those held, how many were found by content after their path missed.
+    pub fn content_hits(&self) -> usize {
+        self.content_hits
     }
 
     /// Whether the extraction order and the resolution were reused.
@@ -857,12 +927,65 @@ mod tests {
             "an input that is still in the list was discarded with the list"
         );
 
-        // What does not survive is the input that left it.
+        // What does not survive is the input that stops being linked. It
+        // takes two links to go: the content index is pruned by *use*, not by
+        // the input list, because surviving a link whose paths all changed is
+        // the whole reason it exists (finding 145). So one link that does not
+        // touch it marks it, and the next drops it.
+        session.begin(&[scratch.join("b.o")]);
         session.begin(&[scratch.join("b.o")]);
         assert!(
             session.object(&path).is_none(),
-            "an input that is no longer linked was kept"
+            "an input nothing has linked for two links was still held — the \
+             content index grows with every build rather than with the program"
         );
+    }
+
+    /// The property the content index exists for: the same bytes under a new
+    /// name are the same parse.
+    ///
+    /// rustc renames every object of a recompiled crate on every debug build,
+    /// so this is not an edge case — it is what the inner loop does.
+    #[test]
+    fn the_same_bytes_under_a_new_name_are_the_same_parse() {
+        let scratch = Scratch::dir("session-renamed-content").expect("scratch");
+        let first = scratch.join("a.0aaaaaa.rcgu.o");
+        let second = scratch.join("a.0bbbbbb.rcgu.o");
+        std::fs::write(&first, vec![7u8; 128]).expect("written");
+        std::fs::write(&second, vec![7u8; 128]).expect("same bytes, new name");
+
+        let mut session = Session::default();
+        session.begin(std::slice::from_ref(&first));
+        let backing = Arc::new(Backing::Heap(vec![7u8; 128]));
+        let parsed = Arc::new(ParsedObject {
+            id: blinker_macho::ObjectId(0),
+            architecture: blinker_macho::Architecture::Arm64,
+            subsections_via_symbols: true,
+            metadata: blinker_macho::ObjectMetadata {
+                path: first.clone(),
+                member: None,
+                file_size: 128,
+                has_debug_info: false,
+                has_unwind_info: false,
+            },
+            sections: Vec::new(),
+            symbols: Vec::new(),
+            relocations: Vec::new(),
+        });
+        session.store_object(&first, &parsed, &backing);
+
+        session.begin(std::slice::from_ref(&second));
+        let held = session.object(&second);
+        assert!(
+            held.is_some(),
+            "a renamed object with identical bytes was parsed again"
+        );
+        assert!(
+            Arc::ptr_eq(&held.expect("held").0, &parsed),
+            "it was served, but not as the same parse — the per-parse memo \
+             keys on the pointer, so a copy would miss every derived fact"
+        );
+        assert_eq!(session.content_hits(), 1);
     }
 
     #[test]

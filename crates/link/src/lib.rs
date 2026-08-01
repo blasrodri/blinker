@@ -41,6 +41,7 @@ use std::collections::BTreeSet;
 use hashing::{FastMap as HashMap, FastSet as HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use blinker_layout::InputPlacement;
 use blinker_macho::{
@@ -669,6 +670,16 @@ struct LoadedObject {
     /// `ParsedObject` after it is parsed, which is what makes that sound.
     parsed: std::sync::Arc<ParsedObject>,
     data: SourceBytes,
+    /// The file this link read it from.
+    ///
+    /// Not `parsed.metadata.path`, which is the path it was *first* parsed
+    /// from and is baked into the shared parse. Those differ exactly when the
+    /// same bytes arrive under a new name, which rustc does to every object of
+    /// a recompiled crate on every debug build (finding 144) — and reusing the
+    /// parse across that rename is the whole point of the content index.
+    /// Anything that names the file to a consumer — the debug map's `OSO`,
+    /// the cache's record of what it read — must use this one.
+    path: std::sync::Arc<Path>,
 }
 
 /// Sections that exist for the linker's benefit and must not reach the output.
@@ -2135,7 +2146,7 @@ fn link_inner(
             .collect();
         let source_of: HashMap<u32, &Path> = objects
             .iter()
-            .map(|o| (o.parsed.id.0, o.parsed.metadata.path.as_path()))
+            .map(|o| (o.parsed.id.0, o.path.as_ref()))
             .collect();
 
         for section in &image.layout.sections {
@@ -2284,7 +2295,7 @@ fn plan_reuse<'a>(
         let Some(entry) = by_placement.get(&(first.section, first.start)) else {
             continue;
         };
-        let path = object.parsed.metadata.path.as_path();
+        let path = object.path.as_ref();
         // From the session when it has one: it proved this input a moment ago,
         // and re-proving a rustc object means reading and hashing it again.
         let Some(key) = keys
@@ -2352,7 +2363,7 @@ fn build_cache(
         .iter()
         .filter_map(|record| {
             let object = index_of.get(record.object)?;
-            let path = object.parsed.metadata.path.as_path();
+            let path = object.path.as_ref();
             // From the session, for the same reason `plan_reuse` asks it: the
             // input was proven a moment ago and re-proving one of rustc's
             // objects means reading and hashing it again.
@@ -2950,6 +2961,7 @@ fn load_one(path: &Path, id: Option<ObjectId>) -> Result<Loaded, LinkError> {
             Ok(Loaded::Object(LoadedObject {
                 parsed: std::sync::Arc::new(parsed),
                 data: SourceBytes::whole(data),
+                path: Arc::from(path),
             }))
         }
     }
@@ -3001,6 +3013,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
                     Loaded::Object(LoadedObject {
                         parsed,
                         data: SourceBytes::whole_shared(&data),
+                        path: Arc::from(path.as_path()),
                     })
                 })
             }),
@@ -3099,6 +3112,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
                 Some((parsed, range)) if parsed.id == id => LoadedObject {
                     parsed,
                     data: SourceBytes::window(data, range),
+                    path: Arc::from(path.as_path()),
                 },
                 // A member the session lost — it can only have been dropped
                 // with its archive, and its archive cannot have changed, so
@@ -3174,6 +3188,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
             held[at] = Some(LoadedObject {
                 parsed,
                 data: SourceBytes::window(data, range),
+                path: Arc::from(path.as_path()),
             });
         }
         let todo: Vec<usize> = (0..round.len()).filter(|at| held[*at].is_none()).collect();
@@ -3324,6 +3339,7 @@ fn parse_member(
     Ok(LoadedObject {
         parsed: std::sync::Arc::new(parsed),
         data: SourceBytes::window(data, start..start + bytes.len()),
+        path: Arc::from(path),
     })
 }
 
@@ -3723,7 +3739,9 @@ fn debug_map(objects: &[LoadedObject], placed: &[PlacedSymbol<'_>]) -> Vec<Outpu
         symbols.extend(placed[start..end].iter());
         symbols.sort_by_key(|symbol| (symbol.section.0, symbol.address));
 
-        let path = &object.parsed.metadata.path;
+        // The path this link read it from, not the one it was first parsed
+        // from: an `OSO` stab names a file a debugger will go and open.
+        let path: &Path = object.path.as_ref();
         let directory = path
             .parent()
             .map(|parent| format!("{}/", parent.display()))
