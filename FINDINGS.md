@@ -5535,3 +5535,57 @@ conditions should be re-checked when the system underneath them changes.
 Dead-strip is now the largest single item, and it is entirely global: it rebuilds
 the atom graph and re-derives liveness over 900 objects to discover that 24 of
 6879 addresses moved.
+
+## 114. What is left is four independent walks over every relocation in the program
+
+With the cache round-trip gone (110) and relocation reuse on (113), the warm
+relink is 16.9 ms and fully accounted. Splitting the last composite stage —
+`synthetic` — finishes the map:
+
+```
+    eh_frame          0.08 ms     repairing __eh_frame
+    tables            0.02 ms     GOT, stubs, thread pointers
+    unwind            1.36 ms     rebuilding __unwind_info
+```
+
+The indirect tables, which sound like the expensive part, are 20 microseconds:
+they are proportional to the number of *slots*, and slots barely move.
+`__unwind_info` is 1.36 ms because it is rebuilt from every function in the
+program, every link.
+
+That is the pattern in everything that remains. Sorted by cost:
+
+```
+    liveness          2.07     traverses the whole reference graph
+    emit              1.51
+    unwind-info       1.36     every function's unwind entry
+    layout            1.04
+    atoms             1.01     every section's atom boundaries, every relocation
+    prepare           0.96     every __eh_frame section's personality fields
+    survey            0.92     every relocation, to find GOT/stub/TLV needs
+    apply             0.84     4% of relocations; 96% reused
+    address_table     0.83     hashes every defined name
+    address_map       0.71
+    cache_build       0.67
+    cache_plan        0.63
+    symbols           0.63
+```
+
+**Four of these — atoms, prepare, survey, unwind — are independent walks over
+the same 900 objects' relocations, each collecting something different, each
+recomputed in full.** Together they are 4.25 ms, a quarter of the link. Every
+one of them is a *pure function of a single object*: the atom boundaries of an
+object depend on that object, its personality fields depend on that object, the
+GOT names it needs depend on that object, its unwind entries depend on that
+object. Two of 69 inputs changed.
+
+So the next structural move is not four separate optimisations. It is one: a
+per-object memo in the session, holding each object's projection alongside the
+parse that is already held there. The session already proves an object unchanged
+in order to hand back its `ParsedObject`; everything derived from that object
+and nothing else is valid for exactly as long.
+
+`liveness` (2.07 ms) is the one that does not fit — it is genuinely global,
+and it is the hard problem left. `apply` at 0.84 ms is what this looks like when
+it is solved: 96% of the work skipped, and what remains is proportional to the
+edit.

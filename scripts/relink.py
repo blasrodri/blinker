@@ -356,6 +356,7 @@ def main():
                   # made `unmeasured` negative, which is the one way a profile
                   # can announce that it does not add up.
                   "address_table", "cache_plan",
+                  "eh_frame", "tables", "unwind",
                   "emit_layout", "emit_contents", "emit_linkedit",
                   "emit_assemble", "emit_uuid", "emit_sign",
                   "address_map", "contents", "synthetic", "apply"}
@@ -363,7 +364,7 @@ def main():
                  "atoms", "liveness", "strip_build",
                  "prepare", "accounting", "address_table", "address_diff", "relocate", "emit", "emit_layout", "emit_contents",
                  "emit_linkedit", "emit_assemble", "emit_uuid", "emit_sign",
-                 "address_map", "contents", "synthetic", "apply", "symbols", "survey",
+                 "address_map", "contents", "synthetic", "eh_frame", "tables", "unwind", "apply", "symbols", "survey",
                  "cache_load", "cache_plan",
                  "cache_build", "cache_store"]:
         value = timings.get(f"link_{name}_ms")
@@ -380,6 +381,8 @@ def main():
             marker = "  (inside relocate)"
         elif name in ("atoms", "liveness", "strip_build"):
             marker = "  (inside dead_strip)"
+        elif name in ("eh_frame", "tables", "unwind"):
+            marker = "  (inside synthetic)"
         elif name in ("address_table", "cache_plan"):
             marker = "  (inside relocate)"
         print(f"    {name:<16}{value:6.2f} ms  {value / total * 100:5.1f}%{marker}")

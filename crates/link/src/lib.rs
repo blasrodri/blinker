@@ -150,6 +150,11 @@ pub struct LinkTimings {
     /// costs what doing it costs, there is nothing here.
     pub address_table_ms: f64,
     pub address_diff_ms: f64,
+    /// Inside `synthetic`: repairing `__eh_frame`, filling the indirect tables,
+    /// and rebuilding `__unwind_info`.
+    pub eh_frame_ms: f64,
+    pub tables_ms: f64,
+    pub unwind_ms: f64,
     /// How many addresses this link changed, out of how many there are.
     pub changed_addresses: u64,
     pub total_addresses: u64,
@@ -1746,10 +1751,23 @@ fn link_inner(
     timings.contents_ms = elapsed_ms(sub);
 
     let sub = std::time::Instant::now();
+    // Split because the five have nothing in common but the stage they share.
+    // The tables are proportional to the number of *slots*, which barely moves;
+    // `__unwind_info` is rebuilt from every function in the program, which is
+    // the kind of global recomputation this linker is supposed to be getting
+    // rid of. Which of those the 1.44 ms is decides whether there is anything
+    // here worth doing.
+    let part = std::time::Instant::now();
     repair_eh_frame(&mut contents, &probe, &objects, &strip);
+    timings.eh_frame_ms = elapsed_ms(part);
+
+    let part = std::time::Instant::now();
     fill_got(&mut contents, &probe, &got, &addresses, &imports)?;
     fill_stubs(&mut contents, &probe, &stubs, &got_slots)?;
     fill_pointer_table(&mut contents, &probe, &tlv, &addresses, "__thread_ptrs")?;
+    timings.tables_ms = elapsed_ms(part);
+
+    let part = std::time::Instant::now();
     fill_unwind_info(
         &mut contents,
         &probe,
@@ -1759,6 +1777,7 @@ fn link_inner(
         &strip,
         &got_slots,
     )?;
+    timings.unwind_ms = elapsed_ms(part);
     timings.synthetic_ms = elapsed_ms(sub);
 
     // Whether this link records what each object read, so a later one can skip

@@ -95,6 +95,12 @@ pub struct PhaseTimings {
     pub link_address_table_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link_address_diff_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_eh_frame_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_tables_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_unwind_ms: Option<f64>,
     pub link_relocate_ms: Option<f64>,
     pub link_emit_ms: Option<f64>,
     /// What the cache cost, as against what it saved.
@@ -158,6 +164,8 @@ pub struct LinkStages {
     pub accounting: f64,
     pub address_table: f64,
     pub address_diff: f64,
+    /// Inside `synthetic`: eh_frame repair, indirect tables, unwind info.
+    pub synthetic_breakdown: [f64; 3],
     pub changed_addresses: u64,
     pub total_addresses: u64,
     /// Output symbols and the debug map.
@@ -348,6 +356,7 @@ impl LinkRecord {
             accounting,
             address_table,
             address_diff,
+            synthetic_breakdown,
             changed_addresses,
             total_addresses,
         } = stages;
@@ -370,6 +379,11 @@ impl LinkRecord {
         self.timings.link_prepare_ms = (prepare > 0.0).then_some(prepare);
         self.timings.link_address_table_ms = (address_table > 0.0).then_some(address_table);
         self.timings.link_address_diff_ms = (address_diff > 0.0).then_some(address_diff);
+        if synthetic_breakdown.iter().any(|v| *v > 0.0) {
+            self.timings.link_eh_frame_ms = Some(synthetic_breakdown[0]);
+            self.timings.link_tables_ms = Some(synthetic_breakdown[1]);
+            self.timings.link_unwind_ms = Some(synthetic_breakdown[2]);
+        }
         if total_addresses > 0 {
             self.counters.changed_addresses = Some(changed_addresses);
             self.counters.total_addresses = Some(total_addresses);
@@ -505,6 +519,9 @@ impl LinkRecord {
             ("accounting", self.timings.link_accounting_ms),
             ("address-table", self.timings.link_address_table_ms),
             ("address-diff", self.timings.link_address_diff_ms),
+            ("  eh-frame", self.timings.link_eh_frame_ms),
+            ("  tables", self.timings.link_tables_ms),
+            ("  unwind-info", self.timings.link_unwind_ms),
             ("layout", self.timings.link_layout_ms),
             ("relocate", self.timings.link_relocate_ms),
             ("emit+sign", self.timings.link_emit_ms),

@@ -210,6 +210,7 @@ pub fn run_in(
                 prepare: phases.prepare_ms,
                 accounting: phases.accounting_ms,
                 address_table: phases.address_table_ms,
+                synthetic_breakdown: [phases.eh_frame_ms, phases.tables_ms, phases.unwind_ms],
                 address_diff: phases.address_diff_ms,
                 changed_addresses: phases.changed_addresses,
                 total_addresses: phases.total_addresses,
