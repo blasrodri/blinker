@@ -460,6 +460,16 @@ impl Session {
         self.resident
     }
 
+    /// The key this session proved `path` by, when it has one.
+    ///
+    /// Every input was probed during loading — a `stat` for a content-addressed
+    /// path, a read and a hash for one of rustc's, which is the expensive kind.
+    /// Anything later in the link that wants to know whether a file changed
+    /// should ask here rather than probe it a second time.
+    pub fn key_for(&self, path: &Path) -> Option<blinker_cache::InputKey> {
+        self.entries.get(path).map(|(key, _)| key.clone())
+    }
+
     /// Take the cache held for `path`, if this session produced one.
     ///
     /// Taken rather than borrowed: the link consumes the previous cache and

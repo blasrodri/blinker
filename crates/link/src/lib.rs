@@ -1850,7 +1850,9 @@ fn link_inner(
 
     let cache_step = std::time::Instant::now();
     let plan = match (&previous, &current_addresses) {
-        (Some(previous), Some(current)) => Some(plan_reuse(&objects, &probe, previous, current)),
+        (Some(previous), Some(current)) => {
+            Some(plan_reuse(&objects, &probe, previous, current, session))
+        }
         _ => None,
     };
     timings.cache_plan_ms = elapsed_ms(cache_step);
@@ -2092,6 +2094,7 @@ fn plan_reuse<'a>(
     image: &Image,
     previous: &'a blinker_cache::LinkCache,
     current_addresses: &[(blinker_cache::NameHash, u64)],
+    session: &Session,
 ) -> ReusePlan<'a> {
     let changed: std::collections::HashSet<blinker_cache::NameHash> = blinker_cache::LinkCache {
         addresses: current_addresses.to_vec(),
@@ -2120,9 +2123,15 @@ fn plan_reuse<'a>(
             continue;
         };
         let path = object.parsed.metadata.path.as_path();
+        // From the session when it has one: it proved this input a moment ago,
+        // and re-proving a rustc object means reading and hashing it again.
         let Some(key) = keys
             .entry(path)
-            .or_insert_with(|| blinker_cache::InputKey::probe(path))
+            .or_insert_with(|| {
+                session
+                    .key_for(path)
+                    .or_else(|| blinker_cache::InputKey::probe(path))
+            })
             .clone()
         else {
             continue;

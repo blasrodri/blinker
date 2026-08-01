@@ -5746,3 +5746,24 @@ how many allocations there were — the useless one removed the most — but
 the other two sat on paths walked once per edge and once per lookup. Counting
 allocations predicts nothing. Knowing which loop you are in predicts everything,
 and the only reliable way to find out is to measure the stage before and after.
+
+## 119. The relocation plan was re-proving inputs the session had just proved
+
+Deciding which objects can skip relocation starts by asking whether their file
+changed — `InputKey::probe`, which for a content-addressed rlib is a `stat` and
+for one of rustc's objects is a read and a hash. `plan_reuse` probed every
+distinct input file itself.
+
+Every one of them had already been probed, minutes of CPU earlier, by the
+session: that is how it decides whether to hand back a held parse at all, and it
+keeps the key it proved. Asking the session instead:
+
+```
+  cache_plan   0.71 ms -> 0.55 ms
+```
+
+Small, and it is the shape that matters rather than the size: the session is
+accumulating the answers to questions the rest of the link keeps asking
+independently. `key_for` is the second of those to be shared, after the cache
+itself. Every stage that still walks all the inputs to work out what changed is
+recomputing something one component already knows.
