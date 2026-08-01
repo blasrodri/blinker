@@ -363,6 +363,50 @@ fn wants_dead_strip(parsed: &ParsedInvocation) -> bool {
         .any(|(_, arg)| matches!(arg, LinkerArg::LinkerFlag(flag) if flag == "-dead_strip"))
 }
 
+/// The `.tbd` stubs the command line's `-l` and `-framework` requests name.
+///
+/// `-L` and `-F` accumulate first because a search path applies to every
+/// request, wherever it appeared: `ld` collects the paths and then resolves.
+/// The SDK's own directories come last, inside the resolver.
+///
+/// A request that resolves to something other than a `.tbd` is dropped rather
+/// than guessed at — a `.dylib` needs its export trie read and a `.a` is an
+/// archive, and neither is supported yet. The symbols it would have provided
+/// then arrive as a named undefined-symbol error, which is the correct
+/// outcome for "this link needs something blinker cannot read".
+fn stub_libraries(parsed: &ParsedInvocation) -> Vec<PathBuf> {
+    let mut library_paths = Vec::new();
+    let mut framework_paths = Vec::new();
+    for (_, arg) in &parsed.args {
+        match arg {
+            LinkerArg::LibrarySearchPath(path) => library_paths.push(path.clone()),
+            LinkerArg::FrameworkSearchPath(path) => framework_paths.push(path.clone()),
+            _ => {}
+        }
+    }
+
+    let sdk = blinker_link::sdk_root();
+    let mut found = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (_, arg) in &parsed.args {
+        let path = match arg {
+            LinkerArg::Library(name) => {
+                blinker_link::libraries::find_library(name, &library_paths, sdk.as_deref())
+            }
+            LinkerArg::Framework(name) => {
+                blinker_link::libraries::find_framework(name, &framework_paths, sdk.as_deref())
+            }
+            LinkerArg::DynamicLibrary(path) => Some(path.clone()),
+            _ => continue,
+        };
+        let Some(path) = path else { continue };
+        if path.extension().is_some_and(|e| e == "tbd") && seen.insert(path.clone()) {
+            found.push(path);
+        }
+    }
+    found
+}
+
 /// Perform the link with blinker's own linker.
 ///
 /// Only object files are accepted so far. An archive or a dylib on the command
@@ -392,6 +436,7 @@ fn internal_link(
     let mut request = blinker_link::LinkRequest::new(objects)
         .identifier(&identifier)
         .dead_stripped(wants_dead_strip(parsed))
+        .stub_libraries(stub_libraries(parsed))
         // Reserved slack pays for itself only across links, so it is turned on
         // with the cache — but it is applied to the cold link too, so that the
         // cached output is the one a cold link with the same options produces.

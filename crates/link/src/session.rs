@@ -225,8 +225,9 @@ pub struct Session {
     held_resolution: bool,
 }
 
-/// What the SDK's `.tbd` stubs say the system exports.
-pub type StubExports = std::collections::BTreeSet<String>;
+/// What the `.tbd` stubs say the dynamic libraries export, and which exports
+/// each name. See [`crate::libraries::StubExports`].
+pub type StubExports = crate::libraries::StubExports;
 
 impl Session {
     /// Begin a link over `inputs`, discarding anything that cannot apply.
@@ -723,7 +724,12 @@ mod tests {
     use blinker_test_support::Scratch;
 
     fn exports(names: &[&str]) -> Arc<StubExports> {
-        Arc::new(names.iter().map(|n| n.to_string()).collect())
+        let mut exports = StubExports::default();
+        let library = exports.library("/usr/lib/libSystem.B.dylib");
+        for name in names {
+            exports.export(library, name.to_string());
+        }
+        Arc::new(exports)
     }
 
     /// The stubs are held across links while their files are untouched.
@@ -739,7 +745,7 @@ mod tests {
 
         session.store_stub_exports(&stubs, exports(&["_malloc"]));
         assert_eq!(
-            session.stub_exports(&stubs).map(|e| e.len()),
+            session.stub_exports(&stubs).map(|e| e.count()),
             Some(1),
             "the exports were not held"
         );

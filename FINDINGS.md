@@ -6621,3 +6621,76 @@ xtask, not rust-analyzer` is printed on exactly this path. A guard worth having
 is worth having say so out loud when it declines.
 
 Fixed by comparing canonical names with `-` and `_` folded together.
+
+## 140. blinker links a real program
+
+Finding 138 recorded that blinker could only link programs whose one dynamic
+dependency is libSystem. It now resolves `-l<name>` and `-framework <name>`
+through `-L`/`-F` and the SDK, and binds each import against the library that
+actually exports it.
+
+```
+$ blinker --blinker-internal <rust-analyzer's 341 inputs> -framework CoreFoundation ...
+$ ./rust-analyzer --version
+rust-analyzer 0.0.0 (804ee7d 2026-08-01)
+
+$ otool -L rust-analyzer
+  /System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation
+  /System/Library/Frameworks/CoreServices.framework/Versions/A/CoreServices
+  /usr/lib/libiconv.2.dylib
+  /usr/lib/libSystem.B.dylib
+```
+
+A working 187 MB binary, and the first program blinker has ever linked that it
+did not compile itself.
+
+### The part that would have failed silently
+
+Mach-O's two-level namespace records, per imported symbol, the *ordinal of the
+library it came from*, and dyld looks there and nowhere else. Resolving
+`_CFRelease` against CoreFoundation while writing libSystem's ordinal produces
+a binary that links, passes every structural check, and fails at launch — so
+`StubExports` had to stop being a `BTreeSet<String>` and become a map from name
+to owning library, carried from resolution all the way to the bind opcodes.
+Where the ordinal is unknown it falls back to the first library rather than to
+zero, because zero means flat-namespace lookup: the program would then search
+every library, usually find the symbol, and work — hiding the bug.
+
+One subtlety that is not obvious from the format: a symbol is attributed to the
+`.tbd` file's *own* install name, not to whichever re-exported sub-document
+defines it. `libSystem.tbd` is 40 documents; `_malloc` is written in
+`libsystem_malloc.dylib` and must bind against libSystem, because libSystem is
+what the image loads.
+
+### Still missing
+
+`.dylib` (needs the export trie) and `.a` from `-l` (the archive path). A
+request resolving to either is dropped rather than guessed at, so the symbols
+arrive as a named undefined-symbol error. That is why `pulsevm` — which wants
+Homebrew's `libz3` and `libxml2` — still does not link. The `current_version`
+written into `LC_LOAD_DYLIB` is libSystem's for every library; it is cosmetic,
+and should be read from the `.tbd`.
+
+## 141. Ten times slower, on the link that matters
+
+With a real program linkable, the question finding 137 could not answer:
+
+```
+  rust-analyzer, debug, 341 inputs, cold
+    ld64       319 ms      220 MB
+    blinker  3,104 ms      187 MB      9.7x
+```
+
+Against blinker's own debug self-link — 80 inputs, the fixture every number in
+this file was taken on — it is 1.1x. Seven times the inputs, and the ratio
+moves by a factor of nine.
+
+Finding 130 measured this scaling and called it "blinker grows 3.4x where ld64
+grows 1.3x" from two points that were 40 ms apart. It was right about the
+direction and far too optimistic about the magnitude, because both of its
+points were small.
+
+Everything measured before today was measured on the wrong workload. The
+milliseconds were real and the changes were real, but "which stage matters" was
+answered by a link that finishes in the time this one spends on any single
+stage. Before any further optimisation, the profile has to be retaken here.

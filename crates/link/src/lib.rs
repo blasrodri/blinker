@@ -57,6 +57,7 @@ use reachability::Strip;
 
 mod hashing;
 mod identity;
+pub mod libraries;
 mod mapping;
 mod session;
 use hashing::FastMap;
@@ -444,6 +445,18 @@ impl LinkRequest {
     }
 
     /// Use a `.tbd` stub library as the source of importable symbols.
+    /// Replace the stub libraries with the ones the command line resolved.
+    ///
+    /// Additive rather than replacing when the list is empty, so a caller that
+    /// resolved nothing keeps the default libSystem — an in-process API user
+    /// linking a pure-Rust program passes no `-l` at all.
+    pub fn stub_libraries(mut self, paths: Vec<PathBuf>) -> Self {
+        if !paths.is_empty() {
+            self.stub_libraries = paths;
+        }
+        self
+    }
+
     pub fn stub_library(mut self, path: PathBuf) -> Self {
         self.stub_libraries.push(path);
         self
@@ -454,16 +467,27 @@ impl LinkRequest {
     /// `None` when no stub library was supplied, which is different from an
     /// empty set: with no library, nothing can be imported and every
     /// undefined reference is an error.
-    fn dynamic_symbols(&self) -> Option<BTreeSet<String>> {
+    fn dynamic_symbols(&self) -> Option<libraries::StubExports> {
         if self.stub_libraries.is_empty() {
             return None;
         }
-        let mut all = BTreeSet::new();
+        let mut all = libraries::StubExports::default();
         for path in &self.stub_libraries {
             let Ok(file) = blinker_tbd::parse_tbd_file(path) else {
                 continue;
             };
-            all.extend(file.exported_symbols(blinker_tbd::Target::aarch64_macos()));
+            // Attributed to the file's *own* install name, not to whichever
+            // sub-document a re-exported symbol was written in. `libSystem`
+            // re-exports forty libraries; `_malloc` lives in
+            // `libsystem_malloc.dylib` and binds against libSystem, because
+            // libSystem is what the image loads and what the ordinal names.
+            let Some(install_name) = file.primary().map(|d| d.install_name.clone()) else {
+                continue;
+            };
+            let library = all.library(&install_name);
+            for name in file.exported_symbols(blinker_tbd::Target::aarch64_macos()) {
+                all.export(library, name);
+            }
         }
         Some(all)
     }
@@ -506,25 +530,42 @@ const SDK_UNDER_DEVELOPER_DIR: &[&str] = &[
 ];
 
 fn discover_stub_library() -> Option<PathBuf> {
-    let stub_in = |sdk: &Path| {
-        let path = sdk.join("usr/lib/libSystem.tbd");
-        path.exists().then_some(path)
-    };
-    let stub_under = |developer: &Path| {
+    let sdk = sdk_root()?;
+    let path = sdk.join("usr/lib/libSystem.tbd");
+    path.exists().then_some(path)
+}
+
+/// The macOS SDK this link resolves libraries and frameworks against.
+///
+/// Cached for the same reason `default_stub_library` is: asking `xcrun` costs
+/// 14 ms, and the answer cannot change while blinker is running.
+pub fn sdk_root() -> Option<PathBuf> {
+    static CACHED: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    CACHED.get_or_init(discover_sdk_root).clone()
+}
+
+fn discover_sdk_root() -> Option<PathBuf> {
+    // An SDK is recognised by containing the one library every link needs. A
+    // directory that merely exists is not an SDK, and accepting one turns a
+    // wrong `SDKROOT` into "undefined _printf" rather than into a miss here.
+    let sdk_at = |sdk: &Path| sdk.join("usr/lib/libSystem.tbd").exists();
+    let sdk_under = |developer: &Path| {
         SDK_UNDER_DEVELOPER_DIR
             .iter()
-            .find_map(|suffix| stub_in(&developer.join(suffix)))
+            .map(|suffix| developer.join(suffix))
+            .find(|path| sdk_at(path))
     };
 
     // The compiler driver sets `SDKROOT` when it knows the answer, so in some
     // builds it is already in the environment.
     if let Ok(sdk) = std::env::var("SDKROOT") {
-        if let Some(path) = stub_in(Path::new(&sdk)) {
-            return Some(path);
+        let sdk = PathBuf::from(sdk);
+        if sdk_at(&sdk) {
+            return Some(sdk);
         }
     }
     if let Ok(developer) = std::env::var("DEVELOPER_DIR") {
-        if let Some(path) = stub_under(Path::new(&developer)) {
+        if let Some(path) = sdk_under(Path::new(&developer)) {
             return Some(path);
         }
     }
@@ -533,7 +574,7 @@ fn discover_stub_library() -> Option<PathBuf> {
     // a link's wall time, spent before its own timers start, which is why it
     // read as unexplained overhead rather than as a phase.
     for developer in [Path::new(XCODE_SELECT_LINK), Path::new(COMMAND_LINE_TOOLS)] {
-        if let Some(path) = stub_under(developer) {
+        if let Some(path) = sdk_under(developer) {
             return Some(path);
         }
     }
@@ -548,7 +589,8 @@ fn discover_stub_library() -> Option<PathBuf> {
     if !output.status.success() {
         return None;
     }
-    stub_in(Path::new(String::from_utf8_lossy(&output.stdout).trim()))
+    let sdk = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    sdk_at(&sdk).then_some(sdk)
 }
 
 /// An object file and the bytes it was parsed from.
@@ -1569,7 +1611,23 @@ fn link_inner(
     if let (Some(exported), true) = (&exported, stubs_were_parsed) {
         session.store_stub_exports(&request.stub_libraries, std::sync::Arc::clone(exported));
     }
-    let exported = exported.map(|e| (*e).clone());
+    // `exported` is kept as the shared value rather than cloned out: it is
+    // consulted again long after resolution, because every bind opcode needs
+    // the ordinal of the library its symbol came from.
+    // One `LC_LOAD_DYLIB` per library that resolved, in ordinal order. With no
+    // stub libraries at all the request's own list stands, which is what the
+    // in-process API tests supply.
+    let dylibs: Vec<Dylib> = match exported.as_deref() {
+        Some(exports) if !exports.install_names().is_empty() => exports
+            .install_names()
+            .iter()
+            .map(|install_name| Dylib {
+                install_name: install_name.clone(),
+                ..Dylib::lib_system()
+            })
+            .collect(),
+        _ => request.dylibs.clone(),
+    };
     // Both halves are timed, not just the pair. Overlapped work is only free
     // while it is the *shorter* half, and a profile cannot tell the difference:
     // it counts CPU across threads, so a stub parse that is entirely hidden
@@ -1634,7 +1692,7 @@ fn link_inner(
     let imports = match session.imports() {
         Some(held) => held.to_vec(),
         None => {
-            let imports = resolve_imports(&objects, exported)?;
+            let imports = resolve_imports(&objects, exported.as_deref())?;
             // Resolution runs for its diagnostics: it is what turns a
             // genuinely missing definition into a named error rather than a
             // relocation against zero.
@@ -1835,6 +1893,7 @@ fn link_inner(
             placements: &placements,
             previous: previous_layout.as_ref(),
             reservations: reservations.as_ref(),
+            dylibs: &dylibs,
             ..Assembly::default()
         },
     )?;
@@ -1971,6 +2030,7 @@ fn link_inner(
             stubs: &stub_slots,
             tlv: &tlv_slots,
             imports: &imports,
+            exports: exported.as_deref(),
             personalities: &eh_personality_fields,
         },
         contents,
@@ -2023,7 +2083,7 @@ fn link_inner(
     // independent, so dyld must relocate every one of them at load time.
     // A slot whose value we know is rebased; a slot dyld fills is bound.
     let mut rebases = got_rebases(&probe, &got, &imports);
-    let mut binds = got_binds(&probe, &got, &imports);
+    let mut binds = got_binds(&probe, &got, &imports, exported.as_deref());
     binds.extend(patched.binds);
     rebases.extend(pointer_table_rebases(&probe, "__thread_ptrs", tlv.len()));
     rebases.extend(patched.rebases);
@@ -2044,6 +2104,7 @@ fn link_inner(
             previous: previous_layout.as_ref(),
             reservations: reservations.as_ref(),
             previous_signature: previous_signature.as_ref(),
+            dylibs: &dylibs,
         },
     );
     timings.emit_ms = elapsed_ms(step);
@@ -2437,7 +2498,7 @@ fn elapsed_ms(start: std::time::Instant) -> f64 {
 /// Undefined references, checked against what `libSystem` actually exports.
 fn resolve_imports(
     objects: &[LoadedObject],
-    exported: Option<BTreeSet<String>>,
+    exported: Option<&libraries::StubExports>,
 ) -> Result<Vec<String>, LinkError> {
     let undefined = undefined_references(objects);
     if undefined.is_empty() {
@@ -2626,7 +2687,12 @@ fn fill_stubs(
 }
 
 /// Bind entries: one per GOT slot dyld has to fill.
-fn got_binds(image: &Image, got: &[TableEntry], imports: &[String]) -> Vec<Bind> {
+fn got_binds(
+    image: &Image,
+    got: &[TableEntry],
+    imports: &[String],
+    exports: Option<&libraries::StubExports>,
+) -> Vec<Bind> {
     let Some(section) = image.layout.sections.iter().find(|s| s.name == "__got") else {
         return Vec::new();
     };
@@ -2647,8 +2713,9 @@ fn got_binds(image: &Image, got: &[TableEntry], imports: &[String]) -> Vec<Bind>
             segment: segment_index as u8,
             offset: base + slot as u64 * GOT_ENTRY_SIZE,
             symbol: entry.name.clone(),
-            // One-based; the only library in the list is libSystem.
-            library_ordinal: 1,
+            // Which library, not just that there is one: under the two-level
+            // namespace dyld looks in this ordinal's library and nowhere else.
+            library_ordinal: exports.map(|e| e.ordinal(&entry.name)).unwrap_or(1),
             addend: 0,
         })
         .collect()
@@ -3305,6 +3372,14 @@ struct Assembly<'a> {
     /// The previous link's signed bytes and page hashes, so pages that did not
     /// change are not hashed again.
     previous_signature: Option<&'a (Vec<u8>, Vec<[u8; 32]>)>,
+    /// The dynamic libraries this image loads, in ordinal order.
+    ///
+    /// Derived from the stub libraries that were actually resolved rather than
+    /// taken from the request, because the install name is written inside the
+    /// `.tbd` and is not knowable from the command line: `-framework
+    /// CoreFoundation` names a directory, and what goes in `LC_LOAD_DYLIB` is
+    /// `/System/Library/Frameworks/CoreFoundation.framework/Versions/A/CoreFoundation`.
+    dylibs: &'a [Dylib],
 }
 
 /// Contribution identities in the form the output crate accepts: a plain map,
@@ -3342,6 +3417,7 @@ fn assemble(request: &LinkRequest, assembly: &Assembly<'_>) -> Result<Image, Lin
         previous: _,
         reservations: _,
         previous_signature: _,
+        dylibs: _,
     } = *assembly;
     let mut builder = ImageBuilder::new();
     if !assembly.final_pass {
@@ -3367,7 +3443,7 @@ fn assemble(request: &LinkRequest, assembly: &Assembly<'_>) -> Result<Image, Lin
     for placement in placements {
         builder.input(placement.clone());
     }
-    for dylib in &request.dylibs {
+    for dylib in assembly.dylibs {
         builder.dylib(dylib.clone());
     }
     builder.identifier(&request.identifier);
@@ -3951,6 +4027,8 @@ struct IndirectTables<'a> {
     stubs: &'a HashMap<String, u64>,
     tlv: &'a HashMap<String, u64>,
     imports: &'a [String],
+    /// Which dynamic library exports each importable name, for bind ordinals.
+    exports: Option<&'a libraries::StubExports>,
     /// Offsets, per `(object, section)`, of CIE personality fields that use an
     /// indirect encoding.
     ///
@@ -4149,6 +4227,7 @@ fn apply_relocations(
         stubs: stub_slots,
         tlv: tlv_slots,
         imports,
+        exports,
         personalities,
     } = *tables;
 
@@ -4400,7 +4479,9 @@ fn apply_relocations(
                                     segment: segment_index as u8,
                                     offset: place - segment.vm_address,
                                     symbol: symbol.name.clone(),
-                                    library_ordinal: 1,
+                                    library_ordinal: exports
+                                        .map(|e| e.ordinal(&symbol.name))
+                                        .unwrap_or(1),
                                     addend: relocation.addend,
                                 });
                             }
