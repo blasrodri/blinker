@@ -258,6 +258,9 @@ def main():
                         help="also reuse per-object relocations, to read the hit rate")
     parser.add_argument("--no-cache", action="store_true",
                         help="relink without the incremental cache, for comparison")
+    parser.add_argument("--stage-stat", choices=("median", "min"), default="median",
+                        help="statistic for the stage table; `min` is stable "
+                             "under machine load, `median` reflects it")
     parser.add_argument("--recapture", action="store_true",
                         help="take a fresh pair of captures instead of reusing one")
     options = parser.parse_args()
@@ -335,22 +338,31 @@ def main():
             for target, a, _ in versions:
                 shutil.copyfile(a, target)
 
-    # The median of each stage across every iteration, not the last record.
+    # One statistic per stage across every iteration, not the last record.
     #
     # Printing medians for `wall` and `link` and then a breakdown from one
     # arbitrary run means the two disagree whenever that run was an outlier —
     # and under load they are common. A stage table taken from a single slow
     # sample reads as a discovery about the linker.
-    def median_timings(key):
+    #
+    # Which statistic is a question about the machine, not about the linker.
+    # A median measures the linker plus whatever else the machine was doing;
+    # on a busy one it drifts with the load and two runs an hour apart are not
+    # comparable. A minimum is the closest this can get to "the machine got out
+    # of the way", and it is stable under interference — noise only ever adds
+    # time. Stage minima come from different iterations and so do not sum to
+    # the link minimum, which is the honest cost of the choice.
+    def stage_stat(key):
+        pick = min if options.stage_stat == "min" else statistics.median
         merged = {}
         for name in {k for r in records for k in r[key]}:
             values = [r[key][name] for r in records
                       if isinstance(r[key].get(name), (int, float))]
             if values:
-                merged[name] = statistics.median(values)
+                merged[name] = pick(values)
         return merged
 
-    timings = median_timings("timings")
+    timings = stage_stat("timings")
     counters = records[-1]["counters"]
     total = timings.get("internal_link_ms") or 0.0
     # Stage medians do not sum to the median total — each is the middle of its
@@ -364,6 +376,8 @@ def main():
           f"(min {min(walls):.1f}, max {max(walls):.1f})")
     print(f"  link  {statistics.median(links):6.1f} ms   "
           f"(min {min(links):.1f}, max {max(links):.1f})\n")
+    if options.stage_stat == "min":
+        print("  stages below are per-stage minima, not medians\n")
 
     accounted = 0.0
     # `stub_parse` runs *inside* `read_and_parse`, on its own thread. Printed

@@ -6467,3 +6467,69 @@ paying compound interest on its own growth.
 Worth saying because it is invisible in a profile that attributes time to the
 insert: every sample lands on `insert`, which is where the work *is*, and none
 of them says the work was avoidable.
+
+## 136. Two hundred thousand strings that already existed
+
+`address_map` builds a map from every definition in the link to its output
+address, and did it by cloning the name:
+
+```rust
+map.global.insert(symbol.name.clone(), address);
+```
+
+The names live in the parsed objects, which outlive the map by a wide margin —
+the map is built and discarded inside one link. Borrowing them instead, plus
+sizing the global map up front (135) and hoisting the per-object sub-map lookup
+out of the per-symbol loop:
+
+```
+  address_map   2.93 ms -> 1.89 ms
+```
+
+Output byte-identical. This is the same argument that `Atoms::owners` was
+changed by in finding 134, applied to the other half-dozen-line function that
+was doing it — which is worth recording as a pattern rather than as two
+separate fixes: **a lookup table built for the duration of one link should
+borrow its keys, because everything it could key by is already in memory and
+outlives it.**
+
+## 137. The machine was the measurement
+
+Halfway through the above, the numbers stopped making sense: `link` went from
+86 ms to 176 ms across an A/B whose two halves differed by one struct field's
+type, with a `max` of 723 ms. Load average was 11.8 — a browser at 99% of a
+core, a `rustc` build, and a system extension, none of them mine.
+
+Two things came out of it.
+
+**Report minima, not medians, for stages.** Noise only ever adds time, so the
+minimum across iterations is the closest available estimate of "the machine got
+out of the way", and it is stable under interference where a median drifts with
+whatever else is running. `relink.py --stage-stat min` does that now. The cost
+is honest and worth stating: stage minima come from different iterations, so
+they do not sum to the link minimum.
+
+**Every number taken today under load was wrong, in the same direction.** The
+same fixture, once the machine was quiet:
+
+```
+                 loaded median     quiet minimum
+  link              86.6 ms          49.2 ms
+  relocate          23.9              14.8
+  emit              14.2               9.2
+  dead_strip        10.6               5.1
+```
+
+Not a scaling factor — `dead_strip` halved while `emit` fell by a third — so
+there is no rescuing the loaded numbers by dividing. They are discarded.
+
+The one thing the loaded run got right was the *direction* of the A/B, because
+both halves were equally polluted. That is the only claim a busy machine
+supports, and it is the only claim that was made from it.
+
+### And the picture that replaces it
+
+Warm debug edit relink, quiet machine: **49.2 ms link, 58.6 ms wall.** ld64
+links this program cold in 45.5 ms. The gap that the last session recorded as
+2.6x is not 2.6x; it is close to parity, and most of what was believed about
+where the remaining time goes was measured through the same fog.

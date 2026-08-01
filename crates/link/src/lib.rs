@@ -827,7 +827,7 @@ fn eh_frame_fde_offsets(
     objects: &[LoadedObject],
     image: &Image,
     placed: &Placed,
-    addresses: &AddressMap,
+    addresses: &AddressMap<'_>,
     strip: &Strip,
 ) -> HashMap<u64, u32> {
     let mut offsets = HashMap::default();
@@ -1051,7 +1051,7 @@ fn compact_unwind_entries(
     objects: &[LoadedObject],
     image: &Image,
     placed: &Placed,
-    addresses: &AddressMap,
+    addresses: &AddressMap<'_>,
     strip: &Strip,
     got_slots: &HashMap<String, u64>,
     fde_offsets: &HashMap<u64, u32>,
@@ -1353,7 +1353,7 @@ fn natural_alignment(size: u64) -> u32 {
 }
 
 /// Where each common symbol landed, once `__common` has an address.
-fn common_addresses(commons: &[Common], image: &Image) -> Vec<(String, u64)> {
+fn common_addresses<'a>(commons: &'a [Common], image: &Image) -> Vec<(&'a str, u64)> {
     let Some(section) = image.layout.sections.iter().find(|s| s.name == "__common") else {
         return Vec::new();
     };
@@ -1364,7 +1364,7 @@ fn common_addresses(commons: &[Common], image: &Image) -> Vec<(String, u64)> {
             at = at.next_multiple_of(common.alignment.max(1) as u64);
             let address = at;
             at += common.size;
-            (common.name.clone(), address)
+            (common.name.as_str(), address)
         })
         .collect()
 }
@@ -2394,7 +2394,7 @@ fn object_ranges_index(image: &Image) -> HashMap<u32, Vec<blinker_cache::Range>>
 /// while leaving every symbol address untouched, and an entry whose bytes
 /// reference the shifted slot must not look unchanged.
 fn address_table(
-    addresses: &AddressMap,
+    addresses: &AddressMap<'_>,
     got_slots: &HashMap<String, u64>,
     stub_slots: &HashMap<String, u64>,
     tlv_slots: &HashMap<String, u64>,
@@ -2534,7 +2534,7 @@ fn fill_unwind_info(
     image: &Image,
     objects: &[LoadedObject],
     placed: &Placed,
-    addresses: &AddressMap,
+    addresses: &AddressMap<'_>,
     strip: &Strip,
     got_slots: &HashMap<String, u64>,
 ) -> Result<(), LinkError> {
@@ -2691,7 +2691,7 @@ fn fill_pointer_table(
     contents: &mut HashMap<usize, Vec<u8>>,
     image: &Image,
     names: &[TableEntry],
-    addresses: &AddressMap,
+    addresses: &AddressMap<'_>,
     section_name: &str,
 ) -> Result<(), LinkError> {
     if names.is_empty() {
@@ -2727,7 +2727,7 @@ fn fill_got(
     contents: &mut HashMap<usize, Vec<u8>>,
     image: &Image,
     got: &[TableEntry],
-    addresses: &AddressMap,
+    addresses: &AddressMap<'_>,
     imports: &[String],
 ) -> Result<(), LinkError> {
     if got.is_empty() {
@@ -4020,7 +4020,7 @@ fn note_reference(
 /// `__eh_frame` LSDAs.
 fn dependency_hashes(
     object: &LoadedObject,
-    addresses: &AddressMap,
+    addresses: &AddressMap<'_>,
     referenced: &HashSet<(u32, u8)>,
 ) -> Vec<blinker_cache::NameHash> {
     let mut hashes: Vec<_> = referenced
@@ -4095,7 +4095,7 @@ impl Placed {
 /// and `placed` says where a *section* went — and a relocation needs all three
 /// to place its field and find its target.
 struct Placement<'a> {
-    addresses: &'a AddressMap,
+    addresses: &'a AddressMap<'a>,
     strip: &'a Strip,
     placed: &'a Placed,
 }
@@ -4546,7 +4546,7 @@ fn inline_addend(object: &LoadedObject, relocation: &InputRelocation) -> i64 {
 fn target_address(
     object: &LoadedObject,
     placed: &Placed,
-    addresses: &AddressMap,
+    addresses: &AddressMap<'_>,
     target: RelocationTarget,
 ) -> Result<u64, LinkError> {
     match target {
@@ -4584,19 +4584,22 @@ fn target_address(
 ///
 /// Locals are keyed per object because two objects may legitimately define the
 /// same local name; globals are keyed by name alone.
+/// The names are borrowed from the parsed objects, which outlive this. Every
+/// definition in the link used to go through `name.clone()` to build a map
+/// thrown away at the end of the same link — around two hundred thousand heap
+/// allocations, for strings that already existed a pointer away.
 #[derive(Default)]
-struct AddressMap {
-    global: HashMap<String, u64>,
+struct AddressMap<'a> {
+    global: HashMap<&'a str, u64>,
     /// Locals, by object and then by name.
     ///
-    /// Nested rather than keyed by `(u32, String)`, because a tuple key cannot
-    /// be *borrowed*: looking one up meant `name.to_string()` — an allocation
-    /// per question, on a path asked once per relocation, purely to throw it
-    /// away. Two lookups in two maps beat one lookup plus a heap allocation.
-    local: HashMap<u32, HashMap<String, u64>>,
+    /// Nested rather than keyed by `(u32, &str)`, because a tuple key cannot
+    /// be *borrowed*: looking one up meant building the tuple, on a path asked
+    /// once per relocation. Two lookups in two maps beat one lookup plus that.
+    local: HashMap<u32, HashMap<&'a str, u64>>,
 }
 
-impl AddressMap {
+impl AddressMap<'_> {
     /// The scope in which `lookup` would find `name` from `object`.
     ///
     /// Paired with `lookup` so the cache hashes the address the linker would
@@ -4625,10 +4628,26 @@ impl AddressMap {
 }
 
 /// Compute the output address of every definition.
-fn address_map(objects: &[LoadedObject], placed: &Placed, strip: &Strip) -> AddressMap {
+fn address_map<'a>(objects: &'a [LoadedObject], placed: &Placed, strip: &Strip) -> AddressMap<'a> {
     let mut map = AddressMap::default();
+    // Sized once rather than grown into: the global map ends up holding every
+    // non-local definition in the link, and growing there from empty rehashes
+    // everything already inserted, once per doubling (finding 135).
+    map.global.reserve(
+        objects
+            .iter()
+            .flat_map(|o| o.parsed.symbols.iter())
+            .filter(|s| s.strength.is_definition() && s.visibility != SymbolVisibility::Local)
+            .count(),
+    );
 
+    // Split so the two maps can be borrowed independently below.
+    let AddressMap { global, local } = &mut map;
     for object in objects {
+        // Hoisted: the object is the same for every symbol below, so finding
+        // its sub-map inside the loop is one hash per local definition to
+        // answer a question that changes once per object.
+        let locals = local.entry(object.parsed.id.0).or_default();
         for symbol in &object.parsed.symbols {
             if !symbol.strength.is_definition() {
                 continue;
@@ -4657,12 +4676,9 @@ fn address_map(objects: &[LoadedObject], placed: &Placed, strip: &Strip) -> Addr
             let address = chunk + offset;
 
             if symbol.visibility == SymbolVisibility::Local {
-                map.local
-                    .entry(object.parsed.id.0)
-                    .or_default()
-                    .insert(symbol.name.clone(), address);
+                locals.insert(symbol.name.as_str(), address);
             } else {
-                map.global.insert(symbol.name.clone(), address);
+                global.insert(symbol.name.as_str(), address);
             }
         }
     }
