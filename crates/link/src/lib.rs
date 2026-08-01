@@ -132,6 +132,17 @@ pub struct LinkTimings {
     /// Bytes the cache read and wrote, for the same reason.
     pub cache_bytes_read: u64,
     pub cache_bytes_written: u64,
+    /// Contributions that kept the address the previous link gave them, and
+    /// those that did not.
+    ///
+    /// The number "relocations reused" is standing in for. A hit rate is a
+    /// property of the cache; this is a property of the *layout*, and it is the
+    /// one that has to hold first — a reused relocation is only correct because
+    /// what it points at did not move. Zero moved contributions among unchanged
+    /// inputs is the invariant; anything else is a hit rate that happens to be
+    /// high today.
+    pub contributions_retained: u64,
+    pub contributions_moved: u64,
 }
 
 impl std::fmt::Display for LinkTimings {
@@ -1646,6 +1657,25 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
         },
     );
     timings.emit_ms = elapsed_ms(step);
+
+    // What the allocator actually achieved, counted against the table it was
+    // given rather than inferred from how fast the link was.
+    if let (Some((previous, _)), Ok(image)) = (&previous_layout, &image) {
+        for section in &image.layout.sections {
+            let qualified = section.qualified_name();
+            for contribution in &section.contributions {
+                let key = contribution_keys.key_or_fresh(contribution.object, contribution.section);
+                let Some(slot) = previous.slots.get(&key) else {
+                    continue;
+                };
+                if slot.section == qualified && slot.offset == contribution.offset {
+                    timings.contributions_retained += 1;
+                } else {
+                    timings.contributions_moved += 1;
+                }
+            }
+        }
+    }
 
     if let (Some(path), Some(cache), Ok(image)) = (&request.cache_path, &mut cache, &image) {
         let cache_step = std::time::Instant::now();

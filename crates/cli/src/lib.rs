@@ -199,6 +199,9 @@ pub fn run(argv: &[String]) -> Result<Outcome, DriverError> {
                 },
             },
         );
+        if phases.contributions_retained > 0 || phases.contributions_moved > 0 {
+            record.set_placement(phases.contributions_retained, phases.contributions_moved);
+        }
         if phases.cache_bytes_read > 0 || phases.cache_bytes_written > 0 {
             record.set_cache_bytes(phases.cache_bytes_read, phases.cache_bytes_written);
         }

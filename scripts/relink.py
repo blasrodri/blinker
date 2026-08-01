@@ -239,6 +239,13 @@ def main():
     print(f"    {'unmeasured':<16}{total - accounted:6.2f} ms  "
           f"{(total - accounted) / total * 100:5.1f}%")
 
+    retained = counters.get("contributions_retained")
+    if retained is not None:
+        moved = counters.get("contributions_moved") or 0
+        total = retained + moved
+        print(f"\n  placement: {retained}/{total} contributions kept their address"
+              f" ({retained / total * 100:.0f}%), {moved} moved")
+
     reused = counters.get("reused_inputs")
     if reused is not None:
         objects = reused + (counters.get("changed_inputs") or 0)

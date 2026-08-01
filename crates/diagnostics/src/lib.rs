@@ -160,6 +160,13 @@ pub struct Counters {
     /// the finished binary, so what it writes is comparable in size to what the
     /// link produces. Rolled into `bytes_written` that would look like a large
     /// output; named, it looks like what it is.
+    /// Contributions that kept their previous address, and those that did not.
+    ///
+    /// Reported because "relocations reused" cannot distinguish a layout that
+    /// held from a cache that got lucky, and the layout is the thing that has
+    /// to hold first.
+    pub contributions_retained: Option<u64>,
+    pub contributions_moved: Option<u64>,
     pub cache_bytes_read: Option<u64>,
     pub cache_bytes_written: Option<u64>,
     /// `__text` bytes dead-stripping removed. `None` when it did not run.
@@ -259,6 +266,12 @@ impl LinkRecord {
             self.timings.link_cache_build_ms = Some(cache.build);
             self.timings.link_cache_store_ms = Some(cache.store);
         }
+    }
+
+    /// Record how much of the previous layout survived.
+    pub fn set_placement(&mut self, retained: u64, moved: u64) {
+        self.counters.contributions_retained = Some(retained);
+        self.counters.contributions_moved = Some(moved);
     }
 
     /// Record what the cache moved, as bytes.
