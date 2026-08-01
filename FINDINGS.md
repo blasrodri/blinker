@@ -6273,3 +6273,37 @@ says.
 Kept, unmeasured — the fourth this session (123, 125, 127). Three of those four
 are structural changes rather than optimisations, which is the honest pattern:
 a mechanism can be right for reasons a stopwatch cannot see.
+
+## 132. Where to pick this up
+
+The state at the end of this session, so the next one does not have to
+re-derive it.
+
+**What is settled.** The incremental architecture works and scales: at 3,565
+contributions and 277,657 relocations, 96% of relocations are reused, 3 of
+27,803 addresses move, and the placement invariant is exact with zero unchanged
+movers. Held inputs, replayed extraction, held resolution, the session-owned
+cache — all of it fires on the debug workload as designed.
+
+**What is broken.** The cold linker scales with *symbols*, and ld64 does not:
+3.4x against 1.3x for the same growth in work. blinker is 2.6x slower than ld64
+on a debug link, and its incremental relink (65.5 ms) still loses to ld64's cold
+link (45 ms). The disadvantage grows with scale, which is the wrong direction.
+
+**The first concrete lead**, found and not yet acted on: `debug_map` emits five
+to six stab entries per function, each carrying an owned `String` name, and
+`symbols` + `emit_linkedit` are the two worst-scaling stages in the link
+(6.4x and 7.2x). A debug build multiplies function count, and the debug map
+multiplies that again. Making `OutputSymbol` borrow its name rather than own it
+is the obvious change and was not attempted.
+
+**The unexamined stages at debug scale**, all growing 5x or worse and none yet
+looked at with the debug profile in hand: `traverse` 7.6 ms, `liveness` 9.0,
+`atoms` 4.7, `unwind` 3.6, `synthetic` 3.9.
+
+**The measurement gap that outranks all of it.** Every number in this repository
+comes from one program whose link ld64 completes in 45 ms. Nobody complains
+about a 45 ms link. The Rust linking complaint is about binaries where ld64
+takes seconds, and no measurement here has ever touched one. Until a workload of
+that size exists, every conclusion about whether blinker is worth using —
+including the ones in this file — is an extrapolation.
