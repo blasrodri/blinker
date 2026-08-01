@@ -253,3 +253,56 @@ fn relaying_out_unchanged_inputs_reproduces_the_layout() {
         "an unchanged relink produced a different layout"
     );
 }
+
+/// **The case that breaks the invariant, pinned as it currently behaves.**
+///
+/// An unchanged input can still change size. Dead-stripping decides how much
+/// of an object is live, and liveness is not a property of that object — it is
+/// a property of what reaches it. Edit one crate, and an object nobody touched
+/// can have more of itself kept, grow past a capacity sized from last link's
+/// smaller live size, and move.
+///
+/// On a real one-crate edit that is 48 contributions of byte-for-byte
+/// unchanged files (finding 97), and every one invalidates every relocation
+/// pointing at it.
+///
+/// This test asserts what happens *today*, not what should. Two things make
+/// that worth committing rather than leaving as prose: it fails the moment
+/// somebody fixes it, which is when the fix wants to be noticed; and it states
+/// which of the two fixes is acceptable. Capacity reserved against the
+/// object's full unstripped size would make it pass at a cost in image size
+/// proportional to what stripping removes. Persisting liveness per
+/// contribution would make it pass and remove the 4.6 ms the stage costs.
+/// Widening the padding until this particular number goes green is finding 94
+/// a second time, and would leave every other size delta failing silently.
+#[test]
+fn growth_from_liveness_moves_an_input_that_did_not_change() {
+    let first = compute_layout_with_slop(&code([1000, 2000, 3000, 4000]), 0x1000, Slop::DEFAULT);
+    let previous = record(&first);
+
+    // Object 2's file is identical. Dead-stripping simply kept more of it,
+    // because something that changed elsewhere now reaches further in.
+    let second = compute_layout_reusing(
+        &code([1000, 2000, 6000, 4000]),
+        0x1000,
+        Slop::DEFAULT,
+        &previous,
+        &key_of,
+    );
+
+    assert_ne!(
+        address_of(&first, 2),
+        address_of(&second, 2),
+        "this now holds the invariant — delete the assertion and keep the one below"
+    );
+    // What does hold, and must keep holding through any fix: the mover moves
+    // alone. A grown contribution taking a hole or the end is a bounded cost;
+    // pushing its neighbours along is the unbounded one.
+    for object in [0, 1, 3] {
+        assert_eq!(
+            address_of(&first, object),
+            address_of(&second, object),
+            "object {object} moved out of the way, which it need not have"
+        );
+    }
+}
