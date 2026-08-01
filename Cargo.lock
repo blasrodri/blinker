@@ -145,6 +145,7 @@ dependencies = [
  "blinker-symbols",
  "blinker-tbd",
  "blinker-test-support",
+ "libc",
 ]
 
 [[package]]

@@ -57,6 +57,7 @@ use reachability::Strip;
 
 mod hashing;
 mod identity;
+mod mapping;
 use hashing::FastMap;
 pub use identity::ContributionKeys;
 
@@ -479,12 +480,12 @@ fn discover_stub_library() -> Option<PathBuf> {
 /// the way it was: this is a change of ownership, not of meaning.
 #[derive(Clone)]
 struct SourceBytes {
-    whole: std::sync::Arc<Vec<u8>>,
+    whole: std::sync::Arc<mapping::Backing>,
     range: std::ops::Range<usize>,
 }
 
 impl SourceBytes {
-    fn whole(bytes: Vec<u8>) -> SourceBytes {
+    fn whole(bytes: mapping::Backing) -> SourceBytes {
         let range = 0..bytes.len();
         SourceBytes {
             whole: std::sync::Arc::new(bytes),
@@ -493,7 +494,10 @@ impl SourceBytes {
     }
 
     /// A window into an archive, sharing its buffer.
-    fn window(whole: &std::sync::Arc<Vec<u8>>, range: std::ops::Range<usize>) -> SourceBytes {
+    fn window(
+        whole: &std::sync::Arc<mapping::Backing>,
+        range: std::ops::Range<usize>,
+    ) -> SourceBytes {
         SourceBytes {
             whole: std::sync::Arc::clone(whole),
             range,
@@ -2448,15 +2452,15 @@ enum Loaded {
     Archive(
         PathBuf,
         blinker_archive::ArchiveIndex,
-        std::sync::Arc<Vec<u8>>,
+        std::sync::Arc<mapping::Backing>,
     ),
 }
 
 /// Read and parse one input. Pure with respect to the others, which is what
 /// lets [`load_objects`] run them concurrently.
-fn load_one(path: &PathBuf, id: Option<ObjectId>) -> Result<Loaded, LinkError> {
-    let data = std::fs::read(path).map_err(|source| LinkError::Read {
-        path: path.clone(),
+fn load_one(path: &Path, id: Option<ObjectId>) -> Result<Loaded, LinkError> {
+    let data = mapping::read(path).map_err(|source| LinkError::Read {
+        path: path.to_path_buf(),
         source,
     })?;
     match id {
@@ -2464,7 +2468,7 @@ fn load_one(path: &PathBuf, id: Option<ObjectId>) -> Result<Loaded, LinkError> {
             let index = blinker_archive::index_archive(&data, path)
                 .map_err(|source| LinkError::Archive(Box::new(source)))?;
             Ok(Loaded::Archive(
-                path.clone(),
+                path.to_path_buf(),
                 index,
                 std::sync::Arc::new(data),
             ))
@@ -2550,7 +2554,7 @@ fn load_objects(paths: &[PathBuf]) -> Result<Vec<LoadedObject>, LinkError> {
     let mut archives: Vec<(
         PathBuf,
         blinker_archive::ArchiveIndex,
-        std::sync::Arc<Vec<u8>>,
+        std::sync::Arc<mapping::Backing>,
     )> = Vec::new();
     for slot in loaded {
         match slot.expect("every input was visited")? {
@@ -2715,7 +2719,7 @@ fn resolve_symbols(objects: &[LoadedObject], imports: &[String]) -> Result<Symbo
 fn parse_member(
     path: &Path,
     index: &blinker_archive::ArchiveIndex,
-    data: &std::sync::Arc<Vec<u8>>,
+    data: &std::sync::Arc<mapping::Backing>,
     member_id: blinker_archive::MemberId,
     id: ObjectId,
 ) -> Result<LoadedObject, LinkError> {

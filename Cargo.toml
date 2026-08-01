@@ -39,6 +39,7 @@ blinker-tbd = { path = "crates/tbd" }
 blinker-test-support = { path = "crates/test-support" }
 
 blake3 = "1"
+libc = "0.2"
 object = { version = "0.36", default-features = false, features = ["read_core", "macho", "archive", "std"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
