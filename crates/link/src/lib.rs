@@ -2269,18 +2269,19 @@ fn address_table(
     tlv_slots: &HashMap<String, u64>,
 ) -> Vec<(blinker_cache::NameHash, u64)> {
     use blinker_cache::{dep_hash, Table, GLOBAL};
-    let mut table: Vec<_> =
-        addresses
-            .global
-            .iter()
-            .map(|(name, address)| (dep_hash(GLOBAL, Table::Symbol, name), *address))
-            .chain(addresses.local.iter().map(|((object, name), address)| {
-                (dep_hash(*object, Table::Symbol, name), *address)
-            }))
-            .chain(indirect_entries(got_slots, Table::Got))
-            .chain(indirect_entries(stub_slots, Table::Stub))
-            .chain(indirect_entries(tlv_slots, Table::ThreadLocal))
-            .collect();
+    let mut table: Vec<_> = addresses
+        .global
+        .iter()
+        .map(|(name, address)| (dep_hash(GLOBAL, Table::Symbol, name), *address))
+        .chain(addresses.local.iter().flat_map(|(object, names)| {
+            names
+                .iter()
+                .map(move |(name, address)| (dep_hash(*object, Table::Symbol, name), *address))
+        }))
+        .chain(indirect_entries(got_slots, Table::Got))
+        .chain(indirect_entries(stub_slots, Table::Stub))
+        .chain(indirect_entries(tlv_slots, Table::ThreadLocal))
+        .collect();
     table.sort_unstable();
     table.dedup();
     table
@@ -4450,7 +4451,13 @@ fn target_address(
 #[derive(Default)]
 struct AddressMap {
     global: HashMap<String, u64>,
-    local: HashMap<(u32, String), u64>,
+    /// Locals, by object and then by name.
+    ///
+    /// Nested rather than keyed by `(u32, String)`, because a tuple key cannot
+    /// be *borrowed*: looking one up meant `name.to_string()` — an allocation
+    /// per question, on a path asked once per relocation, purely to throw it
+    /// away. Two lookups in two maps beat one lookup plus a heap allocation.
+    local: HashMap<u32, HashMap<String, u64>>,
 }
 
 impl AddressMap {
@@ -4459,7 +4466,11 @@ impl AddressMap {
     /// Paired with `lookup` so the cache hashes the address the linker would
     /// actually have read, rather than one that merely shares its name.
     fn scope_of(&self, object: ObjectId, name: &str) -> u32 {
-        if self.local.contains_key(&(object.0, name.to_string())) {
+        if self
+            .local
+            .get(&object.0)
+            .is_some_and(|names| names.contains_key(name))
+        {
             object.0
         } else {
             blinker_cache::GLOBAL
@@ -4470,7 +4481,8 @@ impl AddressMap {
         // A local definition in this object shadows a global of the same name,
         // which is what "local" means.
         self.local
-            .get(&(object.0, name.to_string()))
+            .get(&object.0)
+            .and_then(|names| names.get(name))
             .or_else(|| self.global.get(name))
             .copied()
     }
@@ -4510,7 +4522,9 @@ fn address_map(objects: &[LoadedObject], placed: &Placed, strip: &Strip) -> Addr
 
             if symbol.visibility == SymbolVisibility::Local {
                 map.local
-                    .insert((object.parsed.id.0, symbol.name.clone()), address);
+                    .entry(object.parsed.id.0)
+                    .or_default()
+                    .insert(symbol.name.clone(), address);
             } else {
                 map.global.insert(symbol.name.clone(), address);
             }

@@ -5702,3 +5702,47 @@ pattern did, and only measurement showed it.
 `traverse` at 1.54 ms is now the largest single item in the link, and it is
 still recomputing global reachability to discover that 24 of 6879 addresses
 moved. That remains the hard problem.
+
+## 118. A hash map keyed by a tuple cannot be looked up without allocating
+
+`AddressMap` held local symbols as `HashMap<(u32, String), u64>`. Rust can
+borrow a `String` key as `&str`, but it cannot borrow a `(u32, String)` key as
+`(u32, &str)` — so every lookup built the key it needed:
+
+```rust
+self.local.get(&(object.0, name.to_string()))
+```
+
+An allocation per question, thrown away immediately, on the path that answers
+"where did this name go" — asked by every relocation applied, every GOT slot
+filled, and every unwind record built. Nesting the map by object first removes
+it: two lookups in two maps, no heap.
+
+```
+                before   after
+  address_map   0.94 ms  0.74 ms
+  apply         0.98 ms  0.75 ms
+  unwind        1.52 ms  1.21 ms
+  link         16.6  ms 15.7  ms
+```
+
+Nearly a millisecond, and the beneficiaries were three separate stages that
+never appeared to have anything in common.
+
+### Three measurements of the same intuition
+
+This session removed allocations from three places, all of them "obviously"
+wasteful:
+
+```
+  survey's seen-sets      ~90,000 clones     0.05 ms   (finding 115)
+  dead-strip's live set   hashing indices    0.68 ms   (finding 117)
+  address map's lookups   ~1 alloc/lookup    0.90 ms   (this)
+```
+
+A factor of eighteen between the first and the last. What separates them is not
+how many allocations there were — the useless one removed the most — but
+**where in the loop nest they sat**. `survey` allocated once per distinct name;
+the other two sat on paths walked once per edge and once per lookup. Counting
+allocations predicts nothing. Knowing which loop you are in predicts everything,
+and the only reliable way to find out is to measure the stage before and after.
