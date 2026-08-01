@@ -16,8 +16,13 @@
 //! # What is archived
 //!
 //! Every positional input (`.o`, `.a`, `.rlib`, `.dylib`) is copied next to the
-//! record. Flag arguments are left alone — they carry no file identity — and
-//! the output path is deliberately *not* rewritten here; replay redirects it so
+//! record, and so is every file named by a flag that reads one — see
+//! `FILE_VALUED_FLAGS`. Those were missed at first on the reasoning that flags
+//! carry no file identity, which is true of flags in general and false of the
+//! `-exported_symbols_list` rustc passes on every binary link: it points into
+//! the same doomed temporary directory as the objects.
+//!
+//! The output path is deliberately *not* rewritten here; replay redirects it so
 //! a replayed link cannot overwrite a real build artifact.
 
 use std::collections::HashMap;
@@ -55,6 +60,56 @@ pub fn archive_inputs(
         std::fs::copy(&input.path, &archived)?;
         mapping.insert(input.path.clone(), archived.clone());
         input.archived_path = Some(archived);
+    }
+    Ok(mapping)
+}
+
+/// Flags whose value is a path to a file the link *reads*.
+///
+/// These are not inputs in the sense `archive_inputs` means — nothing is linked
+/// out of them — but they are read, and rustc writes them into the same
+/// temporary directory it deletes on the way out. `-exported_symbols_list` is
+/// the one that matters in practice: rustc passes it on every binary link, and
+/// a record that named the deleted file replayed as an errno from ld64 rather
+/// than as a link. A recorded invocation that cannot be replayed is not a
+/// recording, so these travel with the objects.
+const FILE_VALUED_FLAGS: &[&str] = &[
+    "-exported_symbols_list",
+    "-unexported_symbols_list",
+    "-reexported_symbols_list",
+    "-order_file",
+    "-filelist",
+    "-alias_list",
+];
+
+/// Copy the files named by `FILE_VALUED_FLAGS` into `dest`.
+///
+/// Named by flag rather than by index because they are not positional, and
+/// prefixed with `flag-` so they cannot collide with an archived input.
+pub fn archive_side_files(
+    argv: &[String],
+    dest: &Path,
+) -> std::io::Result<HashMap<PathBuf, PathBuf>> {
+    let mut mapping = HashMap::new();
+    for (index, arg) in argv.iter().enumerate() {
+        if !FILE_VALUED_FLAGS.contains(&arg.as_str()) {
+            continue;
+        }
+        let Some(value) = argv.get(index + 1) else {
+            continue;
+        };
+        let source = Path::new(value);
+        if !source.is_file() {
+            continue;
+        }
+        let name = source
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "list".to_string());
+        std::fs::create_dir_all(dest)?;
+        let archived = dest.join(format!("flag-{index:04}-{name}"));
+        std::fs::copy(source, &archived)?;
+        mapping.insert(source.to_path_buf(), archived);
     }
     Ok(mapping)
 }
@@ -198,5 +253,60 @@ mod tests {
     fn a_trailing_output_flag_does_not_panic() {
         let argv = vec!["a.o".to_string(), "-o".to_string()];
         assert_eq!(redirect_output(&argv, Path::new("/tmp/x")), argv);
+    }
+}
+
+#[cfg(test)]
+mod side_file_tests {
+    use super::*;
+    use blinker_test_support::Scratch;
+
+    /// The property the recorder exists for, applied to a file that is not an
+    /// object: after archiving, the replayed argument vector must name only
+    /// files that survive rustc deleting its temporary directory.
+    #[test]
+    fn an_exported_symbols_list_is_archived_and_the_argv_points_at_the_copy() {
+        let scratch = Scratch::dir("archive-side-files").unwrap();
+        let temporary = scratch.join("rustcXXXX");
+        std::fs::create_dir_all(&temporary).unwrap();
+        let list = temporary.join("list");
+        std::fs::write(&list, "_main\n").unwrap();
+
+        let argv = vec![
+            "-exported_symbols_list".to_string(),
+            list.display().to_string(),
+            "-o".to_string(),
+            "program".to_string(),
+        ];
+        let dest = scratch.join("inputs");
+        let mapping = archive_side_files(&argv, &dest).unwrap();
+        let replayed = rewrite_argv(&argv, &mapping);
+
+        // rustc's directory goes away the instant the link returns.
+        std::fs::remove_dir_all(&temporary).unwrap();
+
+        let archived = Path::new(&replayed[1]);
+        assert!(
+            archived.is_file(),
+            "the replay argv still names the deleted file: {}",
+            replayed[1]
+        );
+        assert_eq!(std::fs::read_to_string(archived).unwrap(), "_main\n");
+        assert_eq!(replayed[3], "program", "unrelated arguments were rewritten");
+    }
+
+    /// A flag whose value is missing or is not a file is left alone rather than
+    /// failing the whole recording.
+    #[test]
+    fn a_flag_with_no_readable_value_is_passed_through() {
+        let scratch = Scratch::dir("archive-side-files-absent").unwrap();
+        let argv = vec![
+            "-order_file".to_string(),
+            scratch.join("nothing-here").display().to_string(),
+            "-exported_symbols_list".to_string(),
+        ];
+        let mapping = archive_side_files(&argv, &scratch.join("inputs")).unwrap();
+        assert!(mapping.is_empty());
+        assert_eq!(rewrite_argv(&argv, &mapping), argv);
     }
 }

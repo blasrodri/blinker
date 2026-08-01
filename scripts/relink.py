@@ -249,6 +249,15 @@ def main():
 
     edited = materialise_pair(options, project, source, manifest["profile"])
 
+    # The two captures must describe the same link. They pick their record by
+    # input count, and an incremental build that relinked something else would
+    # hand back a different program entirely — which reads as an enormous blast
+    # radius rather than as the harness losing its place.
+    twin = json.loads((edited / "manifest.json").read_text())
+    if twin["output_name"] != manifest["output_name"]:
+        fail(f"the pair captured two different links: {manifest['output_name']}"
+             f" and {twin['output_name']} — try --recapture")
+
     argv, before = inputs_of(base / "argv.txt")
     _, after = inputs_of(edited / "argv.txt")
     changed, missing = differing(before, after)

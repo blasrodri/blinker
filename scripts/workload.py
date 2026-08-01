@@ -87,8 +87,30 @@ def run(cmd, **kwargs):
     return result
 
 
+def force_final_link(project):
+    """Make sure the build actually performs the link being captured.
+
+    The build directory is shared between captures on purpose (finding 106), and
+    the consequence is that a capture with no source change relinks *nothing* —
+    cargo has a current binary and leaves it alone. The recorder then holds only
+    the incidental links, a build script or a proc-macro dylib, and
+    `largest_record` picks one of those and calls it the workload. It is the
+    same failure as finding 106 wearing different clothes: the harness quietly
+    measuring a different link from the one it claims.
+
+    Touching the binary crate's own source is enough. It costs one small
+    recompile, changes no content, and guarantees the final link happens.
+    """
+    touched = sorted(project.glob("**/src/main.rs"))
+    for path in touched:
+        path.touch()
+    if not touched:
+        fail(f"no binary crate found under {project} to force a link")
+
+
 def capture(project, records, linker, target_dir, profile):
     """Build `project` with blinker recording every link it is asked to do."""
+    force_final_link(project)
     flags = f'["-C", "link-arg=--blinker-record-invocation={records}"]'
     cmd = [
         "cargo",
@@ -96,6 +118,18 @@ def capture(project, records, linker, target_dir, profile):
         f"--target-dir={target_dir}",
         f"--config=target.{TARGET}.linker='{linker}'",
         f"--config=target.{TARGET}.rustflags={flags}",
+        # The captured build must not use fat LTO, whatever the project's own
+        # profile says. Under `lto = "fat"` rustc merges every crate itself and
+        # hands the linker one object: blinker's self-link went from 62 inputs
+        # and 692 objects to 3 inputs and 378. That is a real link, but it is
+        # not the link this benchmark is about, and a linker benchmark whose
+        # workload has three inputs measures almost nothing about linking.
+        #
+        # blinker's own release profile *does* use fat LTO — it is worth 7% on
+        # the link — so without this the shipped binary's profile silently
+        # reshapes the fixture that judges it.
+        "--config=profile.release.lto=false",
+        "--config=profile.release.codegen-units=16",
     ]
     if profile == "release":
         cmd.append("--release")
@@ -115,6 +149,17 @@ def largest_record(records):
     for path in sorted(Path(records).glob("*.json")):
         with open(path) as handle:
             record = json.load(handle)
+        # A record whose argument vector names a file that no longer exists
+        # cannot be replayed, and picking it produces a workload that fails
+        # verification with an errno from ld64 rather than a useful message.
+        # The recorder archives these now (`archive_side_files`); this stays as
+        # the check that it did, because the failure mode is a *silently
+        # different* workload rather than an error.
+        argv = record.get("replay_argv") or record.get("argv") or []
+        if any(a.startswith("/") and "/" in a[1:] and a.endswith("/list")
+               and not os.path.exists(a) for a in argv):
+            print(f"    skipping {path.name}: it names a file that is gone")
+            continue
         count = len(record.get("inputs") or [])
         if count > best_count:
             best, best_count = record, count
@@ -231,9 +276,14 @@ def main():
     if not BLINKER.exists():
         fail(f"{BLINKER} not built — run: cargo build --release")
 
-    destination = Path(options.out) / options.name
-    if destination.exists():
-        shutil.rmtree(destination)
+    # Built beside the real one and moved into place at the end. Clearing the
+    # destination first means a capture that fails — and they do; a build that
+    # relinks nothing produces an unreplayable record — takes the existing
+    # workload with it, and the next run reports "no workload" instead of the
+    # error that actually happened.
+    final = Path(options.out) / options.name
+    destination = Path(options.out) / f".{options.name}.partial"
+    shutil.rmtree(destination, ignore_errors=True)
     destination.mkdir(parents=True)
 
     # Copied, not referenced: the capture build rewrites target/release/blinker
@@ -274,7 +324,15 @@ def main():
     print("  verifying the workload links")
     blinker_ms, blinker_size, ld64_ms = verify(argv, destination)
 
-    (destination / "argv.txt").write_text("\n".join(argv) + "\n")
+    # Verified in the staging directory, recorded against the final one: the
+    # workload is built beside its own name and moved into place, so every path
+    # written down now has to be the path it will have afterwards. Writing the
+    # staging paths produced an `argv.txt` naming a directory that no longer
+    # existed, and ld64 reported it as `undefined _main` — the objects were
+    # simply not there, and an argument vector of missing files still looks like
+    # a link.
+    final_argv = [a.replace(str(destination), str(final)) for a in argv]
+    (destination / "argv.txt").write_text("\n".join(final_argv) + "\n")
     manifest = {
         "name": options.name,
         "project": str(Path(options.project).resolve()),
@@ -291,11 +349,29 @@ def main():
 
     # The build directory is shared and outlives this capture; see above.
 
+    # Only now, with both linkers having accepted it, does it replace whatever
+    # workload of this name was there before.
+    shutil.rmtree(final, ignore_errors=True)
+    shutil.move(str(destination), str(final))
+
+    # And the recorded vector is checked against the filesystem it will be
+    # replayed on, because "verified, then moved" is exactly the window in which
+    # a workload can become unreplayable without anything noticing.
+    output = final_argv[final_argv.index("-o") + 1]
+    absent = [
+        a
+        for a in final_argv
+        if a.startswith(str(final)) and a != output and not os.path.exists(a)
+    ]
+    if absent:
+        fail(f"{len(absent)} archived path(s) do not exist after the move, "
+             f"first: {absent[0]}")
+
     print(f"\n  {options.name}: {files} files, {objects} objects, "
           f"{size / 1024 / 1024:.1f} MB")
     print(f"  one link: blinker {blinker_ms:.0f} ms"
           + (f", ld64 {ld64_ms:.0f} ms" if ld64_ms else ""))
-    print(f"\n  scripts/bench.py {destination / 'argv.txt'}")
+    print(f"\n  scripts/bench.py {final / 'argv.txt'}")
 
 
 if __name__ == "__main__":

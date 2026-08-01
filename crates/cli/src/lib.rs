@@ -162,7 +162,9 @@ pub fn run_in(
     // the object files as soon as the link returns, so afterwards is too late.
     if let Some(dir) = &options.record_invocation {
         let archive_dir = recording_path(dir, &record).with_extension("inputs");
-        let mapping = archive::archive_inputs(&mut inputs, &archive_dir)?;
+        let mut mapping = archive::archive_inputs(&mut inputs, &archive_dir)?;
+        // The objects are not everything the link reads; see `FILE_VALUED_FLAGS`.
+        mapping.extend(archive::archive_side_files(&parsed.argv, &archive_dir)?);
         record.replay_argv = Some(archive::rewrite_argv(&parsed.argv, &mapping));
     }
     record.set_inputs(inputs);
