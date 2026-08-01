@@ -58,8 +58,10 @@ use reachability::Strip;
 mod hashing;
 mod identity;
 mod mapping;
+mod session;
 use hashing::FastMap;
 pub use identity::ContributionKeys;
+pub use session::Session;
 
 pub mod error;
 pub use error::LinkError;
@@ -175,6 +177,10 @@ pub struct LinkTimings {
     /// Surveying every relocation to discover which GOT, stub and TLV slots the
     /// link needs. Between `resolve` and `layout`, and in neither.
     pub survey_ms: f64,
+    /// Inputs served from memory, and inputs that had to be read. Both zero
+    /// for a one-shot link, which holds nothing.
+    pub inputs_held: u64,
+    pub inputs_read: u64,
 }
 
 impl std::fmt::Display for LinkTimings {
@@ -256,7 +262,7 @@ impl std::fmt::Display for LinkTimings {
 /// Link, reporting how long each stage took.
 pub fn link_timed(request: &LinkRequest) -> Result<(Image, LinkTimings), LinkError> {
     let mut timings = LinkTimings::default();
-    let image = link_inner(request, &mut timings)?;
+    let image = link_inner(request, &mut timings, &mut Session::default())?;
     Ok((image, timings))
 }
 
@@ -268,7 +274,7 @@ pub mod reachability;
 /// changes no output: the model is checked against a linker that already
 /// strips correctly before anything is rebuilt around it (finding 70).
 pub fn reachability_report(request: &LinkRequest) -> Result<reachability::Report, LinkError> {
-    let objects = load_objects(&request.objects)?;
+    let objects = load_objects(&request.objects, &mut Session::default())?;
     Ok(reachability::analyse(&objects, &request.entry_symbol))
 }
 
@@ -509,6 +515,25 @@ impl SourceBytes {
         }
     }
 
+    /// A whole file whose bytes are already shared.
+    fn whole_shared(whole: &std::sync::Arc<mapping::Backing>) -> SourceBytes {
+        let range = 0..whole.len();
+        SourceBytes {
+            whole: std::sync::Arc::clone(whole),
+            range,
+        }
+    }
+
+    /// The shared buffer behind this window.
+    fn backing(&self) -> &std::sync::Arc<mapping::Backing> {
+        &self.whole
+    }
+
+    /// Which bytes of that buffer this window covers.
+    fn range(&self) -> std::ops::Range<usize> {
+        self.range.clone()
+    }
+
     /// A window into an archive, sharing its buffer.
     fn window(
         whole: &std::sync::Arc<mapping::Backing>,
@@ -533,7 +558,10 @@ impl std::ops::Deref for SourceBytes {
 }
 
 struct LoadedObject {
-    parsed: ParsedObject,
+    /// Shared, because a resident linker parses an unchanged input once and
+    /// hands the same answer to every later link. Nothing mutates a
+    /// `ParsedObject` after it is parsed, which is what makes that sound.
+    parsed: std::sync::Arc<ParsedObject>,
     data: SourceBytes,
 }
 
@@ -1345,10 +1373,18 @@ fn undefined_references(objects: &[LoadedObject]) -> Vec<String> {
 
 /// Link the request into an image.
 pub fn link(request: &LinkRequest) -> Result<Image, LinkError> {
-    link_inner(request, &mut LinkTimings::default())
+    link_inner(
+        request,
+        &mut LinkTimings::default(),
+        &mut Session::default(),
+    )
 }
 
-fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image, LinkError> {
+fn link_inner(
+    request: &LinkRequest,
+    timings: &mut LinkTimings,
+    session: &mut Session,
+) -> Result<Image, LinkError> {
     let overall = std::time::Instant::now();
 
     // The stub library's export list is a pure function of a file on disk —
@@ -1361,15 +1397,31 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     // cache, and therefore no new state whose staleness could change an
     // output.
     let step = std::time::Instant::now();
+    session.begin(&request.objects);
+    let held_stubs = session.stub_exports(&request.stub_libraries);
     let (objects, exported, stub_ms) = std::thread::scope(|scope| {
-        let stub = scope.spawn(|| {
+        let held = held_stubs.clone();
+        let stub = scope.spawn(move || {
             let started = std::time::Instant::now();
-            (request.dynamic_symbols(), elapsed_ms(started))
+            // Held from a previous link when the SDK has not moved. This is
+            // the parse finding 100 measured at 6.0 ms of the 7.6 ms stage —
+            // hidden behind reading the objects, and therefore worth nothing
+            // to cache until the objects stop being read either. Both stop
+            // here at once.
+            let exported = match held {
+                Some(held) => Some(held),
+                None => request.dynamic_symbols().map(std::sync::Arc::new),
+            };
+            (exported, elapsed_ms(started))
         });
-        let objects = load_objects(&request.objects);
+        let objects = load_objects(&request.objects, session);
         let (exported, stub_ms) = stub.join().expect("the stub reader did not panic");
         (objects, exported, stub_ms)
     });
+    if let Some(exported) = &exported {
+        session.store_stub_exports(&request.stub_libraries, std::sync::Arc::clone(exported));
+    }
+    let exported = exported.map(|e| (*e).clone());
     // Both halves are timed, not just the pair. Overlapped work is only free
     // while it is the *shorter* half, and a profile cannot tell the difference:
     // it counts CPU across threads, so a stub parse that is entirely hidden
@@ -2513,14 +2565,14 @@ fn load_one(path: &Path, id: Option<ObjectId>) -> Result<Loaded, LinkError> {
             let parsed = parse_object(&data, path, None, id)
                 .map_err(|source| LinkError::Parse(Box::new(source)))?;
             Ok(Loaded::Object(LoadedObject {
-                parsed,
+                parsed: std::sync::Arc::new(parsed),
                 data: SourceBytes::whole(data),
             }))
         }
     }
 }
 
-fn load_objects(paths: &[PathBuf]) -> Result<Vec<LoadedObject>, LinkError> {
+fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedObject>, LinkError> {
     // Object ids are assigned by position, before anything is read, so that
     // running the reads out of order cannot change them. `is_archive` looks
     // only at the path, so the assignment needs no I/O.
@@ -2547,6 +2599,30 @@ fn load_objects(paths: &[PathBuf]) -> Result<Vec<LoadedObject>, LinkError> {
     let mut loaded: Vec<Option<Result<Loaded, LinkError>>> =
         (0..paths.len()).map(|_| None).collect();
 
+    // Whatever this process already holds, taken first and serially: a probe is
+    // a `stat` (or a read and a hash for the inputs whose paths do not identify
+    // them), and the session is not shareable across the worker threads below.
+    // What is left is what has to be read.
+    let mut todo: Vec<usize> = Vec::with_capacity(paths.len());
+    for (at, path) in paths.iter().enumerate() {
+        let held = match ids[at] {
+            Some(_) => session.object(path).map(|(parsed, data)| {
+                Loaded::Object(LoadedObject {
+                    parsed,
+                    data: SourceBytes::whole_shared(&data),
+                })
+            }),
+            None => session
+                .archive(path)
+                .map(|(index, data)| Loaded::Archive(path.clone(), index, data)),
+        };
+        match held {
+            Some(entry) => loaded[at] = Some(Ok(entry)),
+            None => todo.push(at),
+        }
+    }
+
+    let threads = threads.min(todo.len().max(1));
     if threads > 1 {
         // A shared cursor rather than a contiguous slice each. The inputs are
         // wildly uneven — 37 objects averaging 8 KB, then 19 rlibs averaging
@@ -2555,7 +2631,7 @@ fn load_objects(paths: &[PathBuf]) -> Result<Vec<LoadedObject>, LinkError> {
         // gave the last thread every large file and saved 1.2 ms of 6.9;
         // letting threads take the next unclaimed input balances itself.
         let cursor = std::sync::atomic::AtomicUsize::new(0);
-        let (paths, ids) = (&paths, &ids);
+        let (paths, ids, todo) = (&paths, &ids, &todo);
         let claimed: Vec<Vec<(usize, Result<Loaded, LinkError>)>> = std::thread::scope(|scope| {
             let workers: Vec<_> = (0..threads)
                 .map(|_| {
@@ -2563,10 +2639,10 @@ fn load_objects(paths: &[PathBuf]) -> Result<Vec<LoadedObject>, LinkError> {
                     scope.spawn(move || {
                         let mut mine = Vec::new();
                         loop {
-                            let at = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if at >= paths.len() {
+                            let next = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(&at) = todo.get(next) else {
                                 return mine;
-                            }
+                            };
                             mine.push((at, load_one(&paths[at], ids[at])));
                         }
                     })
@@ -2581,8 +2657,19 @@ fn load_objects(paths: &[PathBuf]) -> Result<Vec<LoadedObject>, LinkError> {
             loaded[at] = Some(result);
         }
     } else {
-        for (at, slot) in loaded.iter_mut().enumerate() {
-            *slot = Some(load_one(&paths[at], ids[at]));
+        for &at in &todo {
+            loaded[at] = Some(load_one(&paths[at], ids[at]));
+        }
+    }
+
+    // Everything freshly read goes into the session for the next link.
+    for &at in &todo {
+        match loaded[at].as_ref().and_then(|r| r.as_ref().ok()) {
+            Some(Loaded::Object(object)) => {
+                session.store_object(&paths[at], &object.parsed, object.data.backing())
+            }
+            Some(Loaded::Archive(path, index, data)) => session.store_archive(path, index, data),
+            None => {}
         }
     }
 
@@ -2645,14 +2732,38 @@ fn load_objects(paths: &[PathBuf]) -> Result<Vec<LoadedObject>, LinkError> {
         // parsed one after another on one thread.
         let base = next_id;
         next_id += round.len() as u32;
+
+        // Members this process already parsed, taken before any thread starts.
+        // The id check is the whole safety argument: a held member carries the
+        // id it was parsed with, and everything downstream keys on that id. It
+        // matches whenever the extraction order does, and when it does not the
+        // member is simply parsed again rather than served under a name that
+        // now means something else.
+        let mut held: Vec<Option<LoadedObject>> = (0..round.len()).map(|_| None).collect();
+        for (at, (archive_index, member_id)) in round.iter().enumerate() {
+            let (path, _, data) = &archives[*archive_index];
+            let Some((parsed, range)) = session.member(path, member_id.0) else {
+                continue;
+            };
+            if parsed.id != ObjectId(base + at as u32) {
+                continue;
+            }
+            held[at] = Some(LoadedObject {
+                parsed,
+                data: SourceBytes::window(data, range),
+            });
+        }
+        let todo: Vec<usize> = (0..round.len()).filter(|at| held[*at].is_none()).collect();
+
         let round = &round;
         let archives_ref = &archives;
+        let todo_ref = &todo;
         let parsed: Vec<Result<LoadedObject, LinkError>> = {
             let cursor = std::sync::atomic::AtomicUsize::new(0);
             let threads = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1)
-                .min(round.len());
+                .min(todo.len());
             let claimed: Vec<Vec<(usize, Result<LoadedObject, LinkError>)>> =
                 std::thread::scope(|scope| {
                     let workers: Vec<_> = (0..threads.max(1))
@@ -2661,11 +2772,11 @@ fn load_objects(paths: &[PathBuf]) -> Result<Vec<LoadedObject>, LinkError> {
                             scope.spawn(move || {
                                 let mut mine = Vec::new();
                                 loop {
-                                    let at =
+                                    let next =
                                         cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                    if at >= round.len() {
+                                    let Some(&at) = todo_ref.get(next) else {
                                         return mine;
-                                    }
+                                    };
                                     let (archive_index, member_id) = round[at];
                                     let (path, index, data) = &archives_ref[archive_index];
                                     mine.push((
@@ -2692,11 +2803,30 @@ fn load_objects(paths: &[PathBuf]) -> Result<Vec<LoadedObject>, LinkError> {
             for (at, result) in claimed.into_iter().flatten() {
                 ordered[at] = Some(result);
             }
+            for (at, member) in held.into_iter().enumerate() {
+                if let Some(member) = member {
+                    ordered[at] = Some(Ok(member));
+                }
+            }
             ordered
                 .into_iter()
                 .map(|slot| slot.expect("every member was visited"))
                 .collect()
         };
+
+        // Freshly parsed members go into the session; held ones are already in
+        // it, and re-storing them would be a map write per member per link.
+        let mut fresh = todo.iter().copied().peekable();
+        for (at, loaded) in parsed.iter().enumerate() {
+            if fresh.peek() != Some(&at) {
+                continue;
+            }
+            fresh.next();
+            if let Ok(loaded) = loaded {
+                let (path, _, _) = &archives[round[at].0];
+                session.store_member(path, round[at].1 .0, &loaded.parsed, loaded.data.range());
+            }
+        }
 
         for loaded in parsed {
             let loaded = loaded?;
@@ -2768,7 +2898,7 @@ fn parse_member(
         .map_err(|source| LinkError::Parse(Box::new(source)))?;
     let start = member.offset as usize;
     Ok(LoadedObject {
-        parsed,
+        parsed: std::sync::Arc::new(parsed),
         data: SourceBytes::window(data, start..start + bytes.len()),
     })
 }
@@ -4250,10 +4380,30 @@ pub fn link_to_file(request: &LinkRequest, output: &Path) -> Result<Image, LinkE
 /// skipped. Callers that need them should use [`link_to_file`], which always
 /// performs a full link.
 pub fn link_to_file_timed(request: &LinkRequest, output: &Path) -> Result<LinkTimings, LinkError> {
+    link_to_file_in(request, output, &mut Session::default())
+}
+
+/// Link and write, keeping parsed inputs in `session` for the next call.
+///
+/// The one-shot entry points create a `Session` and drop it, which is exactly
+/// the previous behaviour. A resident linker keeps one and hands it to every
+/// link, which is the whole of what "resident" buys: an input whose bytes have
+/// not changed is not read, not parsed, and not turned into symbols again.
+pub fn link_to_file_in(
+    request: &LinkRequest,
+    output: &Path,
+    session: &mut Session,
+) -> Result<LinkTimings, LinkError> {
     if let Some(timings) = reuse_finished_image(request, output)? {
         return Ok(timings);
     }
-    let (image, timings) = link_timed(request)?;
+    let mut timings = LinkTimings::default();
+    let overall = std::time::Instant::now();
+    let image = link_inner(request, &mut timings, session)?;
+    timings.total_ms = elapsed_ms(overall);
+    let (held, read) = session.counts();
+    timings.inputs_held = held as u64;
+    timings.inputs_read = read as u64;
     write_output(&image.bytes, output)?;
     Ok(timings)
 }

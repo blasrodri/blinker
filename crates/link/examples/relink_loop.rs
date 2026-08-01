@@ -16,7 +16,7 @@
 //!   sample $! 15 -file /tmp/profile.txt
 //! ```
 
-use blinker_link::{link_to_file, LinkRequest};
+use blinker_link::{link_to_file_in, LinkRequest, Session};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -44,11 +44,21 @@ fn main() {
     let out = PathBuf::from("/tmp/relink-loop-out");
     let request = LinkRequest::new(inputs).dead_stripped(true);
 
+    // One session across every link, which is what a resident linker has and
+    // a process per link cannot.
+    let mut session = Session::default();
     let deadline = Instant::now() + Duration::from_secs(seconds);
     let mut links = 0u64;
+    let mut last = None;
     while Instant::now() < deadline {
-        link_to_file(&request, &out).expect("the link succeeds");
+        last = Some(link_to_file_in(&request, &out, &mut session).expect("the link succeeds"));
         links += 1;
+    }
+    if let Some(timings) = last {
+        println!(
+            "  inputs: {} held, {} read   read+parse {:.2} ms   link {:.2} ms",
+            timings.inputs_held, timings.inputs_read, timings.read_and_parse_ms, timings.total_ms
+        );
     }
     // Printed rather than returned: this is a tool, and the count is how you
     // tell a profile of the linker from a profile of a process that spent the
