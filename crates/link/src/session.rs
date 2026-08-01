@@ -77,6 +77,12 @@ enum Entry {
 /// what the generation counter below does in one assignment.
 type MemberKey = (PathBuf, u32);
 
+/// The archives an extraction order is indexed against, and the order itself.
+///
+/// `(archive position, member)` means nothing against a different set of
+/// archives, so the two travel together.
+type ExtractionOrder = (Vec<PathBuf>, Vec<(usize, u32)>);
+
 /// The SDK stub files an exports set was read from, and the set itself.
 type HeldStubs = (Vec<(PathBuf, blinker_cache::InputKey)>, Arc<StubExports>);
 
@@ -122,7 +128,13 @@ pub struct Session {
     /// define a name that stops a member being wanted, or want one that was
     /// not, and there is no cheap way to know which; the plan is discarded and
     /// recomputed.
-    extraction: Option<Vec<(usize, u32)>>,
+    /// The archive sub-list this order indexes into, and the order.
+    ///
+    /// The order is `(archive position, member)`, so it means nothing against
+    /// a different set of archives. Storing them together is what lets the
+    /// order survive an input list that changed *elsewhere* — which is every
+    /// debug rebuild, because rustc renames the loose objects (finding 144).
+    extraction: Option<ExtractionOrder>,
     /// A digest of each input's *symbol interface* — what it defines and what
     /// it leaves undefined — from when it was last parsed.
     ///
@@ -285,8 +297,6 @@ impl Session {
             });
             self.indexes
                 .retain(|path, _| surviving.contains(path.as_path()));
-            self.extraction = None;
-            self.imports = None;
             self.inputs = inputs.to_vec();
         }
         // Contents the previous link never looked at are dropped now, so a
@@ -348,6 +358,7 @@ impl Session {
         let (parsed, backing) = self.by_content.get(&hash)?;
         let (parsed, backing) = (Arc::clone(parsed), Arc::clone(backing));
         self.used_content.insert(hash);
+        self.note_interface_unchanged(path, &parsed);
         // Filed under its new name too, so the next link finds it by path and
         // the entry is dropped with the input list when it stops being linked.
         self.entries.insert(
@@ -522,12 +533,29 @@ impl Session {
     /// changed. A re-read object whose defined and undefined names are what
     /// they were cannot make any archive want a different member, because
     /// those two sets are the frontier's only input.
-    pub fn extraction(&mut self) -> Option<&[(usize, u32)]> {
-        if self.interfaces_changed || self.extraction.is_none() {
+    pub fn extraction(&mut self, archives: &[PathBuf]) -> Option<&[(usize, u32)]> {
+        if self.interfaces_changed {
+            return None;
+        }
+        let (recorded, order) = self.extraction.as_ref()?;
+        if recorded != archives {
             return None;
         }
         self.replayed_extraction = true;
-        self.extraction.as_deref()
+        Some(order)
+    }
+
+    /// Record an interface that is known not to have moved.
+    ///
+    /// A content hit is the same bytes under a new name, so its interface is
+    /// the one already held — but it is held under the *old* name, which the
+    /// input list no longer contains. Filing it under the new one keeps the
+    /// map complete without `note_interface`'s "absent means changed" rule
+    /// firing on a rename, which would invalidate every answer that a rename
+    /// is supposed to leave alone.
+    fn note_interface_unchanged(&mut self, path: &Path, parsed: &ParsedObject) {
+        self.interfaces
+            .insert(path.to_path_buf(), interface_digest(parsed));
     }
 
     /// Whether a freshly parsed member's interface is the one held for it.
@@ -568,8 +596,8 @@ impl Session {
     }
 
     /// Remember which members were extracted, and in what order.
-    pub fn store_extraction(&mut self, order: Vec<(usize, u32)>) {
-        self.extraction = Some(order);
+    pub fn store_extraction(&mut self, archives: Vec<PathBuf>, order: Vec<(usize, u32)>) {
+        self.extraction = Some((archives, order));
     }
 
     /// Inputs served from memory, and inputs that had to be read.
@@ -989,23 +1017,39 @@ mod tests {
     }
 
     #[test]
-    fn a_changed_input_list_drops_what_was_derived_from_the_whole_list() {
+    fn the_extraction_order_survives_a_rename_but_not_a_changed_archive_set() {
         let scratch = Scratch::dir("session-whole-list").expect("scratch");
-        let path = scratch.join("a.o");
-        std::fs::write(&path, vec![0u8; 128]).expect("written");
+        let object = scratch.join("a.0aaaaaa.rcgu.o");
+        let archive = scratch.join("libx-0123456789abcdef.rlib");
+        std::fs::write(&object, vec![0u8; 128]).expect("written");
+        std::fs::write(&archive, vec![0u8; 128]).expect("written");
 
         let mut session = Session::default();
-        session.begin(std::slice::from_ref(&path));
-        session.store_extraction(vec![(0, 0)]);
-        session.store_imports(&["_malloc".to_string()]);
-        assert!(session.extraction().is_some(), "it was not held");
+        session.begin(&[object.clone(), archive.clone()]);
+        session.store_extraction(vec![archive.clone()], vec![(0, 0)]);
+        assert!(
+            session.extraction(std::slice::from_ref(&archive)).is_some(),
+            "it was not held"
+        );
 
-        // The extraction order and the import set are answers about every
-        // input at once, so a list that gained or lost one invalidates them
-        // however many of the others survived.
-        session.begin(&[path.clone(), scratch.join("b.o")]);
-        assert!(session.extraction().is_none(), "a stale extraction order");
-        assert!(session.imports().is_none(), "a stale import set");
+        // The loose object is renamed, which is what a debug rebuild does. The
+        // archives are untouched, so the order still means what it meant.
+        let renamed = scratch.join("a.0bbbbbb.rcgu.o");
+        session.begin(&[renamed, archive.clone()]);
+        assert!(
+            session.extraction(std::slice::from_ref(&archive)).is_some(),
+            "a rename of something that is not an archive discarded the \
+             extraction order"
+        );
+
+        // A different set of archives, though, renumbers what the order is
+        // written in terms of.
+        let other = scratch.join("liby-fedcba9876543210.rlib");
+        assert!(
+            session.extraction(&[other, archive]).is_none(),
+            "an order indexed against one archive list was replayed against \
+             another"
+        );
     }
 
     /// A rewritten object is re-read even though its path is the same.

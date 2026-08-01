@@ -6923,3 +6923,74 @@ be keyed by content and a renamed-but-identical object would be a hit.
 That is the next thing, and it is worth stating plainly what it means: **for
 the inner loop this linker exists to serve, a third of the work it does is on
 inputs it has already parsed, unchanged, under a different name.**
+
+## 145. Serving a renamed object from its content, and the invalidation behind it
+
+Finding 144 removed the cliff where a renamed input list threw the session
+away. It left 2.5 seconds of work on 132 objects that were byte-identical to
+ones already parsed, because they were identified by path.
+
+`InputKey::probe` already hashes exactly these files — an `.rlib` path is
+content-addressed and a `.rcgu.o` path is not, so rustc's objects were being
+hashed anyway. So the parse cache gets a second index, keyed by that hash, and
+a renamed object is a hit.
+
+Two things had to come with it, and neither is incidental.
+
+**The path had to leave the shared parse.** `ParsedObject.metadata.path` is the
+path it was *first* parsed from, and reusing a parse across a rename makes that
+stale. An `OSO` stab names a file a debugger will open; a contribution's
+identity is hashed from its input's name. `LoadedObject` now carries the path
+this link read it from, and the five places that name the file to a consumer
+use that. Without it, a contribution's identity would depend on whether the
+session happened to be holding it — a warm link and a cold link would disagree
+about what the same bytes are called.
+
+**The index had to be pruned by use, not by the input list.** Pruning by list
+is exactly what it exists to survive. It follows `forget_unused_memos`: a
+parse lives as long as something keeps linking it, and two links that do not
+touch it drop it.
+
+### And then the number barely moved
+
+```
+  132 renamed / same bytes    2902 ms   held=341 read=0   parse=980
+```
+
+Every input from memory, nothing read — and `read_and_parse` was still a
+second. It is not I/O. `Session::begin` discarded the extraction order and the
+import set whenever the input list changed, so the archive-member frontier ran
+again over 5,600 objects and resolution redid the whole symbol table.
+
+That invalidation was wrong in the same way the wipe was. The extraction order
+is `(archive position, member)`, so what it depends on is the *archives* and
+the interfaces — neither of which a rename of the loose objects touches. Stored
+with the archive list it is indexed against, and guarded by the interface check
+that was already there, it survives:
+
+```
+                       cold      rename    rename    rename
+  link                 3861 ms   1513      1420      1360
+    read_and_parse      1342       35        32        33
+    resolve              602        0         0         0
+    dead_strip           520      228       231       231
+    relocate             391      391       345       396
+    emit                 359      311       310       304
+```
+
+Against where the day started, on a rename of a third of the inputs with not
+one byte changed:
+
+```
+  3645 ms  ->  1360 ms
+```
+
+Output verified by running it: `rust-analyzer 0.0.0 (804ee7d 2026-08-01)`.
+
+### What is left, and it is now the whole of it
+
+A rename with zero content change should cost what the no-op path costs — 47
+ms. It costs 1,360, and the profile no longer has a dominant term: `dead_strip`
+231, `relocate` 391, `emit` 311. None of them consults whether anything
+changed. That is the same list finding 142 ended with, minus the two entries
+that turned out to be about reading files.

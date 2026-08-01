@@ -3098,11 +3098,16 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
     // now, and members are numbered after them in extraction order.
     let first_member_id = next_id;
 
+    // The archive sub-list the extraction order is indexed against. A rename
+    // of the loose objects — every debug rebuild — leaves this identical, so
+    // the order survives; a changed set of archives invalidates it.
+    let archive_paths: Vec<PathBuf> = archives.iter().map(|(path, _, _)| path.clone()).collect();
+
     // The order a previous link settled on, when every input came from memory
     // and so cannot have changed what any archive is asked for. Replaying it
     // skips the frontier entirely: with the parses held, those rounds are the
     // whole of what this stage still costs.
-    if let Some(order) = session.extraction() {
+    if let Some(order) = session.extraction(&archive_paths) {
         let order = order.to_vec();
         for (position, (archive_index, member)) in order.iter().enumerate() {
             let (path, index, data) = &archives[*archive_index];
@@ -3159,7 +3164,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
             }
         }
         if round.is_empty() {
-            session.store_extraction(order);
+            session.store_extraction(archive_paths, order);
             return Ok(objects);
         }
         order.extend(round.iter().map(|(archive, member)| (*archive, member.0)));
@@ -3274,7 +3279,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
         }
 
         if !added {
-            session.store_extraction(order);
+            session.store_extraction(archive_paths, order);
             return Ok(objects);
         }
     }
