@@ -52,6 +52,8 @@ import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from workload import objects_in  # noqa: E402  one definition, two callers (139)
 BLINKER = REPO / "target" / "release" / "blinker"
 # A real item, not a comment. The first version of this appended a comment and
 # the rebuild produced byte-identical rlibs: rustc hashes the crate's meaning,
@@ -295,8 +297,14 @@ def main():
     if not changed:
         fail("the rebuild produced identical inputs — the edit changed nothing")
 
+    # Both denominators, because they disagree by an order of magnitude and the
+    # object count is the one that bounds how much work the link can avoid.
+    changed_objects = sum(objects_in(path) for path, _ in changed)
+    total_objects = sum(objects_in(path) for path in before)
     print(f"  blast radius: {len(changed)} of {len(before)} inputs changed"
           + (f", {len(missing)} unmatched" if missing else ""))
+    print(f"                {changed_objects} of {total_objects} objects"
+          f" ({100 * changed_objects / max(total_objects, 1):.0f}%)")
     for path, _ in changed[:6]:
         print(f"    {Path(path).name}")
     if len(changed) > 6:

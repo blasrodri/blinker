@@ -317,6 +317,43 @@ def replay_argv_with(argv, output):
     return out
 
 
+def objects_in(path):
+    """How many object files an archive holds, without spawning `ar`.
+
+    An `.rlib` is not a unit of anything: rust-analyzer's large crates are 256
+    objects each and its leaf crates are one. "15 of 341 inputs changed" was
+    read as a four percent blast radius when it was fifty-seven percent of the
+    program (finding 143), and no amount of care with the *linker* would have
+    caught that — the harness was reporting the wrong denominator.
+
+    The `ar` format is a global header, then 60-byte member headers each
+    followed by their data, padded to even. Both the BSD long-name form
+    (`#1/<len>`, name stored in the data) and the plain form appear in rlibs.
+    """
+    if not path.endswith((".rlib", ".a")):
+        return 1
+    try:
+        with open(path, "rb") as handle:
+            if handle.read(8) != b"!<arch>\n":
+                return 1
+            count = 0
+            while True:
+                header = handle.read(60)
+                if len(header) < 60:
+                    return count
+                name = header[:16].decode("ascii", "replace").strip()
+                size = int(header[48:58].decode("ascii", "replace").strip() or 0)
+                if name.startswith("#1/"):
+                    extra = int(name[3:])
+                    name = handle.read(extra).decode("ascii", "replace").rstrip("\0")
+                    size -= extra
+                if name.rstrip("/").endswith(".o"):
+                    count += 1
+                handle.seek(size + (size & 1), 1)
+    except OSError:
+        return 1
+
+
 def count_objects(argv):
     """Objects, counting archive members — the unit the linker actually reads.
 
@@ -325,15 +362,10 @@ def count_objects(argv):
     both.
     """
     files = [Path(a) for a in argv if a.endswith((".o", ".rlib", ".a"))]
-    objects = 0
-    for path in files:
-        if path.suffix == ".o":
-            objects += 1
-            continue
-        listing = subprocess.run(
-            ["/usr/bin/ar", "-t", str(path)], capture_output=True, text=True
-        )
-        objects += sum(1 for line in listing.stdout.splitlines() if line.strip())
+    # Counting every `ar -t` line included `lib.rmeta`, which the linker never
+    # reads — three members per rlib, and about ten percent of the number this
+    # manifest publishes as "objects".
+    objects = sum(objects_in(str(path)) for path in files)
     size = sum(p.stat().st_size for p in files if p.exists())
     return len(files), objects, size
 
