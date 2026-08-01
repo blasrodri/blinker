@@ -6694,3 +6694,79 @@ Everything measured before today was measured on the wrong workload. The
 milliseconds were real and the changes were real, but "which stage matters" was
 answered by a link that finishes in the time this one spends on any single
 stage. Before any further optimisation, the profile has to be retaken here.
+
+## 142. Incremental buys nothing on the link it was built for
+
+The whole premise: a resident linker that holds its inputs should relink an
+edit far faster than a cold linker can start. Measured on the long link, with
+an edit to `crates/base-db/src/lib.rs` — near the bottom of rust-analyzer's
+graph, so the blast radius is real:
+
+```
+  blinker, cold                3,276 ms
+  blinker, warm incremental    3,312 ms
+  ld64, cold                     336 ms
+```
+
+**The warm relink is not faster than the cold one.** It is 9.9x ld64.
+
+### The layout half works perfectly
+
+```
+  placement: 9719/9722 contributions kept their address (100%), 3 moved
+  of those, 0 belonged to inputs that did not change
+  addresses: 197/506405 changed (0.04%)
+  reachability: 1/5637 objects' projection moved
+  session: 326 inputs held, 15 read
+```
+
+Every invariant this linker was designed around holds, at ten times the scale
+they were established at. 15 of 341 inputs changed. One object of 5,637 has a
+different call graph. Four hundredths of one percent of addresses moved.
+
+And it takes 3.3 seconds, because knowing that almost nothing changed is not
+the same as doing almost nothing.
+
+### Where the 3.3 seconds goes
+
+```
+    read_and_parse   991 ms   30.2%     326 of 341 inputs were held
+    relocate         929      28.3%
+      apply          618      18.8%     26% of relocations reused
+    resolve          439      13.4%     redone: 2 interfaces moved
+    dead_strip       354      10.8%     one object's graph moved
+      traverse       130
+      atoms          100
+      digest          97
+    emit             243       7.4%
+      emit_linkedit  166
+    symbols          136       4.1%
+    survey            71       2.2%
+```
+
+Three numbers do not fit and each is a separate defect:
+
+- **`read_and_parse` is 991 ms with 326 of 341 inputs held.** The archives are
+  held and their members are re-extracted anyway — "extraction recomputed" in
+  the session line. Residency is holding the wrong granularity.
+- **Relocation reuse is 26%, where the self-link gets 96%.** 15 inputs of 341
+  changed, so ~96% is what the mechanism should deliver. Something is
+  invalidating four objects for every one that actually moved.
+- **`dead_strip` is 354 ms to accommodate one object of 5,637.** This is
+  finding 133 again, at a scale where it costs a third of a second rather than
+  five milliseconds.
+
+### What this settles
+
+The scaling law (130, 141) is not a story about constants. Every stage is
+proportional to the *program* while every measured change is proportional to
+the *edit*, and on an 80-input fixture that gap is invisible because the whole
+link fits in 50 ms. At 341 inputs it is the entire result.
+
+The design was right and the implementation of it stops at layout. Placement,
+addresses and reachability are all incremental and all demonstrably correct at
+this scale; reading, resolving, relocating, stripping, emitting and symbol
+table construction are not incremental at all.
+
+That is the work. It is now measurable, on a fixture that exists, against a
+program blinker can link.
