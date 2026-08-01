@@ -4855,3 +4855,62 @@ So the ordering is not "cheapest first" or "biggest sample count first" — it i
 and two `Instant::now()` calls can. `stub_parse_ms` is now reported next to the
 stage it lives in, so the day it becomes the longer half is visible rather than
 deduced.
+
+## 101. Copying a relocated byte costs more than relocating it
+
+Finding 94 measured the per-object relocation cache at 10.2 ms of cost against
+5.6 ms of possible saving, and switched it off. The reason given was that reuse
+was 0%: the layout kept moving, so nothing could be reused. Retained placement
+has since taken reuse to 73%, so the measurement was worth repeating.
+
+```
+  edit relink, image replay only     36.3, 36.7 ms
+  edit relink, + relocation reuse    40.3, 39.1 ms
+```
+
+Still negative, by 2.4–4.0 ms. And the stage itself says why:
+
+```
+  relocate, no cache          7.6 ms     every object relocated
+  relocate, 73% reused       10.0 ms     three quarters of the work skipped
+```
+
+**Skipping three quarters of the work made the stage forty per cent slower.**
+
+That is not overhead around a good idea; it is the idea. Applying a relocation
+is a handful of arithmetic on bytes that are already in cache — a load, an add,
+a store, on the same cache line as the last one. Reusing it means decoding a
+cache file, looking up the object's ranges, and memcpy-ing the identical bytes
+into the same place. The copy moves as many bytes as the arithmetic did, and
+does not save the arithmetic's cache line.
+
+### What this eliminates from the plan
+
+The next milestone was to be "fixup ownership": persist per-contribution
+dependencies and relocate only what changed. Half of that is still right — not
+*walking* an unchanged object's relocations is a real saving. The other half,
+keeping its relocated *bytes* to copy back in, is now measured as a loss twice
+over, at 0% and at 73% reuse.
+
+Which points past it. The only way an unchanged contribution costs nothing is
+if nothing touches its bytes at all — no relocation, no copy, no write. That
+means the previous output file *is* the byte store: clone it, patch the ranges
+that changed, and leave the rest of the file untouched on disk. Unchanged
+contributions are then not fast, they are absent.
+
+That also settles what the cache should hold. Storing every patched section
+*and* the finished image is storing two copies of bytes the output file already
+contains, and the measurement above says the second copy has no reader worth
+paying for. What is worth persisting is what cannot be recomputed: the
+placement table, input identities, and which contribution owns which output
+range.
+
+### The rule
+
+**A cache that saves an operation cheaper than a memory copy cannot win.** The
+question to ask before building one is not "how often will it hit" — the hit
+rate here went from 0% to 73% and the answer did not change sign — but "what
+does the work cost, and what does the lookup cost?" Relocation is one of the
+cheapest things a linker does per byte. It was chosen as the first thing to
+cache because it was easy to attribute per object, not because it was
+expensive.

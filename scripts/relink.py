@@ -228,14 +228,21 @@ def main():
           f"(min {min(links):.1f}, max {max(links):.1f})\n")
 
     accounted = 0.0
+    # `stub_parse` runs *inside* `read_and_parse`, on its own thread. Printed
+    # for its own sake and excluded from the sum: adding an overlapped half to
+    # the stage containing it double-counts, and the first version of this made
+    # `unmeasured` negative — which is at least a number that announces itself.
+    overlapped = {"stub_parse"}
     for name in ["read_and_parse", "stub_parse", "resolve", "layout", "dead_strip",
                  "relocate", "emit", "cache_load", "cache_plan",
                  "cache_build", "cache_store"]:
         value = timings.get(f"link_{name}_ms")
         if value is None:
             continue
-        accounted += value
-        print(f"    {name:<16}{value:6.2f} ms  {value / total * 100:5.1f}%")
+        if name not in overlapped:
+            accounted += value
+        marker = "  (inside read_and_parse)" if name in overlapped else ""
+        print(f"    {name:<16}{value:6.2f} ms  {value / total * 100:5.1f}%{marker}")
     print(f"    {'unmeasured':<16}{total - accounted:6.2f} ms  "
           f"{(total - accounted) / total * 100:5.1f}%")
 
