@@ -23,6 +23,21 @@ paths, which is exactly what a developer's rebuild produces.
 The edit's blast radius is reported rather than assumed: touching one crate
 recompiles everything downstream of it, and how many inputs that is decides
 what any reuse number means.
+
+The pair is the fixture
+-----------------------
+
+What this measures is not a workload, it is a *pair* of them: the build before
+an edit and the build after it. Capturing only the second half and pairing it
+with whatever `target/workloads/<name>` happened to hold made every run compare
+against a different baseline — the base capture was taken at some earlier hour,
+against some earlier state of the shared build directory, and the blast radius
+came out 2 on one run and 3 on the next. That is not noise in the linker, it is
+noise in the fixture, and it is the kind that looks like a result.
+
+So the pair is captured consecutively — base, edit, edited — and then kept.
+Later runs reuse it, which is what makes two measurements comparable at all;
+`--recapture` takes a fresh one when the source has moved on.
 """
 
 import argparse
@@ -102,6 +117,59 @@ def capture(name, project, profile, out):
         fail(f"capturing the edited build failed:\n{result.stdout}{result.stderr}")
 
 
+def pair_descriptor(options, project, source, profile):
+    """What a captured pair has to agree with to be reusable.
+
+    A `--body-only` pair and an exported-symbol pair are different experiments
+    (see TOUCH_PRIVATE), and so are two pairs that edited different files. Reuse
+    is only sound when all of that matches, so it is written down and compared
+    rather than assumed.
+    """
+    return {
+        "workload": options.workload,
+        "project": str(project),
+        "profile": profile,
+        "edit": str(source),
+        "mode": "private" if options.body_only else "exported",
+    }
+
+
+def capture_pair(options, project, source, profile, descriptor):
+    """Capture the before and after builds back to back, and keep them.
+
+    Consecutive matters. Both captures share one build directory, so the second
+    is the incremental rebuild the edit actually causes (finding 106); a base
+    captured hours earlier, against a build directory that has since moved,
+    pairs the edit against a different program.
+    """
+    edited = Path(options.out) / f"{options.workload}-edited"
+    original = source.read_bytes()
+    print(f"  capturing the pair: {source.relative_to(project)}, unedited then edited")
+    capture(options.workload, project, profile, options.out)
+    try:
+        touch = TOUCH_PRIVATE if options.body_only else TOUCH
+        source.write_bytes(original + touch.encode())
+        capture(edited.name, project, profile, options.out)
+    finally:
+        source.write_bytes(original)
+    (edited / "pair.json").write_text(json.dumps(descriptor, indent=2) + "\n")
+    return edited
+
+
+def materialise_pair(options, project, source, profile):
+    """The captured pair, reused when it still describes this experiment."""
+    edited = Path(options.out) / f"{options.workload}-edited"
+    descriptor = pair_descriptor(options, project, source, profile)
+    stamp = edited / "pair.json"
+    if not options.recapture and stamp.exists():
+        if json.loads(stamp.read_text()) == descriptor:
+            print(f"  reusing the captured pair ({descriptor['mode']} edit)"
+                  f" — --recapture to take a fresh one")
+            return edited
+        print("  the captured pair describes a different experiment; recapturing")
+    return capture_pair(options, project, source, profile, descriptor)
+
+
 def archived_name(path):
     """The input's own name, without the archive's ordering prefix.
 
@@ -162,8 +230,8 @@ def main():
                         help="also reuse per-object relocations, to read the hit rate")
     parser.add_argument("--no-cache", action="store_true",
                         help="relink without the incremental cache, for comparison")
-    parser.add_argument("--keep", action="store_true",
-                        help="keep the edited capture instead of removing it")
+    parser.add_argument("--recapture", action="store_true",
+                        help="take a fresh pair of captures instead of reusing one")
     options = parser.parse_args()
 
     base = Path(options.out) / options.workload
@@ -179,18 +247,10 @@ def main():
     if not source.exists():
         fail(f"{source} does not exist")
 
-    edited_name = f"{options.workload}-edited"
-    original = source.read_bytes()
-    print(f"  editing {source.relative_to(project)} and rebuilding")
-    try:
-        touch = TOUCH_PRIVATE if options.body_only else TOUCH
-        source.write_bytes(original + touch.encode())
-        capture(edited_name, project, manifest["profile"], options.out)
-    finally:
-        source.write_bytes(original)
+    edited = materialise_pair(options, project, source, manifest["profile"])
 
     argv, before = inputs_of(base / "argv.txt")
-    _, after = inputs_of(Path(options.out) / edited_name / "argv.txt")
+    _, after = inputs_of(edited / "argv.txt")
     changed, missing = differing(before, after)
     if not changed:
         fail("the rebuild produced identical inputs — the edit changed nothing")
@@ -313,8 +373,8 @@ def main():
                   f"({relocations / work * 100:.0f}%)", end="")
         print()
 
-    if not options.keep:
-        shutil.rmtree(Path(options.out) / edited_name, ignore_errors=True)
+    # The pair stays: it is the fixture, and re-taking it per run is what made
+    # consecutive measurements incomparable.
 
 
 if __name__ == "__main__":

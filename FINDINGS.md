@@ -5184,3 +5184,74 @@ manufacturing a workload that no build would ever hand a linker.
 It cost more than a wrong number. Three sessions of design were spent on the
 question "how do we retain addresses when fourteen crates change at once",
 which is a question nobody asked.
+
+## 107. At the real blast radius the placement invariant is total, and the whole edit relink is 22 ms
+
+Finding 106 left an open question: the `__eh_frame` movers, and everything else
+finding 98 counted, were measured on a blast radius seven times too large. Here
+is the same measurement on a pair of captures taken back to back, so the second
+is the incremental rebuild the edit actually causes.
+
+Editing a *private* function in `blinker-diagnostics` — the ordinary developer
+change, and the one no exported symbol moves for — then relinking through a
+resident daemon:
+
+```
+  blast radius: 2 of 62 inputs changed
+  placement: 724/727 contributions kept their address (100%), 3 moved
+  of those, 0 belonged to inputs that did not change — the invariant holds
+  session: 60 inputs held, 2 read; extraction replayed, resolution held
+```
+
+**Three moved contributions, all of them in the two rebuilt rlibs.** Not one
+unchanged input moved. The `__eh_frame` problem finding 98 spent a page on does
+not appear at this blast radius: with two inputs changing, the packed
+`__eh_frame` chain absorbs them and nothing downstream shifts.
+
+That does not make `__eh_frame` retention wrong, it makes it **not urgent**. It
+is a fourteen-input problem, and fourteen inputs is what a `cargo clean` does.
+
+### Every held-state rule fires, and each is worth what it claimed
+
+The three mechanisms built for this case — input residency, extraction replay,
+and resolution holding — had never been observed firing together, because the
+faked blast radius disabled all three. Cold link versus the same link through
+the daemon, same machine, same minute:
+
+| stage | cold | resident | |
+|---|---|---|---|
+| `read_and_parse` | 16.03 ms | 1.25 ms | 60 of 62 inputs held |
+| `resolve` | 5.89 ms | 0.00 ms | resolution held |
+| `stub_parse` | 11.82 ms | 0.00 ms | the SDK stub is parsed once, ever |
+
+The link goes **42.1 ms → 22.4 ms**, and the wall through the client 52.7 → 30.2.
+
+(Both numbers are inflated maybe 1.3x: the machine had a load average of 6 and
+ld64 moved from its usual 28 ms to 36 ms alongside blinker. The ratio is what
+survives that, and the counters do not care.)
+
+### What is left, and what it says to do next
+
+```
+    relocate          6.71 ms   33.5%     apply 3.96, synthetic 1.52
+    dead_strip        3.55 ms   17.7%
+    layout            1.66 ms    8.3%
+    emit              1.37 ms    6.8%
+    symbols + survey  2.24 ms   11.1%
+    cache             1.49 ms    7.4%
+    read_and_parse    1.25 ms    6.2%
+```
+
+Relocation is now a third of the link, and it is applying **87,545
+relocations** to produce an output in which 724 of 727 contributions sit at
+exactly the address they sat at last time, from input bytes that did not
+change. Those bytes are, necessarily, the bytes that are already in the
+previous output.
+
+This is the argument for output patching, and it is a different argument from
+the one that killed the relocation cache in finding 91. That cached *relocated
+section contents* and lost because copying a section costs about what relocating
+it costs. Patching does not copy: the previous image stays in the session, and a
+link writes only the ranges that are dirty. The work it avoids is not a memcpy,
+it is `apply` — and now that the placement invariant holds at 100%, "dirty" is a
+small and precisely known set.
