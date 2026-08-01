@@ -176,6 +176,16 @@ def largest_record(records, wanted=None):
     dylibs, each test binary. They are all real invocations and the corpus
     tooling wants them; a benchmark wants a *named* one.
     """
+    # Cargo names a binary target `rust-analyzer`; the file rustc links is
+    # `rust_analyzer-<hash>`. Comparing them literally meant the preferred name
+    # never matched, the fallback picked `xtask`, and the capture announced a
+    # rust-analyzer workload built from a 300-line build tool. That is the
+    # silent substitution this function's docstring is about, arriving through
+    # a hyphen.
+    def canonical(name):
+        return name.replace("-", "_")
+
+    wanted = [canonical(w) for w in wanted] if wanted else wanted
     best, best_count = None, -1
     for path in sorted(Path(records).glob("*.json")):
         with open(path) as handle:
@@ -193,7 +203,7 @@ def largest_record(records, wanted=None):
             continue
         # A binary target's link beats any number of inputs elsewhere.
         name = Path(record.get("output_path", "")).name
-        stem = name.rsplit("-", 1)[0] if "-" in name else name
+        stem = canonical(name.rsplit("-", 1)[0] if "-" in name else name)
         count = len(record.get("inputs") or [])
         # Preferred binary first, any binary second, anything else last. Two
         # binary targets in one workspace (`blinker` and `blinker_corpus`) is
@@ -208,7 +218,7 @@ def largest_record(records, wanted=None):
         fail(f"no records under {records} — did the build link anything?")
     if wanted:
         chosen = Path(best.get("output_path", "")).name
-        stem = chosen.rsplit("-", 1)[0] if "-" in chosen else chosen
+        stem = canonical(chosen.rsplit("-", 1)[0] if "-" in chosen else chosen)
         if stem not in wanted:
             fail(f"the chosen link is {chosen}, which is not one of this "
                  f"project's binaries ({', '.join(sorted(wanted))})")

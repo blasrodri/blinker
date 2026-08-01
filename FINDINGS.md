@@ -6533,3 +6533,91 @@ Warm debug edit relink, quiet machine: **49.2 ms link, 58.6 ms wall.** ld64
 links this program cold in 45.5 ms. The gap that the last session recorded as
 2.6x is not 2.6x; it is close to parity, and most of what was believed about
 where the remaining time goes was measured through the same fog.
+
+## 138. blinker cannot link a real program
+
+Asked whether the benchmarks cover long debug links, the answer was no — every
+number in this file comes from blinker linking itself, a link ld64 finishes in
+43.7 ms. So: point it at the largest Rust program on this machine, `pulsevm`,
+552 inputs and a 189 MB debug binary.
+
+The build succeeded. The link was refused:
+
+```
+blinker: undefined symbols:
+_CFErrorCopyDescription
+_CFErrorGetCode
+_CFErrorGetDomain
+```
+
+Every pulsevm binary needs this:
+
+```
+-lc++ -lffi -liconv -lxml2 -lz -lz3 -lzstd
+-framework CoreFoundation -framework SystemConfiguration -framework Security
+```
+
+blinker handles none of it. `discover_stub_library` finds exactly one file —
+`<sdk>/usr/lib/libSystem.tbd` — and there is no `-framework` handling and no
+general `-l<name>` search anywhere in the option parser. The honest capability
+statement is:
+
+> **blinker links pure-Rust programs whose only dynamic dependency is
+> libSystem.**
+
+That is a much narrower claim than "an incremental Mach-O linker", and it was
+invisible for as long as the only program it ever linked was itself — because
+blinker is exactly such a program. A benchmark that is also the only test case
+cannot report the difference between "works" and "works on itself".
+
+### What it would take
+
+Not a small feature. Several things that the single-library assumption is
+currently baked into:
+
+- **Library search.** `-L` paths, `-l<name>` -> `lib<name>.tbd` / `.dylib` /
+  `.a`, `-framework X` -> `X.framework/X.tbd` under the SDK, in the documented
+  order.
+- **Real dylibs, not just `.tbd`.** Homebrew's `libz3` is a Mach-O dylib with
+  an export trie, not a text stub.
+- **Per-library ordinals.** `library_ordinal` is currently the constant 1 with
+  one `LC_LOAD_DYLIB`. The two-level namespace records *which* library each
+  import came from, so this becomes one command and one ordinal per library.
+- **Static archives from `-l`.** `-lc++` may resolve to an archive, which is
+  the extraction path rather than the import path.
+
+Recorded as the largest single gap between what this repository does and what
+it claims. It is not a performance item, which is the reason it never came up:
+every session so far has been about milliseconds on a fixture that dodges it.
+
+## 139. The workload harness captured a 300-line build tool and called it
+## rust-analyzer
+
+With pulsevm out of reach, `rust-analyzer` is the substitute: 376 crates and no
+native dependency at all. The capture reported:
+
+```
+  note: captured xtask, not rust-analyzer
+  radbg: 319 files, 1067 objects, 68.7 MB
+```
+
+`xtask` is rust-analyzer's build helper. `largest_record` is supposed to
+prevent exactly this — its docstring is three paragraphs about how picking "the
+biggest link" silently substitutes a different program, and it takes a
+preferred binary name for that reason. The preferred name still did not match,
+because cargo calls the target `rust-analyzer` and rustc writes
+`rust_analyzer-<hash>`:
+
+```python
+if wanted and stem == wanted[0]:      # "rust_analyzer" == "rust-analyzer"
+```
+
+One hyphen. The guard was present, correct in shape, and compared two strings
+that name the same target in two different spellings — so it never fired, and
+the fallback rule the guard exists to override picked the build tool.
+
+It announced itself, which is the only reason it was caught: `note: captured
+xtask, not rust-analyzer` is printed on exactly this path. A guard worth having
+is worth having say so out loud when it declines.
+
+Fixed by comparing canonical names with `-` and `_` folded together.
