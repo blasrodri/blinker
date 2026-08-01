@@ -237,7 +237,7 @@ pub(crate) struct Atoms<'a> {
     /// allocations to build a map that is discarded at the end of the same
     /// function, and it was 0.72 ms of a 1.23 ms stage. The names live in the
     /// parsed objects, which outlive this.
-    owners: HashMap<&'a str, Vec<usize>>,
+    owners: HashMap<&'a str, Owners>,
 }
 
 impl<'a> Atoms<'a> {
@@ -288,11 +288,17 @@ impl<'a> Atoms<'a> {
                     continue;
                 };
                 if let Some(index) = result.containing(object.parsed.id, section, offset) {
-                    result
-                        .owners
-                        .entry(symbol.name.as_str())
-                        .or_default()
-                        .push(index);
+                    match result.owners.entry(symbol.name.as_str()) {
+                        std::collections::hash_map::Entry::Occupied(mut held) => {
+                            held.get_mut().push(index)
+                        }
+                        std::collections::hash_map::Entry::Vacant(slot) => {
+                            slot.insert(Owners {
+                                first: index,
+                                rest: Vec::new(),
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -341,8 +347,13 @@ impl<'a> Atoms<'a> {
                         if let Some((section, _)) = offset_of(object, symbol) {
                             opaque.insert((object.parsed.id.0, section.0));
                         }
-                        for target in self.owners.get(symbol.name.as_str()).into_iter().flatten() {
-                            opaque.insert(self.atoms[*target].key());
+                        for target in self
+                            .owners
+                            .get(symbol.name.as_str())
+                            .into_iter()
+                            .flat_map(Owners::all)
+                        {
+                            opaque.insert(self.atoms[target].key());
                         }
                     }
                 }
@@ -377,12 +388,12 @@ impl<'a> Atoms<'a> {
             }
         }
         // A reference resolves to whatever object defines the name.
-        self.owners.get(symbol.name.as_str())?.first().copied()
+        self.owners.get(symbol.name.as_str()).map(|o| o.first)
     }
 
     /// Every atom defining `name`, for use as a root.
-    fn defining(&self, name: &str) -> &[usize] {
-        self.owners.get(name).map(Vec::as_slice).unwrap_or(&[])
+    fn defining(&self, name: &str) -> impl Iterator<Item = usize> + '_ {
+        self.owners.get(name).into_iter().flat_map(Owners::all)
     }
 }
 
@@ -450,6 +461,30 @@ impl LiveSet {
     }
 }
 
+/// The atoms defining one name.
+///
+/// The first inline, the rest in a `Vec` that stays empty — and an empty `Vec`
+/// does not allocate. Nearly every name has exactly one definition; a weak
+/// symbol may have several and all of them are kept, because which one wins is
+/// decided elsewhere. Storing a `Vec` for every name meant a heap allocation
+/// per externally visible symbol, around seven thousand of them, to hold one
+/// `usize` each.
+#[derive(Debug)]
+pub(crate) struct Owners {
+    first: usize,
+    rest: Vec<usize>,
+}
+
+impl Owners {
+    fn push(&mut self, index: usize) {
+        self.rest.push(index);
+    }
+
+    fn all(&self) -> impl Iterator<Item = usize> + '_ {
+        std::iter::once(self.first).chain(self.rest.iter().copied())
+    }
+}
+
 /// Which atoms a program can reach from `entry`.
 fn liveness(
     objects: &[LoadedObject],
@@ -480,8 +515,8 @@ fn liveness(
 
     // Roots. The entry point, anything the object marked as never strippable,
     // and every atom of a section that has to be kept whole.
-    for index in atoms.defining(entry) {
-        mark(*index, &mut live, &mut worklist);
+    for index in atoms.defining(entry).collect::<Vec<_>>() {
+        mark(index, &mut live, &mut worklist);
     }
     for (index, atom) in atoms.atoms.iter().enumerate() {
         if atoms.opaque.contains(&atom.key()) {

@@ -5884,3 +5884,40 @@ iterates it — which is the reason to note this at all. `deps` is *only* ever
 read; nothing mutates an entry's dependency list after the link that produced
 it. A `Vec` in a structure that is cloned and never modified is an owned copy of
 something that has no owner.
+
+## 123. A change kept without a number
+
+`Atoms::owners` maps each externally visible name to the atoms defining it, and
+stored a `Vec<usize>` per name — a heap allocation per symbol, around seven
+thousand of them, almost all holding exactly one index. Weak symbols may have
+several definitions and all are kept, which is why it was a `Vec` at all.
+
+Storing the first inline with an empty `Vec` for the rest — and an empty `Vec`
+does not allocate — removes every one of those allocations for the common case.
+
+The output is byte-identical, verified against the same three hashes as every
+other change in this run. The timing is not conclusive:
+
+```
+  before (load 6.1)   atoms 1.05   traverse 1.75   link 15.8
+  after  (load 4.3)   atoms 0.97   traverse 1.63   link 15.2
+```
+
+The machine got quieter between the two, by more than the difference. **This is
+recorded as "no measured effect"**, not as a 0.6 ms improvement, because the
+only honest reading of those two rows is that the load changed.
+
+It stays because it is strictly less work for identical output, which needs no
+justification from a benchmark. But finding 115 measured exactly this intuition
+at 0.05 ms and finding 118 measured it at 0.90 ms, and the difference between
+them was never predictable in advance. Writing "kept, unmeasured" is cheaper
+than a number that turns out to be the machine.
+
+### On measuring at all today
+
+Every timing in findings 117–122 was taken with load averages between 4 and 7 on
+a machine running someone's browser. The stage-level before/afters are trustworthy
+because both halves come from the same run minutes apart; whole-link medians drift
+by more than most individual changes are worth. That is why the harness now takes
+a median per stage rather than the last record, and why the interleaved
+`scripts/ab.py` exists for anything closer than a millisecond.
