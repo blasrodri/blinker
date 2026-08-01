@@ -161,6 +161,20 @@ pub struct LinkTimings {
     pub stub_parse_ms: f64,
     /// Where the time inside `emit` went.
     pub emit_breakdown: blinker_output::EmitTimings,
+    /// Inside `relocate`, which is a stage name that covers five different
+    /// jobs. Splitting `emit` the same way found 4.4 ms of one hash sitting
+    /// next to a better one (finding 102); a stage this composite has no
+    /// business being a single number either.
+    pub address_map_ms: f64,
+    pub contents_ms: f64,
+    pub synthetic_ms: f64,
+    pub apply_ms: f64,
+    /// Building the output symbol table and the debug map, which sit between
+    /// `relocate` and `emit` and were in neither.
+    pub symbols_ms: f64,
+    /// Surveying every relocation to discover which GOT, stub and TLV slots the
+    /// link needs. Between `resolve` and `layout`, and in neither.
+    pub survey_ms: f64,
 }
 
 impl std::fmt::Display for LinkTimings {
@@ -1397,7 +1411,9 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     resolve_symbols(&objects, &imports)?;
     timings.resolve_ms = elapsed_ms(step);
 
+    let sub = std::time::Instant::now();
     let survey = survey_relocations(&objects, &imports, &strip);
+    timings.survey_ms = elapsed_ms(sub);
     let stubs = survey.stubs;
     // Synthesise `__got` before layout, so it is placed and addressed like any
     // other section rather than appended afterwards. Internal targets and
@@ -1567,6 +1583,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     // With addresses known, copy content and patch it.
     let step = std::time::Instant::now();
     // Built once from the layout, and consulted a few hundred thousand times.
+    let sub = std::time::Instant::now();
     let placed = Placed::index(&probe);
     let mut addresses = address_map(&objects, &placed, &strip);
     // Commons have no section of their own in any input, so `address_map` —
@@ -1578,7 +1595,13 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     let got_slots = got_slot_addresses(&got, &probe);
     let stub_slots = stub_addresses(&stubs, &probe);
     let tlv_slots = pointer_slot_addresses(&tlv, &probe, "__thread_ptrs");
+    timings.address_map_ms = elapsed_ms(sub);
+
+    let sub = std::time::Instant::now();
     let mut contents = build_contents(&objects, &probe, &strip)?;
+    timings.contents_ms = elapsed_ms(sub);
+
+    let sub = std::time::Instant::now();
     repair_eh_frame(&mut contents, &probe, &objects, &strip);
     fill_got(&mut contents, &probe, &got, &addresses, &imports)?;
     fill_stubs(&mut contents, &probe, &stubs, &got_slots)?;
@@ -1592,6 +1615,8 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
         &strip,
         &got_slots,
     )?;
+    timings.synthetic_ms = elapsed_ms(sub);
+
     // Whether this link records what each object read, so a later one can skip
     // relocating it. See `LinkRequest::reuse_relocations`: it is off by default
     // because the recording costs more than the reuse saves.
@@ -1618,6 +1643,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     timings.cache_plan_ms = elapsed_ms(cache_step);
     timings.total_objects = objects.len() as u64;
 
+    let sub = std::time::Instant::now();
     let patched = apply_relocations(
         &objects,
         &probe,
@@ -1640,6 +1666,8 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     // Built here, while the patched contents still exist, but not written
     // until the image does — the fast path needs the finished binary, and that
     // is the last thing produced.
+    timings.apply_ms = elapsed_ms(sub);
+
     let cache_step = std::time::Instant::now();
     let mut cache = match (&request.cache_path, current_addresses) {
         (Some(_), Some(addresses)) => Some(build_cache(
@@ -1670,6 +1698,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     // The symbol table grows between passes, which changes `LC_SYMTAB`'s
     // contents but not the load commands' *sizes* — so the section addresses
     // the relocations were computed against still hold.
+    let sub = std::time::Instant::now();
     let placed_symbols = placed_symbols(&objects, &placed, &strip);
     let mut symbols = output_symbols(&placed_symbols);
     // After the ordinary locals, which is where `ld` puts them and where a
@@ -1684,6 +1713,8 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     binds.extend(patched.binds);
     rebases.extend(pointer_table_rebases(&probe, "__thread_ptrs", tlv.len()));
     rebases.extend(patched.rebases);
+
+    timings.symbols_ms = elapsed_ms(sub);
 
     let step = std::time::Instant::now();
     let image = assemble(

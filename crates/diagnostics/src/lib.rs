@@ -97,6 +97,15 @@ pub struct PhaseTimings {
     pub link_emit_contents_ms: Option<f64>,
     pub link_emit_linkedit_ms: Option<f64>,
     pub link_emit_assemble_ms: Option<f64>,
+    /// Inside `relocate`: address map, contents, synthetic tables, apply.
+    pub link_address_map_ms: Option<f64>,
+    pub link_contents_ms: Option<f64>,
+    pub link_synthetic_ms: Option<f64>,
+    pub link_apply_ms: Option<f64>,
+    /// The output symbol table and debug map, between `relocate` and `emit`.
+    pub link_symbols_ms: Option<f64>,
+    /// Surveying relocations for GOT/stub/TLV slots.
+    pub link_survey_ms: Option<f64>,
     pub link_emit_uuid_ms: Option<f64>,
     pub link_emit_sign_ms: Option<f64>,
     pub link_cache_load_ms: Option<f64>,
@@ -124,6 +133,12 @@ pub struct LinkStages {
     pub stub_parse: f64,
     /// Inside `emit`, in order: layout, contents, linkedit, assemble, sign.
     pub emit_breakdown: [f64; 6],
+    /// Inside `relocate`, in order: address map, contents, synthetic, apply.
+    pub relocate_breakdown: [f64; 4],
+    /// Output symbols and the debug map.
+    pub symbols: f64,
+    /// Surveying relocations for indirect slots.
+    pub survey: f64,
     /// Load, plan, build, store — the cache's four costs, zero without one.
     pub cache: CacheStages,
 }
@@ -269,6 +284,9 @@ impl LinkRecord {
             cache,
             stub_parse,
             emit_breakdown,
+            relocate_breakdown,
+            symbols,
+            survey,
         } = stages;
         self.timings.internal_link_ms = Some(as_ms(total));
         self.timings.link_read_and_parse_ms = Some(read_and_parse);
@@ -286,6 +304,14 @@ impl LinkRecord {
             self.timings.link_emit_uuid_ms = Some(emit_breakdown[4]);
             self.timings.link_emit_sign_ms = Some(emit_breakdown[5]);
         }
+        if relocate_breakdown.iter().any(|v| *v > 0.0) {
+            self.timings.link_address_map_ms = Some(relocate_breakdown[0]);
+            self.timings.link_contents_ms = Some(relocate_breakdown[1]);
+            self.timings.link_synthetic_ms = Some(relocate_breakdown[2]);
+            self.timings.link_apply_ms = Some(relocate_breakdown[3]);
+        }
+        self.timings.link_symbols_ms = (symbols > 0.0).then_some(symbols);
+        self.timings.link_survey_ms = (survey > 0.0).then_some(survey);
         self.timings.link_relocate_ms = Some(relocate);
         self.timings.link_emit_ms = Some(emit);
         if cache.ran() {

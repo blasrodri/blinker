@@ -200,6 +200,14 @@ pub fn run(argv: &[String]) -> Result<Outcome, DriverError> {
                     phases.emit_breakdown.uuid_ms,
                     phases.emit_breakdown.sign_ms,
                 ],
+                relocate_breakdown: [
+                    phases.address_map_ms,
+                    phases.contents_ms,
+                    phases.synthetic_ms,
+                    phases.apply_ms,
+                ],
+                symbols: phases.symbols_ms,
+                survey: phases.survey_ms,
                 cache: blinker_diagnostics::CacheStages {
                     load: phases.cache_load_ms,
                     plan: phases.cache_plan_ms,

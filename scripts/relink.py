@@ -233,10 +233,12 @@ def main():
     # the stage containing it double-counts, and the first version of this made
     # `unmeasured` negative — which is at least a number that announces itself.
     overlapped = {"stub_parse", "emit_layout", "emit_contents", "emit_linkedit",
-                  "emit_assemble", "emit_uuid", "emit_sign"}
+                  "emit_assemble", "emit_uuid", "emit_sign",
+                  "address_map", "contents", "synthetic", "apply"}
     for name in ["read_and_parse", "stub_parse", "resolve", "layout", "dead_strip",
                  "relocate", "emit", "emit_layout", "emit_contents",
                  "emit_linkedit", "emit_assemble", "emit_uuid", "emit_sign",
+                 "address_map", "contents", "synthetic", "apply", "symbols", "survey",
                  "cache_load", "cache_plan",
                  "cache_build", "cache_store"]:
         value = timings.get(f"link_{name}_ms")
@@ -249,6 +251,8 @@ def main():
             marker = "  (inside read_and_parse)"
         elif name.startswith("emit_"):
             marker = "  (inside emit)"
+        elif name in ("address_map", "contents", "synthetic", "apply"):
+            marker = "  (inside relocate)"
         print(f"    {name:<16}{value:6.2f} ms  {value / total * 100:5.1f}%{marker}")
     print(f"    {'unmeasured':<16}{total - accounted:6.2f} ms  "
           f"{(total - accounted) / total * 100:5.1f}%")

@@ -4965,3 +4965,66 @@ returns.
 **The largest remaining item in a profile is not the largest remaining
 opportunity. The largest opportunity is in whatever has never been measured at
 the resolution the decision needs.**
+
+## 103. The whole link, measured at the resolution a decision needs
+
+Finding 102 came from splitting one stage nobody suspected. Applying that to
+every remaining stage took an afternoon of `Instant::now()` calls and leaves
+this — a one-crate edit relink, every item over a millisecond named:
+
+```
+  read+parse        7.6      of which .tbd YAML parse   6.0  (overlapped)
+  relocate          6.4      apply       3.5
+                             synthetic   1.5
+                             address map 0.8
+                             contents    0.2
+  dead-strip        3.7
+  layout            3.7
+  resolve           3.1
+  emit              2.5      uuid        0.7
+                             sign        0.6
+                             linkedit    0.5
+                             layout      0.2
+  cache             1.3
+  survey            1.0
+  symbols           0.7
+  unmeasured        2.4
+                   ----
+                   ~30 ms
+```
+
+`unmeasured` was 13% before this and is 8% now; everything above a millisecond
+has a name.
+
+### What the shape says
+
+**There is no big item left.** The largest is a stage that is really two
+overlapped halves, and the largest single job in the link — applying every
+relocation — is 3.5 ms, 12%. Nothing here can be halved into a 15% win the way
+the UUID could.
+
+That is the answer to "is 35 ms a lot of I/O": no. Reading 60 MB out of the
+page cache, threaded and now mapped rather than copied, is a couple of
+milliseconds. The link is 30 ms because it does eleven different things costing
+1-7 ms each, and *all of them* are work a cold link genuinely has to do.
+
+### Which is the argument for the daemon, stated properly
+
+An incremental link should not be a cold link made faster. Every item above is
+recomputed from scratch on every invocation, and for an edit touching one crate
+almost all of it is recomputing the same answer from the same bytes:
+
+- **read+parse** — the same 60 MB, of which ~2 MB changed.
+- **the .tbd parse** — the same SDK stubs, which never change.
+- **dead-strip, resolve, survey** — the same graph, from the same symbols.
+- **layout** — already incremental (retained placement).
+- **apply, emit** — genuinely proportional to what changed, once the rest is.
+
+Nothing on that list gets to zero by being optimised. They get to zero by not
+running, which needs the answers to still exist when the next invocation
+arrives — and that is a resident process, not a cache file. A cache file can
+only hold what is cheap to serialise and cheaper to read back than to recompute,
+and finding 101 is what happens when that test is failed.
+
+**The remaining work is not performance work. It is a change of process
+model.**
