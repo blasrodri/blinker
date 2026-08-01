@@ -249,7 +249,12 @@ impl SymbolTableBuilder {
         // half the string table would otherwise be a copy of the other half.
         // First occurrence wins, and insertion order is already deterministic,
         // so the offsets are too.
-        let mut interned: std::collections::HashMap<&str, u32> = std::collections::HashMap::new();
+        // Fast-hashed, not `std`'s SipHash. This map is probed once per symbol,
+        // and a debug build's symbol count is what makes `emit_linkedit` the
+        // worst-scaling stage in the link — 7.2x when the work grew 3.7x
+        // (finding 130). The reasoning is the one in `blinker_hashing`: every
+        // key here comes from an object file the linker was told to read.
+        let mut interned: blinker_hashing::FastMap<&str, u32> = blinker_hashing::FastMap::default();
 
         for symbol in &self.symbols {
             let name_offset = if symbol.name.is_empty() {

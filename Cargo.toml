@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/cli",
+    "crates/hashing",
     "crates/cache",
     "crates/differential",
     "crates/corpus",
@@ -27,6 +28,7 @@ license = "MIT OR Apache-2.0"
 blinker-arguments = { path = "crates/arguments" }
 blinker-cache = { path = "crates/cache" }
 blinker-diagnostics = { path = "crates/diagnostics" }
+blinker-hashing = { path = "crates/hashing" }
 blinker-differential = { path = "crates/differential" }
 blinker-archive = { path = "crates/archive" }
 blinker-layout = { path = "crates/layout" }

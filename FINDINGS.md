@@ -6241,3 +6241,35 @@ architecture is validated and works at 4x scale. It is:
    `symbols`, the two worst scalers and both symbol-table code;
 2. get a workload where ld64 takes seconds, and check the slope holds;
 3. return to incremental, which is already good and will inherit every gain.
+
+## 131. The hasher note said "names too", and one crate never got the message
+
+`blinker_hashing`'s own module docs record a correction: an early version kept
+`std`'s SipHash for symbol names, on the reasoning that names are long and
+hashed rarely, and a profile afterwards showed 1136 samples still in
+`SipHasher::write`. Both halves of the reasoning were wrong.
+
+`blinker-output`'s symbol-table encoder was never converted. It interns every
+symbol name through a `std::collections::HashMap` — once per symbol, on
+`emit_linkedit`, which finding 130 measured as **the worst-scaling stage in the
+whole link** (7.2x when the work grew 3.7x). It was missed because the hasher
+lived inside `blinker-link`, and `output` cannot depend on `link` — the
+dependency runs the other way. The fix that was applied everywhere it was
+reachable simply stopped at a crate boundary.
+
+The hasher now lives in its own crate below both, and `link::hashing` is a
+re-export so every existing `crate::hashing::FastMap` path still means what it
+did.
+
+### Not measured
+
+Machine spread was 40-53% (`ld64` itself ranged 42.7 to 66.6 ms on a 45 ms
+link). `emit_linkedit` read 4.01 ms before and 5.03 ms after, which is noise in
+both directions. **No effect is claimed.** The change is in because the
+reasoning that justified the hasher everywhere else applies here unchanged, and
+because the crate boundary that hid it is worth removing whatever the timing
+says.
+
+Kept, unmeasured — the fourth this session (123, 125, 127). Three of those four
+are structural changes rather than optimisations, which is the honest pattern:
+a mechanism can be right for reasons a stopwatch cannot see.

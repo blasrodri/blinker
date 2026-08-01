@@ -1,0 +1,9 @@
+[package]
+name = "blinker-hashing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "blinker_hashing"
+path = "src/lib.rs"
