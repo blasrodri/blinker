@@ -1762,9 +1762,27 @@ fn link_inner(
     timings.synthetic_ms = elapsed_ms(sub);
 
     // Whether this link records what each object read, so a later one can skip
-    // relocating it. See `LinkRequest::reuse_relocations`: it is off by default
-    // because the recording costs more than the reuse saves.
-    let reuse_relocations = request.cache_path.is_some() && request.reuse_relocations;
+    // relocating it.
+    //
+    // Automatic in a resident process, and off otherwise, because the same
+    // mechanism loses badly in one setting and wins clearly in the other. What
+    // it costs is recording; what it saves is relocating. Finding 94 measured
+    // it as a loss at any hit rate — and measured it going through a cache
+    // *file*, where every link decoded a few megabytes to recover the entries
+    // and encoded them again afterwards.
+    //
+    // With the session holding the cache (finding 110) that cost is gone, and
+    // the same machinery on the same workload:
+    //
+    // ```
+    //   apply     3.67 ms -> 0.83 ms    96% of 87,834 relocations reused
+    //   link     19.6 ms  -> 16.8 ms
+    // ```
+    //
+    // A one-shot link still gets the old answer, and correctly: it has no
+    // previous entries to reuse, so recording would be pure cost.
+    let reuse_relocations =
+        request.cache_path.is_some() && (request.reuse_relocations || session.is_resident());
 
     // The addresses this link produced, in the form the cache compares. Built
     // before relocation because it is what decides which objects can skip it —

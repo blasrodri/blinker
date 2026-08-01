@@ -215,3 +215,45 @@ int main(void) { printf("%d\n", helper(3) + other(4) + extra(1)); return 0; }
         "the new member was not extracted: a replayed extraction order"
     );
 }
+
+/// A resident session records what each object read so the next link can skip
+/// relocating it. That is the one reuse that rewrites the *output bytes* from
+/// somewhere other than the inputs, so it gets its own property: the binary
+/// must not depend on how much of it was reused.
+///
+/// The failure this guards against is silent. Reused bytes that are subtly
+/// stale still link, still run for most inputs, and differ from a correct
+/// binary in a handful of words — exactly the shape of bug that a "the link
+/// succeeded" test cannot see. So two sessions link the same inputs the same
+/// number of times, differing only in whether relocation reuse was on, and the
+/// bytes are compared.
+#[test]
+fn relocation_reuse_does_not_change_the_binary() {
+    let scratch = Scratch::dir("session-reuse-identical").expect("scratch");
+    let objects = inputs(&scratch);
+    let cache = scratch.join("cache");
+
+    let mut outputs = Vec::new();
+    for (tag, resident) in [("plain", false), ("reusing", true)] {
+        let mut session = Session::default();
+        session.set_resident(resident);
+        let request = LinkRequest::new(objects.clone()).cached_at(cache.clone());
+        let mut last = None;
+        // Three, not two: the first link records, the second reuses what it
+        // recorded, and the third reuses across a link that itself reused.
+        for round in 0..3 {
+            let output = scratch.join(format!("{tag}-{round}"));
+            link_to_file_in(&request, &output, &mut session).expect("the link succeeds");
+            last = Some(output);
+        }
+        let output = last.expect("three links ran");
+        assert_eq!(run(&output), "125\n", "{tag} produced a broken program");
+        outputs.push(std::fs::read(&output).expect("output"));
+        std::fs::remove_file(&cache).ok();
+    }
+
+    assert_eq!(
+        outputs[0], outputs[1],
+        "reusing relocations changed the binary"
+    );
+}

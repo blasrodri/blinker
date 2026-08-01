@@ -352,6 +352,10 @@ def main():
     # the stage containing it double-counts, and the first version of this made
     # `unmeasured` negative — which is at least a number that announces itself.
     overlapped = {"stub_parse", "atoms", "liveness", "strip_build",
+                  # Both run inside the relocate timer. Counting them again
+                  # made `unmeasured` negative, which is the one way a profile
+                  # can announce that it does not add up.
+                  "address_table", "cache_plan",
                   "emit_layout", "emit_contents", "emit_linkedit",
                   "emit_assemble", "emit_uuid", "emit_sign",
                   "address_map", "contents", "synthetic", "apply"}
@@ -376,6 +380,8 @@ def main():
             marker = "  (inside relocate)"
         elif name in ("atoms", "liveness", "strip_build"):
             marker = "  (inside dead_strip)"
+        elif name in ("address_table", "cache_plan"):
+            marker = "  (inside relocate)"
         print(f"    {name:<16}{value:6.2f} ms  {value / total * 100:5.1f}%{marker}")
     print(f"    {'unmeasured':<16}{total - accounted:6.2f} ms  "
           f"{(total - accounted) / total * 100:5.1f}%")

@@ -339,6 +339,9 @@ pub fn serve_links() -> std::io::Result<()> {
     let executable = std::env::current_exe()?;
     let socket = socket_path(&executable);
     let mut session = blinker_link::Session::default();
+    // The one thing that distinguishes this from a one-shot link: there will be
+    // another one. See `Session::resident`.
+    session.set_resident(true);
 
     serve(&socket, move |cwd, argv| {
         // Relative input and output paths are resolved against the caller's

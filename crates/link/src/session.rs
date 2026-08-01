@@ -126,6 +126,14 @@ pub struct Session {
     interfaces_changed: bool,
     /// Whether the cache file has been written at least once by this session.
     wrote_cache: bool,
+    /// Whether this session outlives the link that is using it.
+    ///
+    /// Set by the daemon, and by nothing else. It is not "am I warm yet" — it
+    /// is "will there be a next link through me", which is what decides whether
+    /// work done *for* the next link is an investment or a waste. Recording
+    /// what each object read is the case that turns on it: pure cost to a
+    /// process that is about to exit, and 2.8 ms a link to one that is not.
+    resident: bool,
     /// The cache this session's last link produced, and the path it belongs to.
     ///
     /// The cache file is a *restart* mechanism: it exists so a cold process can
@@ -433,6 +441,16 @@ impl Session {
     /// Whether the extraction order and the resolution were reused.
     pub fn reused(&self) -> (bool, bool) {
         (self.replayed_extraction, self.held_resolution)
+    }
+
+    /// Declare that this session will serve more than one link.
+    pub fn set_resident(&mut self, resident: bool) {
+        self.resident = resident;
+    }
+
+    /// Whether more links are expected through this session; see `resident`.
+    pub fn is_resident(&self) -> bool {
+        self.resident
     }
 
     /// Take the cache held for `path`, if this session produced one.

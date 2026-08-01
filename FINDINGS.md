@@ -5465,3 +5465,73 @@ machine for deciding what changed, and it is only as good as its notion of
 sameness — which means every identity it compares has to be checked against the
 question being asked, not against byte equality. Byte equality is always
 available and it is almost always the wrong test.
+
+## 113. The relocation cache was never the problem; the file was
+
+Finding 91 killed per-object relocation reuse, and finding 94 confirmed it: at
+73% reuse it *lost*, because recording what each object read doubled the
+relocation stage and copying cached bytes cost about what relocating them cost.
+The conclusion drawn was "do not cache relocated bytes", and it was written down
+as settled.
+
+It was settled about the wrong thing. Every cost in that verdict belonged to the
+cache **file**, not to the reuse:
+
+- the entries were decoded from disk on every link and encoded back afterwards
+- the cached section bytes were a `Vec<u8>` reconstructed per link
+- and the recording ran unconditionally, including for the objects it would
+  never help
+
+Finding 110 moved the cache into the session. Running the same code, unchanged,
+with the same flag, on the same workload:
+
+```
+                    file-backed   session-held
+  apply                 3.67 ms       0.83 ms
+  link                 19.6  ms      16.7  ms
+  relocations reused          -   83,964 / 87,834  (96%)
+```
+
+**96%.** It is now on automatically whenever the session is resident, and off
+otherwise — which is not a compromise but the actual shape of the economics.
+Recording is an investment in the *next* link; a process about to exit has no
+next link, so for a one-shot invocation the original verdict still holds exactly
+as measured. `Session::is_resident` is the flag, and the daemon is the only
+thing that sets it.
+
+A test pins the property that makes this safe: two sessions link the same inputs
+three times each, differing only in whether reuse was on, and the binaries must
+match. Reused bytes that are subtly stale still link and still run — the failure
+this can have is silent, so "it succeeded" is not the assertion.
+
+### What this says about killed ideas
+
+The measurement that killed relocation reuse was correct. What was wrong was the
+scope of the conclusion: it measured *reuse through a file* and concluded
+something about *reuse*. Both of the mechanisms that made it win — a resident
+process, and holding the cache in memory — were built afterwards, for other
+reasons, and nothing went back to ask whether the dead idea was still dead.
+
+A rejected design should carry the conditions it was rejected under, and those
+conditions should be re-checked when the system underneath them changes.
+
+### Where the warm relink stands
+
+```
+  wall  21.6 ms      link  16.7 ms      (was 27.0 / 18.7 at finding 107)
+
+    dead_strip        3.60      liveness 2.19, atoms 1.15
+    relocate          5.18      apply 0.84, address table 0.78, plan 0.62
+    emit              1.43
+    read_and_parse    1.27
+    layout            1.14
+    survey            1.02
+    prepare           1.01
+    cache_build       0.66
+    symbols           0.65
+    unmeasured        0.14
+```
+
+Dead-strip is now the largest single item, and it is entirely global: it rebuilds
+the atom graph and re-derives liveness over 900 objects to discover that 24 of
+6879 addresses moved.
