@@ -100,10 +100,18 @@ def force_final_link(project):
 
     Touching the binary crate's own source is enough. It costs one small
     recompile, changes no content, and guarantees the final link happens.
+
+    *Which* source has to come from cargo, not from a glob. `**/src/main.rs`
+    misses `src/bin/main.rs`, which is where rust-analyzer's entry point lives
+    — so the capture touched `xtask`, relinked only `xtask`, and produced a
+    workload named after a program it had not linked (139). cargo already
+    reports the exact path of every binary target; the glob was guessing at
+    something that was available for the asking.
     """
-    touched = sorted(project.glob("**/src/main.rs"))
+    touched = [path for _, path in binary_targets(project)]
     for path in touched:
-        path.touch()
+        if path.exists():
+            path.touch()
     if not touched:
         fail(f"no binary crate found under {project} to force a link")
 
@@ -137,6 +145,27 @@ def capture(project, records, linker, target_dir, profile):
     run(cmd, cwd=project)
 
 
+def binary_targets(project):
+    """Every binary target of the workspace, as `(name, source path)`.
+
+    One question to cargo, answering both "which links matter" and "which files
+    to touch to make them happen". Asking it twice, in two different ways, is
+    how those two answers came to disagree (139).
+    """
+    meta = subprocess.run(
+        ["cargo", "metadata", "--no-deps", "--format-version=1"],
+        cwd=project, capture_output=True, text=True,
+    )
+    if meta.returncode != 0:
+        return []
+    targets = []
+    for package in json.loads(meta.stdout).get("packages", []):
+        for target in package.get("targets", []):
+            if "bin" in target.get("kind", []):
+                targets.append((target["name"], Path(target["src_path"])))
+    return targets
+
+
 def package_binaries(project, preferred=None):
     """The project's binary targets, most-wanted first.
 
@@ -144,18 +173,7 @@ def package_binaries(project, preferred=None):
     `blinker` is the linker and `blinker_corpus` is a diagnostic tool that
     happens to depend on more crates. Choosing by size picked the second one.
     """
-    meta = subprocess.run(
-        ["cargo", "metadata", "--no-deps", "--format-version=1"],
-        cwd=project, capture_output=True, text=True,
-    )
-    if meta.returncode != 0:
-        return set()
-    names = []
-    for package in json.loads(meta.stdout).get("packages", []):
-        for target in package.get("targets", []):
-            if "bin" in target.get("kind", []):
-                names.append(target["name"])
-    names.sort()
+    names = sorted(name for name, _ in binary_targets(project))
     # The one named like the project comes first unless told otherwise.
     head = preferred or project.name
     return sorted(names, key=lambda n: (n != head, n))
