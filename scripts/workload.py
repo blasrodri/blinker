@@ -137,13 +137,44 @@ def capture(project, records, linker, target_dir, profile):
     run(cmd, cwd=project)
 
 
-def largest_record(records):
-    """The final binary's link, which is the one with the most inputs.
+def package_binaries(project, preferred=None):
+    """The project's binary targets, most-wanted first.
 
-    A cargo build records every link it performs — build scripts, proc-macro
+    A workspace usually has more than one, and they are not interchangeable:
+    `blinker` is the linker and `blinker_corpus` is a diagnostic tool that
+    happens to depend on more crates. Choosing by size picked the second one.
+    """
+    meta = subprocess.run(
+        ["cargo", "metadata", "--no-deps", "--format-version=1"],
+        cwd=project, capture_output=True, text=True,
+    )
+    if meta.returncode != 0:
+        return set()
+    names = []
+    for package in json.loads(meta.stdout).get("packages", []):
+        for target in package.get("targets", []):
+            if "bin" in target.get("kind", []):
+                names.append(target["name"])
+    names.sort()
+    # The one named like the project comes first unless told otherwise.
+    head = preferred or project.name
+    return sorted(names, key=lambda n: (n != head, n))
+
+
+def largest_record(records, wanted=None):
+    """The link this workload is about.
+
+    Picked by *name* when the project's binary targets are known, and by input
+    count only as a fallback. Input count is what this used to use, and it chose
+    wrong twice: once a proc-macro dylib, once `blinker_corpus` instead of
+    `blinker` — both real links, neither the one the benchmark claimed to be
+    measuring. "The biggest link" is a proxy for "the link that matters", and a
+    proxy that silently substitutes a different program is the failure finding
+    106 was about.
+
+    A cargo build records every link it performs: build scripts, proc-macro
     dylibs, each test binary. They are all real invocations and the corpus
-    tooling wants them; a *benchmark* wants the biggest one, because the
-    question a benchmark answers is about scale.
+    tooling wants them; a benchmark wants a *named* one.
     """
     best, best_count = None, -1
     for path in sorted(Path(records).glob("*.json")):
@@ -160,11 +191,29 @@ def largest_record(records):
                and not os.path.exists(a) for a in argv):
             print(f"    skipping {path.name}: it names a file that is gone")
             continue
+        # A binary target's link beats any number of inputs elsewhere.
+        name = Path(record.get("output_path", "")).name
+        stem = name.rsplit("-", 1)[0] if "-" in name else name
         count = len(record.get("inputs") or [])
+        # Preferred binary first, any binary second, anything else last. Two
+        # binary targets in one workspace (`blinker` and `blinker_corpus`) is
+        # enough for "is a binary" to still pick the wrong one.
+        if wanted and stem == wanted[0]:
+            count += 2_000_000
+        elif wanted and stem in wanted:
+            count += 1_000_000
         if count > best_count:
             best, best_count = record, count
     if best is None:
         fail(f"no records under {records} — did the build link anything?")
+    if wanted:
+        chosen = Path(best.get("output_path", "")).name
+        stem = chosen.rsplit("-", 1)[0] if "-" in chosen else chosen
+        if stem not in wanted:
+            fail(f"the chosen link is {chosen}, which is not one of this "
+                 f"project's binaries ({', '.join(sorted(wanted))})")
+        if stem != wanted[0]:
+            print(f"  note: captured {stem}, not {wanted[0]}")
     return best
 
 
@@ -271,6 +320,7 @@ def main():
     )
     parser.add_argument("--out", default=str(REPO / "target" / "workloads"))
     parser.add_argument("--profile", choices=["debug", "release"], default="release")
+    parser.add_argument("--binary", help="which binary target's link to capture")
     options = parser.parse_args()
 
     if not BLINKER.exists():
@@ -313,7 +363,10 @@ def main():
     records = destination / "records"
     shutil.move(str(staging), str(records))
 
-    record = largest_record(records)
+    record = largest_record(
+        records,
+        package_binaries(Path(options.project).resolve(), options.binary),
+    )
     argv = replay_argv(record, destination / "link-output")
     argv = [a.replace(str(staging), str(records)) for a in argv]
 

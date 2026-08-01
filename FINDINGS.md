@@ -6067,3 +6067,54 @@ This is the third "kept, unmeasured" entry (123, 125). What makes it acceptable
 is that it is a *mechanism*, not an optimisation: the value is that the next
 four things — grouped relocations, opacity, personality fields, per-object
 survey contributions — now have somewhere to go.
+
+## 128. The benchmark was a release build, and release is the easy case
+
+Every performance number in findings 92–127 was taken on one workload: blinker
+linking itself, **release** profile. On that workload blinker reached parity
+with ld64 (1.04x) and an edit relink of 21 ms.
+
+A developer's edit–test loop does not use the release profile. Measuring the
+debug link of the same program — after fixing the harness to pick a link by
+*name* rather than by input count, which had silently captured a different
+binary:
+
+```
+                inputs  objects   output    ld64     blinker
+  release           69      900     2 MB   32.5 ms   34.0 ms   1.04x
+  debug             80    1,643   8-9 MB   43.7 ms  114.9 ms   2.63x  <-- slower
+```
+
+**blinker is 2.6x slower than ld64 on the build people actually run.** Not
+slower than its own release number by a little: 114.9 ms against 34.0, on inputs
+that grew from 63 MB to 102 MB and from 900 objects to 1,643.
+
+The link is correct — the binary runs and its signature validates — so this is
+about cost, not breakage. (The output is 11% *smaller* than ld64's, which is
+unexplained and worth its own investigation before it is called an advantage.)
+
+### What this invalidates
+
+Not the individual measurements; each was real. What it invalidates is the
+*conclusion drawn from them*. "blinker is at parity cold and 1.6x faster on an
+edit" describes the release profile only. The stage profile that every
+optimisation this session was aimed at — traverse 1.66, emit 1.53, layout
+1.10 — is the release profile's shape. The debug link is three times the size
+and nothing says the same stages dominate it.
+
+And the strategic claim built on top, that linking is only 1.8% of a rebuild and
+therefore not worth optimising, was doubly wrong: it compared a release link to a
+debug rebuild, and the debug link it should have used is five times larger than
+the number it used.
+
+### The rule, for the third time
+
+Finding 77: a fixture is a claim about scale and it expires. Finding 106: a
+harness that produces inputs differently from production measures a different
+system. This is the same failure with a different variable — **a fixture is also
+a claim about the *build profile*, and the profile a benchmark is convenient to
+build is not the profile anybody waits on.**
+
+Release was chosen because it is what `workload.py` defaulted to. No argument
+was ever made for it. Nine sessions of optimisation were aimed at the case that
+was already fine.
