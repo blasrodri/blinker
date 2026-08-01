@@ -5813,3 +5813,53 @@ stood between this and being visible, and neither of them was looking for it.
 A general-purpose function paying its full cost on inputs that need none of it
 is invisible precisely because nothing about the call site suggests expense.
 
+
+## 121. Resolving every relocation to read one of them, and the bug that nearly hid in the fix
+
+`fill_unwind_info` was 1.25 ms. Splitting it:
+
+```
+    eh_frame_fde_offsets   1.00 ms
+    compact_unwind_entries 0.23 ms
+    unwind::build          0.02 ms
+```
+
+Encoding the table — the thing the function is named for — is two hundredths of
+a millisecond. All the cost is in working out where each function's FDE landed.
+
+That function built a `HashMap<offset, address>` of the section's relocations
+and then looked up one entry per FDE. Two separate wastes. It called
+`target_address` for *every* relocation in `__eh_frame` — the LSDA pointers, the
+personality references, the CIE back-pointers — when the only one ever read back
+is the FDE's `PC begin`. And it hashed and stored every result to answer lookups
+that arrive in strictly increasing order, which a cursor answers without hashing
+anything.
+
+Walking the relocations in lockstep with the records:
+
+```
+  unwind      1.68 ms -> 0.75 ms
+  synthetic   1.46 ms -> 0.85 ms
+```
+
+### The part worth writing down
+
+The first version of the cursor was wrong, and it produced a binary that linked,
+ran, and passed every test that checks a program's output.
+
+A `PC begin` field is a `SUBTRACTOR` pair: **two relocations at the same
+offset**, the anchor and then the function. The map this replaced inserted both
+and kept whichever came last, which is the function. A cursor that stops at the
+first match takes the anchor instead. The result is an unwind table pointing at
+the wrong addresses — invisible until something actually unwinds.
+
+`a_caught_panic_still_runs_destructors_after_stripping` caught it. That test
+exists because catching a panic and running destructors is the one thing that
+reads the unwind tables at runtime, and nothing else in a passing test suite
+touches them. Without it this would have shipped: every binary correct except
+when a Rust program panics.
+
+The fix is two lines — a stable sort, and taking the last match rather than the
+first — and neither is obvious from reading the code that was replaced. "Insert
+into a map" quietly encodes a last-wins policy over duplicate keys, and
+replacing it with anything ordered has to reproduce that policy on purpose.

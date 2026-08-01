@@ -833,18 +833,33 @@ fn eh_frame_fde_offsets(
             };
             let chunk_offset = chunk - output.vm_address;
 
-            // Relocations in this section, by offset.
-            let mut targets: HashMap<u64, u64> = HashMap::default();
-            for relocation in object
+            // This section's relocations, in offset order, walked in lockstep
+            // with the records below rather than hashed into a map.
+            //
+            // Two costs went away with the map. It resolved `target_address`
+            // for *every* relocation in `__eh_frame` — the LSDA pointers, the
+            // personality references, the CIE back-pointers — when the only one
+            // ever read back is the FDE's `PC begin`. And it hashed and stored
+            // every result to answer lookups that arrive in increasing order,
+            // which a cursor answers without hashing anything.
+            //
+            // `eh_frame_fde_offsets` was 1.00 ms of `fill_unwind_info`'s 1.25;
+            // encoding the actual table was 0.02.
+            let mut relocations: Vec<&blinker_macho::InputRelocation> = object
                 .parsed
                 .relocations
                 .iter()
                 .filter(|r| r.section == section.id)
-            {
-                if let Ok(address) = target_address(object, placed, addresses, relocation.target) {
-                    targets.insert(relocation.offset, address);
-                }
-            }
+                .collect();
+            // Stable, and the *last* match wins below. Both matter: a `PC
+            // begin` field is a SUBTRACTOR pair — two relocations at one offset,
+            // the anchor then the function — and the map this replaced kept
+            // whichever was inserted last, which is the function. Taking the
+            // first instead produced a binary that linked, ran, and unwound
+            // into the wrong place; `a_caught_panic_still_runs_destructors_
+            // after_stripping` caught it.
+            relocations.sort_by_key(|r| r.offset);
+            let mut cursor = 0usize;
 
             let mut position = 0u64;
             while position + 8 <= section.size {
@@ -872,12 +887,29 @@ fn eh_frame_fde_offsets(
                 // stripped has no offset to publish, and no live function is
                 // looking for one.
                 if id != 0 {
-                    // `PC begin` immediately follows the CIE pointer.
-                    if let (Some(function), Some(placed)) = (
-                        targets.get(&(position + 8)),
+                    // `PC begin` immediately follows the CIE pointer. Records
+                    // are walked in increasing offset, so the cursor only ever
+                    // moves forward.
+                    let want = position + 8;
+                    while relocations.get(cursor).is_some_and(|r| r.offset < want) {
+                        cursor += 1;
+                    }
+                    let mut at_pc_begin = None;
+                    let mut scan = cursor;
+                    while let Some(relocation) = relocations.get(scan).filter(|r| r.offset == want)
+                    {
+                        at_pc_begin = Some(relocation);
+                        scan += 1;
+                    }
+                    if let (Some(relocation), Some(moved)) = (
+                        at_pc_begin,
                         strip.remap(object.parsed.id, section.id, position),
                     ) {
-                        offsets.insert(*function, (chunk_offset + placed) as u32);
+                        if let Ok(function) =
+                            target_address(object, placed, addresses, relocation.target)
+                        {
+                            offsets.insert(function, (chunk_offset + moved) as u32);
+                        }
                     }
                 }
 
