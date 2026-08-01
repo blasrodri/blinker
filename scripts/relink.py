@@ -228,7 +228,7 @@ def main():
           f"(min {min(links):.1f}, max {max(links):.1f})\n")
 
     accounted = 0.0
-    for name in ["read_and_parse", "resolve", "layout", "dead_strip",
+    for name in ["read_and_parse", "stub_parse", "resolve", "layout", "dead_strip",
                  "relocate", "emit", "cache_load", "cache_plan",
                  "cache_build", "cache_store"]:
         value = timings.get(f"link_{name}_ms")

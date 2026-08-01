@@ -152,6 +152,12 @@ pub struct LinkTimings {
     /// pointing at it. This number is the acceptance criterion for retained
     /// placement, and it is meant to be zero.
     pub contributions_moved_unchanged: u64,
+    /// How long parsing the SDK's `.tbd` stubs took, on its own thread.
+    ///
+    /// Compare against `read_and_parse_ms`, which is the whole overlapped
+    /// stage: if this is the smaller of the two it costs nothing, and if it is
+    /// the larger it is setting the pace.
+    pub stub_parse_ms: f64,
 }
 
 impl std::fmt::Display for LinkTimings {
@@ -1335,11 +1341,22 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     // cache, and therefore no new state whose staleness could change an
     // output.
     let step = std::time::Instant::now();
-    let (objects, exported) = std::thread::scope(|scope| {
-        let stub = scope.spawn(|| request.dynamic_symbols());
+    let (objects, exported, stub_ms) = std::thread::scope(|scope| {
+        let stub = scope.spawn(|| {
+            let started = std::time::Instant::now();
+            (request.dynamic_symbols(), elapsed_ms(started))
+        });
         let objects = load_objects(&request.objects);
-        (objects, stub.join().expect("the stub reader did not panic"))
+        let (exported, stub_ms) = stub.join().expect("the stub reader did not panic");
+        (objects, exported, stub_ms)
     });
+    // Both halves are timed, not just the pair. Overlapped work is only free
+    // while it is the *shorter* half, and a profile cannot tell the difference:
+    // it counts CPU across threads, so a stub parse that is entirely hidden
+    // and one that sets the pace look identical in it. Finding 91 cached this
+    // parse, measured nothing, and reverted — this is the number that says
+    // whether that was the cache being useless or the cost being hidden.
+    timings.stub_parse_ms = stub_ms;
     let objects = objects?;
     timings.read_and_parse_ms = elapsed_ms(step);
 

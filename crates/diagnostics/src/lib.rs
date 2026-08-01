@@ -89,6 +89,9 @@ pub struct PhaseTimings {
     /// cache switched off, and none of the 5.5 ms appeared under any stage —
     /// decoding and planning were charged to `relocate`, and building and
     /// storing happened after `emit` had stopped.
+    /// Parsing the SDK's `.tbd` stubs, which overlaps reading the objects.
+    /// Only a cost when it is the longer of the two.
+    pub link_stub_parse_ms: Option<f64>,
     pub link_cache_load_ms: Option<f64>,
     pub link_cache_plan_ms: Option<f64>,
     pub link_cache_build_ms: Option<f64>,
@@ -109,6 +112,9 @@ pub struct LinkStages {
     pub dead_strip: f64,
     pub relocate: f64,
     pub emit: f64,
+    /// Parsing `.tbd` stubs, which happens on its own thread inside
+    /// `read_and_parse` rather than after it.
+    pub stub_parse: f64,
     /// Load, plan, build, store — the cache's four costs, zero without one.
     pub cache: CacheStages,
 }
@@ -252,6 +258,7 @@ impl LinkRecord {
             relocate,
             emit,
             cache,
+            stub_parse,
         } = stages;
         self.timings.internal_link_ms = Some(as_ms(total));
         self.timings.link_read_and_parse_ms = Some(read_and_parse);
@@ -260,6 +267,7 @@ impl LinkRecord {
         // Absent rather than zero when nothing was stripped, so "the stage did
         // not run" and "the stage was free" stay distinguishable.
         self.timings.link_dead_strip_ms = (dead_strip > 0.0).then_some(dead_strip);
+        self.timings.link_stub_parse_ms = (stub_parse > 0.0).then_some(stub_parse);
         self.timings.link_relocate_ms = Some(relocate);
         self.timings.link_emit_ms = Some(emit);
         if cache.ran() {

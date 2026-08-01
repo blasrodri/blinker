@@ -191,6 +191,7 @@ pub fn run(argv: &[String]) -> Result<Outcome, DriverError> {
                 dead_strip: phases.dead_strip_ms,
                 relocate: phases.relocate_ms,
                 emit: phases.emit_ms,
+                stub_parse: phases.stub_parse_ms,
                 cache: blinker_diagnostics::CacheStages {
                     load: phases.cache_load_ms,
                     plan: phases.cache_plan_ms,

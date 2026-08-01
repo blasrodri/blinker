@@ -4806,3 +4806,52 @@ every edit that changes the image's size, which is every edit. The reuse path
 was wired end to end and fired on nothing — and the emit time not moving is
 exactly what that looks like from outside, which is why it took a second look
 to tell it apart from the answer above.
+
+## 100. A profile cannot see that work is hidden, and that is why finding 91 was null
+
+Re-profiling after the signing work — because finding 99 had just established
+that a profile expires when you act on it — put `yaml_rust2::parser` third,
+above `sha256`:
+
+```
+  3082  blinker_link::load_one
+  3033  std::fs::read::inner
+  1546  yaml_rust2::parser          <- .tbd stub parsing
+   967  sha256::compress256         <- was 2259 before threading
+   962  open
+   809  LinkRequest::dynamic_symbols
+```
+
+Parsing the SDK's `.tbd` stubs is YAML parsing of files that never change,
+which reads as the most obviously wasteful thing in the link. Finding 91 built
+a cache for exactly that, measured 217 → 209 links per six seconds, and
+reverted it as a null result.
+
+Both are true, and the reason is that `sample` counts CPU across threads while
+a link is measured in wall clock. The stub parse already runs on its own
+thread, alongside reading the objects. Timing the two halves separately rather
+than the pair:
+
+```
+  read_and_parse   8.24 ms      the whole overlapped stage
+  stub_parse       6.28 ms      of which this is hidden inside
+```
+
+**Overlapped work is free only while it is the shorter half**, and a profile
+cannot distinguish a thread that is entirely hidden from one setting the pace —
+they produce identical sample counts. Finding 91's cache removed CPU that
+nothing was waiting for.
+
+### What the number is actually for
+
+6.28 of 8.24 ms means the stub parse is 76% of the stage it hides in. It is
+free now and it stops being free the moment reading the objects gets faster,
+which is precisely what the daemon is for. Cache the stub parse first and it
+measures nothing; make reading fast first and the same cache is suddenly worth
+most of what remains.
+
+So the ordering is not "cheapest first" or "biggest sample count first" — it is
+**whichever half is longer**, and that is a question a profile cannot answer
+and two `Instant::now()` calls can. `stub_parse_ms` is now reported next to the
+stage it lives in, so the day it becomes the longer half is visible rather than
+deduced.
