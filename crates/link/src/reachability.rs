@@ -413,17 +413,66 @@ fn within<'g, 'a>(grouped: &'g ByOffset<'a>, atom: &Atom) -> &'g [&'a InputReloc
     &list[start..end]
 }
 
+/// The set of live atoms, as a bit per atom.
+///
+/// Atoms are numbered `0..n` and every one of them is asked about — several
+/// times, once per edge that points at it. A `HashSet<usize>` hashes an integer
+/// that is already a perfect index, and scatters the answer across memory; the
+/// traversal was 2.22 ms of a 16.8 ms link and almost all of it was this.
+///
+/// The API is deliberately the same three operations the `HashSet` offered, so
+/// the traversal below reads unchanged.
+#[derive(Debug, Clone)]
+pub(crate) struct LiveSet {
+    bits: Vec<u64>,
+}
+
+impl LiveSet {
+    fn with_capacity(atoms: usize) -> LiveSet {
+        LiveSet {
+            bits: vec![0; atoms.div_ceil(64)],
+        }
+    }
+
+    /// Mark `index` live, returning whether it was not already.
+    fn insert(&mut self, index: usize) -> bool {
+        let (word, bit) = (index / 64, 1u64 << (index % 64));
+        let slot = &mut self.bits[word];
+        let new = *slot & bit == 0;
+        *slot |= bit;
+        new
+    }
+
+    pub(crate) fn contains(&self, index: usize) -> bool {
+        self.bits
+            .get(index / 64)
+            .is_some_and(|word| word & (1u64 << (index % 64)) != 0)
+    }
+}
+
 /// Which atoms a program can reach from `entry`.
-fn liveness(objects: &[LoadedObject], atoms: &Atoms<'_>, entry: &str) -> (HashSet<usize>, usize) {
+fn liveness(
+    objects: &[LoadedObject],
+    atoms: &Atoms<'_>,
+    entry: &str,
+    parts: &mut [f64; 2],
+) -> (LiveSet, usize) {
+    // Grouping is a pure function of one object — its relocations, by section,
+    // sorted by offset — and it is rebuilt for all of them on every link. The
+    // traversal that follows is genuinely global. Timed apart because only one
+    // of the two can be held in a session.
+    let step = std::time::Instant::now();
     let grouped: HashMap<u32, ByOffset<'_>> = objects
         .iter()
         .map(|o| (o.parsed.id.0, group_relocations(o)))
         .collect();
     let by_id: HashMap<u32, &LoadedObject> = objects.iter().map(|o| (o.parsed.id.0, o)).collect();
+    parts[0] = step.elapsed().as_secs_f64() * 1000.0;
+    let step = std::time::Instant::now();
 
-    let mut live: HashSet<usize> = HashSet::default();
+    let mut live = LiveSet::with_capacity(atoms.atoms.len());
     let mut worklist: Vec<usize> = Vec::new();
-    let mark = |index: usize, live: &mut HashSet<usize>, worklist: &mut Vec<usize>| {
+    let mark = |index: usize, live: &mut LiveSet, worklist: &mut Vec<usize>| {
         if live.insert(index) {
             worklist.push(index);
         }
@@ -478,44 +527,43 @@ fn liveness(objects: &[LoadedObject], atoms: &Atoms<'_>, entry: &str) -> (HashSe
     // so these are the only places the invariant can be violated — and the only
     // places the verification below has to look.
     let mut suppressed: Vec<usize> = Vec::new();
-    let propagate =
-        |live: &mut HashSet<usize>, worklist: &mut Vec<usize>, suppressed: &mut Vec<usize>| {
-            while let Some(index) = worklist.pop() {
-                let atom = &atoms.atoms[index];
-                let Some(object) = by_id.get(&atom.object.0) else {
-                    continue;
-                };
-                let Some(grouped) = grouped.get(&atom.object.0) else {
-                    continue;
-                };
-                // Metadata's own references do not keep anything alive; it is kept
-                // alive *by* what it describes, below.
-                if object
+    let propagate = |live: &mut LiveSet, worklist: &mut Vec<usize>, suppressed: &mut Vec<usize>| {
+        while let Some(index) = worklist.pop() {
+            let atom = &atoms.atoms[index];
+            let Some(object) = by_id.get(&atom.object.0) else {
+                continue;
+            };
+            let Some(grouped) = grouped.get(&atom.object.0) else {
+                continue;
+            };
+            // Metadata's own references do not keep anything alive; it is kept
+            // alive *by* what it describes, below.
+            if object
+                .parsed
+                .section(atom.section)
+                .is_some_and(|s| is_metadata(&s.name))
+            {
+                // Except forward: a live unwind record's exception table is
+                // part of it, so an `__eh_frame` FDE that survives brings its
+                // LSDA with it.
+                if !object
                     .parsed
                     .section(atom.section)
-                    .is_some_and(|s| is_metadata(&s.name))
+                    .is_some_and(|s| s.name == "__eh_frame")
                 {
-                    // Except forward: a live unwind record's exception table is
-                    // part of it, so an `__eh_frame` FDE that survives brings its
-                    // LSDA with it.
-                    if !object
-                        .parsed
-                        .section(atom.section)
-                        .is_some_and(|s| s.name == "__eh_frame")
-                    {
-                        suppressed.push(index);
-                        continue;
-                    }
+                    suppressed.push(index);
+                    continue;
                 }
-                for relocation in within(grouped, atom) {
-                    if let Some(target) = atoms.target_atom(object, relocation) {
-                        if live.insert(target) {
-                            worklist.push(target);
-                        }
+            }
+            for relocation in within(grouped, atom) {
+                if let Some(target) = atoms.target_atom(object, relocation) {
+                    if live.insert(target) {
+                        worklist.push(target);
                     }
                 }
             }
-        };
+        }
+    };
     propagate(&mut live, &mut worklist, &mut suppressed);
 
     // Metadata comes alive with its subject, not before it.
@@ -556,7 +604,7 @@ fn liveness(objects: &[LoadedObject], atoms: &Atoms<'_>, entry: &str) -> (HashSe
             };
             for relocation in within(grouped, atom) {
                 if let Some(target) = atoms.target_atom(object, relocation) {
-                    if !live.contains(&target) {
+                    if !live.contains(target) {
                         found.push(target);
                     }
                 }
@@ -576,6 +624,7 @@ fn liveness(objects: &[LoadedObject], atoms: &Atoms<'_>, entry: &str) -> (HashSe
         propagate(&mut live, &mut worklist, &mut suppressed);
     }
 
+    parts[1] = step.elapsed().as_secs_f64() * 1000.0;
     (live, revived)
 }
 
@@ -588,7 +637,7 @@ fn revive_eh_frame(
     atoms: &Atoms<'_>,
     grouped: &ByOffset<'_>,
     section: &InputSection,
-    live: &mut HashSet<usize>,
+    live: &mut LiveSet,
     worklist: &mut Vec<usize>,
 ) {
     let Some(range) = atoms
@@ -623,7 +672,7 @@ fn revive_eh_frame(
             .iter()
             .find(|r| r.offset == atom.offset + 8 && r.kind != Arm64RelocationKind::Subtractor)
             .and_then(|r| atoms.target_atom(object, r));
-        if function.is_some_and(|f| live.contains(&f)) && live.insert(index) {
+        if function.is_some_and(|f| live.contains(f)) && live.insert(index) {
             worklist.push(index);
         }
     }
@@ -639,7 +688,7 @@ fn revive_lsdas(
     atoms: &Atoms<'_>,
     grouped: &ByOffset<'_>,
     section: &InputSection,
-    live: &mut HashSet<usize>,
+    live: &mut LiveSet,
     worklist: &mut Vec<usize>,
 ) {
     let Some(list) = grouped.get(&section.id.0) else {
@@ -665,7 +714,7 @@ fn revive_lsdas(
         let alive = functions
             .get(&record)
             .and_then(|f| *f)
-            .is_some_and(|f| live.contains(&f));
+            .is_some_and(|f| live.contains(f));
         if alive && live.insert(lsda) {
             worklist.push(lsda);
         }
@@ -796,7 +845,7 @@ impl Strip {
     }
 
     /// Build the map from a liveness result.
-    fn build(objects: &[LoadedObject], atoms: &Atoms<'_>, live: &HashSet<usize>) -> Strip {
+    fn build(objects: &[LoadedObject], atoms: &Atoms<'_>, live: &LiveSet) -> Strip {
         let mut sections = crate::hashing::FastMap::default();
         for object in objects {
             for section in &object.parsed.sections {
@@ -804,13 +853,13 @@ impl Strip {
                 let Some(range) = atoms.by_section.get(&key).cloned() else {
                     continue;
                 };
-                if range.clone().all(|index| live.contains(&index)) {
+                if range.clone().all(|index| live.contains(index)) {
                     continue;
                 }
                 let mut pieces: Vec<Piece> = Vec::new();
                 let mut cursor = 0u64;
                 for index in range {
-                    if !live.contains(&index) {
+                    if !live.contains(index) {
                         continue;
                     }
                     let atom = &atoms.atoms[index];
@@ -860,6 +909,9 @@ pub(crate) struct StripTimings {
     pub atoms_ms: f64,
     pub liveness_ms: f64,
     pub build_ms: f64,
+    /// Inside `liveness_ms`: grouping relocations per object, then traversing.
+    pub group_ms: f64,
+    pub traverse_ms: f64,
 }
 
 /// Decide what a link keeps.
@@ -871,8 +923,11 @@ pub(crate) fn plan(objects: &[LoadedObject], entry: &str) -> (Strip, Report, Str
     timings.atoms_ms = step.elapsed().as_secs_f64() * 1000.0;
 
     let step = std::time::Instant::now();
-    let (live, revived) = liveness(objects, &atoms, entry);
+    let mut live_parts = [0.0f64; 2];
+    let (live, revived) = liveness(objects, &atoms, entry, &mut live_parts);
     timings.liveness_ms = step.elapsed().as_secs_f64() * 1000.0;
+    timings.group_ms = live_parts[0];
+    timings.traverse_ms = live_parts[1];
 
     let step = std::time::Instant::now();
     let strip = Strip::build(objects, &atoms, &live);
@@ -887,12 +942,7 @@ pub(crate) fn analyse(objects: &[LoadedObject], entry: &str) -> Report {
 }
 
 /// The `__text` numbers, which are what can be compared against another linker.
-fn report(
-    objects: &[LoadedObject],
-    atoms: &Atoms<'_>,
-    live: &HashSet<usize>,
-    revived: usize,
-) -> Report {
+fn report(objects: &[LoadedObject], atoms: &Atoms<'_>, live: &LiveSet, revived: usize) -> Report {
     let is_text: HashSet<(u32, u32)> = objects
         .iter()
         .flat_map(|o| {
@@ -915,7 +965,7 @@ fn report(
         }
         report.total_atoms += 1;
         report.total_bytes += atom.size;
-        let alive = live.contains(&index);
+        let alive = live.contains(index);
         if alive {
             report.live_atoms += 1;
             report.live_bytes += atom.size;

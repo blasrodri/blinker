@@ -5661,3 +5661,44 @@ when the session only ever serves one target, which is what every test does. The
 daemon's tests link one program; the corpus links one program; the benchmark
 links one program. It took a stray measurement of a *different* program through
 an already-warm daemon to see it.
+
+## 117. Dead-strip's traversal was hashing integers that were already indices
+
+Finding 114 named `liveness` (2.07 ms) as the largest remaining item and the one
+that does not decompose per object. Splitting it says most of that is true:
+
+```
+    group             0.31 ms     relocations per object, by section, sorted
+    traverse          2.22 ms     reachability from the roots
+```
+
+Grouping is a pure function of one object and could be held in a session — and
+it is worth 0.31 ms, so it is not the thing to build. The traversal is the cost,
+and it is genuinely global.
+
+But it was not global work that made it slow. Atoms are numbered `0..n`, and the
+live set was a `HashSet<usize>` — hashing an integer that is already a perfect
+index, and scattering one bit of information across a hash table, once per edge.
+Every atom is asked about several times, once per reference that points at it.
+
+A bit per atom:
+
+```
+                before   after
+  traverse      2.22 ms  1.54 ms
+  dead_strip    3.75 ms  3.01 ms
+```
+
+**0.68 ms**, for a container swap behind an unchanged three-method interface.
+
+Worth putting next to finding 115, which measured the opposite result an hour
+earlier: removing ~90,000 short-string allocations from the same stage bought
+0.05 ms. Same intuition — "this data structure is doing needless work" — and the
+two differ by more than a factor of ten. The allocations were on a path walked
+once per *name*; the hashing was on a path walked once per *edge*. Neither the
+allocation count nor the container type predicted which mattered. The access
+pattern did, and only measurement showed it.
+
+`traverse` at 1.54 ms is now the largest single item in the link, and it is
+still recomputing global reachability to discover that 24 of 6879 addresses
+moved. That remains the hard problem.

@@ -351,7 +351,7 @@ def main():
     # for its own sake and excluded from the sum: adding an overlapped half to
     # the stage containing it double-counts, and the first version of this made
     # `unmeasured` negative — which is at least a number that announces itself.
-    overlapped = {"stub_parse", "atoms", "liveness", "strip_build",
+    overlapped = {"stub_parse", "atoms", "liveness", "group", "traverse", "strip_build",
                   # Both run inside the relocate timer. Counting them again
                   # made `unmeasured` negative, which is the one way a profile
                   # can announce that it does not add up.
@@ -361,7 +361,7 @@ def main():
                   "emit_assemble", "emit_uuid", "emit_sign",
                   "address_map", "contents", "synthetic", "apply"}
     for name in ["read_and_parse", "stub_parse", "resolve", "layout", "dead_strip",
-                 "atoms", "liveness", "strip_build",
+                 "atoms", "liveness", "group", "traverse", "strip_build",
                  "prepare", "accounting", "address_table", "address_diff", "relocate", "emit", "emit_layout", "emit_contents",
                  "emit_linkedit", "emit_assemble", "emit_uuid", "emit_sign",
                  "address_map", "contents", "synthetic", "eh_frame", "tables", "unwind", "apply", "symbols", "survey",
@@ -379,6 +379,8 @@ def main():
             marker = "  (inside emit)"
         elif name in ("address_map", "contents", "synthetic", "apply"):
             marker = "  (inside relocate)"
+        elif name in ("group", "traverse"):
+            marker = "  (inside liveness)"
         elif name in ("atoms", "liveness", "strip_build"):
             marker = "  (inside dead_strip)"
         elif name in ("eh_frame", "tables", "unwind"):

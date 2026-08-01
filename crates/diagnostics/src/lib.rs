@@ -96,6 +96,10 @@ pub struct PhaseTimings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link_address_diff_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_group_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_traverse_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub link_eh_frame_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link_tables_ms: Option<f64>,
@@ -166,6 +170,8 @@ pub struct LinkStages {
     pub address_diff: f64,
     /// Inside `synthetic`: eh_frame repair, indirect tables, unwind info.
     pub synthetic_breakdown: [f64; 3],
+    /// Inside `liveness`: grouping relocations per object, then traversing.
+    pub liveness_breakdown: [f64; 2],
     pub changed_addresses: u64,
     pub total_addresses: u64,
     /// Output symbols and the debug map.
@@ -357,6 +363,7 @@ impl LinkRecord {
             address_table,
             address_diff,
             synthetic_breakdown,
+            liveness_breakdown,
             changed_addresses,
             total_addresses,
         } = stages;
@@ -379,6 +386,10 @@ impl LinkRecord {
         self.timings.link_prepare_ms = (prepare > 0.0).then_some(prepare);
         self.timings.link_address_table_ms = (address_table > 0.0).then_some(address_table);
         self.timings.link_address_diff_ms = (address_diff > 0.0).then_some(address_diff);
+        if liveness_breakdown.iter().any(|v| *v > 0.0) {
+            self.timings.link_group_ms = Some(liveness_breakdown[0]);
+            self.timings.link_traverse_ms = Some(liveness_breakdown[1]);
+        }
         if synthetic_breakdown.iter().any(|v| *v > 0.0) {
             self.timings.link_eh_frame_ms = Some(synthetic_breakdown[0]);
             self.timings.link_tables_ms = Some(synthetic_breakdown[1]);
@@ -515,6 +526,8 @@ impl LinkRecord {
             ("  atoms", self.timings.link_atoms_ms),
             ("  liveness", self.timings.link_liveness_ms),
             ("  strip-build", self.timings.link_strip_build_ms),
+            ("    group", self.timings.link_group_ms),
+            ("    traverse", self.timings.link_traverse_ms),
             ("prepare", self.timings.link_prepare_ms),
             ("accounting", self.timings.link_accounting_ms),
             ("address-table", self.timings.link_address_table_ms),
