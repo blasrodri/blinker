@@ -5336,3 +5336,54 @@ a 30% improvement (141 to 97 ms) on the first try, and it was noise. The
 interleaved A/B in a single binary is what caught it. A change that costs one
 line and *appears* to work is the hardest kind to reject, because nobody asks a
 free change to prove itself.
+
+## 110. The cache file was a resident process talking to itself through the disk
+
+A link with `--blinker-cache` loaded a cache and stored one: read a few
+megabytes, decode them, and at the end encode and write them back. Inside a
+daemon both halves are the same process, one link apart. It encoded a structure
+it was holding, wrote it, dropped it, and read it back to recover what it had
+never stopped having.
+
+The cache file is a **restart** mechanism. It exists so a cold process can pick
+up where a previous one left off, and that is worth its cost exactly once.
+Between two links in one process it is pure overhead:
+
+```
+                    before   after
+  cache_load        0.59 ms   0.00 ms
+  cache_store       0.58 ms   0.04 ms
+```
+
+The session now holds the cache and *takes* it — moved, not cloned, because it
+contains the whole output image and a borrow would have meant copying two
+megabytes to avoid copying two megabytes. The file is written on a session's
+first link and left alone after that, so a restart still finds a usable cache;
+it is one link stale, which costs one colder link and never a wrong one,
+because every cache is validated against its inputs before it is believed.
+
+### Where the warm relink stands
+
+Everything in the link is now accounted for. 69 inputs, 900 objects, a
+private-function edit that changes 2 of them, through the daemon:
+
+```
+  wall  24.9 ms      link  17.9 ms
+
+    relocate          6.51      apply 3.62, synthetic 1.5, address map 0.8
+    dead_strip        3.69      liveness 2.21, atoms 1.20
+    emit              1.41
+    read_and_parse    1.25
+    layout            1.15
+    prepare           0.99
+    survey            0.93
+    symbols           0.56
+    cache_build       0.46
+    accounting        0.31      diagnostics only; not in a production link
+    unmeasured        0.33
+```
+
+There is no big item left, which is the point: every remaining stage recomputes
+a global answer that barely changed. `relocate` applies 87,545 relocations to
+produce an output in which 1060 of 1063 contributions sit where they already
+sat. That is the next thing, and it is the last structural one.

@@ -142,6 +142,8 @@ pub struct LinkTimings {
     ///
     /// A cache is a trade, and a trade shows up in a report as two numbers.
     pub cache_load_ms: f64,
+    /// Whether the previous cache came from this process rather than from disk.
+    pub cache_held: bool,
     pub cache_plan_ms: f64,
     pub cache_build_ms: f64,
     pub cache_store_ms: f64,
@@ -1652,13 +1654,31 @@ fn link_inner(
     timings.prepare_ms += elapsed_ms(prep);
 
     let cache_step = std::time::Instant::now();
-    let previous_cache = request.cache_path.as_deref().and_then(blinker_cache::load);
-    timings.cache_load_ms = elapsed_ms(cache_step);
-    timings.cache_bytes_read = request
+    // From this process first. A resident linker wrote this structure a moment
+    // ago and then encoded it, wrote it, and is about to read and decode it
+    // back — several megabytes through the filesystem to recover what it never
+    // stopped having. The file is how a *restart* stays warm, not how two links
+    // in one process talk to each other.
+    let held_cache = request
         .cache_path
         .as_deref()
-        .and_then(|path| std::fs::metadata(path).ok())
-        .map_or(0, |meta| meta.len());
+        .and_then(|path| session.take_cache(path));
+    timings.cache_held = held_cache.is_some();
+    let previous_cache = match held_cache {
+        Some(cache) => Some(cache),
+        None => request.cache_path.as_deref().and_then(blinker_cache::load),
+    };
+    timings.cache_load_ms = elapsed_ms(cache_step);
+    // Only when the file was actually read: a `stat` per link to report a
+    // number about a file nothing opened is the same species of cost as the
+    // placement counter.
+    if !timings.cache_held {
+        timings.cache_bytes_read = request
+            .cache_path
+            .as_deref()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map_or(0, |meta| meta.len());
+    }
 
     let contribution_keys = match request.cache_path {
         Some(_) => identity::ContributionKeys::build(&objects),
@@ -1906,11 +1926,18 @@ fn link_inner(
         let cache_step = std::time::Instant::now();
         cache.image = image.bytes.clone();
         cache.page_hashes.clone_from(&image.page_hashes);
-        // A cache that cannot be written is not an error: the link succeeded,
-        // and the only consequence is that the next one is cold.
-        let _ = blinker_cache::store(path, cache);
+        // Written on this session's first link and held in memory thereafter;
+        // see `Session::store_cache`. A cache that cannot be written is not an
+        // error: the link succeeded, and the only consequence is that a future
+        // process starts cold.
+        let write = session.store_cache(path, std::mem::take(cache));
+        if write {
+            if let Some((_, held)) = session.cache_for(path) {
+                let _ = blinker_cache::store(path, held);
+            }
+            timings.cache_bytes_written = std::fs::metadata(path).map_or(0, |meta| meta.len());
+        }
         timings.cache_store_ms = elapsed_ms(cache_step);
-        timings.cache_bytes_written = std::fs::metadata(path).map_or(0, |meta| meta.len());
     }
 
     timings.total_ms = elapsed_ms(overall);

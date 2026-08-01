@@ -124,6 +124,21 @@ pub struct Session {
     indexes: FastMap<PathBuf, Vec<(String, blinker_archive::MemberId)>>,
     /// Whether any input's interface differs from the one held for it.
     interfaces_changed: bool,
+    /// Whether the cache file has been written at least once by this session.
+    wrote_cache: bool,
+    /// The cache this session's last link produced, and the path it belongs to.
+    ///
+    /// The cache file is a *restart* mechanism: it exists so a cold process can
+    /// pick up where a previous one left off. Between two links handled by the
+    /// same resident process it is pure overhead — the link encodes a few
+    /// megabytes, writes them, and the next link reads and decodes them back
+    /// into the structure it just discarded.
+    ///
+    /// So a session keeps it. The first link through a session still writes the
+    /// file, because a daemon that never wrote one would make every restart
+    /// cold; every link after that keeps it in memory and leaves the disk
+    /// alone.
+    cache: Option<(PathBuf, blinker_cache::LinkCache)>,
     /// How many inputs' interfaces moved, and the first one that did.
     ///
     /// A boolean says the replay was refused; this says by whom. Three of this
@@ -418,6 +433,38 @@ impl Session {
     /// Whether the extraction order and the resolution were reused.
     pub fn reused(&self) -> (bool, bool) {
         (self.replayed_extraction, self.held_resolution)
+    }
+
+    /// Take the cache held for `path`, if this session produced one.
+    ///
+    /// Taken rather than borrowed: the link consumes the previous cache and
+    /// produces the next, and handing out a reference would mean cloning a
+    /// structure that contains the whole output image.
+    pub fn take_cache(&mut self, path: &Path) -> Option<blinker_cache::LinkCache> {
+        match &self.cache {
+            Some((held, _)) if held == path => self.cache.take().map(|(_, cache)| cache),
+            _ => None,
+        }
+    }
+
+    /// The cache held for `path`, for writing it out.
+    pub fn cache_for(&self, path: &Path) -> Option<&(PathBuf, blinker_cache::LinkCache)> {
+        self.cache.as_ref().filter(|(held, _)| held == path)
+    }
+
+    /// Hold the cache this link produced, and say whether it must also be
+    /// written to disk.
+    ///
+    /// True exactly once per session per path — the first link. After that the
+    /// file would only ever be re-read by this same process, which now has the
+    /// structure in memory. A restart still finds a usable file; it is simply
+    /// one link old, which costs one colder link and never a wrong one, because
+    /// every cache is validated against its inputs before it is believed.
+    pub fn store_cache(&mut self, path: &Path, cache: blinker_cache::LinkCache) -> bool {
+        let first = !self.wrote_cache;
+        self.wrote_cache = true;
+        self.cache = Some((path.to_path_buf(), cache));
+        first
     }
 
     /// How many interfaces moved, and the first one that did.
