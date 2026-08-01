@@ -15,6 +15,24 @@
 //! exception: it carries a single anchor symbol per section, and is framed by
 //! its own record lengths instead.
 //!
+//! # Atoms are numbered per object
+//!
+//! An atom's name is `(object, index within that object)`, and the flat
+//! `0..n` numbering the traversal uses is that pair plus the object's base.
+//! The distinction matters because a global index is not a property of the
+//! atom: inserting one atom into the first object renumbers every atom in the
+//! link, so nothing derived from the numbering could be held across a link.
+//! Per object, the numbering only moves when that object does — which is why
+//! [`ObjectAtoms`] is a pure function of one parse and can be memoised beside
+//! its boundaries.
+//!
+//! [`ObjectAtoms`] holds everything the traversal reads about an object: its
+//! atoms, the edges leaving each one, which of them are roots, and how its
+//! unwind metadata points back at the code it describes. That set is exactly
+//! what [`reachability_digest`] hashes, so the memo and the invalidation key
+//! describe the same thing rather than two things that have to be kept in
+//! agreement.
+//!
 //! # Atoms do not become the unit of layout
 //!
 //! They could have: every input section split into one placement per atom,
@@ -46,11 +64,14 @@
 //!   from live bytes is revived, and the count is reported. A hole in the model
 //!   then shows up as a number rather than as a corrupt binary.
 
+use std::ops::Range;
+use std::sync::Arc;
+
 use crate::hashing::{FastMap as HashMap, FastSet as HashSet};
 use crate::LoadedObject;
 use blinker_macho::{
     Arm64RelocationKind, InputRelocation, InputSection, ObjectId, RelocationTarget, SectionId,
-    SectionKind, SymbolVisibility,
+    SectionKind, SymbolId, SymbolVisibility,
 };
 
 /// One symbol's worth of bytes.
@@ -218,12 +239,322 @@ fn offset_of(
     Some((id, symbol.value.saturating_sub(section.vm_address)))
 }
 
-/// Every atom of a link, with the index needed to find one by address.
-pub(crate) struct Atoms<'a> {
+/// One edge out of an atom, named without reference to the whole link.
+///
+/// A reference either lands inside the object it was written in — in which
+/// case the target is one of that object's own atoms, and stays that atom
+/// however the link is renumbered — or it goes out through a name, and which
+/// atom that reaches is not knowable until every object has been read. Keeping
+/// the second case as the *symbol* rather than as a resolved index is what
+/// makes the whole edge list a pure function of one object.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Edge {
+    /// An atom of this same object, by its index within it.
+    Local(u32),
+    /// Whatever defines this symbol's name, decided globally.
+    Name(SymbolId),
+}
+
+/// One `__eh_frame` record and the function it describes.
+#[derive(Debug, Clone, Copy)]
+struct EhRecord {
+    atom: u32,
+    /// A CIE, which every live FDE needs and which is kept unconditionally.
+    cie: bool,
+    function: Option<Edge>,
+}
+
+/// Everything reachability reads about one object, in that object's numbering.
+///
+/// A pure function of the parse, and held beside its boundaries in the session
+/// memo. On an edit, one object of a thousand has a different one (finding
+/// 133) — so building this per link, for every object, was rebuilding the same
+/// answer a thousand times to get one new one.
+pub(crate) struct ObjectAtoms {
+    /// Ascending within each section; sections in the order the object lists.
     atoms: Vec<Atom>,
-    /// `(object, section)` -> that section's atoms, as a range of indices into
-    /// `atoms`, ascending by offset.
-    by_section: crate::hashing::FastMap<(u32, u32), std::ops::Range<usize>>,
+    /// Section id -> that section's atoms, as local indices.
+    by_section: HashMap<u32, Range<u32>>,
+    /// Per atom, its edges as a range of `edges`.
+    spans: Vec<(u32, u32)>,
+    edges: Vec<Edge>,
+    /// Per atom: its own edges do not keep anything alive.
+    ///
+    /// Metadata describes code rather than using it. Precomputed because the
+    /// alternative is a section lookup and a string match inside the traversal,
+    /// once per live atom.
+    suppress: Vec<bool>,
+    /// Edges out of sections this link does not split, which are roots.
+    unsplit: Vec<Edge>,
+    /// Atoms a symbol forbids stripping.
+    never_strip: Vec<u32>,
+    eh_frame: Vec<EhRecord>,
+    /// `__compact_unwind`: the function a record describes, and its LSDA.
+    unwind: Vec<(Option<Edge>, Edge)>,
+    /// Sections of this object that must be kept whole.
+    opaque: Vec<u32>,
+    /// Symbols whose *defining* section must be kept whole, wherever it is.
+    opaque_via: Vec<SymbolId>,
+    /// Non-local definitions, and the atom that owns each.
+    owned: Vec<(SymbolId, u32)>,
+}
+
+/// Project one object into the form the traversal consumes.
+pub(crate) fn project(object: &LoadedObject) -> ObjectAtoms {
+    let mut atoms: Vec<Atom> = Vec::new();
+    let mut by_section: HashMap<u32, Range<u32>> = HashMap::default();
+    for section in &object.parsed.sections {
+        let Some(offsets) = boundaries(object, section) else {
+            continue;
+        };
+        let start = atoms.len() as u32;
+        for (index, offset) in offsets.iter().copied().enumerate() {
+            let end = offsets.get(index + 1).copied().unwrap_or(section.size);
+            atoms.push(Atom {
+                object: object.parsed.id,
+                section: section.id,
+                offset,
+                size: end.saturating_sub(offset),
+            });
+        }
+        by_section.insert(section.id.0, start..atoms.len() as u32);
+    }
+
+    // The atom holding a byte, within this object alone.
+    let containing = |section: SectionId, offset: u64| -> Option<u32> {
+        let range = by_section.get(&section.0)?.clone();
+        let slice = &atoms[range.start as usize..range.end as usize];
+        let index = slice
+            .partition_point(|a| a.offset <= offset)
+            .checked_sub(1)?;
+        (offset < slice[index].end()).then(|| range.start + index as u32)
+    };
+
+    // The atom a relocation points at, as far as this object can say.
+    let edge = |relocation: &InputRelocation| -> Option<Edge> {
+        let RelocationTarget::Symbol(id) = relocation.target else {
+            // A section-relative target keeps its section whole, so there is no
+            // single atom to name and nothing to propagate to.
+            return None;
+        };
+        let symbol = object.parsed.symbol(id)?;
+        if symbol.strength.is_definition() {
+            if let Some((section, offset)) = offset_of(object, symbol) {
+                if let Some(local) = containing(section, offset) {
+                    return Some(Edge::Local(local));
+                }
+            }
+        }
+        // A reference resolves to whatever object defines the name.
+        Some(Edge::Name(id))
+    };
+
+    let grouped = group_relocations(object);
+
+    let mut spans = Vec::with_capacity(atoms.len());
+    let mut edges = Vec::new();
+    let mut suppress = Vec::with_capacity(atoms.len());
+    for atom in &atoms {
+        let start = edges.len() as u32;
+        edges.extend(within(&grouped, atom).iter().filter_map(|r| edge(r)));
+        spans.push((start, edges.len() as u32));
+        suppress.push(object.parsed.section(atom.section).is_some_and(|s| {
+            // `__eh_frame` is metadata whose references do count forward: a
+            // surviving FDE brings its exception table with it.
+            is_metadata(&s.name) && s.name != "__eh_frame"
+        }));
+    }
+
+    // A section this link does not split still holds references, and they
+    // still reach. `__data`, the thread-local block and any section in an
+    // object without `MH_SUBSECTIONS_VIA_SYMBOLS` arrive here.
+    let mut unsplit = Vec::new();
+    for section in &object.parsed.sections {
+        if by_section.contains_key(&section.id.0)
+            || is_metadata(&section.name)
+            || section.kind == SectionKind::Debug
+        {
+            continue;
+        }
+        if let Some(list) = grouped.get(&section.id.0) {
+            unsplit.extend(list.iter().filter_map(|r| edge(r)));
+        }
+    }
+
+    let mut never_strip = Vec::new();
+    let mut owned = Vec::new();
+    for symbol in &object.parsed.symbols {
+        let Some((section, offset)) = offset_of(object, symbol) else {
+            continue;
+        };
+        if !symbol.strength.is_definition() {
+            continue;
+        }
+        let Some(local) = containing(section, offset) else {
+            continue;
+        };
+        if symbol.no_dead_strip {
+            never_strip.push(local);
+        }
+        if symbol.visibility != SymbolVisibility::Local {
+            owned.push((symbol.id, local));
+        }
+    }
+
+    // Sections that must be kept whole: a reference that does not land on a
+    // symbol would follow the bytes it meant only by accident once the atoms
+    // moved. References *from* metadata do not count — those are resolved by
+    // the code that understands the format, and are remapped rather than
+    // copied.
+    let mut opaque = Vec::new();
+    let mut opaque_via = Vec::new();
+    for relocation in &object.parsed.relocations {
+        let from_metadata = object
+            .parsed
+            .section(relocation.section)
+            .is_some_and(|s| is_metadata(&s.name) || s.kind == SectionKind::Debug);
+        if from_metadata {
+            continue;
+        }
+        match relocation.target {
+            RelocationTarget::Section(section) => opaque.push(section.0),
+            RelocationTarget::Symbol(id) => {
+                if !stores_addend(relocation) || crate::inline_addend(object, relocation) == 0 {
+                    continue;
+                }
+                let Some(symbol) = object.parsed.symbol(id) else {
+                    continue;
+                };
+                // The addend is measured from the symbol, so the section
+                // holding that symbol is the one at risk — here, and wherever
+                // else the name is defined.
+                if let Some((section, _)) = offset_of(object, symbol) {
+                    opaque.push(section.0);
+                }
+                opaque_via.push(id);
+            }
+        }
+    }
+    opaque.sort_unstable();
+    opaque.dedup();
+    opaque_via.sort_unstable_by_key(|id| id.0);
+    opaque_via.dedup();
+
+    let mut eh_frame = Vec::new();
+    let mut unwind = Vec::new();
+    for section in &object.parsed.sections {
+        match section.name.as_str() {
+            "__eh_frame" => {
+                let (Some(range), Some(file_offset)) =
+                    (by_section.get(&section.id.0).cloned(), section.file_offset)
+                else {
+                    continue;
+                };
+                for local in range {
+                    let atom = &atoms[local as usize];
+                    let at = (file_offset + atom.offset) as usize;
+                    let id = object
+                        .data
+                        .get(at + 4..at + 8)
+                        .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
+                        .unwrap_or(0);
+                    if id == 0 {
+                        eh_frame.push(EhRecord {
+                            atom: local,
+                            cie: true,
+                            function: None,
+                        });
+                        continue;
+                    }
+                    // `PC begin` follows the CIE pointer, and carries the
+                    // relocation naming the function. Both halves of the
+                    // `SUBTRACTOR` pair share that offset; the one that is not
+                    // the subtractor names the function.
+                    let function = within(&grouped, atom)
+                        .iter()
+                        .find(|r| {
+                            r.offset == atom.offset + 8 && r.kind != Arm64RelocationKind::Subtractor
+                        })
+                        .and_then(|r| edge(r));
+                    eh_frame.push(EhRecord {
+                        atom: local,
+                        cie: false,
+                        function,
+                    });
+                }
+            }
+            "__compact_unwind" => {
+                let Some(list) = grouped.get(&section.id.0) else {
+                    continue;
+                };
+                let mut functions: HashMap<u64, Option<Edge>> = HashMap::default();
+                let mut lsdas: Vec<(u64, Edge)> = Vec::new();
+                for relocation in list {
+                    let record = relocation.offset / COMPACT_UNWIND_RECORD;
+                    match relocation.offset % COMPACT_UNWIND_RECORD {
+                        CU_FUNCTION => {
+                            // Unlike everything else in the link this is a
+                            // *section* relocation with the function's address
+                            // stored inline, so the offset has to be recovered
+                            // before the atom can be found.
+                            let function = match relocation.target {
+                                RelocationTarget::Section(id) => object
+                                    .parsed
+                                    .section(id)
+                                    .and_then(|s| {
+                                        let inline =
+                                            crate::inline_addend(object, relocation) as u64;
+                                        containing(id, inline.saturating_sub(s.vm_address))
+                                    })
+                                    .map(Edge::Local),
+                                RelocationTarget::Symbol(_) => edge(relocation),
+                            };
+                            functions.insert(record, function);
+                        }
+                        CU_LSDA => {
+                            if let Some(target) = edge(relocation) {
+                                lsdas.push((record, target));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                for (record, lsda) in lsdas {
+                    unwind.push((functions.get(&record).copied().flatten(), lsda));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    ObjectAtoms {
+        atoms,
+        by_section,
+        spans,
+        edges,
+        suppress,
+        unsplit,
+        never_strip,
+        eh_frame,
+        unwind,
+        opaque,
+        opaque_via,
+        owned,
+    }
+}
+
+/// Every atom of a link, as the objects' own numbering plus a base each.
+pub(crate) struct Atoms<'a> {
+    objects: &'a [LoadedObject],
+    blocks: Vec<Arc<ObjectAtoms>>,
+    /// Where each block's atoms start in the flat numbering.
+    base: Vec<usize>,
+    /// Per flat index, the block it belongs to. One `u32` per atom, filled in
+    /// a linear pass, so the traversal never binary-searches `base`.
+    slot_of: Vec<u32>,
+    /// Object id -> block index.
+    slot: HashMap<u32, usize>,
+    total: usize,
     /// Sections kept whole because a reference into their middle would not
     /// survive their atoms being moved.
     opaque: HashSet<(u32, u32)>,
@@ -232,6 +563,7 @@ pub(crate) struct Atoms<'a> {
     /// A weak symbol may have several definitions, and all of them are kept:
     /// which one wins is decided elsewhere, and guessing here would strip the
     /// one that does.
+    ///
     /// Borrowed, not cloned. Every non-local defined symbol in the link went
     /// through `name.clone()` here — around seven thousand `String`
     /// allocations to build a map that is discarded at the end of the same
@@ -242,70 +574,48 @@ pub(crate) struct Atoms<'a> {
 
 impl<'a> Atoms<'a> {
     /// Split three ways because the three are incremental to different degrees:
-    /// boundaries are a pure function of one object, owners need the global
-    /// atom numbering, and opacity is a scan of every relocation in the link.
+    /// a block is a pure function of one object and is usually reused whole,
+    /// owners need every object's definitions at once, and opacity resolves
+    /// names across the link.
     pub(crate) fn build(
         objects: &'a [LoadedObject],
         parts: &mut [f64; 3],
         session: &mut crate::session::Session,
     ) -> Atoms<'a> {
         let step = std::time::Instant::now();
-        let mut atoms: Vec<Atom> = Vec::new();
-        let mut by_section = crate::hashing::FastMap::default();
-
+        let mut blocks: Vec<Arc<ObjectAtoms>> = Vec::with_capacity(objects.len());
+        let mut base = Vec::with_capacity(objects.len());
+        let mut slot = HashMap::default();
+        let mut total = 0usize;
+        let mut slot_of: Vec<u32> = Vec::new();
         for object in objects {
-            for section in &object.parsed.sections {
-                // Held across links: a pure function of this object, and 67 of
-                // 69 inputs are the same parse as last time.
-                let Some(offsets) = session
-                    .boundaries(&object.parsed, section.id.0, || boundaries(object, section))
-                else {
-                    continue;
-                };
-                let start = atoms.len();
-                for (index, offset) in offsets.iter().copied().enumerate() {
-                    let end = offsets.get(index + 1).copied().unwrap_or(section.size);
-                    atoms.push(Atom {
-                        object: object.parsed.id,
-                        section: section.id,
-                        offset,
-                        size: end.saturating_sub(offset),
-                    });
-                }
-                by_section.insert((object.parsed.id.0, section.id.0), start..atoms.len());
-            }
+            let block = session.atoms(&object.parsed, || project(object));
+            slot.insert(object.parsed.id.0, blocks.len());
+            base.push(total);
+            slot_of.resize(total + block.atoms.len(), blocks.len() as u32);
+            total += block.atoms.len();
+            blocks.push(block);
         }
 
         parts[0] = step.elapsed().as_secs_f64() * 1000.0;
         let step = std::time::Instant::now();
 
-        let mut result = Atoms {
-            atoms,
-            by_section,
-            opaque: HashSet::default(),
-            owners: HashMap::default(),
-        };
-
-        for object in objects {
-            for symbol in &object.parsed.symbols {
-                if !symbol.strength.is_definition() || symbol.visibility == SymbolVisibility::Local
-                {
-                    continue;
-                }
-                let Some((section, offset)) = offset_of(object, symbol) else {
+        let mut owners: HashMap<&'a str, Owners> = HashMap::default();
+        for (index, object) in objects.iter().enumerate() {
+            for (symbol, local) in &blocks[index].owned {
+                let Some(name) = object.parsed.symbol(*symbol).map(|s| s.name.as_str()) else {
                     continue;
                 };
-                if let Some(index) = result.containing(object.parsed.id, section, offset) {
-                    match result.owners.entry(symbol.name.as_str()) {
-                        std::collections::hash_map::Entry::Occupied(mut held) => {
-                            held.get_mut().push(index)
-                        }
-                        std::collections::hash_map::Entry::Vacant(slot) => {
-                            slot.insert(Owners {
-                                first: index,
-                                rest: Vec::new(),
-                            });
-                        }
+                let atom = base[index] + *local as usize;
+                match owners.entry(name) {
+                    std::collections::hash_map::Entry::Occupied(mut held) => {
+                        held.get_mut().push(atom)
+                    }
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        slot.insert(Owners {
+                            first: atom,
+                            rest: Vec::new(),
+                        });
                     }
                 }
             }
@@ -313,90 +623,69 @@ impl<'a> Atoms<'a> {
 
         parts[1] = step.elapsed().as_secs_f64() * 1000.0;
         let step = std::time::Instant::now();
-        result.opaque = result.find_opaque(objects);
+
+        let mut result = Atoms {
+            objects,
+            blocks,
+            base,
+            slot_of,
+            slot,
+            total,
+            opaque: HashSet::default(),
+            owners,
+        };
+        result.opaque = result.find_opaque();
         parts[2] = step.elapsed().as_secs_f64() * 1000.0;
         result
     }
 
     /// Sections that must be kept whole.
-    ///
-    /// A reference that does not land on a symbol keeps its whole target
-    /// section, because moving the atoms would move the bytes out from under
-    /// it. Two shapes qualify: a section-relative target, and a symbol-relative
-    /// one with a non-zero addend. References *from* metadata do not count —
-    /// those are resolved by the code that understands the format, and are
-    /// remapped rather than copied.
-    fn find_opaque(&self, objects: &[LoadedObject]) -> HashSet<(u32, u32)> {
+    fn find_opaque(&self) -> HashSet<(u32, u32)> {
         let mut opaque = HashSet::default();
-        for object in objects {
-            for relocation in &object.parsed.relocations {
-                let from_metadata = object
-                    .parsed
-                    .section(relocation.section)
-                    .is_some_and(|s| is_metadata(&s.name) || s.kind == SectionKind::Debug);
-                if from_metadata {
+        for (index, object) in self.objects.iter().enumerate() {
+            let block = &self.blocks[index];
+            for section in &block.opaque {
+                opaque.insert((object.parsed.id.0, *section));
+            }
+            for symbol in &block.opaque_via {
+                let Some(name) = object.parsed.symbol(*symbol).map(|s| s.name.as_str()) else {
                     continue;
-                }
-                match relocation.target {
-                    RelocationTarget::Section(section) => {
-                        opaque.insert((object.parsed.id.0, section.0));
-                    }
-                    RelocationTarget::Symbol(id) => {
-                        if !stores_addend(relocation)
-                            || crate::inline_addend(object, relocation) == 0
-                        {
-                            continue;
-                        }
-                        // The addend is measured from the symbol, so the
-                        // section holding that symbol is the one at risk.
-                        let Some(symbol) = object.parsed.symbol(id) else {
-                            continue;
-                        };
-                        if let Some((section, _)) = offset_of(object, symbol) {
-                            opaque.insert((object.parsed.id.0, section.0));
-                        }
-                        for target in self
-                            .owners
-                            .get(symbol.name.as_str())
-                            .into_iter()
-                            .flat_map(Owners::all)
-                        {
-                            opaque.insert(self.atoms[target].key());
-                        }
-                    }
+                };
+                for target in self.owners.get(name).into_iter().flat_map(Owners::all) {
+                    opaque.insert(self.atom(target).key());
                 }
             }
         }
         opaque
     }
 
-    /// The atom holding `offset` bytes into `(object, section)`.
-    fn containing(&self, object: ObjectId, section: SectionId, offset: u64) -> Option<usize> {
-        let range = self.by_section.get(&(object.0, section.0))?.clone();
-        let slice = &self.atoms[range.clone()];
-        // The first atom starting after `offset`; the one before it is the
-        // only candidate, because atoms tile their section in order.
-        let index = slice
-            .partition_point(|a| a.offset <= offset)
-            .checked_sub(1)?;
-        (offset < slice[index].end()).then_some(range.start + index)
+    fn len(&self) -> usize {
+        self.total
     }
 
-    /// The atom a relocation points at, if the target is one this link splits.
-    fn target_atom(&self, object: &LoadedObject, relocation: &InputRelocation) -> Option<usize> {
-        let RelocationTarget::Symbol(id) = relocation.target else {
-            // A section-relative target keeps its section whole, so there is no
-            // single atom to name and nothing to propagate to.
-            return None;
-        };
-        let symbol = object.parsed.symbol(id)?;
-        if symbol.strength.is_definition() {
-            if let Some((section, offset)) = offset_of(object, symbol) {
-                return self.containing(object.parsed.id, section, offset);
+    /// The atom at a flat index.
+    fn atom(&self, index: usize) -> &Atom {
+        let slot = self.slot_of[index] as usize;
+        &self.blocks[slot].atoms[index - self.base[slot]]
+    }
+
+    /// That section's atoms, as flat indices.
+    fn section_range(&self, object: ObjectId, section: SectionId) -> Option<Range<usize>> {
+        let slot = *self.slot.get(&object.0)?;
+        let range = self.blocks[slot].by_section.get(&section.0)?;
+        let base = self.base[slot];
+        Some(base + range.start as usize..base + range.end as usize)
+    }
+
+    /// Where an edge out of block `slot` lands, in the flat numbering.
+    fn resolve(&self, slot: usize, edge: Edge) -> Option<usize> {
+        match edge {
+            Edge::Local(local) => Some(self.base[slot] + local as usize),
+            Edge::Name(id) => {
+                let name = self.objects[slot].parsed.symbol(id)?.name.as_str();
+                self.owners.get(name).map(|o| o.first)
             }
         }
-        // A reference resolves to whatever object defines the name.
-        self.owners.get(symbol.name.as_str()).map(|o| o.first)
     }
 
     /// Every atom defining `name`, for use as a root.
@@ -408,9 +697,8 @@ impl<'a> Atoms<'a> {
 /// A digest of everything about one object that reachability reads.
 ///
 /// Which atoms it has, and which name each of its relocations points at. That
-/// is the whole of what the traversal consults — so if no object's digest
-/// moved, the live set cannot have moved either, and the entire strip can be
-/// reused.
+/// is the whole of what the traversal consults — so an object whose digest did
+/// not move contributes exactly the edges it contributed last time.
 ///
 /// Deliberately *not* a hash of the object's bytes. An ordinary edit changes
 /// the bytes of every function it touches while leaving the call graph exactly
@@ -555,26 +843,9 @@ impl Owners {
 }
 
 /// Which atoms a program can reach from `entry`.
-fn liveness(
-    objects: &[LoadedObject],
-    atoms: &Atoms<'_>,
-    entry: &str,
-    parts: &mut [f64; 2],
-) -> (LiveSet, usize) {
-    // Grouping is a pure function of one object — its relocations, by section,
-    // sorted by offset — and it is rebuilt for all of them on every link. The
-    // traversal that follows is genuinely global. Timed apart because only one
-    // of the two can be held in a session.
+fn liveness(atoms: &Atoms<'_>, entry: &str, parts: &mut [f64; 2]) -> (LiveSet, usize) {
     let step = std::time::Instant::now();
-    let grouped: HashMap<u32, ByOffset<'_>> = objects
-        .iter()
-        .map(|o| (o.parsed.id.0, group_relocations(o)))
-        .collect();
-    let by_id: HashMap<u32, &LoadedObject> = objects.iter().map(|o| (o.parsed.id.0, o)).collect();
-    parts[0] = step.elapsed().as_secs_f64() * 1000.0;
-    let step = std::time::Instant::now();
-
-    let mut live = LiveSet::with_capacity(atoms.atoms.len());
+    let mut live = LiveSet::with_capacity(atoms.len());
     let mut worklist: Vec<usize> = Vec::new();
     let mark = |index: usize, live: &mut LiveSet, worklist: &mut Vec<usize>| {
         if live.insert(index) {
@@ -583,48 +854,28 @@ fn liveness(
     };
 
     // Roots. The entry point, anything the object marked as never strippable,
-    // and every atom of a section that has to be kept whole.
+    // every atom of a section that has to be kept whole, and everything the
+    // sections this link does not split refer to.
     for index in atoms.defining(entry).collect::<Vec<_>>() {
         mark(index, &mut live, &mut worklist);
     }
-    for (index, atom) in atoms.atoms.iter().enumerate() {
-        if atoms.opaque.contains(&atom.key()) {
+    for index in 0..atoms.len() {
+        if atoms.opaque.contains(&atoms.atom(index).key()) {
             mark(index, &mut live, &mut worklist);
         }
     }
-    for object in objects {
-        for symbol in &object.parsed.symbols {
-            if !symbol.no_dead_strip || !symbol.strength.is_definition() {
-                continue;
-            }
-            let Some((section, offset)) = offset_of(object, symbol) else {
-                continue;
-            };
-            if let Some(index) = atoms.containing(object.parsed.id, section, offset) {
+    for (slot, block) in atoms.blocks.iter().enumerate() {
+        for local in &block.never_strip {
+            mark(atoms.base[slot] + *local as usize, &mut live, &mut worklist);
+        }
+        for edge in &block.unsplit {
+            if let Some(index) = atoms.resolve(slot, *edge) {
                 mark(index, &mut live, &mut worklist);
             }
         }
     }
-    // A section this link does not split still holds references, and they
-    // still reach. `__data`, the thread-local block and any section in an
-    // object without `MH_SUBSECTIONS_VIA_SYMBOLS` arrive here.
-    for object in objects {
-        for section in &object.parsed.sections {
-            if atoms
-                .by_section
-                .contains_key(&(object.parsed.id.0, section.id.0))
-                || is_metadata(&section.name)
-                || section.kind == SectionKind::Debug
-            {
-                continue;
-            }
-            for relocation in object.parsed.relocations_for(section.id) {
-                if let Some(index) = atoms.target_atom(object, relocation) {
-                    mark(index, &mut live, &mut worklist);
-                }
-            }
-        }
-    }
+    parts[0] = step.elapsed().as_secs_f64() * 1000.0;
+    let step = std::time::Instant::now();
 
     // Atoms whose own edges were deliberately not followed. Every other live
     // atom passes through the worklist exactly once and has its targets marked,
@@ -633,34 +884,18 @@ fn liveness(
     let mut suppressed: Vec<usize> = Vec::new();
     let propagate = |live: &mut LiveSet, worklist: &mut Vec<usize>, suppressed: &mut Vec<usize>| {
         while let Some(index) = worklist.pop() {
-            let atom = &atoms.atoms[index];
-            let Some(object) = by_id.get(&atom.object.0) else {
-                continue;
-            };
-            let Some(grouped) = grouped.get(&atom.object.0) else {
-                continue;
-            };
+            let slot = atoms.slot_of[index] as usize;
+            let block = &atoms.blocks[slot];
+            let local = index - atoms.base[slot];
             // Metadata's own references do not keep anything alive; it is kept
             // alive *by* what it describes, below.
-            if object
-                .parsed
-                .section(atom.section)
-                .is_some_and(|s| is_metadata(&s.name))
-            {
-                // Except forward: a live unwind record's exception table is
-                // part of it, so an `__eh_frame` FDE that survives brings its
-                // LSDA with it.
-                if !object
-                    .parsed
-                    .section(atom.section)
-                    .is_some_and(|s| s.name == "__eh_frame")
-                {
-                    suppressed.push(index);
-                    continue;
-                }
+            if block.suppress[local] {
+                suppressed.push(index);
+                continue;
             }
-            for relocation in within(grouped, atom) {
-                if let Some(target) = atoms.target_atom(object, relocation) {
+            let (start, end) = block.spans[local];
+            for edge in &block.edges[start as usize..end as usize] {
+                if let Some(target) = atoms.resolve(slot, *edge) {
                     if live.insert(target) {
                         worklist.push(target);
                     }
@@ -670,20 +905,31 @@ fn liveness(
     };
     propagate(&mut live, &mut worklist, &mut suppressed);
 
-    // Metadata comes alive with its subject, not before it.
-    for object in objects {
-        let Some(grouped) = grouped.get(&object.parsed.id.0) else {
-            continue;
-        };
-        for section in &object.parsed.sections {
-            match section.name.as_str() {
-                "__eh_frame" => {
-                    revive_eh_frame(object, atoms, grouped, section, &mut live, &mut worklist)
+    // Metadata comes alive with its subject, not before it. An `__eh_frame`
+    // FDE is live when the function it describes is, and a `__compact_unwind`
+    // record's exception table is live when its function is — the record
+    // itself never reaches the output, but the `__gcc_except_tab` atom it
+    // points at does, and nothing else refers to that atom.
+    for (slot, block) in atoms.blocks.iter().enumerate() {
+        let base = atoms.base[slot];
+        for record in &block.eh_frame {
+            let alive = record.cie
+                || record
+                    .function
+                    .and_then(|edge| atoms.resolve(slot, edge))
+                    .is_some_and(|f| live.contains(f));
+            if alive {
+                mark(base + record.atom as usize, &mut live, &mut worklist);
+            }
+        }
+        for (function, lsda) in &block.unwind {
+            let alive = function
+                .and_then(|edge| atoms.resolve(slot, edge))
+                .is_some_and(|f| live.contains(f));
+            if alive {
+                if let Some(index) = atoms.resolve(slot, *lsda) {
+                    mark(index, &mut live, &mut worklist);
                 }
-                "__compact_unwind" => {
-                    revive_lsdas(object, atoms, grouped, section, &mut live, &mut worklist)
-                }
-                _ => {}
             }
         }
     }
@@ -700,14 +946,11 @@ fn liveness(
     loop {
         let mut found = Vec::new();
         for index in suppressed.iter().copied() {
-            let atom = &atoms.atoms[index];
-            let (Some(object), Some(grouped)) =
-                (by_id.get(&atom.object.0), grouped.get(&atom.object.0))
-            else {
-                continue;
-            };
-            for relocation in within(grouped, atom) {
-                if let Some(target) = atoms.target_atom(object, relocation) {
+            let slot = atoms.slot_of[index] as usize;
+            let block = &atoms.blocks[slot];
+            let (start, end) = block.spans[index - atoms.base[slot]];
+            for edge in &block.edges[start as usize..end as usize] {
+                if let Some(target) = atoms.resolve(slot, *edge) {
                     if !live.contains(target) {
                         found.push(target);
                     }
@@ -721,128 +964,13 @@ fn liveness(
         // Revived atoms go through the worklist, so their own edges are
         // followed and the invariant extends to them too.
         for index in found {
-            if live.insert(index) {
-                worklist.push(index);
-            }
+            mark(index, &mut live, &mut worklist);
         }
         propagate(&mut live, &mut worklist, &mut suppressed);
     }
 
     parts[1] = step.elapsed().as_secs_f64() * 1000.0;
     (live, revived)
-}
-
-/// An `__eh_frame` record is live when the function it describes is.
-///
-/// CIEs are kept unconditionally: there are a handful per link, every live FDE
-/// needs one, and deciding which would cost more than the bytes are worth.
-fn revive_eh_frame(
-    object: &LoadedObject,
-    atoms: &Atoms<'_>,
-    grouped: &ByOffset<'_>,
-    section: &InputSection,
-    live: &mut LiveSet,
-    worklist: &mut Vec<usize>,
-) {
-    let Some(range) = atoms
-        .by_section
-        .get(&(object.parsed.id.0, section.id.0))
-        .cloned()
-    else {
-        return;
-    };
-    let Some(file_offset) = section.file_offset else {
-        return;
-    };
-    for index in range {
-        let atom = &atoms.atoms[index];
-        let at = (file_offset + atom.offset) as usize;
-        let id = object
-            .data
-            .get(at + 4..at + 8)
-            .map(|b| u32::from_le_bytes(b.try_into().expect("4 bytes")))
-            .unwrap_or(0);
-        if id == 0 {
-            // A CIE.
-            if live.insert(index) {
-                worklist.push(index);
-            }
-            continue;
-        }
-        // `PC begin` follows the CIE pointer, and carries the relocation
-        // naming the function. Both halves of the pair share that offset; the
-        // one that is not the `SUBTRACTOR` names the function.
-        let function = within(grouped, atom)
-            .iter()
-            .find(|r| r.offset == atom.offset + 8 && r.kind != Arm64RelocationKind::Subtractor)
-            .and_then(|r| atoms.target_atom(object, r));
-        if function.is_some_and(|f| live.contains(f)) && live.insert(index) {
-            worklist.push(index);
-        }
-    }
-}
-
-/// A compact unwind record's exception table is live when its function is.
-///
-/// The record itself never reaches the output — it is input to
-/// `__unwind_info` — but the `__gcc_except_tab` atom it points at does, and
-/// nothing else refers to that atom when the encoding is not DWARF mode.
-fn revive_lsdas(
-    object: &LoadedObject,
-    atoms: &Atoms<'_>,
-    grouped: &ByOffset<'_>,
-    section: &InputSection,
-    live: &mut LiveSet,
-    worklist: &mut Vec<usize>,
-) {
-    let Some(list) = grouped.get(&section.id.0) else {
-        return;
-    };
-    let mut functions: HashMap<u64, Option<usize>> = HashMap::default();
-    let mut lsdas: HashMap<u64, usize> = HashMap::default();
-    for relocation in list {
-        let record = relocation.offset / COMPACT_UNWIND_RECORD;
-        match relocation.offset % COMPACT_UNWIND_RECORD {
-            CU_FUNCTION => {
-                functions.insert(record, function_atom(object, atoms, relocation));
-            }
-            CU_LSDA => {
-                if let Some(index) = atoms.target_atom(object, relocation) {
-                    lsdas.insert(record, index);
-                }
-            }
-            _ => {}
-        }
-    }
-    for (record, lsda) in lsdas {
-        let alive = functions
-            .get(&record)
-            .and_then(|f| *f)
-            .is_some_and(|f| live.contains(f));
-        if alive && live.insert(lsda) {
-            worklist.push(lsda);
-        }
-    }
-}
-
-/// The atom a `__compact_unwind` function pointer names.
-///
-/// Unlike everything else in the link, this is a *section* relocation with the
-/// function's address stored inline, so the offset has to be recovered before
-/// the atom can be found.
-fn function_atom(
-    object: &LoadedObject,
-    atoms: &Atoms<'_>,
-    relocation: &InputRelocation,
-) -> Option<usize> {
-    match relocation.target {
-        RelocationTarget::Section(id) => {
-            let origin = object.parsed.section(id)?.vm_address;
-            let inline = crate::inline_addend(object, relocation) as u64;
-            atoms.containing(object.parsed.id, id, inline.saturating_sub(origin))
-        }
-        RelocationTarget::Symbol(_) => atoms.target_atom(object, relocation),
-    }
 }
 
 /// One run of surviving bytes, and where it moved to.
@@ -954,7 +1082,7 @@ impl Strip {
         for object in objects {
             for section in &object.parsed.sections {
                 let key = (object.parsed.id.0, section.id.0);
-                let Some(range) = atoms.by_section.get(&key).cloned() else {
+                let Some(range) = atoms.section_range(object.parsed.id, section.id) else {
                     continue;
                 };
                 if range.clone().all(|index| live.contains(index)) {
@@ -966,7 +1094,7 @@ impl Strip {
                     if !live.contains(index) {
                         continue;
                     }
-                    let atom = &atoms.atoms[index];
+                    let atom = atoms.atom(index);
                     // Adjacent survivors keep their relative positions, which
                     // costs nothing and keeps any alignment they had.
                     if let Some(last) = pieces.last_mut() {
@@ -1013,7 +1141,7 @@ pub(crate) struct StripTimings {
     pub atoms_ms: f64,
     pub liveness_ms: f64,
     pub build_ms: f64,
-    /// Inside `liveness_ms`: grouping relocations per object, then traversing.
+    /// Inside `liveness_ms`: collecting roots, then traversing from them.
     pub group_ms: f64,
     pub traverse_ms: f64,
     /// Computing every object's reachability digest, and what it found.
@@ -1030,10 +1158,9 @@ pub(crate) fn plan(
 ) -> (Strip, Report, StripTimings) {
     let mut timings = StripTimings::default();
 
-    // Before anything: has any object's reachability projection actually moved?
-    // Measured first because if the answer is usually "no", the whole of what
-    // follows is skippable, and if it is usually "yes" then no amount of
-    // fingerprinting helps and the incremental update has to be built properly.
+    // How much of the graph moved. Not consulted by anything below yet; it is
+    // the invalidation key an incremental traversal needs, and it is reported
+    // so that the size of the dirty set is a measurement rather than a guess.
     let digest_step = std::time::Instant::now();
     let digests: Vec<(u32, u64)> = objects
         .iter()
@@ -1054,7 +1181,7 @@ pub(crate) fn plan(
 
     let step = std::time::Instant::now();
     let mut live_parts = [0.0f64; 2];
-    let (live, revived) = liveness(objects, &atoms, entry, &mut live_parts);
+    let (live, revived) = liveness(&atoms, entry, &mut live_parts);
     timings.liveness_ms = step.elapsed().as_secs_f64() * 1000.0;
     timings.group_ms = live_parts[0];
     timings.traverse_ms = live_parts[1];
@@ -1089,7 +1216,8 @@ fn report(objects: &[LoadedObject], atoms: &Atoms<'_>, live: &LiveSet, revived: 
         ..Report::default()
     };
     let mut by_section: HashMap<(u32, u32), (u64, bool)> = HashMap::default();
-    for (index, atom) in atoms.atoms.iter().enumerate() {
+    for index in 0..atoms.len() {
+        let atom = atoms.atom(index);
         if !is_text.contains(&atom.key()) {
             continue;
         }

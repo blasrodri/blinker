@@ -48,6 +48,19 @@ struct Memo {
     boundaries: FastMap<u32, Option<Arc<Vec<u64>>>>,
     /// This object's reachability digest, which is also a pure function of it.
     digest: Option<u64>,
+    /// This object's atoms and the edges leaving them, in its own numbering.
+    atoms: Option<Arc<crate::reachability::ObjectAtoms>>,
+}
+
+impl Memo {
+    fn new(parse: &Arc<ParsedObject>) -> Memo {
+        Memo {
+            _parse: Arc::clone(parse),
+            boundaries: FastMap::default(),
+            digest: None,
+            atoms: None,
+        }
+    }
 }
 
 /// One input, as this process last saw it.
@@ -513,15 +526,28 @@ impl Session {
         compute: impl FnOnce() -> Option<Vec<u64>>,
     ) -> Option<Arc<Vec<u64>>> {
         let key = Arc::as_ptr(parse) as usize;
-        let memo = self.memo.entry(key).or_insert_with(|| Memo {
-            _parse: Arc::clone(parse),
-            boundaries: FastMap::default(),
-            digest: None,
-        });
+        let memo = self.memo.entry(key).or_insert_with(|| Memo::new(parse));
         memo.boundaries
             .entry(section)
             .or_insert_with(|| compute().map(Arc::new))
             .clone()
+    }
+
+    /// This object's whole reachability projection, computing it once.
+    ///
+    /// Its atoms in its own numbering, the edges leaving each of them, and
+    /// which of them are roots. Pure in the object — which is the point of
+    /// numbering atoms per object rather than per link, because a flat index
+    /// is a fact about the link and would be wrong the moment any earlier
+    /// object gained an atom.
+    pub(crate) fn atoms(
+        &mut self,
+        parse: &Arc<ParsedObject>,
+        compute: impl FnOnce() -> crate::reachability::ObjectAtoms,
+    ) -> Arc<crate::reachability::ObjectAtoms> {
+        let key = Arc::as_ptr(parse) as usize;
+        let memo = self.memo.entry(key).or_insert_with(|| Memo::new(parse));
+        Arc::clone(memo.atoms.get_or_insert_with(|| Arc::new(compute())))
     }
 
     /// This object's reachability digest, computing it once per parse.
@@ -532,11 +558,7 @@ impl Session {
     /// relink; 78 of 80 inputs are the same parse as last time.
     pub fn digest(&mut self, parse: &Arc<ParsedObject>, compute: impl FnOnce() -> u64) -> u64 {
         let key = Arc::as_ptr(parse) as usize;
-        let memo = self.memo.entry(key).or_insert_with(|| Memo {
-            _parse: Arc::clone(parse),
-            boundaries: FastMap::default(),
-            digest: None,
-        });
+        let memo = self.memo.entry(key).or_insert_with(|| Memo::new(parse));
         *memo.digest.get_or_insert_with(compute)
     }
 

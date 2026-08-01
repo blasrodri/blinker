@@ -6355,3 +6355,73 @@ this ratio, a bug that quietly widens the region would still look fast.
 The digest is also exactly the invalidation key the update needs. It does not
 have to be invented separately — it is measured, memoised, and costs half a
 millisecond.
+
+## 134. Atom identity was a fact about the link, not about the atom
+
+The design named per-object atom identity as the *enabling change* for
+incremental liveness — a prerequisite, expected to be a pure refactor that
+bought nothing on its own. It halved `dead_strip`.
+
+An atom used to be a position in a flat `Vec` built fresh every link. That
+number is not a property of the atom: give the first object one more atom and
+every atom in the link is renumbered. Nothing derived from the numbering could
+survive a link, so nothing was.
+
+Now an atom is `(object, index within that object)`, and the flat numbering is
+that pair plus the object's base. `ObjectAtoms` holds everything the traversal
+reads about one object — its atoms, the edges leaving each of them, which are
+roots, and how its unwind metadata points back at the code it describes — and
+is a pure function of the parse, memoised beside its boundaries.
+
+Same machine, back to back, on the debug workload:
+
+```
+                     before      after
+  dead_strip        23.80 ms   12.89 ms
+    atoms            5.08       4.27
+    liveness        17.01       6.47
+      group          1.81       0.18
+      traverse      14.83       6.29
+  link              97.0       90.2
+```
+
+Output byte-identical, verified by linking the same workload with both binaries
+to the same path.
+
+### Why a refactor was worth 11 ms
+
+Because "pure function of one object" is not just a statement about caching. It
+is a statement about what the *inner loop* is allowed to do. The old traversal,
+per live atom, looked the atom's section up by id, matched its name against a
+list of metadata names, found the object's relocation group in a map, binary
+searched that group twice for the atom's offset range, and then for each
+relocation resolved a symbol id, tested whether it was a definition, recovered
+its section, and binary searched the section's atoms. All of that is the same
+answer every time for the same object, and all of it was inside the loop
+because there was nowhere to put it that outlived a link.
+
+Once there is somewhere, it moves — and the loop becomes a slice index and a
+name lookup. `group` fell from 1.81 ms to 0.18 not because grouping got faster
+but because grouping is now part of the projection, done once for the one
+object that changed. The 0.18 ms is the memo.
+
+The same is true of the `relocations_for(section)` scan that collected edges out
+of unsplit sections: a linear filter over *all* of an object's relocations, run
+once per section of that object.
+
+### And the same argument now applies to what is left
+
+`atoms` is still 4.27 ms with 1,058 of 1,059 blocks served from the memo, so
+almost none of it is projection. It is rebuilding the `owners` map — every
+non-local definition in the link, ~77,000 of them, hashed by name into a table
+that is thrown away at the end of the function — plus resolving opacity through
+it. That is the next thing that is a fact about the link rather than about any
+object.
+
+### A caution recorded on the way
+
+Two runs of the *same* binary produced different bytes, which looked like
+non-determinism until the diff turned out to be a single byte: `'0'` vs `'1'`,
+from the output path, which the debug map records. The comparison has to write
+to the same path. A one-byte diff is the cheapest possible answer and it was
+still nearly mistaken for a real one.
