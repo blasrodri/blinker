@@ -5956,3 +5956,37 @@ correctly, and the loop still reads correctly.
 
 What finds them is a profile with no unexplained residue, so that a stage which
 is 0.9 ms for no visible reason has nowhere to hide.
+
+## 125. The same quadratic again, in the function next door
+
+`OutputSection::address_of` finds where an input section landed by scanning
+every contribution of that output section. Two callers ask it inside a loop over
+every object that has an `__eh_frame` section — against the output `__eh_frame`
+section, which holds a contribution from every one of them. Both then subtract
+`vm_address` from the answer immediately, so what they actually wanted was the
+contribution's offset.
+
+One pass builds every answer, and the call sites index it.
+
+This is the fourth appearance of the pattern in findings 120, 121 and 124: a
+helper that answers a question about one item by scanning all of them, called
+once per item. It is now frequent enough to be worth stating as a rule rather
+than a series of anecdotes:
+
+> **A method that takes an identity and searches a collection is a lookup
+> wearing the clothes of an accessor.** `image.address_of(object, section)`
+> reads like a field access and costs a scan. The cost is invisible at the call
+> site by construction, so it can only be found by profiling the caller or by
+> reading the accessor — and nobody reads an accessor.
+
+### Not measured
+
+The machine reached a load average of 21 while this was being timed, and a
+20-iteration run reported a 46.5 ms link with 12.6 ms unaccounted. There is no
+honest number to report, so none is recorded: the change is in because it is
+asymptotically less work for byte-identical output, verified against the same
+three hashes as everything else in this run, with the suite green.
+
+Finding 123 made the same call for the same reason. Two "kept, unmeasured"
+entries in one session is a fair record of what it is like to benchmark
+milliseconds on a machine somebody else is using.

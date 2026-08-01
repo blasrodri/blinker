@@ -801,6 +801,24 @@ fn personality_field_in_cie(data: &[u8], start: usize, start_offset: u64) -> Opt
 /// answer is already available from the relocation list, in the same form the
 /// rest of the linker uses. Decoding DWARF pointer encodings here would be
 /// re-deriving something the object already states.
+/// Each contributing section's offset within one output section.
+///
+/// `OutputSection::address_of` answers this with a linear `find` over every
+/// contribution, which is fine once and quadratic in a loop — and both callers
+/// are loops over every object with an `__eh_frame` section, against an output
+/// section holding a contribution from every one of them. One pass builds all
+/// the answers.
+///
+/// The offset rather than the address, because both callers subtract
+/// `vm_address` from the address immediately.
+fn contribution_offsets(output: &blinker_layout::OutputSection) -> HashMap<(u32, u32), u64> {
+    output
+        .contributions
+        .iter()
+        .map(|c| ((c.object.0, c.section.0), c.offset))
+        .collect()
+}
+
 fn eh_frame_fde_offsets(
     objects: &[LoadedObject],
     image: &Image,
@@ -818,6 +836,7 @@ fn eh_frame_fde_offsets(
     else {
         return offsets;
     };
+    let offsets_of = contribution_offsets(output);
 
     for object in objects {
         for section in &object.parsed.sections {
@@ -828,10 +847,9 @@ fn eh_frame_fde_offsets(
                 continue;
             };
             // Where this object's records begin within the output section.
-            let Some(chunk) = output.address_of(object.parsed.id, section.id) else {
+            let Some(&chunk_offset) = offsets_of.get(&(object.parsed.id.0, section.id.0)) else {
                 continue;
             };
-            let chunk_offset = chunk - output.vm_address;
 
             // This section's relocations, in offset order, walked in lockstep
             // with the records below rather than hashed into a map.
@@ -3803,6 +3821,7 @@ fn repair_eh_frame(
     let Some(buffer) = contents.get_mut(&index) else {
         return;
     };
+    let offsets_of = contribution_offsets(output);
 
     for object in objects {
         for section in &object.parsed.sections {
@@ -3813,14 +3832,13 @@ fn repair_eh_frame(
             if strip.pieces(object.parsed.id, section.id).is_none() {
                 continue;
             }
-            let (Some(records), Some(chunk), Some(file_offset)) = (
+            let (Some(records), Some(&base), Some(file_offset)) = (
                 reachability::eh_frame_boundaries(object, section),
-                output.address_of(object.parsed.id, section.id),
+                offsets_of.get(&(object.parsed.id.0, section.id.0)),
                 section.file_offset,
             ) else {
                 continue;
             };
-            let base = chunk - output.vm_address;
 
             for record in records {
                 let Some(placed) = strip.remap(object.parsed.id, section.id, record) else {
