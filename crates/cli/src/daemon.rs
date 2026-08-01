@@ -218,7 +218,13 @@ where
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
     }
-    listener.set_nonblocking(true)?;
+    // A *blocking* accept with a timeout, not a non-blocking one in a sleep
+    // loop. The first version polled every 20 ms, which is invisible in a test
+    // and adds an average of 10 ms of latency to every link — measured at
+    // +10.6 ms, which made the daemon slower than not having one and wiped out
+    // everything residency had bought. A linker's whole job here is measured in
+    // tens of milliseconds; a sleep is not a small thing to put in front of it.
+    accept_timeout(&listener, Duration::from_secs(1))?;
 
     let mut idle_since = Instant::now();
     loop {
@@ -233,12 +239,17 @@ where
                     let _ = error;
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            // The timeout expiring, which is how idleness is noticed.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
                 if idle_since.elapsed() >= IDLE_TIMEOUT {
                     let _ = std::fs::remove_file(socket);
                     return Ok(());
                 }
-                std::thread::sleep(Duration::from_millis(20));
             }
             Err(error) => {
                 let _ = std::fs::remove_file(socket);
@@ -246,6 +257,36 @@ where
             }
         }
     }
+}
+
+/// Make `accept` block, but not forever.
+///
+/// `std` has no accept timeout, and the alternatives are both worse: a
+/// non-blocking accept in a sleep loop trades latency for idleness, and a
+/// blocking one never notices it should exit. `SO_RCVTIMEO` on the listening
+/// socket gives an `accept` that returns as soon as a client arrives and gives
+/// up after `timeout`.
+fn accept_timeout(listener: &UnixListener, timeout: Duration) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let value = libc::timeval {
+        tv_sec: timeout.as_secs() as libc::time_t,
+        tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+    };
+    // SAFETY: `fd` is the listener's, open for the call; `value` is a
+    // correctly-sized `timeval` and its length is passed as such.
+    let result = unsafe {
+        libc::setsockopt(
+            listener.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            std::ptr::addr_of!(value).cast(),
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn serve_one<F>(stream: &mut UnixStream, handle: &mut F) -> std::io::Result<()>
