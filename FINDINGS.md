@@ -5028,3 +5028,63 @@ and finding 101 is what happens when that test is failed.
 
 **The remaining work is not performance work. It is a change of process
 model.**
+
+## 104. Residency, and what it turns out to be worth
+
+Finding 103 ended by saying the remaining work was not performance work but a
+change of process model. Here is what that change is worth, measured on the
+resident loop — the same 61 inputs linked over and over in one process:
+
+```
+                             per link     links in 6 s
+  before                       41.9 ms         212
+  parses held                  21.3            251
+  extraction order held        19.2            312
+```
+
+**2.2x, from not doing work whose answer had not changed.**
+
+The pieces, in the order they mattered:
+
+- **Archive members.** 685 of the objects in this link come out of 19 rlibs.
+  Holding the archives' bytes without holding what was parsed out of them left
+  the larger half of the work in place: `read+parse` went from 10.7 to 5.0 ms
+  only once members were held too.
+- **The extraction frontier.** With every parse held, the whole remaining cost
+  of the stage was the fixed point that decides *which* members to pull in —
+  rounds of "which names are still undefined, which archive defines one" over
+  every symbol of every object. It is a pure function of symbols that did not
+  change, so a link where nothing was re-read replays the order the last one
+  settled on: 5.0 ms to 1.4.
+- **The `.tbd` stubs.** Finding 100 measured this at 6.0 ms of the 7.6 ms stage,
+  hidden behind reading the objects, and predicted it would stop being free the
+  moment reading got faster. Holding it was one field.
+
+### What separates this from finding 101
+
+Finding 101 killed a cache: relocated bytes, serialised to a file and read back,
+losing to memcpy because relocating was cheaper than copying. The rule it left
+was "a cache that saves an operation cheaper than a memory copy cannot win".
+
+Nothing here is copied or decoded. An `Arc<ParsedObject>` handed to the next
+link is the same allocation, in the same shape, and the cost of proving it still
+valid is a `stat`. That is the difference between *persisting* an answer and
+*keeping* one, and it is why the same idea fails in a cache file and works in a
+process.
+
+### Two bugs, and what each one says
+
+**A held member was given the whole archive as its byte window.** Every section
+then read from the wrong offset. It failed loudly — a misaligned relocation on
+the second link — and only because the offsets happened not to line up. A member
+whose sections landed somewhere plausible would have produced a running,
+*wrong* binary, and every test asserting "the link succeeded" would have passed.
+The test written afterwards compares bytes against a cold link and runs the
+program.
+
+**The hit counter did not count the interesting misses.** Both early exits — no
+entry, and a failed probe — returned before the counter was touched, so a link
+that correctly re-read a changed archive reported reading nothing. A counter
+that undercounts misses is worse than no counter: it makes a cache look perfect
+exactly when it has stopped working, which is finding 64 with a different
+mechanism. Caught by a test asserting `inputs_read > 0` after an edit.
