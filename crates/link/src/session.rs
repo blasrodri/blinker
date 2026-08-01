@@ -100,6 +100,19 @@ pub struct Session {
     /// not, and there is no cheap way to know which; the plan is discarded and
     /// recomputed.
     extraction: Option<Vec<(usize, u32)>>,
+    /// A digest of each input's *symbol interface* — what it defines and what
+    /// it leaves undefined — from when it was last parsed.
+    ///
+    /// The extraction frontier reads nothing else. An edit that changes a
+    /// function's body changes the object's bytes, so it must be re-parsed;
+    /// it does not change which names the object offers or asks for, so it
+    /// cannot change which archive members get pulled in. Without this, one
+    /// re-read input disables the replay for the whole link, which is the
+    /// common case rather than a corner: an edit that changes nothing else
+    /// still changes something.
+    interfaces: FastMap<PathBuf, u64>,
+    /// Whether any input's interface differs from the one held for it.
+    interfaces_changed: bool,
     hits: usize,
     misses: usize,
 }
@@ -113,11 +126,13 @@ impl Session {
         if self.inputs != inputs {
             self.entries.clear();
             self.members.clear();
+            self.interfaces.clear();
             self.extraction = None;
             self.inputs = inputs.to_vec();
         }
         self.hits = 0;
         self.misses = 0;
+        self.interfaces_changed = false;
     }
 
     /// The entry for `path`, if this process has it and it is still current.
@@ -179,6 +194,7 @@ impl Session {
         let Some(key) = blinker_cache::InputKey::probe(path) else {
             return;
         };
+        self.note_interface(path, parsed);
         self.entries.insert(
             path.to_path_buf(),
             (key, Entry::Object(Arc::clone(parsed), Arc::clone(data))),
@@ -209,6 +225,10 @@ impl Session {
         parsed: &Arc<ParsedObject>,
         range: std::ops::Range<usize>,
     ) {
+        // A member's interface is noted under a path of its own, so two
+        // members of one archive cannot overwrite each other's digest.
+        let named = archive.join(format!("({member})"));
+        self.note_interface(&named, parsed);
         self.members
             .insert((archive.to_path_buf(), member), (Arc::clone(parsed), range));
     }
@@ -258,10 +278,25 @@ impl Session {
         self.stubs = Some((recorded, exports));
     }
 
-    /// The extraction order the last link settled on, if every input this link
-    /// read was served from memory.
+    /// The extraction order the last link settled on, if it must still hold.
+    ///
+    /// It holds when no input's symbol interface changed — not when no input
+    /// changed. A re-read object whose defined and undefined names are what
+    /// they were cannot make any archive want a different member, because
+    /// those two sets are the frontier's only input.
     pub fn extraction(&self) -> Option<&[(usize, u32)]> {
-        (self.misses == 0).then_some(self.extraction.as_deref())?
+        (!self.interfaces_changed).then_some(self.extraction.as_deref())?
+    }
+
+    /// Note an input's symbol interface, and whether it moved.
+    fn note_interface(&mut self, path: &Path, parsed: &ParsedObject) {
+        let digest = interface_digest(parsed);
+        match self.interfaces.insert(path.to_path_buf(), digest) {
+            Some(previous) if previous == digest => {}
+            // Absent as well as different: an input this process has not seen
+            // before could define anything, so the frontier has to run.
+            _ => self.interfaces_changed = true,
+        }
     }
 
     /// Remember which members were extracted, and in what order.
@@ -273,6 +308,26 @@ impl Session {
     pub fn counts(&self) -> (usize, usize) {
         (self.hits, self.misses)
     }
+}
+
+/// A digest of what an object defines and what it leaves undefined.
+///
+/// Names only. Addresses, sizes, section contents and relocations are all
+/// invisible here by design: they are what an edit changes, and none of them
+/// can change which archive member defines a name.
+fn interface_digest(parsed: &ParsedObject) -> u64 {
+    use std::hash::{Hash, Hasher};
+    // Order-independent, because a re-parse may list symbols in a different
+    // order without meaning anything different — combined with `wrapping_add`
+    // rather than a sequential hash for exactly that reason.
+    let mut total = 0u64;
+    for symbol in &parsed.symbols {
+        let mut hasher = crate::hashing::FastHasher::default();
+        symbol.name.hash(&mut hasher);
+        symbol.strength.is_definition().hash(&mut hasher);
+        total = total.wrapping_add(hasher.finish());
+    }
+    total
 }
 
 #[cfg(test)]

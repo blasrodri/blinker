@@ -163,3 +163,55 @@ fn a_changed_input_is_not_served_from_the_session() {
         std::fs::read(&cold).expect("cold")
     );
 }
+
+/// An edit that changes what an object *needs* must change which archive
+/// members are pulled in.
+///
+/// The session replays the previous extraction order whenever no input's
+/// symbol interface moved, on the reasoning that the frontier reads nothing
+/// else. This is the case that reasoning has to survive: `main.o` gains a call
+/// to a function living in a member the previous link never extracted. Replay
+/// the old order and the link is missing a member — an undefined symbol if you
+/// are lucky, and a member resolved to the wrong definition if you are not.
+#[test]
+fn an_edit_that_needs_a_new_member_extracts_it() {
+    let scratch = Scratch::dir("session-new-member").expect("scratch");
+
+    let main = compile(&scratch, "main.c", MAIN);
+    let helper = compile(&scratch, "helper.c", HELPER);
+    let other = compile(&scratch, "other.c", OTHER);
+    // A third member nothing reaches yet, so the first link leaves it out.
+    let extra = compile(
+        &scratch,
+        "extra.c",
+        "int extra(int n) { return n + 1000; }\n",
+    );
+    let library = archive(&scratch, &[helper, other, extra]);
+    let request = LinkRequest::new(vec![main, library]);
+
+    let mut session = Session::default();
+    let first = scratch.join("first");
+    link_to_file_in(&request, &first, &mut session).expect("first");
+    assert_eq!(run(&first), "125\n");
+
+    // main now calls `extra`, which lives in the member nothing wanted before.
+    compile(
+        &scratch,
+        "main.c",
+        r#"
+#include <stdio.h>
+int helper(int n);
+int other(int n);
+int extra(int n);
+int main(void) { printf("%d\n", helper(3) + other(4) + extra(1)); return 0; }
+"#,
+    );
+
+    let second = scratch.join("second");
+    link_to_file_in(&request, &second, &mut session).expect("second");
+    assert_eq!(
+        run(&second),
+        "1126\n",
+        "the new member was not extracted: a replayed extraction order"
+    );
+}

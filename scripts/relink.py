@@ -140,6 +140,8 @@ def main():
     parser.add_argument("--out", default=str(REPO / "target" / "workloads"))
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=2)
+    parser.add_argument("--daemon", action="store_true",
+                        help="link through a resident linker, if one is running")
     parser.add_argument("--relocations", action="store_true",
                         help="also reuse per-object relocations, to read the hit rate")
     parser.add_argument("--no-cache", action="store_true",
@@ -197,7 +199,10 @@ def main():
 
         output, record = scratch / "relink-out", scratch / "record.json"
         argv[argv.index("-o") + 1] = str(output)
-        cmd = [str(BLINKER), "--blinker-internal"]
+        cmd = [str(BLINKER)]
+        if options.daemon:
+            cmd.append("--blinker-daemon")
+        cmd.append("--blinker-internal")
         if not options.no_cache:
             cmd.append("--blinker-cache-relocations"
                        if options.relocations else "--blinker-cache")

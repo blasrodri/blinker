@@ -111,6 +111,14 @@ fn read_frame(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
     Ok(payload)
 }
 
+/// A request with no working directory and no arguments: "are you alive?".
+///
+/// A real exchange is the only way to tell a live daemon from a socket file
+/// left by a dead one — `connect` succeeding proves nothing on macOS, which is
+/// what made the first version of `serve` refuse to start after a crash, for
+/// as long as the stale file existed.
+const PING: &[u8] = b"";
+
 /// Encode a working directory and argument vector into a request frame.
 fn encode_request(cwd: &Path, argv: &[String]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -191,6 +199,20 @@ fn is_absent(error: &std::io::Error) -> bool {
     )
 }
 
+/// Whether a daemon is listening at `socket` and answering.
+///
+/// Sends the ping and requires an answer. Anything else — no file, a refused
+/// connection, a connection that accepts and then ends — is not a daemon.
+pub fn is_alive(socket: &Path) -> bool {
+    let Ok(mut stream) = UnixStream::connect(socket) else {
+        return false;
+    };
+    // A daemon mid-link will not answer promptly; this is asking whether one
+    // exists, and one that is busy still exists.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    write_frame(&mut stream, PING).is_ok() && read_frame(&mut stream).is_ok()
+}
+
 /// Run the daemon, serving links until it has been idle for [`IDLE_TIMEOUT`].
 ///
 /// `handle` performs one link and returns its exit code and captured stderr.
@@ -203,7 +225,7 @@ where
     // A socket file left by a dead daemon would make `bind` fail with
     // `EADDRINUSE` forever. Connecting first distinguishes the two cases: if
     // something answers, that daemon is alive and this one is not needed.
-    if UnixStream::connect(socket).is_ok() {
+    if is_alive(socket) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::AddrInUse,
             "a daemon is already listening",
@@ -294,6 +316,9 @@ where
     F: FnMut(&Path, &[String]) -> (i32, Vec<u8>),
 {
     let payload = read_frame(stream)?;
+    if payload == PING {
+        return write_frame(stream, &0i32.to_le_bytes());
+    }
     let Some((cwd, argv)) = decode_request(&payload) else {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
