@@ -4648,3 +4648,47 @@ shows up as a wrong answer.
 
 The harness also earned its keep: pointed at a stale workload it failed with
 undefined symbols rather than reporting a time. Finding 75 is why it checks.
+
+## 97. The invariant found the hole three commits after it was predicted
+
+The placement counter was added to turn "77% of relocations reused" into the
+property it stands in for. It broke on the first real link it saw:
+
+```
+  placement: 555/692 contributions kept their address (80%), 137 moved
+  of those, 48 belonged to inputs that did not change
+```
+
+Forty-eight contributions of files that are byte-for-byte what they were last
+link moved anyway. The 77% had been hiding it, because a hit rate averages a
+failure away and an invariant does not.
+
+### Why they moved
+
+Dead-stripping. An unchanged object's *live set* is not a property of that
+object — it is a property of what reaches it, and something else changing can
+make more of it live. Its contribution then grows past a capacity sized from
+the previous link's smaller live size, and it has to move.
+
+This is exactly the boundary an architectural review named before any of the
+allocator was built: "an unchanged object can still acquire a different live
+set because another object changed its references." It arrived as a number
+three commits later, which is the right order — the prediction was cheap and
+the number is what says how much it matters.
+
+### What it means for retained placement
+
+Retained placement holds for what fits, and "unchanged input" is not the same
+condition as "unchanged size". The fix is one of two things and not a third:
+
+- **Capacity absorbs liveness churn** — reserve against the object's *full*
+  size rather than its stripped size, so stripping less of it later still
+  fits. Costs image size in proportion to what dead-stripping removes, which
+  on a Rust link is most of it.
+- **Liveness becomes incremental** — persist the reachability result per
+  contribution, and recompute only where the graph changed. Larger, and the
+  only version that also removes the 4.6 ms the stage costs.
+
+What it is **not** is more padding chosen to make today's number go green.
+That is finding 94 again, and the counter that just caught this is the thing
+that would catch it.
