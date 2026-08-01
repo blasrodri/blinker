@@ -401,6 +401,28 @@ impl LinkRecord {
             };
             s.push_str(&format!("\n  reused: {reused}/{total} objects{share}"));
         }
+        // Printed next to the reuse line, and deliberately: a hit rate averages
+        // a failure away, and this is the failure. A contribution of a file
+        // that did not change has no business moving, and every one that does
+        // invalidates every relocation pointing at it.
+        if let (Some(kept), Some(moved)) = (
+            self.counters.contributions_retained,
+            self.counters.contributions_moved,
+        ) {
+            let placed = kept + moved;
+            if placed > 0 {
+                s.push_str(&format!(
+                    "\n  placement: {kept}/{placed} contributions kept their address"
+                ));
+                match self.counters.contributions_moved_unchanged {
+                    Some(0) => s.push_str(", none of the movers were unchanged"),
+                    Some(stale) => {
+                        s.push_str(&format!(", {stale} of the movers were UNCHANGED inputs"))
+                    }
+                    None => {}
+                }
+            }
+        }
         if let Some(stripped) = self.counters.stripped_bytes {
             s.push_str(&format!(
                 "\n  dead-stripped: {} KB of __text",
