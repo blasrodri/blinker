@@ -214,8 +214,8 @@ OPTIONS:
     --blinker-diagnostics <LEVEL>      quiet | normal | verbose
     --blinker-internal                 Link internally instead of delegating
     --blinker-cache                    Replay an unchanged image from a previous link
-    --blinker-cache-relocations        Also reuse per-object relocations (experimental,
-                                       measured slower than not using it)
+    --blinker-cache-relocations        Force per-object relocation reuse. Automatic
+                                       under --blinker-daemon; a loss for one-shot links
     --blinker-daemon                   Link via a resident linker, if one is running
     --blinker-daemon-serve             Become the resident linker
     --blinker-print-stats              Print the human-readable summary
