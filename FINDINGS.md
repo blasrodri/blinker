@@ -6770,3 +6770,70 @@ table construction are not incremental at all.
 
 That is the work. It is now measurable, on a fixture that exists, against a
 program blinker can link.
+
+## 143. Counting inputs hid that they are not the same size
+
+Finding 142 named three defects from one relink. Two of them were mine, not the
+linker's, and the instrument that found that out took ten minutes to build:
+
+```
+  members: 2131 held, 0 renumbered, 3373 missing
+```
+
+The suspicion was that `ObjectId` — positional, assigned in extraction order —
+renumbers every member after the first change, invalidating the member cache
+the way a global atom index invalidated everything in finding 134. It is the
+same shape of bug and it would have been a satisfying second instance.
+
+**Zero renumbered.** The ids were never the problem.
+
+What was missing was simply not there, and the reason is arithmetic:
+
+```
+  members in changed archives: 3388 of 5946  (57%)
+     256  libhir_expand    256  libhir_def    256  libhir_ty
+     256  libhir           256  libide_db     256  libide_assists
+```
+
+**15 of 341 inputs is 57% of the program.** The edit was to
+`crates/base-db/src/lib.rs`, near the bottom of rust-analyzer's graph; cargo
+recompiled every crate downstream, and those are the large ones. So:
+
+- `read_and_parse` re-read 57% of the object code because 57% of it was new.
+  There was no cache to hit.
+- Relocation reuse of 26% is not against a ceiling of 96%. Only 43% of objects
+  survived at all, so the ceiling was 43% and the gap is a third, not a
+  quarter of what it looked like.
+
+The third defect stands, and stands out more sharply now: **`dead_strip` spends
+354 ms accommodating one changed object out of 5,637**, on a link where 3,388
+objects were genuinely rewritten. The reachability digest — which hashes the
+call graph and not the bytes — says the graph did not move even though most of
+the bytes did. That is precisely the case it was built for.
+
+### Three blast radii, and only one of them was being quoted
+
+```
+  by input file      15 of 341     ( 4%)
+  by object        3388 of 5946    (57%)
+  by call graph       1 of 5637    (0.02%)
+```
+
+The harness prints the first, because inputs are what a command line has. It is
+the least informative of the three and it is the one every "blast radius" line
+in this file has meant. A `.rlib` is not a unit of anything: rust-analyzer's
+are 256 objects each and its leaf crates are one.
+
+Stages that must re-read bytes are bounded by the middle number and there is
+nothing to win there. Stages that depend only on the graph are bounded by the
+last one, and they are the whole of the remaining opportunity.
+
+### And the fixture was a worst case
+
+Editing the bottom of the dependency graph is a real thing developers do, but
+it is not the inner loop. The inner loop edits a leaf, cargo recompiles one
+crate, and the blast radius is genuinely small. That measurement is the one
+that says whether incremental linking is worth anything, and it had not been
+taken — the harness's default edit target is chosen to *maximise* blast radius
+("a crate near the bottom of the graph, so the edit has a blast radius"), which
+is the right default for stressing correctness and the wrong one for this.
