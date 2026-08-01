@@ -5134,3 +5134,53 @@ loading a 1.7 MB binary, and the socket exchange. `rustc` spawns a linker per
 crate and there is no avoiding *a* process — but there is no reason it has to
 be this one. A client that only speaks the protocol would be a fraction of the
 size, and that is the next thing worth measuring rather than assuming.
+
+## 106. The fourteen-crate blast radius was the harness rebuilding from scratch
+
+Findings 94, 97 and 98 all reason about a one-crate edit that changes
+**fourteen of sixty-one inputs**. Every design decision downstream took that
+as the shape of the problem: retained placement was judged against it, the
+extraction replay was disabled by it, and finding 98's remaining
+`__eh_frame` movers were counted under it.
+
+It was an artifact of the measuring instrument. `scripts/workload.py` gave each
+capture its own cargo target directory, so the second capture built the entire
+project from scratch — and rustc, building the same source twice from nothing,
+emits codegen units in a different order. Thirteen crates the edit never
+touched came out with different bytes and different member ordering inside
+their rlibs.
+
+Sharing the build directory, so the second capture is the *incremental rebuild*
+a developer's edit actually produces:
+
+```
+  from-scratch captures     14 of 61 inputs changed
+  incremental captures       2 of 62
+```
+
+**Two.** With the session holding the rest: 60 inputs held, 2 read.
+
+### What it invalidates and what it does not
+
+The measurements stand — they were real links of real inputs. What changes is
+what they were measurements *of*: not "a one-crate edit" but "a one-crate edit
+plus a from-scratch rebuild of everything else", which is a different and much
+harder problem, and not one a build system poses.
+
+So finding 98's conclusion — that the remaining moved contributions are all
+`__eh_frame` — was measured on a blast radius seven times too large. The
+`__eh_frame` reasoning holds (it cannot be hole-filled), but how much it costs
+is now an open question rather than a settled one.
+
+### The rule, again
+
+Finding 77 said a benchmark fixture is a claim about scale and it expires.
+Finding 93 said a workload that cannot be rebuilt has already expired. This is
+the third form: **a harness that produces its inputs differently from the way
+production produces them is measuring a different system.** The from-scratch
+rebuild was not a shortcut or an approximation — it was the harness
+manufacturing a workload that no build would ever hand a linker.
+
+It cost more than a wrong number. Three sessions of design were spent on the
+question "how do we retain addresses when fourteen crates change at once",
+which is a question nobody asked.
