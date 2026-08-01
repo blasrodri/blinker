@@ -6179,3 +6179,65 @@ a real complaint about Rust.** The architecture is validated — the held state,
 the retained placement, the relocation reuse all work at scale and produce a
 correct, running, signed binary. What is missing is that three stages still do
 global work, and the debug profile is where that bill comes due.
+
+## 130. blinker scales with symbols; ld64 apparently does not
+
+Between the release and debug workloads of the same program the work grows:
+objects 1.8x, input bytes 1.6x, **output 4.1x**. The two linkers respond very
+differently:
+
+```
+  ld64      32.5 -> 43.7 ms    1.34x
+  blinker   34.0 -> 114.9 ms   3.38x
+```
+
+Per stage, sorted by how badly each scales (total grew 3.73x):
+
+```
+  emit_linkedit    0.56 ->  4.01    7.17x    symbol and string table encoding
+  symbols          0.64 ->  4.08    6.37x    output symbols + debug map
+  traverse         1.41 ->  7.56    5.36x
+  unwind           0.68 ->  3.64    5.35x
+  liveness         1.78 ->  9.00    5.06x
+  synthetic        0.77 ->  3.90    5.05x
+  atoms            1.00 ->  4.66    4.67x
+  apply            2.88 -> 11.55    4.01x
+  ...
+  read_and_parse   9.23 -> 28.02    3.04x
+  layout           0.90 ->  2.12    2.34x
+  stub_parse       5.41 ->  6.48    1.20x    fixed: the SDK does not grow
+```
+
+Nothing here is quadratic — the quadratics were found and removed (120, 121,
+124, 125). What this shows is different: **almost every stage grows faster than
+the object count, and the two worst are both the symbol table.** A debug build
+does not add many objects; it adds an enormous number of *symbols* to the
+objects it already had, and blinker's cost is per symbol far more than per byte.
+
+### Why this outranks the incremental work
+
+An incremental linker's value is bounded by its cold link. blinker's incremental
+debug relink is 65.5 ms against ld64's 43.7 ms *cold* — the held state is
+working perfectly (96% of relocations reused, 3 of 27,803 addresses moved) and it
+still loses, because it starts 2.6x too high.
+
+Worse, the trend runs the wrong way. blinker's disadvantage grows with scale, so
+at the size where linking is a real complaint about Rust — binaries where ld64
+takes seconds, not 44 ms — extrapolating this slope makes blinker far worse than
+2.6x, not better. **It becomes less competitive exactly as it becomes more
+needed.**
+
+### The correction to the whole project
+
+Every performance decision recorded before this was made on a workload where the
+baseline is 44 ms. Nobody has ever complained about a 44 ms link. The Rust
+linking complaint is about projects an order of magnitude larger, and no
+measurement in this repository has ever touched one.
+
+So the ordering changes. Not "make the incremental path faster" — that
+architecture is validated and works at 4x scale. It is:
+
+1. find why per-symbol work dominates, starting with `emit_linkedit` and
+   `symbols`, the two worst scalers and both symbol-table code;
+2. get a workload where ld64 takes seconds, and check the slope holds;
+3. return to incremental, which is already good and will inherit every gain.
