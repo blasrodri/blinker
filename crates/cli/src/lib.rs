@@ -211,6 +211,9 @@ pub fn run_in(
                 accounting: phases.accounting_ms,
                 address_table: phases.address_table_ms,
                 liveness_breakdown: [phases.group_ms, phases.traverse_ms],
+                digest: phases.digest_ms,
+                reach_moved: phases.reach_moved,
+                reach_total: phases.reach_total,
                 prepare_breakdown: [
                     phases.placements_ms,
                     phases.personality_ms,

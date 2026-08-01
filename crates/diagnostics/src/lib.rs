@@ -104,6 +104,8 @@ pub struct PhaseTimings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link_commons_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_digest_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub link_group_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link_traverse_ms: Option<f64>,
@@ -180,6 +182,10 @@ pub struct LinkStages {
     pub synthetic_breakdown: [f64; 3],
     /// Inside `liveness`: grouping relocations per object, then traversing.
     pub liveness_breakdown: [f64; 2],
+    /// Reachability digests: time, objects moved, objects compared.
+    pub digest: f64,
+    pub reach_moved: u64,
+    pub reach_total: u64,
     /// Inside `prepare`: placements, eh personalities, unwind sizing, commons.
     pub prepare_breakdown: [f64; 4],
     pub changed_addresses: u64,
@@ -253,6 +259,11 @@ pub struct Counters {
     pub inputs_held: Option<u64>,
     /// Addresses this link changed, and how many there are. The size of the
     /// blast radius in the units relocation cares about.
+    /// Objects whose reachability projection moved, of how many compared.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reach_moved: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reach_total: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub changed_addresses: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -374,6 +385,9 @@ impl LinkRecord {
             address_diff,
             synthetic_breakdown,
             liveness_breakdown,
+            digest,
+            reach_moved,
+            reach_total,
             prepare_breakdown,
             changed_addresses,
             total_addresses,
@@ -397,6 +411,11 @@ impl LinkRecord {
         self.timings.link_prepare_ms = (prepare > 0.0).then_some(prepare);
         self.timings.link_address_table_ms = (address_table > 0.0).then_some(address_table);
         self.timings.link_address_diff_ms = (address_diff > 0.0).then_some(address_diff);
+        self.timings.link_digest_ms = (digest > 0.0).then_some(digest);
+        if reach_total > 0 {
+            self.counters.reach_moved = Some(reach_moved);
+            self.counters.reach_total = Some(reach_total);
+        }
         if prepare_breakdown.iter().any(|v| *v > 0.0) {
             self.timings.link_placements_ms = Some(prepare_breakdown[0]);
             self.timings.link_personality_ms = Some(prepare_breakdown[1]);
@@ -543,6 +562,7 @@ impl LinkRecord {
             ("  atoms", self.timings.link_atoms_ms),
             ("  liveness", self.timings.link_liveness_ms),
             ("  strip-build", self.timings.link_strip_build_ms),
+            ("  digest", self.timings.link_digest_ms),
             ("    group", self.timings.link_group_ms),
             ("    traverse", self.timings.link_traverse_ms),
             ("prepare", self.timings.link_prepare_ms),

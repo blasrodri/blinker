@@ -46,6 +46,8 @@ struct Memo {
     _parse: Arc<ParsedObject>,
     /// Atom boundaries by section id; `None` for a section that is not split.
     boundaries: FastMap<u32, Option<Arc<Vec<u64>>>>,
+    /// This object's reachability digest, which is also a pure function of it.
+    digest: Option<u64>,
 }
 
 /// One input, as this process last saw it.
@@ -163,6 +165,14 @@ pub struct Session {
     /// pieces depends on that object's symbols and relocations and on nothing
     /// else in the link.
     memo: FastMap<usize, Memo>,
+    /// Each object's reachability digest, as the last link computed it.
+    ///
+    /// Keyed by object id, which is positional and stable for as long as the
+    /// input list is — the same precondition the whole session runs under.
+    reach: FastMap<u32, u64>,
+    /// How many digests moved on this link, and how many were compared.
+    reach_moved: u64,
+    reach_total: u64,
     /// The cache this session's last link produced, and the path it belongs to.
     ///
     /// The cache file is a *restart* mechanism: it exists so a cold process can
@@ -506,11 +516,28 @@ impl Session {
         let memo = self.memo.entry(key).or_insert_with(|| Memo {
             _parse: Arc::clone(parse),
             boundaries: FastMap::default(),
+            digest: None,
         });
         memo.boundaries
             .entry(section)
             .or_insert_with(|| compute().map(Arc::new))
             .clone()
+    }
+
+    /// This object's reachability digest, computing it once per parse.
+    ///
+    /// The digest reads only the object — its atom boundaries, its relocations'
+    /// targets by name, its defined symbols — so it is valid for exactly as
+    /// long as the parse is. Computing all of them cost 5.8 ms of a 73 ms debug
+    /// relink; 78 of 80 inputs are the same parse as last time.
+    pub fn digest(&mut self, parse: &Arc<ParsedObject>, compute: impl FnOnce() -> u64) -> u64 {
+        let key = Arc::as_ptr(parse) as usize;
+        let memo = self.memo.entry(key).or_insert_with(|| Memo {
+            _parse: Arc::clone(parse),
+            boundaries: FastMap::default(),
+            digest: None,
+        });
+        *memo.digest.get_or_insert_with(compute)
     }
 
     /// Drop derived facts about parses this link did not use.
@@ -520,6 +547,34 @@ impl Session {
     /// every rebuild rather than with the program being linked.
     pub fn forget_unused_memos(&mut self, used: &FastMap<usize, ()>) {
         self.memo.retain(|key, _| used.contains_key(key));
+    }
+
+    /// Record this link's reachability digests and report how many moved.
+    ///
+    /// A digest that moved means some atom boundary or some edge in that object
+    /// changed; if none moved, the live set cannot have changed and the whole
+    /// strip is reusable.
+    pub fn note_reachability(&mut self, digests: &[(u32, u64)]) -> (u64, u64) {
+        let mut moved = 0;
+        let comparable = !self.reach.is_empty();
+        for (object, digest) in digests {
+            if comparable && self.reach.get(object) != Some(digest) {
+                moved += 1;
+            }
+        }
+        self.reach = digests.iter().copied().collect();
+        self.reach_moved = if comparable {
+            moved
+        } else {
+            digests.len() as u64
+        };
+        self.reach_total = digests.len() as u64;
+        (self.reach_moved, self.reach_total)
+    }
+
+    /// How many objects' reachability projection moved on the last link.
+    pub fn reachability_moved(&self) -> (u64, u64) {
+        (self.reach_moved, self.reach_total)
     }
 
     /// Take the cache held for `path`, if this session produced one.

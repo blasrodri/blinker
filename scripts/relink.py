@@ -370,7 +370,7 @@ def main():
     # for its own sake and excluded from the sum: adding an overlapped half to
     # the stage containing it double-counts, and the first version of this made
     # `unmeasured` negative — which is at least a number that announces itself.
-    overlapped = {"stub_parse", "atoms", "liveness", "group", "traverse", "strip_build",
+    overlapped = {"stub_parse", "digest", "atoms", "liveness", "group", "traverse", "strip_build",
                   # Both run inside the relocate timer. Counting them again
                   # made `unmeasured` negative, which is the one way a profile
                   # can announce that it does not add up.
@@ -381,7 +381,7 @@ def main():
                   "emit_assemble", "emit_uuid", "emit_sign",
                   "address_map", "contents", "synthetic", "apply"}
     for name in ["read_and_parse", "stub_parse", "resolve", "layout", "dead_strip",
-                 "atoms", "liveness", "group", "traverse", "strip_build",
+                 "digest", "atoms", "liveness", "group", "traverse", "strip_build",
                  "prepare", "placements", "personality", "unwind_size", "commons", "accounting", "address_table", "address_diff", "relocate", "emit", "emit_layout", "emit_contents",
                  "emit_linkedit", "emit_assemble", "emit_uuid", "emit_sign",
                  "address_map", "contents", "synthetic", "eh_frame", "tables", "unwind", "apply", "symbols", "survey",
@@ -435,6 +435,11 @@ def main():
             import os as _os
             first = counters.get("first_interface_change") or ""
             print(f"           {changes} interface(s) moved, first: {_os.path.basename(first)}")
+
+    moved = counters.get("reach_moved")
+    if moved is not None:
+        print(f"  reachability: {moved}/{counters.get('reach_total')} objects' "
+              f"projection moved")
 
     changed_addr = counters.get("changed_addresses")
     if changed_addr is not None:

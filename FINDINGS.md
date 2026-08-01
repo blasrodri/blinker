@@ -6307,3 +6307,51 @@ about a 45 ms link. The Rust linking complaint is about binaries where ld64
 takes seconds, and no measurement here has ever touched one. Until a workload of
 that size exists, every conclusion about whether blinker is worth using —
 including the ones in this file — is an extrapolation.
+
+## 133. One object of 1,059
+
+`DESIGN-incremental-liveness.md` proposes rebuilding reachability only for the
+part of the graph an edit touches. Before building it, the premise is worth
+testing: **how much of the graph does an ordinary edit actually touch?**
+
+A *reachability digest* per object — its atom boundaries, and the name each of
+its relocations resolves through, and its defined symbols. Deliberately not a
+hash of its bytes: an ordinary edit changes the bytes of every function it
+touches while leaving the call graph exactly where it was, and that is the case
+this exists to catch.
+
+On the debug workload, a body edit:
+
+```
+  reachability: 1 of 1,059 objects' projection moved
+```
+
+**One.** Two rlibs were re-read and re-parsed; of the 1,059 objects in the link,
+exactly one has a different graph. Everything `dead_strip` does — 19.3 ms of a
+73 ms relink, the largest stage — is recomputed to accommodate one object.
+
+Computing all 1,059 digests cost 5.80 ms, which would have eaten a third of the
+prize. But a digest reads only its own object, so it belongs in the per-parse
+memo from finding 127:
+
+```
+  digest   5.80 ms -> 0.49 ms
+```
+
+### What this settles about the design
+
+The all-or-nothing version — "if no digest moved, reuse the whole strip" — will
+not fire on an edit, because the answer is one and not zero. So the incremental
+update has to be built properly, as the design says.
+
+What changes is the confidence and the shape. The dirty set is not "a couple of
+crates" or "the blast radius", it is **one object**, and the design's step 4 —
+bounded re-derivation over the affected region — is re-deriving reachability
+around a single object's atoms rather than around anything resembling the
+program. The cost of getting the region wrong is now the difference between
+one object and 1,059, which is also the argument for the verification mode: at
+this ratio, a bug that quietly widens the region would still look fast.
+
+The digest is also exactly the invalidation key the update needs. It does not
+have to be invented separately — it is measured, memoised, and costs half a
+millisecond.

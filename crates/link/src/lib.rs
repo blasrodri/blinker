@@ -119,6 +119,10 @@ pub struct LinkTimings {
     /// Inside `liveness_ms`: grouping relocations, then traversing the graph.
     pub group_ms: f64,
     pub traverse_ms: f64,
+    /// Objects whose reachability projection moved, of how many compared.
+    pub digest_ms: f64,
+    pub reach_moved: u64,
+    pub reach_total: u64,
     /// Work between the named stages that no stage owned: building placements,
     /// scanning `__eh_frame` for personality fields, sizing the unwind table,
     /// and collecting commons. It was 1.9 ms of "unmeasured" and the only
@@ -1603,6 +1607,9 @@ fn link_inner(
     timings.strip_build_ms = strip_timings.build_ms;
     timings.group_ms = strip_timings.group_ms;
     timings.traverse_ms = strip_timings.traverse_ms;
+    timings.digest_ms = strip_timings.digest_ms;
+    timings.reach_moved = strip_timings.reach_moved;
+    timings.reach_total = strip_timings.reach_total;
     timings.stripped_bytes = report.dead_bytes();
     timings.revived_atoms = report.revived as u64;
 

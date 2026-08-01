@@ -405,6 +405,67 @@ impl<'a> Atoms<'a> {
     }
 }
 
+/// A digest of everything about one object that reachability reads.
+///
+/// Which atoms it has, and which name each of its relocations points at. That
+/// is the whole of what the traversal consults — so if no object's digest
+/// moved, the live set cannot have moved either, and the entire strip can be
+/// reused.
+///
+/// Deliberately *not* a hash of the object's bytes. An ordinary edit changes
+/// the bytes of every function it touches while leaving the call graph exactly
+/// where it was, which is the case this exists to catch.
+pub(crate) fn reachability_digest(object: &LoadedObject) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = blinker_hashing::FastHasher::default();
+
+    for section in &object.parsed.sections {
+        section.name.hash(&mut hasher);
+        section.no_dead_strip.hash(&mut hasher);
+        // Atom boundaries: where this section divides.
+        if let Some(offsets) = boundaries(object, section) {
+            offsets.hash(&mut hasher);
+        } else {
+            u64::MAX.hash(&mut hasher);
+        }
+    }
+
+    // Edges, by the name they resolve through rather than by any index: an
+    // index is a position in this link and moves for reasons that are not
+    // about this object.
+    for relocation in &object.parsed.relocations {
+        relocation.section.0.hash(&mut hasher);
+        relocation.offset.hash(&mut hasher);
+        match relocation.target {
+            RelocationTarget::Symbol(id) => match object.parsed.symbol(id) {
+                Some(symbol) => {
+                    symbol.name.hash(&mut hasher);
+                    symbol.strength.is_definition().hash(&mut hasher);
+                }
+                None => 0u8.hash(&mut hasher),
+            },
+            RelocationTarget::Section(id) => {
+                1u8.hash(&mut hasher);
+                id.0.hash(&mut hasher);
+            }
+        }
+    }
+
+    for symbol in &object.parsed.symbols {
+        if symbol.strength.is_definition() && symbol.visibility != SymbolVisibility::Local {
+            symbol.name.hash(&mut hasher);
+            symbol.value.hash(&mut hasher);
+            symbol
+                .section
+                .map(|s| s.0)
+                .unwrap_or(u32::MAX)
+                .hash(&mut hasher);
+        }
+    }
+
+    hasher.finish()
+}
+
 /// The relocations of one object, grouped by section and sorted by offset.
 type ByOffset<'a> = HashMap<u32, Vec<&'a InputRelocation>>;
 
@@ -955,6 +1016,10 @@ pub(crate) struct StripTimings {
     /// Inside `liveness_ms`: grouping relocations per object, then traversing.
     pub group_ms: f64,
     pub traverse_ms: f64,
+    /// Computing every object's reachability digest, and what it found.
+    pub digest_ms: f64,
+    pub reach_moved: u64,
+    pub reach_total: u64,
 }
 
 /// Decide what a link keeps.
@@ -964,6 +1029,24 @@ pub(crate) fn plan(
     session: &mut crate::session::Session,
 ) -> (Strip, Report, StripTimings) {
     let mut timings = StripTimings::default();
+
+    // Before anything: has any object's reachability projection actually moved?
+    // Measured first because if the answer is usually "no", the whole of what
+    // follows is skippable, and if it is usually "yes" then no amount of
+    // fingerprinting helps and the incremental update has to be built properly.
+    let digest_step = std::time::Instant::now();
+    let digests: Vec<(u32, u64)> = objects
+        .iter()
+        .map(|o| {
+            let digest = session.digest(&o.parsed, || reachability_digest(o));
+            (o.parsed.id.0, digest)
+        })
+        .collect();
+    let (moved, total) = session.note_reachability(&digests);
+    timings.digest_ms = digest_step.elapsed().as_secs_f64() * 1000.0;
+    timings.reach_moved = moved;
+    timings.reach_total = total;
+
     let step = std::time::Instant::now();
     let mut parts = [0.0f64; 3];
     let atoms = Atoms::build(objects, &mut parts, session);
