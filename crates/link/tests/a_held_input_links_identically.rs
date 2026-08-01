@@ -257,3 +257,84 @@ fn relocation_reuse_does_not_change_the_binary() {
         "reusing relocations changed the binary"
     );
 }
+
+/// An input list that gains a member renumbers everything after it, and the
+/// session is now allowed to survive that.
+///
+/// Object ids are positional. Until finding 144 the session threw everything
+/// away whenever the input list changed at all, which made this safe by making
+/// it impossible — and made a resident linker go cold on every real rebuild,
+/// because rustc renames the objects of a recompiled crate every time. The
+/// session now keeps what it can and `load_objects` serves a held parse only
+/// under the id this link would assign it.
+///
+/// So the hazard is real and the guard is somewhere else, which is exactly the
+/// arrangement that needs a test: link, then link again with an extra object
+/// *first*, so every held id is off by one. The result must equal a cold link
+/// of the same list.
+#[test]
+fn an_input_list_that_renumbers_still_links_correctly() {
+    let scratch = Scratch::dir("session-renumber").expect("scratch");
+    let held = inputs(&scratch);
+
+    // Prepended, so `main.o` and the archive both move up one position.
+    let extra = compile(
+        &scratch,
+        "extra.c",
+        "int unused_leaf(int n) { return n; }\n",
+    );
+    let mut renumbered = vec![extra];
+    renumbered.extend(held.iter().cloned());
+
+    let cold = scratch.join("cold");
+    link_to_file(&LinkRequest::new(renumbered.clone()), &cold).expect("the cold link succeeds");
+
+    let mut session = Session::default();
+    let first = scratch.join("first");
+    link_to_file_in(&LinkRequest::new(held), &first, &mut session).expect("the first link");
+    let second = scratch.join("second");
+    link_to_file_in(&LinkRequest::new(renumbered), &second, &mut session)
+        .expect("the renumbered link");
+
+    assert_eq!(
+        std::fs::read(&second).expect("second"),
+        std::fs::read(&cold).expect("cold"),
+        "a renumbered link differed from a cold one — a held parse was served \
+         under an id that now means a different object"
+    );
+    assert_eq!(run(&second), "125\n");
+}
+
+/// The other half: when the list changes but a path stays put, the session
+/// must actually keep it. Otherwise the guard above is enforced by discarding
+/// everything, which is the behaviour finding 144 removed.
+#[test]
+fn an_input_that_kept_its_place_is_kept_across_a_changed_list() {
+    let scratch = Scratch::dir("session-kept").expect("scratch");
+    let held = inputs(&scratch);
+
+    // Appended, so nothing already in the list is renumbered.
+    let extra = compile(
+        &scratch,
+        "extra.c",
+        "int unused_leaf(int n) { return n; }\n",
+    );
+    let mut grown = held.clone();
+    grown.push(extra);
+
+    let mut session = Session::default();
+    let first = scratch.join("first");
+    link_to_file_in(&LinkRequest::new(held), &first, &mut session).expect("the first link");
+    let second = scratch.join("second");
+    let timings =
+        link_to_file_in(&LinkRequest::new(grown), &second, &mut session).expect("the grown link");
+
+    assert!(
+        timings.inputs_held > 0,
+        "a changed input list discarded every input that survived it: \
+         {} held, {} read",
+        timings.inputs_held,
+        timings.inputs_read
+    );
+    assert_eq!(run(&second), "125\n");
+}

@@ -6837,3 +6837,89 @@ that says whether incremental linking is worth anything, and it had not been
 taken — the harness's default edit target is chosen to *maximise* blast radius
 ("a crate near the bottom of the graph, so the edit has a blast radius"), which
 is the right default for stressing correctness and the wrong one for this.
+
+## 144. rustc renames every object of a recompiled crate, and the session went
+## cold on it
+
+Trying to measure the developer inner loop — edit the binary crate, relink —
+the harness refused: "the rebuild produced identical inputs — the edit changed
+nothing". It was right, and for a reason worth the whole detour:
+
+```
+  rust_analyzer-f5cc78900386defc.001z4lyiuuj1qmjjq7sk5cs4o.02n9mi4.rcgu.o   before
+  rust_analyzer-f5cc78900386defc.001z4lyiuuj1qmjjq7sk5cs4o.0l3l1uh.rcgu.o   after
+```
+
+The codegen unit's own hash is identical. The last component changed, and it
+changed to the *same* new value for all 132 objects — it identifies the build,
+not the content. Checking the bytes:
+
+```
+  matched by content-identity: 341 of 341
+  rcgu objects: 132 byte-identical, 0 actually changed
+```
+
+**Every object of the recompiled crate was renamed. None of them changed.**
+This is what a debug rebuild does, every time, because cargo turns on
+incremental compilation and rustc names its objects per build session.
+
+### What that cost
+
+`Session::begin` discarded the entire session whenever the input list differed:
+
+```rust
+if self.inputs != inputs { self.entries.clear(); self.members.clear(); ... }
+```
+
+So the normal case — a developer edits a file and rebuilds — presented a
+changed input list, and a resident linker went cold. Isolated, on the same
+directory, with only the 132 names changed and not one byte:
+
+```
+  cold                            3755 ms   held=0   read=341
+  132 renamed / same bytes        3645 ms   held=0   read=341
+```
+
+A rename of a third of the inputs cost a full cold link.
+
+### Why it was written that way, and where the guard belongs
+
+The reason is real: object ids are positional, and a held parse carries the id
+it was parsed with. Discarding everything made that safe by making it
+impossible.
+
+It is the same mistake as finding 134 in a different place — *identity taken
+from position* — and it has the same fix. The session now keeps the per-path
+facts for paths that survived, drops what was derived from the list as a whole
+(the extraction order, the import set), and `load_objects` serves a held parse
+only under the id this link would assign it.
+
+```
+                                  before     after
+  132 renamed / same bytes        3645 ms   2934 ms   held 0 -> 209
+  renamed back                    3143      2549      held 0 -> 209
+```
+
+### The test that had encoded the bug as the contract
+
+`a_changed_input_list_starts_over` asserted the wipe. Its *name* said "starts
+over" and its assertion message said "a renumbered link served an object
+carrying its old id" — the second is the property worth having and the first
+was one way to get it. Rewritten to assert what actually matters, plus two link
+level tests: one that prepends an input so every held id is off by one and
+requires the result to equal a cold link, and one that appends an input and
+requires the session to keep the others. The first fails without the id check —
+verified by removing it.
+
+### Still 2.5 seconds for nothing
+
+Holding 209 of 341 inputs is not the answer, it is the removal of a cliff. The
+132 renamed objects are byte-identical and are still read, parsed, and
+relocated from scratch, because they are identified by path. blinker already
+computes a content hash for exactly these inputs — `InputKey::probe` does it
+because rustc's paths do not identify their contents — so the parse cache could
+be keyed by content and a renamed-but-identical object would be a hit.
+
+That is the next thing, and it is worth stating plainly what it means: **for
+the inner loop this linker exists to serve, a third of the work it does is on
+inputs it has already parsed, unchanged, under a different name.**

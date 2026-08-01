@@ -2989,10 +2989,19 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
     let mut todo: Vec<usize> = Vec::with_capacity(paths.len());
     for (at, path) in paths.iter().enumerate() {
         let held = match ids[at] {
-            Some(_) => session.object(path).map(|(parsed, data)| {
-                Loaded::Object(LoadedObject {
-                    parsed,
-                    data: SourceBytes::whole_shared(&data),
+            // Only when the held parse carries the id this link would assign.
+            // Ids are positional, so a session that survived a changed input
+            // list may be holding a parse under a number that now means a
+            // different object; everything downstream keys on that number.
+            // This is the check that lets `Session::begin` keep anything at
+            // all (finding 144), and it is the same argument the archive
+            // member cache has always made.
+            Some(id) => session.object(path).and_then(|(parsed, data)| {
+                (parsed.id == id).then(|| {
+                    Loaded::Object(LoadedObject {
+                        parsed,
+                        data: SourceBytes::whole_shared(&data),
+                    })
                 })
             }),
             None => session

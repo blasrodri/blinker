@@ -37,7 +37,7 @@ use std::sync::Arc;
 
 use blinker_macho::ParsedObject;
 
-use crate::hashing::FastMap;
+use crate::hashing::{FastMap, FastSet};
 use crate::mapping::Backing;
 
 /// What has been worked out about one held parse.
@@ -231,12 +231,39 @@ pub type StubExports = crate::libraries::StubExports;
 
 impl Session {
     /// Begin a link over `inputs`, discarding anything that cannot apply.
+    ///
+    /// A changed input list used to discard *everything*, on the grounds that
+    /// object ids are positional and a held parse carries the id it was parsed
+    /// with. That is true, and throwing the session away is a heavy way to
+    /// enforce it: rustc renames every object of a recompiled crate on every
+    /// debug build — 132 of rust-analyzer's 341 inputs, with byte-identical
+    /// contents — so the list differs on every edit a developer makes, and a
+    /// resident linker went cold every time (finding 144).
+    ///
+    /// So the per-path facts are kept for the paths that survived, and the
+    /// positional hazard is handled where it actually arises: `load_objects`
+    /// serves a held parse only when its id is the one this link would assign.
+    /// What cannot be kept is anything derived from the list *as a whole* —
+    /// the extraction order and the import set, both of which are answers
+    /// about every input at once.
     pub fn begin(&mut self, inputs: &[PathBuf]) {
         if self.inputs != inputs {
-            self.entries.clear();
-            self.members.clear();
-            self.interfaces.clear();
-            self.indexes.clear();
+            let surviving: FastSet<&Path> = inputs.iter().map(PathBuf::as_path).collect();
+            self.entries
+                .retain(|path, _| surviving.contains(path.as_path()));
+            self.members
+                .retain(|(archive, _), _| surviving.contains(archive.as_path()));
+            self.interfaces.retain(|path, _| {
+                // A member's interface is filed under a synthetic path inside
+                // its archive, so it survives with the archive rather than on
+                // its own.
+                surviving.contains(path.as_path())
+                    || path
+                        .parent()
+                        .is_some_and(|parent| surviving.contains(parent))
+            });
+            self.indexes
+                .retain(|path, _| surviving.contains(path.as_path()));
             self.extraction = None;
             self.imports = None;
             self.inputs = inputs.to_vec();
@@ -818,11 +845,44 @@ mod tests {
         session.store_object(&path, &parsed, &backing);
         assert!(session.object(&path).is_some(), "it was not held");
 
+        // A changed input list no longer throws the session away. rustc
+        // renames every object of a recompiled crate on every debug build, so
+        // "the list changed" is the normal case and not an exceptional one
+        // (finding 144). What protects the positional ids is the check in
+        // `load_objects`, which serves a held parse only under the id this
+        // link would assign it.
         session.begin(&[path.clone(), scratch.join("b.o")]);
         assert!(
-            session.object(&path).is_none(),
-            "a renumbered link served an object carrying its old id"
+            session.object(&path).is_some(),
+            "an input that is still in the list was discarded with the list"
         );
+
+        // What does not survive is the input that left it.
+        session.begin(&[scratch.join("b.o")]);
+        assert!(
+            session.object(&path).is_none(),
+            "an input that is no longer linked was kept"
+        );
+    }
+
+    #[test]
+    fn a_changed_input_list_drops_what_was_derived_from_the_whole_list() {
+        let scratch = Scratch::dir("session-whole-list").expect("scratch");
+        let path = scratch.join("a.o");
+        std::fs::write(&path, vec![0u8; 128]).expect("written");
+
+        let mut session = Session::default();
+        session.begin(std::slice::from_ref(&path));
+        session.store_extraction(vec![(0, 0)]);
+        session.store_imports(&["_malloc".to_string()]);
+        assert!(session.extraction().is_some(), "it was not held");
+
+        // The extraction order and the import set are answers about every
+        // input at once, so a list that gained or lost one invalidates them
+        // however many of the others survived.
+        session.begin(&[path.clone(), scratch.join("b.o")]);
+        assert!(session.extraction().is_none(), "a stale extraction order");
+        assert!(session.imports().is_none(), "a stale import set");
     }
 
     /// A rewritten object is re-read even though its path is the same.
