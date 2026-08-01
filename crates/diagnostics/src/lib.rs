@@ -167,6 +167,8 @@ pub struct Counters {
     /// to hold first.
     pub contributions_retained: Option<u64>,
     pub contributions_moved: Option<u64>,
+    /// Of those, the ones whose input had not changed. Meant to be zero.
+    pub contributions_moved_unchanged: Option<u64>,
     pub cache_bytes_read: Option<u64>,
     pub cache_bytes_written: Option<u64>,
     /// `__text` bytes dead-stripping removed. `None` when it did not run.
@@ -269,9 +271,10 @@ impl LinkRecord {
     }
 
     /// Record how much of the previous layout survived.
-    pub fn set_placement(&mut self, retained: u64, moved: u64) {
+    pub fn set_placement(&mut self, retained: u64, moved: u64, moved_unchanged: u64) {
         self.counters.contributions_retained = Some(retained);
         self.counters.contributions_moved = Some(moved);
+        self.counters.contributions_moved_unchanged = Some(moved_unchanged);
     }
 
     /// Record what the cache moved, as bytes.

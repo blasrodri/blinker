@@ -245,6 +245,11 @@ def main():
         total = retained + moved
         print(f"\n  placement: {retained}/{total} contributions kept their address"
               f" ({retained / total * 100:.0f}%), {moved} moved")
+        stale = counters.get("contributions_moved_unchanged")
+        if stale is not None:
+            verdict = "the invariant holds" if stale == 0 else "INVARIANT BROKEN"
+            print(f"  of those, {stale} belonged to inputs that did not change"
+                  f" — {verdict}")
 
     reused = counters.get("reused_inputs")
     if reused is not None:

@@ -143,6 +143,15 @@ pub struct LinkTimings {
     /// high today.
     pub contributions_retained: u64,
     pub contributions_moved: u64,
+    /// Contributions that moved **despite their input not having changed**.
+    ///
+    /// The invariant, as against the statistic above. A contribution of an
+    /// edited crate is entitled to move — it may not fit where it was. One
+    /// belonging to a file that is byte-for-byte what it was last link has no
+    /// such excuse, and every one of them invalidates every relocation
+    /// pointing at it. This number is the acceptance criterion for retained
+    /// placement, and it is meant to be zero.
+    pub contributions_moved_unchanged: u64,
 }
 
 impl std::fmt::Display for LinkTimings {
@@ -1504,6 +1513,10 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     // Only a table this same request produced. A layout is a set of decisions
     // about *these* inputs under *these* options, and one taken under others
     // is not wrong so much as not about this link.
+    let previous_cache_inputs: Vec<(PathBuf, blinker_cache::InputKey)> = previous_cache
+        .as_ref()
+        .map(|cache| cache.inputs.clone())
+        .unwrap_or_default();
     let previous_layout = previous_cache
         .as_ref()
         .filter(|cache| cache.request == request_hash(request))
@@ -1661,6 +1674,20 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     // What the allocator actually achieved, counted against the table it was
     // given rather than inferred from how fast the link was.
     if let (Some((previous, _)), Ok(image)) = (&previous_layout, &image) {
+        // Which inputs are the ones the previous link saw. An archive member
+        // shares its archive's key, so an rlib that changed marks all of its
+        // members changed — coarse, and the reason member-level identity is
+        // the next thing this needs.
+        let unchanged: HashSet<&Path> = previous_cache_inputs
+            .iter()
+            .filter(|(path, key)| blinker_cache::InputKey::probe(path).as_ref() == Some(key))
+            .map(|(path, _)| path.as_path())
+            .collect();
+        let source_of: HashMap<u32, &Path> = objects
+            .iter()
+            .map(|o| (o.parsed.id.0, o.parsed.metadata.path.as_path()))
+            .collect();
+
         for section in &image.layout.sections {
             let qualified = section.qualified_name();
             for contribution in &section.contributions {
@@ -1672,6 +1699,12 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
                     timings.contributions_retained += 1;
                 } else {
                     timings.contributions_moved += 1;
+                    if source_of
+                        .get(&contribution.object.0)
+                        .is_some_and(|path| unchanged.contains(path))
+                    {
+                        timings.contributions_moved_unchanged += 1;
+                    }
                 }
             }
         }
