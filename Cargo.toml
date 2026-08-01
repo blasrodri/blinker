@@ -59,9 +59,15 @@ yaml-rust2 = "0.8"
 #
 # The one that is easy to miss is *startup*. rustc spawns a linker per crate,
 # so every link pays `execve` plus dyld's fixups over the whole image before
-# `main` runs — measured at 4.66 ms for the 1.9 MB binary against 2.18 ms for a
-# 16 KB one. On a link that is trying to finish in ten milliseconds, the size of
-# the binary is a latency figure.
+# `main` runs. Against a 16 KB no-op process, blinker's spawn cost above that
+# floor fell from 2.48 ms to 1.13 ms when LTO took the binary from 1.9 MB to
+# 1.3 MB.
+#
+# What dyld charges for is *fixups*, not file length — see finding 126. Adding
+# `panic = "abort"` on top removed another 130 KB of unwind tables and changed
+# the spawn cost by nothing, because nothing reads an unwind table until
+# something unwinds. LTO helped because it deleted cross-crate symbols and
+# relocations, which are exactly what dyld must resolve.
 [profile.release]
 lto = "fat"
 codegen-units = 1

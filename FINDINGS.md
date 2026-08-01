@@ -5990,3 +5990,43 @@ three hashes as everything else in this run, with the suite green.
 Finding 123 made the same call for the same reason. Two "kept, unmeasured"
 entries in one session is a fair record of what it is like to benchmark
 milliseconds on a machine somebody else is using.
+
+## 126. What dyld charges for is fixups, not bytes
+
+The release profile justified LTO partly on startup: rustc spawns a linker per
+crate, so every link pays `execve` plus dyld's work over the whole image before
+`main` runs. Measured against a 16 KB no-op process, blinker's spawn cost above
+that floor:
+
+```
+  1.9 MB, no LTO          2.48 ms
+  1.3 MB, fat LTO         1.13 ms
+```
+
+So the obvious next step was `panic = "abort"`. The one `catch_unwind` in the
+workspace is in a test module, and cargo builds test targets with unwinding
+whatever the profile says, so it was available. It removed 132 KB — another 10%
+of the binary.
+
+```
+  1.15 MB, +panic=abort   1.14 ms
+```
+
+**Nothing.** Unwind tables are not read at load time; nothing touches one until
+something unwinds. dyld's cost is in *fixups* — the cross-crate symbol
+references and relocations it resolves before `main` — and LTO helped because it
+deleted those, not because it deleted bytes. Two changes that both "made the
+binary smaller", and only one of them was ever about size.
+
+It was reverted, and not because it cost anything. It changes what happens on a
+panic: aborting runs no destructor, and this linker writes to a temporary file
+and renames it. Trading that away for a smaller file with no measured benefit is
+a bad trade in the direction nobody notices until it matters.
+
+### The pattern, again
+
+This is the fourth "obviously free improvement" this session that measured at
+zero: the QoS class (109), the survey's allocations (115), the atom owner
+storage (123), and this. Each had a mechanism that sounded decisive. What they
+share is that the mechanism was real and the *path it sat on* was not the one
+being paid for.
