@@ -2457,6 +2457,11 @@ fn fill_unwind_info(
         return Ok(());
     };
 
+    // Of this function's ~1.25 ms, `eh_frame_fde_offsets` is 1.00, collecting
+    // the compact-unwind entries is 0.23, and encoding the table is 0.02. The
+    // cost is finding where each function's FDE landed, not building the table
+    // — which is the opposite of what the name suggests, and is where any work
+    // on this should go.
     let fde_offsets = eh_frame_fde_offsets(objects, image, placed, addresses, strip);
     let entries = compact_unwind_entries(
         objects,
