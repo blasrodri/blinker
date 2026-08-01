@@ -5921,3 +5921,38 @@ because both halves come from the same run minutes apart; whole-link medians dri
 by more than most individual changes are worth. That is why the harness now takes
 a median per stage rather than the last record, and why the interleaved
 `scripts/ab.py` exists for anything closer than a millisecond.
+
+## 124. A quarter of a million iterations to partition a list of a thousand
+
+`object_ranges(image, object)` answers "where did this object's bytes land" by
+scanning every contribution of every output section and keeping the ones that
+match. Both the reuse plan and the cache builder called it **once per object**.
+
+237 objects against 1,063 contributions is 252,000 iterations, twice a link, to
+compute a partition of the very list being scanned. One pass grouping by object
+produces all of it:
+
+```
+  cache_plan    0.38 ms -> 0.26 ms
+  cache_build   0.93 ms -> 0.57 ms
+```
+
+`build_cache` was also re-probing every input file — the same redundancy finding
+119 removed from `plan_reuse`, in the function immediately below it. Both now
+ask the session, which proved them during loading.
+
+### The shape
+
+This is the third instance of one pattern in this session: **a helper that
+answers a question about one item by scanning all of them, called once per
+item.** `eh_frame_fde_offsets` built a map of every relocation to read one per
+record (121); `common_symbols` hashed every defined name to check a list that
+was empty (120); this partitions a thousand contributions two hundred times.
+
+None of them is a bad function. Each is the obvious way to answer the question
+it was written for, and each became quadratic when a caller started asking it in
+a loop. That transition leaves no trace at either site — the helper still reads
+correctly, and the loop still reads correctly.
+
+What finds them is a profile with no unexplained residue, so that a stage which
+is 0.9 ms for no visible reason has nowhere to hide.

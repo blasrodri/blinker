@@ -1912,9 +1912,11 @@ fn link_inner(
     let previous = previous_cache.filter(|_| reuse_relocations);
 
     let cache_step = std::time::Instant::now();
+    // One pass over the layout, shared by the reuse plan and the cache builder.
+    let ranges_of = object_ranges_index(&probe);
     let plan = match (&previous, &current_addresses) {
         (Some(previous), Some(current)) => {
-            Some(plan_reuse(&objects, &probe, previous, current, session))
+            Some(plan_reuse(&objects, previous, current, session, &ranges_of))
         }
         _ => None,
     };
@@ -1955,7 +1957,7 @@ fn link_inner(
             addresses,
             reuse_relocations.then_some(&patched.contents),
             &patched,
-            &contribution_keys,
+            (session, &ranges_of, &contribution_keys),
         )),
         _ => None,
     };
@@ -2154,10 +2156,10 @@ impl ReusePlan<'_> {
 /// section — so it identifies the entry without needing a name.
 fn plan_reuse<'a>(
     objects: &[LoadedObject],
-    image: &Image,
     previous: &'a blinker_cache::LinkCache,
     current_addresses: &[(blinker_cache::NameHash, u64)],
     session: &Session,
+    ranges_of: &HashMap<u32, Vec<blinker_cache::Range>>,
 ) -> ReusePlan<'a> {
     let changed: std::collections::HashSet<blinker_cache::NameHash> = blinker_cache::LinkCache {
         addresses: current_addresses.to_vec(),
@@ -2178,7 +2180,9 @@ fn plan_reuse<'a>(
     let mut keys: HashMap<&Path, Option<blinker_cache::InputKey>> = HashMap::default();
     let mut entries = HashMap::default();
     for object in objects {
-        let ranges = object_ranges(image, object.parsed.id);
+        let Some(ranges) = ranges_of.get(&object.parsed.id.0) else {
+            continue;
+        };
         let Some(first) = ranges.first() else {
             continue;
         };
@@ -2199,7 +2203,7 @@ fn plan_reuse<'a>(
         else {
             continue;
         };
-        if entry.is_reusable(&key, &ranges, &changed) {
+        if entry.is_reusable(&key, ranges, &changed) {
             entries.insert(object.parsed.id.0, *entry);
         }
     }
@@ -2232,8 +2236,16 @@ fn build_cache(
     // them nothing can read them back.
     contents: Option<&SectionContents>,
     patched: &Patched,
-    identities: &identity::ContributionKeys,
+    // What this link already worked out and should not work out again: the
+    // session that proved every input, the layout partitioned by object, and
+    // the contribution identities.
+    known: (
+        &Session,
+        &HashMap<u32, Vec<blinker_cache::Range>>,
+        &identity::ContributionKeys,
+    ),
 ) -> blinker_cache::LinkCache {
+    let (session, ranges_of, identities) = known;
     // Input keys, one probe per distinct file. Archive members share their
     // archive's path and therefore its key: an rlib is proven unchanged once,
     // not once per member pulled out of it.
@@ -2246,13 +2258,20 @@ fn build_cache(
         .filter_map(|record| {
             let object = index_of.get(record.object)?;
             let path = object.parsed.metadata.path.as_path();
+            // From the session, for the same reason `plan_reuse` asks it: the
+            // input was proven a moment ago and re-proving one of rustc's
+            // objects means reading and hashing it again.
             let key = keys
                 .entry(path)
-                .or_insert_with(|| blinker_cache::InputKey::probe(path))
+                .or_insert_with(|| {
+                    session
+                        .key_for(path)
+                        .or_else(|| blinker_cache::InputKey::probe(path))
+                })
                 .clone()?;
             Some(blinker_cache::Entry {
                 key,
-                ranges: object_ranges(image, record.object),
+                ranges: ranges_of.get(&record.object.0).cloned().unwrap_or_default(),
                 deps: record.deps.clone(),
                 binds: patched.binds[record.binds.clone()]
                     .iter()
@@ -2304,28 +2323,34 @@ fn build_cache(
 }
 
 /// Where one object's bytes sit in the output, in cache terms.
-fn object_ranges(image: &Image, object: ObjectId) -> Vec<blinker_cache::Range> {
-    let mut ranges: Vec<_> = image
-        .layout
-        .sections
-        .iter()
-        .enumerate()
-        .flat_map(|(index, section)| {
-            section
-                .contributions
-                .iter()
-                .filter(move |c| c.object == object)
-                .map(move |c| blinker_cache::Range {
-                    section: index as u32,
-                    start: c.offset,
-                    len: c.size,
-                })
-        })
-        .collect();
-    // Sorted so that comparing two links compares placement, not the order
-    // the layout happened to visit sections in.
-    ranges.sort_unstable_by_key(|r| (r.section, r.start));
-    ranges
+/// Every object's output ranges, from one pass over the layout.
+///
+/// `object_ranges` answers the question for one object by scanning every
+/// contribution of every section. Asking it once per object — which both the
+/// reuse plan and the cache builder did — makes that quadratic: 237 objects
+/// against 1,063 contributions is a quarter of a million iterations, twice a
+/// link, to produce a partition of the very list being scanned.
+fn object_ranges_index(image: &Image) -> HashMap<u32, Vec<blinker_cache::Range>> {
+    let mut index: HashMap<u32, Vec<blinker_cache::Range>> = HashMap::default();
+    for (section_index, section) in image.layout.sections.iter().enumerate() {
+        for contribution in &section.contributions {
+            index
+                .entry(contribution.object.0)
+                .or_default()
+                .push(blinker_cache::Range {
+                    section: section_index as u32,
+                    start: contribution.offset,
+                    len: contribution.size,
+                });
+        }
+    }
+    // Sorted so that comparing two links compares placement, not the order the
+    // layout happened to visit sections in — the same guarantee `object_ranges`
+    // gave.
+    for ranges in index.values_mut() {
+        ranges.sort_unstable_by_key(|r| (r.section, r.start));
+    }
+    index
 }
 
 /// Every address a relocation could have read, in one sorted table.
