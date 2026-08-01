@@ -6118,3 +6118,64 @@ build is not the profile anybody waits on.**
 Release was chosen because it is what `workload.py` defaulted to. No argument
 was ever made for it. Nine sessions of optimisation were aimed at the case that
 was already fine.
+
+## 129. The incremental machinery holds at debug scale; the global stages do not
+
+Finding 128 measured the cold debug link. This is the edit relink of the same
+program — the number the product exists for, on the profile people build.
+
+```
+  ld64, cold debug                43.7 ms
+  blinker, cold debug            114.9 ms
+  blinker, edit relink, daemon    65.5 ms link   /  73.6 ms wall
+```
+
+**blinker's incremental link is still 1.5x slower than simply running ld64
+cold.** On debug, today, there is no reason to use it.
+
+### Every held-state mechanism works, at four times the scale
+
+The session machinery is not what is failing. At 3,565 contributions, 277,657
+relocations and 27,803 addresses — roughly four times the release workload —
+every rule fires and the invariant is exact:
+
+```
+  session          78 of 80 inputs held; extraction replayed, resolution held
+  placement        3562/3565 contributions kept their address, 0 unchanged movers
+  relocations      266,152 of 277,657 reused (96%)
+  addresses moved  3 of 27,803  (0.01%)
+  read_and_parse   29.2 ms -> 3.3 ms
+  resolve          11.5 ms -> 0.0 ms
+  apply            13.5 ms -> 2.4 ms
+```
+
+**Three addresses out of twenty-eight thousand.** The incremental model is right
+and it scales.
+
+### What is left is exactly what was already on the list
+
+```
+  relocate    18.0 ms   of which apply is 2.4 — the rest is address map,
+                        address table, synthetic tables, cache bookkeeping
+  dead_strip  15.0 ms   liveness 10.8, atoms 3.6
+  emit        10.6 ms
+```
+
+41 ms of the 65 is three stages that rebuild a global answer, in a link where
+0.01% of the program moved. Those are the three items already identified as
+needing architectural work: incremental liveness, clone-and-patch output, and an
+address map that is patched rather than rebuilt.
+
+The difference from the release profile is scale, not shape — but at this scale
+the shape finally costs something worth fixing. A release link spends 1.7 ms in
+`traverse`; a debug link spends 10.8. The optimisation targets do not change,
+their value changes by a factor of six.
+
+### The product position, stated honestly
+
+blinker is at parity with ld64 on release links, faster than its own cold link
+on an edit, and **not yet worth using on debug builds, which is where linking is
+a real complaint about Rust.** The architecture is validated — the held state,
+the retained placement, the relocation reuse all work at scale and produce a
+correct, running, signed binary. What is missing is that three stages still do
+global work, and the debug profile is where that bill comes due.
