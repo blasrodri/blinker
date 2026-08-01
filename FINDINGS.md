@@ -5589,3 +5589,30 @@ and nothing else is valid for exactly as long.
 and it is the hard problem left. `apply` at 0.84 ms is what this looks like when
 it is solved: 96% of the work skipped, and what remains is proportional to the
 edit.
+
+## 115. The allocations were not the cost; the walk is
+
+Two stages built hash sets keyed by `String` and asked them a question once per
+*relocation* while getting a new answer once per *name*: `Atoms`' owner map
+(~7,000 clones) and `survey_relocations`' four seen-sets (an allocation on all
+87,000 relocations to record about a thousand distinct names). Both were changed
+to borrow the names out of the parsed objects, which outlive both calls.
+
+```
+                before   after
+  atoms         1.15 ms  0.96 ms
+  survey        0.92 ms  0.87 ms
+```
+
+A quarter of a millisecond, most of it in `atoms`, and `survey` moved by less
+than its run-to-run spread. **Tens of thousands of short-string allocations cost
+almost nothing here**, which is worth knowing precisely because it is not what
+the code looked like it was doing.
+
+The changes stay — fewer allocations for less code is not a trade — but they are
+recorded as *not a win*, so that nobody reads the diff later and infers that
+allocation was the problem. The problem is the walk: `survey` is 0.87 ms because
+it visits 87,000 relocations, and it will be 0.87 ms however cheaply it visits
+them. The only thing that removes it is not visiting the 96% that belong to
+objects nothing about has changed — which is finding 114's per-object memo, and
+is a different change entirely.

@@ -904,7 +904,17 @@ fn survey_relocations(
 ) -> RelocationSurvey {
     let imported: HashSet<&str> = imports.iter().map(String::as_str).collect();
     let mut survey = RelocationSurvey::default();
-    let (mut got_seen, mut tlv_seen, mut stub_seen, mut personality_seen) = (
+    // Borrowed, because these are asked about once per *relocation* and only
+    // answered "new" once per *name*. Keying them by `String` meant
+    // `insert(name.clone())` on all 87,000 relocations to record roughly a
+    // thousand distinct names — an allocation per question rather than per
+    // answer. The names live in the parsed objects, which outlive this call.
+    let (mut got_seen, mut tlv_seen, mut stub_seen, mut personality_seen): (
+        HashSet<&str>,
+        HashSet<&str>,
+        HashSet<&str>,
+        HashSet<&str>,
+    ) = (
         HashSet::default(),
         HashSet::default(),
         HashSet::default(),
@@ -944,21 +954,21 @@ fn survey_relocations(
                 name: symbol.name.clone(),
             };
 
-            if needs_got(relocation.kind) && got_seen.insert(symbol.name.clone()) {
+            if needs_got(relocation.kind) && got_seen.insert(symbol.name.as_str()) {
                 survey.got.push(entry());
             }
-            if needs_tlv(relocation.kind) && tlv_seen.insert(symbol.name.clone()) {
+            if needs_tlv(relocation.kind) && tlv_seen.insert(symbol.name.as_str()) {
                 survey.tlv.push(entry());
             }
             if relocation.kind == Arm64RelocationKind::Branch26
                 && imported.contains(symbol.name.as_str())
-                && stub_seen.insert(symbol.name.clone())
+                && stub_seen.insert(symbol.name.as_str())
             {
                 survey.stubs.push(symbol.name.clone());
             }
             if unwind_sections.contains(&relocation.section)
                 && relocation.offset % COMPACT_UNWIND_RECORD == CU_PERSONALITY
-                && personality_seen.insert(symbol.name.clone())
+                && personality_seen.insert(symbol.name.as_str())
             {
                 survey.personalities.push(entry());
             }
