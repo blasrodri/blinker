@@ -3504,7 +3504,9 @@ fn placed_symbols<'a>(
     placed: &Placed,
     strip: &Strip,
 ) -> Vec<PlacedSymbol<'a>> {
-    let mut out = Vec::new();
+    // An upper bound, and one allocation instead of a doubling sequence that
+    // copies a hundred thousand entries on its way to the final size (135).
+    let mut out = Vec::with_capacity(objects.iter().map(|o| o.parsed.symbols.len()).sum());
     for (index, object) in objects.iter().enumerate() {
         for symbol in &object.parsed.symbols {
             if !symbol.strength.is_definition() || is_temporary_label(&symbol.name) {
@@ -3598,21 +3600,42 @@ fn placed_symbols<'a>(
 fn debug_map(objects: &[LoadedObject], placed: &[PlacedSymbol<'_>]) -> Vec<OutputSymbol> {
     use blinker_output::symtab::stab;
 
-    // Grouped by object, because the map is per compilation unit, and sorted
-    // by address within one so a definition's size is the distance to the next.
-    let mut by_object: HashMap<usize, Vec<&PlacedSymbol<'_>>> = HashMap::default();
-    for symbol in placed {
-        by_object.entry(symbol.object).or_default().push(symbol);
+    // The map is per compilation unit, and sorted by address within one so a
+    // definition's size is the distance to the next.
+    //
+    // `placed` is built by walking the objects in order, so each object's
+    // symbols are already a contiguous run of it. Grouping them into a map
+    // re-derived that — one hash and one push per symbol, and a `Vec`
+    // allocation per object — from a fact the ordering already carried. Found
+    // by looking for containers built from empty (135); this one was not too
+    // small, it was unnecessary.
+    let mut runs: Vec<(usize, usize)> = vec![(0, 0); objects.len()];
+    let mut at = 0usize;
+    while at < placed.len() {
+        let object = placed[at].object;
+        let start = at;
+        while at < placed.len() && placed[at].object == object {
+            at += 1;
+        }
+        if let Some(run) = runs.get_mut(object) {
+            *run = (start, at);
+        }
     }
 
     let mut out = Vec::new();
+    // Reused across objects rather than allocated per object: only the order
+    // within a run changes, and the run is a borrow of `placed`.
+    let mut symbols: Vec<&PlacedSymbol<'_>> = Vec::new();
     for (index, object) in objects.iter().enumerate() {
         if !object.parsed.metadata.has_debug_info {
             continue;
         }
-        let Some(symbols) = by_object.get_mut(&index) else {
+        let (start, end) = runs[index];
+        if start == end {
             continue;
-        };
+        }
+        symbols.clear();
+        symbols.extend(placed[start..end].iter());
         symbols.sort_by_key(|symbol| (symbol.section.0, symbol.address));
 
         let path = &object.parsed.metadata.path;
