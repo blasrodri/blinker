@@ -86,6 +86,20 @@ pub struct Session {
     /// sections happened to land at plausible offsets would have produced a
     /// binary instead.
     members: FastMap<MemberKey, (Arc<ParsedObject>, std::ops::Range<usize>)>,
+    /// Which archive members the last link pulled in, in the order it pulled
+    /// them.
+    ///
+    /// The frontier that decides this is a fixed point: rounds of "which names
+    /// are still undefined, which archive defines one" over every symbol of
+    /// every object. With the parses held it is the whole of what `read+parse`
+    /// still costs — and it is a pure function of the objects' symbols, so if
+    /// no input changed it cannot come out differently.
+    ///
+    /// Held only for a link where *nothing* was re-read. One changed object can
+    /// define a name that stops a member being wanted, or want one that was
+    /// not, and there is no cheap way to know which; the plan is discarded and
+    /// recomputed.
+    extraction: Option<Vec<(usize, u32)>>,
     hits: usize,
     misses: usize,
 }
@@ -99,6 +113,7 @@ impl Session {
         if self.inputs != inputs {
             self.entries.clear();
             self.members.clear();
+            self.extraction = None;
             self.inputs = inputs.to_vec();
         }
         self.hits = 0;
@@ -241,6 +256,17 @@ impl Session {
             recorded.push((path.clone(), key));
         }
         self.stubs = Some((recorded, exports));
+    }
+
+    /// The extraction order the last link settled on, if every input this link
+    /// read was served from memory.
+    pub fn extraction(&self) -> Option<&[(usize, u32)]> {
+        (self.misses == 0).then_some(self.extraction.as_deref())?
+    }
+
+    /// Remember which members were extracted, and in what order.
+    pub fn store_extraction(&mut self, order: Vec<(usize, u32)>) {
+        self.extraction = Some(order);
     }
 
     /// Inputs served from memory, and inputs that had to be read.

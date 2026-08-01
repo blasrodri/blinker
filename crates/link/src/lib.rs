@@ -2689,9 +2689,38 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
     if archives.is_empty() {
         return Ok(objects);
     }
+    // The first id an extracted member gets: every top-level object has one by
+    // now, and members are numbered after them in extraction order.
+    let first_member_id = next_id;
+
+    // The order a previous link settled on, when every input came from memory
+    // and so cannot have changed what any archive is asked for. Replaying it
+    // skips the frontier entirely: with the parses held, those rounds are the
+    // whole of what this stage still costs.
+    if let Some(order) = session.extraction() {
+        let order = order.to_vec();
+        for (position, (archive_index, member)) in order.iter().enumerate() {
+            let (path, index, data) = &archives[*archive_index];
+            let id = ObjectId(first_member_id + position as u32);
+            let member_id = blinker_archive::MemberId(*member);
+            let loaded = match session.member(path, *member) {
+                Some((parsed, range)) if parsed.id == id => LoadedObject {
+                    parsed,
+                    data: SourceBytes::window(data, range),
+                },
+                // A member the session lost — it can only have been dropped
+                // with its archive, and its archive cannot have changed, so
+                // this is a plan recorded before the member cache had it.
+                _ => parse_member(path, index, data, member_id, id)?,
+            };
+            objects.push(loaded);
+        }
+        return Ok(objects);
+    }
 
     // Pull members in until nothing new is needed.
     let mut extracted: HashSet<(usize, u32)> = HashSet::default();
+    let mut order: Vec<(usize, u32)> = Vec::new();
     let mut frontier = Frontier::new(&objects);
     // Names already offered to every archive. One that no archive defines will
     // still be wanted next round, and asking again cannot produce a different
@@ -2724,8 +2753,10 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
             }
         }
         if round.is_empty() {
+            session.store_extraction(order);
             return Ok(objects);
         }
+        order.extend(round.iter().map(|(archive, member)| (*archive, member.0)));
 
         // Parsing a member touches nothing shared. A round is typically
         // dozens of them and a Rust link has 900 in total, all of which were
@@ -2836,6 +2867,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
         }
 
         if !added {
+            session.store_extraction(order);
             return Ok(objects);
         }
     }
