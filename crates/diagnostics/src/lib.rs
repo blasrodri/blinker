@@ -96,6 +96,14 @@ pub struct PhaseTimings {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link_address_diff_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_placements_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_personality_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_unwind_size_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_commons_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub link_group_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link_traverse_ms: Option<f64>,
@@ -172,6 +180,8 @@ pub struct LinkStages {
     pub synthetic_breakdown: [f64; 3],
     /// Inside `liveness`: grouping relocations per object, then traversing.
     pub liveness_breakdown: [f64; 2],
+    /// Inside `prepare`: placements, eh personalities, unwind sizing, commons.
+    pub prepare_breakdown: [f64; 4],
     pub changed_addresses: u64,
     pub total_addresses: u64,
     /// Output symbols and the debug map.
@@ -364,6 +374,7 @@ impl LinkRecord {
             address_diff,
             synthetic_breakdown,
             liveness_breakdown,
+            prepare_breakdown,
             changed_addresses,
             total_addresses,
         } = stages;
@@ -386,6 +397,12 @@ impl LinkRecord {
         self.timings.link_prepare_ms = (prepare > 0.0).then_some(prepare);
         self.timings.link_address_table_ms = (address_table > 0.0).then_some(address_table);
         self.timings.link_address_diff_ms = (address_diff > 0.0).then_some(address_diff);
+        if prepare_breakdown.iter().any(|v| *v > 0.0) {
+            self.timings.link_placements_ms = Some(prepare_breakdown[0]);
+            self.timings.link_personality_ms = Some(prepare_breakdown[1]);
+            self.timings.link_unwind_size_ms = Some(prepare_breakdown[2]);
+            self.timings.link_commons_ms = Some(prepare_breakdown[3]);
+        }
         if liveness_breakdown.iter().any(|v| *v > 0.0) {
             self.timings.link_group_ms = Some(liveness_breakdown[0]);
             self.timings.link_traverse_ms = Some(liveness_breakdown[1]);
@@ -529,6 +546,10 @@ impl LinkRecord {
             ("    group", self.timings.link_group_ms),
             ("    traverse", self.timings.link_traverse_ms),
             ("prepare", self.timings.link_prepare_ms),
+            ("  placements", self.timings.link_placements_ms),
+            ("  personality", self.timings.link_personality_ms),
+            ("  unwind-size", self.timings.link_unwind_size_ms),
+            ("  commons", self.timings.link_commons_ms),
             ("accounting", self.timings.link_accounting_ms),
             ("address-table", self.timings.link_address_table_ms),
             ("address-diff", self.timings.link_address_diff_ms),

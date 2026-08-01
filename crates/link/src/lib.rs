@@ -124,6 +124,11 @@ pub struct LinkTimings {
     /// and collecting commons. It was 1.9 ms of "unmeasured" and the only
     /// reason it looked small is that nothing was looking.
     pub prepare_ms: f64,
+    /// The four unrelated jobs inside `prepare_ms`.
+    pub placements_ms: f64,
+    pub personality_ms: f64,
+    pub unwind_size_ms: f64,
+    pub commons_ms: f64,
     /// Counting the placement invariant, which is diagnostics rather than link.
     pub accounting_ms: f64,
     /// `__text` bytes the strip removed, as the analysis counts them.
@@ -1229,6 +1234,25 @@ struct Common {
 ///
 /// Sorted by name so the section's contents do not depend on object order.
 fn common_symbols(objects: &[LoadedObject]) -> Vec<Common> {
+    // Nothing here unless something actually asks for a common symbol, and on a
+    // Rust link nothing does — rustc does not emit them at all.
+    //
+    // Checked first because the alternative is what this used to do
+    // unconditionally: build a set of every defined name in the program, tens of
+    // thousands of string hashes, so that the loop below can ask whether each
+    // common symbol is already defined. When there are no common symbols that
+    // set answers no questions. It cost 0.78 ms of a 16 ms link to find nothing.
+    //
+    // The scan below is the same walk without the hashing: a comparison per
+    // symbol against an enum.
+    if !objects
+        .iter()
+        .flat_map(|o| &o.parsed.symbols)
+        .any(|s| s.strength == SymbolStrength::Common)
+    {
+        return Vec::new();
+    }
+
     let defined: HashSet<&str> = objects
         .iter()
         .flat_map(|o| &o.parsed.symbols)
@@ -1526,6 +1550,7 @@ fn link_inner(
     let prep = std::time::Instant::now();
     let mut placements = placements_for(&objects, &strip);
     timings.prepare_ms = elapsed_ms(prep);
+    timings.placements_ms = timings.prepare_ms;
 
     if placements.is_empty() {
         return Err(LinkError::NothingToLink);
@@ -1580,6 +1605,7 @@ fn link_inner(
     // appear in DWARF mode (finding 31), which is why collecting them from
     // `__compact_unwind` found none (finding 49).
     let prep = std::time::Instant::now();
+    let personality_step = std::time::Instant::now();
     let mut eh_personality_fields: HashMap<(u32, u32), HashSet<u64>> = HashMap::default();
     for object in &objects {
         for section in &object.parsed.sections {
@@ -1622,7 +1648,10 @@ fn link_inner(
     // `__unwind_info` needs addresses to be built, but its *size* must be known
     // before layout runs. Sized from the record count, which is known now: one
     // entry per record, and the encoder's own size formula.
+    timings.personality_ms = elapsed_ms(personality_step);
+    let unwind_step = std::time::Instant::now();
     let unwind_size = unwind_table_size(&objects, &strip);
+    timings.unwind_size_ms = elapsed_ms(unwind_step);
     if unwind_size > 0 {
         placements.push(InputPlacement {
             object: SYNTHETIC_OBJECT,
@@ -1649,8 +1678,10 @@ fn link_inner(
     }
     // Tentative definitions need real storage, and its size must be known
     // before layout like any other section's.
+    let commons_step = std::time::Instant::now();
     let commons = common_symbols(&objects);
     let (common_size, common_alignment) = common_section_size(&commons);
+    timings.commons_ms = elapsed_ms(commons_step);
     if common_size > 0 {
         placements.push(InputPlacement {
             object: SYNTHETIC_OBJECT,

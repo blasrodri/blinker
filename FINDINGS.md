@@ -5767,3 +5767,49 @@ accumulating the answers to questions the rest of the link keeps asking
 independently. `key_for` is the second of those to be shared, after the cache
 itself. Every stage that still walks all the inputs to work out what changed is
 recomputing something one component already knows.
+
+## 120. Three quarters of a millisecond to find nothing
+
+Splitting `prepare` — the bucket of work that fell between two named stages in
+finding 108 — into its four unrelated jobs:
+
+```
+    placements        0.04 ms
+    personality       0.10 ms
+    unwind-size       0.12 ms
+    commons           0.78 ms
+```
+
+`common_symbols` looks for tentative definitions: C's `int x;` at file scope,
+where several translation units declare the same object and the linker allocates
+one. **rustc does not emit them at all.** On this link the answer is the empty
+set, every time.
+
+Getting to the empty set cost 0.78 ms, because the function began by building a
+`HashSet<&str>` of *every defined name in the program* — tens of thousands of
+string hashes — so that the loop after it could ask whether each common symbol
+was already defined. With no common symbols, that set answers no questions.
+
+Testing the cheap condition first — one enum comparison per symbol, the same
+walk without the hashing:
+
+```
+  commons     0.78 ms -> 0.02 ms
+  prepare     1.04 ms -> 0.35 ms
+```
+
+The six tests covering tentative definitions still pass, which is what makes
+this a short circuit rather than a removal: the expensive path is still there
+and still correct for the C programs that need it.
+
+### Why it survived this long
+
+It never appeared in a profile. `common_symbols` was inside the unnamed gap
+between `dead_strip` and `layout`, which finding 108 found only by insisting
+that the stage timers sum to the total. Then it was inside `prepare`, a
+one-line bucket, until it was split. Two rounds of "make the profile add up"
+stood between this and being visible, and neither of them was looking for it.
+
+A general-purpose function paying its full cost on inputs that need none of it
+is invisible precisely because nothing about the call site suggests expense.
+

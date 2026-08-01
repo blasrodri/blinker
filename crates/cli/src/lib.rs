@@ -211,6 +211,12 @@ pub fn run_in(
                 accounting: phases.accounting_ms,
                 address_table: phases.address_table_ms,
                 liveness_breakdown: [phases.group_ms, phases.traverse_ms],
+                prepare_breakdown: [
+                    phases.placements_ms,
+                    phases.personality_ms,
+                    phases.unwind_size_ms,
+                    phases.commons_ms,
+                ],
                 synthetic_breakdown: [phases.eh_frame_ms, phases.tables_ms, phases.unwind_ms],
                 address_diff: phases.address_diff_ms,
                 changed_addresses: phases.changed_addresses,

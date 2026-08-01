@@ -356,13 +356,14 @@ def main():
                   # made `unmeasured` negative, which is the one way a profile
                   # can announce that it does not add up.
                   "address_table", "cache_plan",
+                  "placements", "personality", "unwind_size", "commons",
                   "eh_frame", "tables", "unwind",
                   "emit_layout", "emit_contents", "emit_linkedit",
                   "emit_assemble", "emit_uuid", "emit_sign",
                   "address_map", "contents", "synthetic", "apply"}
     for name in ["read_and_parse", "stub_parse", "resolve", "layout", "dead_strip",
                  "atoms", "liveness", "group", "traverse", "strip_build",
-                 "prepare", "accounting", "address_table", "address_diff", "relocate", "emit", "emit_layout", "emit_contents",
+                 "prepare", "placements", "personality", "unwind_size", "commons", "accounting", "address_table", "address_diff", "relocate", "emit", "emit_layout", "emit_contents",
                  "emit_linkedit", "emit_assemble", "emit_uuid", "emit_sign",
                  "address_map", "contents", "synthetic", "eh_frame", "tables", "unwind", "apply", "symbols", "survey",
                  "cache_load", "cache_plan",
@@ -379,6 +380,8 @@ def main():
             marker = "  (inside emit)"
         elif name in ("address_map", "contents", "synthetic", "apply"):
             marker = "  (inside relocate)"
+        elif name in ("placements", "personality", "unwind_size", "commons"):
+            marker = "  (inside prepare)"
         elif name in ("group", "traverse"):
             marker = "  (inside liveness)"
         elif name in ("atoms", "liveness", "strip_build"):
