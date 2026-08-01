@@ -219,7 +219,7 @@ fn offset_of(
 }
 
 /// Every atom of a link, with the index needed to find one by address.
-pub(crate) struct Atoms {
+pub(crate) struct Atoms<'a> {
     atoms: Vec<Atom>,
     /// `(object, section)` -> that section's atoms, as a range of indices into
     /// `atoms`, ascending by offset.
@@ -232,11 +232,20 @@ pub(crate) struct Atoms {
     /// A weak symbol may have several definitions, and all of them are kept:
     /// which one wins is decided elsewhere, and guessing here would strip the
     /// one that does.
-    owners: HashMap<String, Vec<usize>>,
+    /// Borrowed, not cloned. Every non-local defined symbol in the link went
+    /// through `name.clone()` here — around seven thousand `String`
+    /// allocations to build a map that is discarded at the end of the same
+    /// function, and it was 0.72 ms of a 1.23 ms stage. The names live in the
+    /// parsed objects, which outlive this.
+    owners: HashMap<&'a str, Vec<usize>>,
 }
 
-impl Atoms {
-    pub(crate) fn build(objects: &[LoadedObject]) -> Atoms {
+impl<'a> Atoms<'a> {
+    /// Split three ways because the three are incremental to different degrees:
+    /// boundaries are a pure function of one object, owners need the global
+    /// atom numbering, and opacity is a scan of every relocation in the link.
+    pub(crate) fn build(objects: &'a [LoadedObject], parts: &mut [f64; 3]) -> Atoms<'a> {
+        let step = std::time::Instant::now();
         let mut atoms: Vec<Atom> = Vec::new();
         let mut by_section = crate::hashing::FastMap::default();
 
@@ -259,6 +268,9 @@ impl Atoms {
             }
         }
 
+        parts[0] = step.elapsed().as_secs_f64() * 1000.0;
+        let step = std::time::Instant::now();
+
         let mut result = Atoms {
             atoms,
             by_section,
@@ -278,14 +290,17 @@ impl Atoms {
                 if let Some(index) = result.containing(object.parsed.id, section, offset) {
                     result
                         .owners
-                        .entry(symbol.name.clone())
+                        .entry(symbol.name.as_str())
                         .or_default()
                         .push(index);
                 }
             }
         }
 
+        parts[1] = step.elapsed().as_secs_f64() * 1000.0;
+        let step = std::time::Instant::now();
         result.opaque = result.find_opaque(objects);
+        parts[2] = step.elapsed().as_secs_f64() * 1000.0;
         result
     }
 
@@ -326,7 +341,7 @@ impl Atoms {
                         if let Some((section, _)) = offset_of(object, symbol) {
                             opaque.insert((object.parsed.id.0, section.0));
                         }
-                        for target in self.owners.get(&symbol.name).into_iter().flatten() {
+                        for target in self.owners.get(symbol.name.as_str()).into_iter().flatten() {
                             opaque.insert(self.atoms[*target].key());
                         }
                     }
@@ -362,7 +377,7 @@ impl Atoms {
             }
         }
         // A reference resolves to whatever object defines the name.
-        self.owners.get(&symbol.name)?.first().copied()
+        self.owners.get(symbol.name.as_str())?.first().copied()
     }
 
     /// Every atom defining `name`, for use as a root.
@@ -399,7 +414,7 @@ fn within<'g, 'a>(grouped: &'g ByOffset<'a>, atom: &Atom) -> &'g [&'a InputReloc
 }
 
 /// Which atoms a program can reach from `entry`.
-fn liveness(objects: &[LoadedObject], atoms: &Atoms, entry: &str) -> (HashSet<usize>, usize) {
+fn liveness(objects: &[LoadedObject], atoms: &Atoms<'_>, entry: &str) -> (HashSet<usize>, usize) {
     let grouped: HashMap<u32, ByOffset<'_>> = objects
         .iter()
         .map(|o| (o.parsed.id.0, group_relocations(o)))
@@ -570,7 +585,7 @@ fn liveness(objects: &[LoadedObject], atoms: &Atoms, entry: &str) -> (HashSet<us
 /// needs one, and deciding which would cost more than the bytes are worth.
 fn revive_eh_frame(
     object: &LoadedObject,
-    atoms: &Atoms,
+    atoms: &Atoms<'_>,
     grouped: &ByOffset<'_>,
     section: &InputSection,
     live: &mut HashSet<usize>,
@@ -621,7 +636,7 @@ fn revive_eh_frame(
 /// nothing else refers to that atom when the encoding is not DWARF mode.
 fn revive_lsdas(
     object: &LoadedObject,
-    atoms: &Atoms,
+    atoms: &Atoms<'_>,
     grouped: &ByOffset<'_>,
     section: &InputSection,
     live: &mut HashSet<usize>,
@@ -664,7 +679,7 @@ fn revive_lsdas(
 /// the atom can be found.
 fn function_atom(
     object: &LoadedObject,
-    atoms: &Atoms,
+    atoms: &Atoms<'_>,
     relocation: &InputRelocation,
 ) -> Option<usize> {
     match relocation.target {
@@ -781,7 +796,7 @@ impl Strip {
     }
 
     /// Build the map from a liveness result.
-    fn build(objects: &[LoadedObject], atoms: &Atoms, live: &HashSet<usize>) -> Strip {
+    fn build(objects: &[LoadedObject], atoms: &Atoms<'_>, live: &HashSet<usize>) -> Strip {
         let mut sections = crate::hashing::FastMap::default();
         for object in objects {
             for section in &object.parsed.sections {
@@ -851,7 +866,8 @@ pub(crate) struct StripTimings {
 pub(crate) fn plan(objects: &[LoadedObject], entry: &str) -> (Strip, Report, StripTimings) {
     let mut timings = StripTimings::default();
     let step = std::time::Instant::now();
-    let atoms = Atoms::build(objects);
+    let mut parts = [0.0f64; 3];
+    let atoms = Atoms::build(objects, &mut parts);
     timings.atoms_ms = step.elapsed().as_secs_f64() * 1000.0;
 
     let step = std::time::Instant::now();
@@ -873,7 +889,7 @@ pub(crate) fn analyse(objects: &[LoadedObject], entry: &str) -> Report {
 /// The `__text` numbers, which are what can be compared against another linker.
 fn report(
     objects: &[LoadedObject],
-    atoms: &Atoms,
+    atoms: &Atoms<'_>,
     live: &HashSet<usize>,
     revived: usize,
 ) -> Report {
