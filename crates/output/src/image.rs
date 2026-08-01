@@ -20,7 +20,14 @@
 //! the code signature. Its contents are produced after layout, so the segment
 //! is reserved during layout and filled here.
 
-use blinker_layout::{align_up, compute_layout_with_slop, InputPlacement, Layout, Slop, PAGE_SIZE};
+/// Contribution identities by `(object, section)` — supplied by the caller,
+/// never derived here. See [`ImageBuilder::reusing_layout`].
+pub type PlacementKeys = std::collections::HashMap<(u32, u32), ContributionKey>;
+
+use blinker_layout::{
+    align_up, compute_layout_reusing, compute_layout_with_slop, ContributionKey, InputPlacement,
+    Layout, PreviousLayout, Slop, PAGE_SIZE,
+};
 
 use crate::commands::{self, LinkEditLayout};
 use crate::dyld_info::{encode_bind, encode_rebase, Bind, Rebase};
@@ -73,6 +80,10 @@ pub struct ImageBuilder {
     /// Padding left after each contribution so a later edit can grow it in
     /// place. `Slop::NONE` unless asked for.
     slop: Slop,
+    /// The previous link's layout, and the identity of each contribution in
+    /// it. Both or neither: a table without keys cannot be matched against
+    /// anything, and keys without a table have nothing to match.
+    previous: Option<(PreviousLayout, PlacementKeys)>,
     /// Whether to compute the ad-hoc signature. See [`ImageBuilder::unsigned`].
     sign: bool,
     /// The identifier embedded in the ad-hoc signature.
@@ -156,6 +167,7 @@ impl ImageBuilder {
     pub fn new() -> Self {
         ImageBuilder {
             slop: Slop::NONE,
+            previous: None,
             sign: true,
             inputs: Vec::new(),
             contents: Vec::new(),
@@ -241,6 +253,17 @@ impl ImageBuilder {
     /// one function moves every section after `__text` (finding 42), which
     /// changes the placement every cache entry is keyed by and invalidates all
     /// of them.
+    /// Lay this image out on top of a previous one.
+    ///
+    /// The keys are supplied rather than computed: identity is the caller's
+    /// business, because the only handle this crate has is an `ObjectId`, which
+    /// is assigned by input order and names a different object between two
+    /// links as soon as one fewer archive member is extracted.
+    pub fn reusing_layout(&mut self, previous: PreviousLayout, keys: PlacementKeys) -> &mut Self {
+        self.previous = Some((previous, keys));
+        self
+    }
+
     pub fn slop(&mut self, slop: Slop) -> &mut Self {
         self.slop = slop;
         self
@@ -255,7 +278,18 @@ impl ImageBuilder {
     /// Lay out and emit the image.
     pub fn build(mut self) -> Result<Image, ImageError> {
         // Pass one: discover the shape with a nominal reservation.
-        let probe = compute_layout_with_slop(&self.inputs, PAGE_SIZE, self.slop);
+        let lay_out = |reservation: u64| match &self.previous {
+            Some((previous, keys)) => {
+                compute_layout_reusing(&self.inputs, reservation, self.slop, previous, &|input| {
+                    keys.get(&(input.object.0, input.section.0))
+                        .copied()
+                        .unwrap_or(ContributionKey(0))
+                })
+            }
+            None => compute_layout_with_slop(&self.inputs, reservation, self.slop),
+        };
+
+        let probe = lay_out(PAGE_SIZE);
         let dylib_bytes: usize = self
             .dylibs
             .iter()
@@ -268,7 +302,7 @@ impl ImageBuilder {
 
         // Pass two: lay out for real, with room for the header and commands.
         let reservation = align_up((MachHeader::SIZE + command_size) as u64, 16);
-        let layout = compute_layout_with_slop(&self.inputs, reservation, self.slop);
+        let layout = lay_out(reservation);
 
         for content in &self.contents {
             let Some(section) = layout.section(content.section) else {

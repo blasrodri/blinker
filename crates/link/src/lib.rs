@@ -1473,10 +1473,37 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
 
     // Pass one: learn where everything lands.
     let step = std::time::Instant::now();
+    // Names for every contribution that survive into the next link, and the
+    // previous link's placements to lay this one out on. Read before the probe
+    // because the probe *is* a layout: sizing the load commands against one
+    // shape and emitting another is how a reservation comes to be wrong.
+    let cache_step = std::time::Instant::now();
+    let previous_cache = request.cache_path.as_deref().and_then(blinker_cache::load);
+    timings.cache_load_ms = elapsed_ms(cache_step);
+    timings.cache_bytes_read = request
+        .cache_path
+        .as_deref()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .map_or(0, |meta| meta.len());
+
+    let contribution_keys = match request.cache_path {
+        Some(_) => identity::ContributionKeys::build(&objects),
+        None => identity::ContributionKeys::default(),
+    };
+    // Only a table this same request produced. A layout is a set of decisions
+    // about *these* inputs under *these* options, and one taken under others
+    // is not wrong so much as not about this link.
+    let previous_layout = previous_cache
+        .as_ref()
+        .filter(|cache| cache.request == request_hash(request))
+        .filter(|cache| !cache.layout.slots.is_empty())
+        .map(|cache| (cache.layout.clone(), contribution_keys.as_map()));
+
     let probe = assemble(
         request,
         &Assembly {
             placements: &placements,
+            previous: previous_layout.as_ref(),
             ..Assembly::default()
         },
     )?;
@@ -1527,18 +1554,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
         }
     });
 
-    let cache_step = std::time::Instant::now();
-    let previous = request
-        .cache_path
-        .as_deref()
-        .filter(|_| reuse_relocations)
-        .and_then(blinker_cache::load);
-    timings.cache_load_ms = elapsed_ms(cache_step);
-    timings.cache_bytes_read = request
-        .cache_path
-        .as_deref()
-        .and_then(|path| std::fs::metadata(path).ok())
-        .map_or(0, |meta| meta.len());
+    let previous = previous_cache.filter(|_| reuse_relocations);
 
     let cache_step = std::time::Instant::now();
     let plan = match (&previous, &current_addresses) {
@@ -1570,14 +1586,6 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     // Built here, while the patched contents still exist, but not written
     // until the image does — the fast path needs the finished binary, and that
     // is the last thing produced.
-    // Names for every contribution that survive into the next link. Built only
-    // when something will store them: it is a hash per input section, which is
-    // cheap, and cheap is not free on a link that will not use it.
-    let contribution_keys = match request.cache_path {
-        Some(_) => identity::ContributionKeys::build(&objects),
-        None => identity::ContributionKeys::default(),
-    };
-
     let cache_step = std::time::Instant::now();
     let mut cache = match (&request.cache_path, current_addresses) {
         (Some(_), Some(addresses)) => Some(build_cache(
@@ -1634,6 +1642,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
             binds: &binds,
             entry_offset,
             final_pass: true,
+            previous: previous_layout.as_ref(),
         },
     );
     timings.emit_ms = elapsed_ms(step);
@@ -2675,7 +2684,17 @@ struct Assembly<'a> {
     rebases: &'a [Rebase],
     binds: &'a [Bind],
     entry_offset: u64,
+    /// The previous link's placements, when there are any to build on.
+    ///
+    /// Both passes get the same one. The probe exists to size the load
+    /// commands, and sizing them against a layout the real pass will not
+    /// produce is how a reservation comes to be wrong.
+    previous: Option<&'a (blinker_layout::PreviousLayout, PlacementKeys)>,
 }
+
+/// Contribution identities in the form the output crate accepts: a plain map,
+/// because that crate must not be able to reach an `ObjectId` through it.
+type PlacementKeys = std::collections::HashMap<(u32, u32), blinker_layout::ContributionKey>;
 
 fn assemble(request: &LinkRequest, assembly: &Assembly<'_>) -> Result<Image, LinkError> {
     let Assembly {
@@ -2686,6 +2705,7 @@ fn assemble(request: &LinkRequest, assembly: &Assembly<'_>) -> Result<Image, Lin
         binds,
         entry_offset,
         final_pass: _,
+        previous: _,
     } = *assembly;
     let mut builder = ImageBuilder::new();
     if !assembly.final_pass {
@@ -2696,6 +2716,9 @@ fn assemble(request: &LinkRequest, assembly: &Assembly<'_>) -> Result<Image, Lin
     // every contribution after it — which is what keeps the cache's placement
     // keys valid across an edit. A link that is not writing a cache has no
     // next link to help, so it pays nothing.
+    if let Some((previous, keys)) = assembly.previous {
+        builder.reusing_layout(previous.clone(), keys.clone());
+    }
     if request.stable_layout {
         builder.slop(blinker_layout::Slop::DEFAULT);
     }

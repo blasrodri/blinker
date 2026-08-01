@@ -283,16 +283,24 @@ fn an_unchanged_object_is_rebuilt_when_a_symbol_it_reads_moves() {
     let after = scratch.join("after");
     blinker_link::link_to_file_timed(&request, &after).expect("warm link");
 
+    // Behaviour, not bytes. This compared the incremental output to a cold
+    // one byte for byte until the layout allocator arrived, at which point the
+    // comparison became a test of the thing D5 gave up: an incremental link
+    // keeps unchanged contributions where the previous link put them, and a
+    // cold link has no previous link, so the two differ by design. What must
+    // still hold is that no object was reused across a move of a symbol it
+    // reads — which shows up as a wrong answer, not as different bytes.
     let reference = scratch.join("reference");
     blinker_link::link_to_file(&LinkRequest::new(objects), &reference).expect("uncached link");
+    let cold = Command::new(&reference).output().expect("the program runs");
+    let warm = Command::new(&after).output().expect("the program runs");
     assert_eq!(
-        std::fs::read(&after).unwrap(),
-        std::fs::read(&reference).unwrap(),
-        "an object was reused across a move of a symbol it reads"
+        String::from_utf8_lossy(&warm.stdout),
+        String::from_utf8_lossy(&cold.stdout),
+        "the incremental binary computed a different answer from the cold one"
     );
-
-    let run = Command::new(&after).output().expect("the program runs");
-    assert_eq!(String::from_utf8_lossy(&run.stdout), "49\n");
+    assert_eq!(warm.status.code(), cold.status.code());
+    assert_eq!(String::from_utf8_lossy(&warm.stdout), "49\n");
 }
 
 /// An object with a zero-filled contribution is still reused.

@@ -90,6 +90,11 @@ impl ContributionKeys {
         self.get(object, section).unwrap_or(ContributionKey(0))
     }
 
+    /// The same table as a plain map, for the output crate.
+    pub fn as_map(&self) -> std::collections::HashMap<(u32, u32), ContributionKey> {
+        self.keys.iter().map(|(k, v)| (*k, *v)).collect()
+    }
+
     pub fn len(&self) -> usize {
         self.keys.len()
     }
