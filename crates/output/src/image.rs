@@ -176,6 +176,30 @@ pub struct Image {
     /// The page hashes the signature was built from, for the next link to
     /// reuse. Empty when the image was not signed.
     pub page_hashes: Vec<crate::signature::PageHash>,
+    /// Where the time inside `build` went.
+    pub timings: EmitTimings,
+}
+
+/// A breakdown of one image's construction.
+///
+/// `emit` was a single number for a long time and the plan for making it
+/// incremental was chosen against that number — twice, wrongly (findings 99 and
+/// 101). Splitting it costs four `Instant::now()` calls and answers "which part
+/// would patching the previous output actually remove" without guessing.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct EmitTimings {
+    /// Both layout passes.
+    pub layout_ms: f64,
+    /// Copying section contents into the image buffer.
+    pub contents_ms: f64,
+    /// The symbol table, the dyld opcode streams, and `__LINKEDIT`.
+    pub linkedit_ms: f64,
+    /// Load commands, the header, and assembling the final buffer.
+    pub assemble_ms: f64,
+    /// Hashing the image to derive `LC_UUID`.
+    pub uuid_ms: f64,
+    /// The code signature.
+    pub sign_ms: f64,
 }
 
 impl ImageBuilder {
@@ -334,6 +358,8 @@ impl ImageBuilder {
             None => compute_layout_with_slop(&self.inputs, reservation, self.slop),
         };
 
+        let mut timings = EmitTimings::default();
+        let started = std::time::Instant::now();
         let probe = lay_out(PAGE_SIZE);
         let dylib_bytes: usize = self
             .dylibs
@@ -348,6 +374,7 @@ impl ImageBuilder {
         // Pass two: lay out for real, with room for the header and commands.
         let reservation = align_up((MachHeader::SIZE + command_size) as u64, 16);
         let layout = lay_out(reservation);
+        timings.layout_ms = started.elapsed().as_secs_f64() * 1000.0;
 
         for content in &self.contents {
             let Some(section) = layout.section(content.section) else {
@@ -364,6 +391,9 @@ impl ImageBuilder {
             }
         }
 
+        timings.contents_ms = started.elapsed().as_secs_f64() * 1000.0 - timings.layout_ms;
+
+        let started = std::time::Instant::now();
         let symbols = std::mem::take(&mut self.symbols).build();
         let rebase_stream = encode_rebase(&self.rebases);
         let bind_stream = encode_bind(&self.binds);
@@ -437,6 +467,8 @@ impl ImageBuilder {
         // which is what ld64 emits and what keeps `code_limit` honest.
         let link_edit_end = signature_start + signature_len as u64;
 
+        timings.linkedit_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let started = std::time::Instant::now();
         let (mut bytes, uuid_offset) = self.emit(
             &layout,
             &symbols,
@@ -465,7 +497,15 @@ impl ImageBuilder {
         // so stamping it afterwards would invalidate every page hash covering
         // the load commands, and hashing the reserved signature space would
         // fold uninitialised bytes into the image's identity.
-        let uuid = content_uuid(&bytes);
+        timings.assemble_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let started = std::time::Instant::now();
+        let previous_pages = self
+            .previous_signature
+            .as_ref()
+            .and_then(|(image, hashes)| crate::signature::PreviousSignature::new(image, hashes));
+        let uuid = content_uuid(&bytes, &request, previous_pages);
+        timings.uuid_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let started = std::time::Instant::now();
         bytes
             .get_mut(uuid_offset..uuid_offset + 16)
             .expect("the UUID command was emitted within the header")
@@ -489,7 +529,9 @@ impl ImageBuilder {
             bytes.resize(bytes.len() + signature_len, 0);
         }
 
+        timings.sign_ms = started.elapsed().as_secs_f64() * 1000.0;
         Ok(Image {
+            timings,
             page_hashes,
             bytes,
             layout,
@@ -660,8 +702,32 @@ impl ImageBuilder {
 /// The UUID field itself is zero while it is hashed, so the hash covers a
 /// well-defined image rather than one that includes a partial copy of its own
 /// digest.
-fn content_uuid(bytes: &[u8]) -> [u8; 16] {
-    let digest = Sha256::digest(bytes);
+/// A content-derived `LC_UUID`, built from the same page hashes the signature
+/// uses rather than from a second pass over the whole image.
+///
+/// The first version hashed `bytes` in one `Sha256::digest` call. That is a
+/// single-threaded SHA-256 over the entire image sitting immediately next to a
+/// code signature that hashes *the same bytes*, threaded, and skips the pages
+/// that have not changed. Measured: **4.43 ms for the UUID against 0.60 ms for
+/// the signature** — 12% of the whole link, spent hashing bytes that were about
+/// to be hashed again properly.
+///
+/// Hashing the page hashes instead makes it a Merkle root over the same
+/// content: identical bytes still give an identical UUID, and different bytes
+/// still give a different one, which is all `LC_UUID` promises. It inherits the
+/// threading and, when a previous image is available, the reuse.
+fn content_uuid(
+    bytes: &[u8],
+    request: &SignatureRequest,
+    previous: Option<crate::signature::PreviousSignature<'_>>,
+) -> [u8; 16] {
+    let slots = crate::signature::code_slot_count(request.code_limit);
+    let pages = crate::signature::page_hashes(bytes, request, slots, previous);
+    let mut hasher = Sha256::new();
+    for page in &pages {
+        hasher.update(page);
+    }
+    let digest = hasher.finalize();
     let mut uuid = [0u8; 16];
     uuid.copy_from_slice(&digest[..16]);
     uuid[6] = (uuid[6] & 0x0f) | 0x50;

@@ -159,6 +159,8 @@ pub struct LinkTimings {
     /// stage: if this is the smaller of the two it costs nothing, and if it is
     /// the larger it is setting the pace.
     pub stub_parse_ms: f64,
+    /// Where the time inside `emit` went.
+    pub emit_breakdown: blinker_output::EmitTimings,
 }
 
 impl std::fmt::Display for LinkTimings {
@@ -1700,6 +1702,9 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
         },
     );
     timings.emit_ms = elapsed_ms(step);
+    if let Ok(image) = &image {
+        timings.emit_breakdown = image.timings;
+    }
 
     // What the allocator actually achieved, counted against the table it was
     // given rather than inferred from how fast the link was.

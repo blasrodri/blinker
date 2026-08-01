@@ -232,16 +232,23 @@ def main():
     # for its own sake and excluded from the sum: adding an overlapped half to
     # the stage containing it double-counts, and the first version of this made
     # `unmeasured` negative — which is at least a number that announces itself.
-    overlapped = {"stub_parse"}
+    overlapped = {"stub_parse", "emit_layout", "emit_contents", "emit_linkedit",
+                  "emit_assemble", "emit_uuid", "emit_sign"}
     for name in ["read_and_parse", "stub_parse", "resolve", "layout", "dead_strip",
-                 "relocate", "emit", "cache_load", "cache_plan",
+                 "relocate", "emit", "emit_layout", "emit_contents",
+                 "emit_linkedit", "emit_assemble", "emit_uuid", "emit_sign",
+                 "cache_load", "cache_plan",
                  "cache_build", "cache_store"]:
         value = timings.get(f"link_{name}_ms")
         if value is None:
             continue
         if name not in overlapped:
             accounted += value
-        marker = "  (inside read_and_parse)" if name in overlapped else ""
+        marker = ""
+        if name == "stub_parse":
+            marker = "  (inside read_and_parse)"
+        elif name.startswith("emit_"):
+            marker = "  (inside emit)"
         print(f"    {name:<16}{value:6.2f} ms  {value / total * 100:5.1f}%{marker}")
     print(f"    {'unmeasured':<16}{total - accounted:6.2f} ms  "
           f"{(total - accounted) / total * 100:5.1f}%")

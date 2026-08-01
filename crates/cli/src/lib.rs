@@ -192,6 +192,14 @@ pub fn run(argv: &[String]) -> Result<Outcome, DriverError> {
                 relocate: phases.relocate_ms,
                 emit: phases.emit_ms,
                 stub_parse: phases.stub_parse_ms,
+                emit_breakdown: [
+                    phases.emit_breakdown.layout_ms,
+                    phases.emit_breakdown.contents_ms,
+                    phases.emit_breakdown.linkedit_ms,
+                    phases.emit_breakdown.assemble_ms,
+                    phases.emit_breakdown.uuid_ms,
+                    phases.emit_breakdown.sign_ms,
+                ],
                 cache: blinker_diagnostics::CacheStages {
                     load: phases.cache_load_ms,
                     plan: phases.cache_plan_ms,

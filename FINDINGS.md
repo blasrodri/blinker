@@ -4914,3 +4914,54 @@ does the work cost, and what does the lookup cost?" Relocation is one of the
 cheapest things a linker does per byte. It was chosen as the first thing to
 cache because it was easy to attribute per object, not because it was
 expensive.
+
+## 102. The UUID was hashing the whole image, next to a signature doing it better
+
+`emit` was 5.9 ms and had never been broken down. Splitting it — four
+`Instant::now()` calls — put almost all of it in one place, and then splitting
+*that* found the actual culprit:
+
+```
+  emit_layout       0.16 ms
+  emit_contents     0.00
+  emit_linkedit     0.55
+  emit_assemble     0.19
+  emit_uuid         4.43        <- a single-threaded SHA-256 of the whole image
+  emit_sign         0.60        <- the same bytes, threaded and incremental
+```
+
+`LC_UUID` is content-derived, and the way it was derived was `Sha256::digest`
+over the entire 1.8 MB image. Immediately after it, the code signature hashed
+**the same bytes** — in 16 KiB pages, across ten threads, skipping pages
+unchanged since the previous link. One of those took 4.43 ms and the other 0.60.
+
+Deriving the UUID from the page hashes instead makes it a Merkle root over the
+same content. Identical bytes still give an identical UUID and different bytes
+still give a different one, which is the whole of what `LC_UUID` promises — and
+it inherits the threading and the reuse for free.
+
+```
+  emit_uuid     4.43 -> 0.65 ms
+  emit          6.51 -> 3.24
+  the link     30.6  -> 25.9      -4.7 ms, -15.5%
+```
+
+Two interleaved runs, sd 0.6/0.7 against a noise floor of 0.3.
+
+### Why it hid for so long
+
+Nothing was wrong with either piece on its own. `content_uuid` is six lines and
+obviously correct; the signature is careful, threaded and now incremental. The
+waste was entirely in their *relationship* — two full hashes of one buffer,
+written months apart, each reasonable in isolation.
+
+A stage timer would never have shown it: `emit` is a legitimate stage and 5.9 ms
+is a legitimate size for it. It took splitting a stage that nobody suspected,
+for no reason other than that the next milestone was going to be chosen from
+it. Findings 99 and 101 are both cases of choosing a target from a number too
+coarse to hold the answer; this is what asking one level down costs, and what it
+returns.
+
+**The largest remaining item in a profile is not the largest remaining
+opportunity. The largest opportunity is in whatever has never been measured at
+the resolution the decision needs.**

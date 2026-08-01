@@ -92,6 +92,13 @@ pub struct PhaseTimings {
     /// Parsing the SDK's `.tbd` stubs, which overlaps reading the objects.
     /// Only a cost when it is the longer of the two.
     pub link_stub_parse_ms: Option<f64>,
+    /// Inside `emit`: layout, contents, linkedit, assemble, sign.
+    pub link_emit_layout_ms: Option<f64>,
+    pub link_emit_contents_ms: Option<f64>,
+    pub link_emit_linkedit_ms: Option<f64>,
+    pub link_emit_assemble_ms: Option<f64>,
+    pub link_emit_uuid_ms: Option<f64>,
+    pub link_emit_sign_ms: Option<f64>,
     pub link_cache_load_ms: Option<f64>,
     pub link_cache_plan_ms: Option<f64>,
     pub link_cache_build_ms: Option<f64>,
@@ -115,6 +122,8 @@ pub struct LinkStages {
     /// Parsing `.tbd` stubs, which happens on its own thread inside
     /// `read_and_parse` rather than after it.
     pub stub_parse: f64,
+    /// Inside `emit`, in order: layout, contents, linkedit, assemble, sign.
+    pub emit_breakdown: [f64; 6],
     /// Load, plan, build, store — the cache's four costs, zero without one.
     pub cache: CacheStages,
 }
@@ -259,6 +268,7 @@ impl LinkRecord {
             emit,
             cache,
             stub_parse,
+            emit_breakdown,
         } = stages;
         self.timings.internal_link_ms = Some(as_ms(total));
         self.timings.link_read_and_parse_ms = Some(read_and_parse);
@@ -268,6 +278,14 @@ impl LinkRecord {
         // not run" and "the stage was free" stay distinguishable.
         self.timings.link_dead_strip_ms = (dead_strip > 0.0).then_some(dead_strip);
         self.timings.link_stub_parse_ms = (stub_parse > 0.0).then_some(stub_parse);
+        if emit_breakdown.iter().any(|v| *v > 0.0) {
+            self.timings.link_emit_layout_ms = Some(emit_breakdown[0]);
+            self.timings.link_emit_contents_ms = Some(emit_breakdown[1]);
+            self.timings.link_emit_linkedit_ms = Some(emit_breakdown[2]);
+            self.timings.link_emit_assemble_ms = Some(emit_breakdown[3]);
+            self.timings.link_emit_uuid_ms = Some(emit_breakdown[4]);
+            self.timings.link_emit_sign_ms = Some(emit_breakdown[5]);
+        }
         self.timings.link_relocate_ms = Some(relocate);
         self.timings.link_emit_ms = Some(emit);
         if cache.ran() {

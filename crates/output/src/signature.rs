@@ -138,7 +138,7 @@ pub fn identifier_from_path(path: &std::path::Path) -> String {
 }
 
 /// Number of code slots for a given covered length.
-fn code_slot_count(code_limit: u64) -> usize {
+pub(crate) fn code_slot_count(code_limit: u64) -> usize {
     (code_limit as usize).div_ceil(PAGE_SIZE)
 }
 
@@ -404,7 +404,7 @@ fn page_of(bytes: &[u8], slot: usize, limit: usize) -> Option<&[u8]> {
 /// hash is a signature that will not verify, which is a binary the kernel
 /// refuses to run, so nothing here is taken on trust from the caller beyond
 /// the previous image's own bytes.
-fn page_hashes(
+pub(crate) fn page_hashes(
     image: &[u8],
     request: &SignatureRequest,
     code_slots: usize,
