@@ -6425,3 +6425,45 @@ non-determinism until the diff turned out to be a single byte: `'0'` vs `'1'`,
 from the output path, which the debug map records. The comparison has to write
 to the same path. A one-byte diff is the cheapest possible answer and it was
 still nearly mistaken for a real one.
+
+## 135. Three milliseconds of rehashing, and how to see it
+
+Finding 134 left `atoms` at 4.27 ms with 1,058 of 1,059 blocks served from the
+memo, which meant almost none of it was projection. Rather than reason about
+which of the three parts it was, print them:
+
+```
+  atom parts: blocks 11.81  owners 3.76  opaque 0.01
+```
+
+Opacity — the part that looked expensive, because it resolves names across the
+whole link — costs a hundredth of a millisecond. `owners` is the whole of it:
+one map from every non-local definition in the link to the atom defining it,
+77,000 entries, built from empty every time.
+
+```rust
+let mut owners = HashMap::with_capacity_and_hasher(
+    blocks.iter().map(|b| b.owned.len()).sum(),
+    Default::default(),
+);
+```
+
+`owners` 3.76 ms -> 0.86. `atoms` 4.27 -> 2.28. `dead_strip` 12.89 -> 10.58.
+
+The map was not slow because of hashing. It was slow because it grew into
+77,000 entries from a default-sized table, which is seventeen doublings, each
+one rehashing everything inserted so far — so most of the work was done on
+entries that were already in the map. The block above already knows the answer;
+it is one `sum()` over data that is in hand.
+
+### The general form
+
+This is the third time the same shape has paid: `Atoms::owners` here, the
+symbol table's interner (131), and `Owners::rest` (which avoided 7,000 heap
+allocations for one `usize` each). A container whose final size is a known
+function of the input, built by repeated insertion from empty, is a linker
+paying compound interest on its own growth.
+
+Worth saying because it is invisible in a profile that attributes time to the
+insert: every sample lands on `insert`, which is where the work *is*, and none
+of them says the work was avoidable.

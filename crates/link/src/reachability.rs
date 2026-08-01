@@ -600,7 +600,13 @@ impl<'a> Atoms<'a> {
         parts[0] = step.elapsed().as_secs_f64() * 1000.0;
         let step = std::time::Instant::now();
 
-        let mut owners: HashMap<&'a str, Owners> = HashMap::default();
+        // Sized up front. The map ends up holding every non-local definition
+        // in the link — 77,000 of them on the debug workload — and growing
+        // into that from empty is seventeen rehashes of an ever-larger table.
+        let mut owners: HashMap<&'a str, Owners> = HashMap::with_capacity_and_hasher(
+            blocks.iter().map(|b| b.owned.len()).sum(),
+            Default::default(),
+        );
         for (index, object) in objects.iter().enumerate() {
             for (symbol, local) in &blocks[index].owned {
                 let Some(name) = object.parsed.symbol(*symbol).map(|s| s.name.as_str()) else {
