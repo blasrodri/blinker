@@ -21,6 +21,29 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // Serving is a mode, not a link: the process becomes the resident linker
+    // and does not return until it has been idle long enough to be pointless.
+    if argv.iter().any(|a| a == "--blinker-daemon-serve") {
+        return match blinker_cli::daemon::serve_links() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("blinker: daemon: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
+
+    // Using one is not. `--blinker-daemon` asks for the link to be performed by
+    // a resident process if there is one, and performs it here if there is not
+    // — so a build configured to use a daemon still links when none is running.
+    if argv.iter().any(|a| a == "--blinker-daemon") {
+        match blinker_cli::daemon::link_via_daemon(&argv) {
+            Ok(Some(code)) => return exit_code(code),
+            Ok(None) => {}
+            Err(error) => eprintln!("blinker: daemon unavailable ({error}); linking in process"),
+        }
+    }
+
     match blinker_cli::run(&argv) {
         Ok(outcome) => exit_code(outcome.exit_code),
         Err(err) => {

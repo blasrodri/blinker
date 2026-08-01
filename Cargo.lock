@@ -84,11 +84,13 @@ dependencies = [
 name = "blinker-cli"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "blinker-arguments",
  "blinker-cache",
  "blinker-diagnostics",
  "blinker-link",
  "blinker-test-support",
+ "libc",
  "serde_json",
 ]
 

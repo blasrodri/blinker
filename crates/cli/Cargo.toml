@@ -18,6 +18,8 @@ blinker-arguments = { workspace = true }
 blinker-diagnostics = { workspace = true }
 blinker-link = { workspace = true }
 serde_json = { workspace = true }
+blake3 = { workspace = true }
+libc = { workspace = true }
 
 [dev-dependencies]
 blinker-test-support = { workspace = true }

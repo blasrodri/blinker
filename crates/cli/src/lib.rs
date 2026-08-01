@@ -24,6 +24,7 @@ use blinker_arguments::{expand_response_files, LinkerArg, ParsedInvocation};
 use blinker_diagnostics::{fingerprint_input, LinkRecord};
 
 pub mod archive;
+pub mod daemon;
 pub mod fallback;
 pub mod options;
 
@@ -98,6 +99,21 @@ pub struct Outcome {
 ///
 /// `argv` excludes the program name.
 pub fn run(argv: &[String]) -> Result<Outcome, DriverError> {
+    run_in(argv, &mut blinker_link::Session::default())
+}
+
+/// Run one invocation, keeping parsed inputs in `session` for the next.
+///
+/// The daemon holds one session and hands it to every request; a one-shot
+/// invocation creates one and drops it, which is exactly what happened before
+/// this existed. Everything between here and the link is identical either way,
+/// which is the property that keeps a daemon from being a second linker: the
+/// argument vector, the classification and the fallback decision are all the
+/// same code.
+pub fn run_in(
+    argv: &[String],
+    session: &mut blinker_link::Session,
+) -> Result<Outcome, DriverError> {
     let started = Instant::now();
 
     let parse_started = Instant::now();
@@ -179,7 +195,7 @@ pub fn run(argv: &[String]) -> Result<Outcome, DriverError> {
         if options.verbosity == Verbosity::Verbose {
             eprintln!("blinker: linking internally");
         }
-        let phases = internal_link(&parsed, &options).map_err(|e| DriverError::Link {
+        let phases = internal_link(&parsed, &options, session).map_err(|e| DriverError::Link {
             detail: e.to_string(),
         })?;
         record.set_timing_internal_link(
@@ -327,6 +343,7 @@ fn wants_dead_strip(parsed: &ParsedInvocation) -> bool {
 fn internal_link(
     parsed: &ParsedInvocation,
     options: &ProjectOptions,
+    session: &mut blinker_link::Session,
 ) -> Result<blinker_link::LinkTimings, blinker_link::LinkError> {
     let output = parsed
         .output_path()
@@ -359,7 +376,7 @@ fn internal_link(
             .cached_at(blinker_cache::cache_path(&output))
             .reusing_relocations(options.reuse_relocations);
     }
-    let timings = blinker_link::link_to_file_timed(&request, &output)?;
+    let timings = blinker_link::link_to_file_in(&request, &output, session)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

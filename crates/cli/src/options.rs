@@ -172,6 +172,9 @@ pub fn split_args(argv: &[String]) -> Result<SplitArgs, OptionError> {
                 };
             }
             "--blinker-internal" => options.internal_link = true,
+            // Handled in `main` before the driver runs, and accepted here so
+            // they are not reported as unrecognized and forwarded to `ld`.
+            "--blinker-daemon" | "--blinker-daemon-serve" => {}
             "--blinker-cache" => options.incremental_cache = true,
             "--blinker-cache-relocations" => {
                 options.incremental_cache = true;
@@ -213,6 +216,8 @@ OPTIONS:
     --blinker-cache                    Replay an unchanged image from a previous link
     --blinker-cache-relocations        Also reuse per-object relocations (experimental,
                                        measured slower than not using it)
+    --blinker-daemon                   Link via a resident linker, if one is running
+    --blinker-daemon-serve             Become the resident linker
     --blinker-print-stats              Print the human-readable summary
     --blinker-strict-fingerprints      Hash every input (slower, exact identity)
     --blinker-version                  Print version
