@@ -176,14 +176,109 @@ fn hash_offset(identifier: &str) -> usize {
 /// `image` must be the complete file up to `code_limit`, with
 /// `LC_CODE_SIGNATURE` already present and pointing at `code_limit` — the
 /// command is inside the region being hashed, so it cannot be added afterwards.
+/// One page's SHA-256, as the code directory stores it.
+pub type PageHash = [u8; HASH_SIZE];
+
+/// The previous link's signed image, and the page hashes it computed.
+///
+/// A page whose bytes are byte-for-byte what they were does not need hashing
+/// again, and on an incremental link most of them are. Hashing was the single
+/// largest cost in a profile of this linker — larger than reading every input
+/// from disk — and threading it only divided the work rather than removing it.
+///
+/// The hashes are carried rather than read back out of the previous image's
+/// own code directory. They are in there, and parsing them out would save
+/// storing 32 bytes per 16 KiB page (3.5 KB on a 1.8 MB binary); it would also
+/// mean the fast path depended on being able to re-parse a structure this
+/// module wrote, so a change to that structure would be caught as a wrong
+/// signature rather than as a compile error.
+#[derive(Debug, Clone, Copy)]
+pub struct PreviousSignature<'a> {
+    image: &'a [u8],
+    hashes: &'a [PageHash],
+}
+
+impl<'a> PreviousSignature<'a> {
+    /// Pair an image with the hashes that describe it, if they do.
+    ///
+    /// The fields are private and this is the only way in, because the pairing
+    /// is the whole safety argument and it cannot be checked per page. Reuse is
+    /// sound when `hashes[i]` is the hash of `image`'s page `i`; comparing the
+    /// current page against `image` proves the *bytes* match, and says nothing
+    /// about whether the hash belongs to them. Hand in an image from one link
+    /// and hashes from another and every page they happen to share gets a hash
+    /// describing different content — a signature that will not verify, which
+    /// is a binary the kernel refuses to run. A test wrote that exact mistake
+    /// and this API accepted it.
+    ///
+    /// So the pairing is sampled: the first and last pages are hashed and
+    /// checked against what was handed in. Two pages is ~60 µs against the
+    /// several milliseconds hashing the whole image costs, and it catches the
+    /// realistic failure — a stale, truncated or unrelated pair — because two
+    /// unrelated images agreeing on both their first and last page is not
+    /// something that happens by accident.
+    ///
+    /// It does not catch an adversary who constructs a pair agreeing at the
+    /// sampled slots and differing elsewhere. That is not the threat: these
+    /// bytes come from a cache file this linker wrote, and anyone able to
+    /// choose its contents can choose the output directly.
+    /// Only *whole* pages are usable, which is why no code limit is passed.
+    ///
+    /// The stored image is the finished file, signature included, so where the
+    /// previous link's covered region ended is not recoverable from it: the
+    /// last hash covers a short page of unknown length. Every other slot covers
+    /// exactly one page, so the last one is simply never reused. It is one page
+    /// of the several hundred in a real binary.
+    ///
+    /// The first version of this took the *current* link's code limit and
+    /// required the previous hash count to match it. That rejected the pair
+    /// outright whenever the image changed size, which is every edit — the
+    /// reuse path was wired end to end and fired on nothing, and the measured
+    /// emit time did not move by a microsecond.
+    pub fn new(image: &'a [u8], hashes: &'a [PageHash]) -> Option<Self> {
+        let whole = hashes.len().checked_sub(1)?;
+        if whole == 0 || image.len() < whole * PAGE_SIZE {
+            return None;
+        }
+        for slot in [0, whole - 1] {
+            let page = image.get(slot * PAGE_SIZE..(slot + 1) * PAGE_SIZE)?;
+            if hashes[slot].as_slice() != Sha256::digest(page).as_slice() {
+                return None;
+            }
+        }
+        Some(PreviousSignature { image, hashes })
+    }
+
+    /// The hash of whole page `slot`, if this pair covers it.
+    fn whole_page(&self, slot: usize) -> Option<(&[u8], &PageHash)> {
+        if slot + 1 >= self.hashes.len() {
+            return None;
+        }
+        let page = self.image.get(slot * PAGE_SIZE..(slot + 1) * PAGE_SIZE)?;
+        Some((page, &self.hashes[slot]))
+    }
+}
+
 pub fn sign(image: &[u8], request: &SignatureRequest) -> Vec<u8> {
+    sign_reusing(image, request, None).0
+}
+
+/// Sign, reusing page hashes from a previous image wherever the bytes match.
+///
+/// Returns the signature and the page hashes it used, for the next link.
+pub fn sign_reusing(
+    image: &[u8],
+    request: &SignatureRequest,
+    previous: Option<PreviousSignature<'_>>,
+) -> (Vec<u8>, Vec<PageHash>) {
     assert!(
         image.len() >= request.code_limit as usize,
         "the image is shorter than the region the signature must cover"
     );
 
     let code_slots = code_slot_count(request.code_limit);
-    let code_directory = build_code_directory(image, request, code_slots);
+    let hashes = page_hashes(image, request, code_slots, previous);
+    let code_directory = build_code_directory(request, code_slots, &hashes);
 
     // The special slots hash the *other* blobs, so they must be built first.
     let mut blob = Vec::with_capacity(signature_size(request));
@@ -215,10 +310,14 @@ pub fn sign(image: &[u8], request: &SignatureRequest) -> Vec<u8> {
         signature_size(request),
         "signature_size disagreed with what was built; code_limit is now wrong"
     );
-    blob
+    (blob, hashes)
 }
 
-fn build_code_directory(image: &[u8], request: &SignatureRequest, code_slots: usize) -> Vec<u8> {
+fn build_code_directory(
+    request: &SignatureRequest,
+    code_slots: usize,
+    hashes: &[PageHash],
+) -> Vec<u8> {
     let identifier = &request.identifier;
     let hash_offset = hash_offset(identifier);
     let length = code_directory_size(identifier, code_slots);
@@ -260,24 +359,75 @@ fn build_code_directory(image: &[u8], request: &SignatureRequest, code_slots: us
     cd.extend_from_slice(&[0u8; HASH_SIZE]); // slot -1: no Info.plist
     debug_assert_eq!(cd.len(), hash_offset);
 
-    // One SHA-256 per page of the covered region. The final page is short
-    // unless code_limit happens to be page-aligned, and is hashed at its real
-    // length rather than padded.
-    //
-    // # Why this is threaded
-    //
-    // A profile of the linker found `sha256::compress256` to be its single
-    // largest cost — larger than reading every input from disk. It is also the
-    // most parallel thing the linker does: each page's hash depends on that
-    // page and nothing else, so there is no ordering to preserve and no state
-    // to share.
-    //
-    // Determinism is by construction rather than by care: every slot writes to
-    // its own index in a pre-sized vector, so no thread's timing can reach the
-    // output. The bytes are identical to the serial version's, which
-    // `the_threaded_hashes_match_the_serial_ones` checks rather than assumes.
+    for hash in hashes {
+        cd.extend_from_slice(hash);
+    }
+
+    debug_assert_eq!(cd.len(), length);
+    cd
+}
+
+/// One page's byte range, clamped to the region the signature covers.
+fn page_of(bytes: &[u8], slot: usize, limit: usize) -> Option<&[u8]> {
+    let start = slot * PAGE_SIZE;
+    let end = ((slot + 1) * PAGE_SIZE).min(limit);
+    bytes.get(start..end)
+}
+
+/// One SHA-256 per page of the covered region.
+///
+/// The final page is short unless `code_limit` happens to be page-aligned, and
+/// is hashed at its real length rather than padded.
+///
+/// # Why this is threaded
+///
+/// A profile of the linker found `sha256::compress256` to be its single
+/// largest cost — larger than reading every input from disk. It is also the
+/// most parallel thing the linker does: each page's hash depends on that page
+/// and nothing else, so there is no ordering to preserve and no state to
+/// share.
+///
+/// Determinism is by construction rather than by care: every slot writes to
+/// its own index in a pre-sized vector, so no thread's timing can reach the
+/// output. The bytes are identical to the serial version's, which
+/// `the_threaded_hashes_match_the_serial_ones` checks rather than assumes.
+///
+/// # Why it is also incremental
+///
+/// Threading divided the work; it did not remove any. A page whose bytes are
+/// identical to the previous link's is a page whose hash is identical, and on
+/// an edit relink most pages are — the layout allocator exists to make that
+/// true. Comparing 16 KiB is roughly two orders of magnitude cheaper than
+/// hashing it, so the comparison is worth making even when it usually fails.
+///
+/// The comparison is on the *page*, never on a claim about the page. A stale
+/// hash is a signature that will not verify, which is a binary the kernel
+/// refuses to run, so nothing here is taken on trust from the caller beyond
+/// the previous image's own bytes.
+fn page_hashes(
+    image: &[u8],
+    request: &SignatureRequest,
+    code_slots: usize,
+    previous: Option<PreviousSignature<'_>>,
+) -> Vec<PageHash> {
     let limit = request.code_limit as usize;
-    let hash_page = |slot: usize, out: &mut [u8; HASH_SIZE]| {
+    let hash_page = |slot: usize, out: &mut PageHash| {
+        // Reuse only when this page's bytes and the previous page's bytes are
+        // the same bytes, and the previous link actually recorded a hash for
+        // that slot.
+        // Whole pages only, on both sides: a short final page is the same
+        // bytes at a different length, and hashing the two gives different
+        // answers.
+        if (slot + 1) * PAGE_SIZE <= limit {
+            if let (Some(now), Some(previous)) = (page_of(image, slot, limit), previous.as_ref()) {
+                if let Some((before, hash)) = previous.whole_page(slot) {
+                    if now == before {
+                        *out = *hash;
+                        return;
+                    }
+                }
+            }
+        }
         let start = slot * PAGE_SIZE;
         let end = ((slot + 1) * PAGE_SIZE).min(limit);
         out.copy_from_slice(&Sha256::digest(&image[start..end]));
@@ -308,12 +458,7 @@ fn build_code_directory(image: &[u8], request: &SignatureRequest, code_slots: us
             }
         });
     }
-    for hash in &hashes {
-        cd.extend_from_slice(hash);
-    }
-
-    debug_assert_eq!(cd.len(), length);
-    cd
+    hashes
 }
 
 #[cfg(test)]
@@ -379,7 +524,8 @@ mod tests {
             exec_segment_limit: 0,
         };
         let slots = code_slot_count(request.code_limit);
-        let directory = build_code_directory(&image, &request, slots);
+        let hashes = page_hashes(&image, &request, slots, None);
+        let directory = build_code_directory(&request, slots, &hashes);
 
         let base = hash_offset(&request.identifier);
         for slot in 0..slots {
@@ -495,6 +641,101 @@ mod tests {
         assert_eq!(
             identifier_from_path(std::path::Path::new("/tmp/build/my-app")),
             "my-app"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reuse_tests {
+    use super::*;
+
+    fn request(limit: u64) -> SignatureRequest {
+        SignatureRequest {
+            identifier: "reuse".to_string(),
+            code_limit: limit,
+            exec_segment_base: 0,
+            exec_segment_limit: limit,
+        }
+    }
+
+    /// A varied image, so equal pages are equal because they are and not
+    /// because everything is zeroes.
+    fn image(len: usize, seed: u8) -> Vec<u8> {
+        (0..len)
+            .map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed))
+            .collect()
+    }
+
+    /// The property. Reusing hashes must produce the same signature as not
+    /// reusing them — anything else is a binary the kernel refuses to run.
+    #[test]
+    fn reusing_hashes_signs_identically_to_hashing_afresh() {
+        let bytes = image(PAGE_SIZE * 5 + 100, 0);
+        let request = request(bytes.len() as u64);
+        let (fresh, hashes) = sign_reusing(&bytes, &request, None);
+        let previous = PreviousSignature::new(&bytes, &hashes);
+        assert!(previous.is_some(), "a genuine pair was rejected");
+        let (reused, again) = sign_reusing(&bytes, &request, previous);
+        assert_eq!(fresh, reused, "reuse changed the signature");
+        assert_eq!(hashes, again);
+    }
+
+    /// And the case it exists for: one page differs, so its hash must be
+    /// recomputed while the rest are taken from the previous link.
+    #[test]
+    fn a_changed_page_is_rehashed_and_the_others_are_not() {
+        let before = image(PAGE_SIZE * 5 + 100, 0);
+        let mut after = before.clone();
+        after[PAGE_SIZE * 2 + 7] ^= 0xff;
+
+        let request = request(after.len() as u64);
+        let (_, previous) = sign_reusing(&before, &request, None);
+        let (incremental, hashes) =
+            sign_reusing(&after, &request, PreviousSignature::new(&before, &previous));
+        let (cold, _) = sign_reusing(&after, &request, None);
+
+        assert_eq!(incremental, cold, "the incremental signature is wrong");
+        assert_ne!(hashes[2], previous[2], "the changed page kept a stale hash");
+        for slot in [0, 1, 3, 4] {
+            assert_eq!(hashes[slot], previous[slot], "slot {slot} was disturbed");
+        }
+    }
+
+    /// A previous image that is stale, short, or simply not the same file must
+    /// not be able to poison a hash. The bytes are compared, never the claim.
+    #[test]
+    fn a_wrong_previous_image_cannot_corrupt_the_signature() {
+        let bytes = image(PAGE_SIZE * 4, 0);
+        let request = request(bytes.len() as u64);
+        let (cold, _) = sign_reusing(&bytes, &request, None);
+
+        let other = image(PAGE_SIZE * 4, 9);
+        let (_, wrong_hashes) = sign_reusing(&other, &request, None);
+        for (what, previous) in [
+            // A different image, honestly paired with its own hashes: every
+            // page differs, so nothing is reused and nothing is wrong.
+            (
+                "another image",
+                PreviousSignature::new(&other, &wrong_hashes),
+            ),
+            // Truncated, and short of the region the signature covers.
+            (
+                "a truncated image",
+                PreviousSignature::new(&bytes[..PAGE_SIZE], &wrong_hashes[..1]),
+            ),
+            // No hashes at all.
+            ("no hashes", PreviousSignature::new(&bytes, &[])),
+        ] {
+            let (signature, _) = sign_reusing(&bytes, &request, previous);
+            assert_eq!(signature, cold, "{what} changed the signature");
+        }
+
+        // And the mismatched pair the first version of this API accepted:
+        // this image's bytes, another image's hashes. The pages that happen to
+        // coincide would otherwise take a hash describing different content.
+        assert!(
+            PreviousSignature::new(&bytes, &wrong_hashes).is_none(),
+            "an image was paired with hashes that do not describe it"
         );
     }
 }

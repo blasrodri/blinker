@@ -1518,6 +1518,11 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
         .map(|cache| cache.inputs.clone())
         .unwrap_or_default();
     let reservations = request.cache_path.as_ref().map(|_| full_sizes(&objects));
+    // Only the final pass signs, so only it needs these.
+    let previous_signature = previous_cache
+        .as_ref()
+        .filter(|cache| !cache.image.is_empty() && !cache.page_hashes.is_empty())
+        .map(|cache| (cache.image.clone(), cache.page_hashes.clone()));
     let previous_layout = previous_cache
         .as_ref()
         .filter(|cache| cache.request == request_hash(request))
@@ -1670,6 +1675,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
             final_pass: true,
             previous: previous_layout.as_ref(),
             reservations: reservations.as_ref(),
+            previous_signature: previous_signature.as_ref(),
         },
     );
     timings.emit_ms = elapsed_ms(step);
@@ -1716,6 +1722,7 @@ fn link_inner(request: &LinkRequest, timings: &mut LinkTimings) -> Result<Image,
     if let (Some(path), Some(cache), Ok(image)) = (&request.cache_path, &mut cache, &image) {
         let cache_step = std::time::Instant::now();
         cache.image = image.bytes.clone();
+        cache.page_hashes.clone_from(&image.page_hashes);
         // A cache that cannot be written is not an error: the link succeeded,
         // and the only consequence is that the next one is cold.
         let _ = blinker_cache::store(path, cache);
@@ -1921,6 +1928,8 @@ fn build_cache(
         sections,
         inputs: input_keys(request).unwrap_or_default(),
         request: request_hash(request),
+        // Filled in with the image, for the same reason.
+        page_hashes: Vec::new(),
         // Read back off the layout this link produced, keyed by an identity
         // that survives the next one. This is what the retained-placement
         // allocator consumes; recording it costs a walk over the contributions
@@ -2758,6 +2767,9 @@ struct Assembly<'a> {
     previous: Option<&'a (blinker_layout::PreviousLayout, PlacementKeys)>,
     /// Room to reserve per contribution. See [`full_sizes`].
     reservations: Option<&'a blinker_output::PlacementReservations>,
+    /// The previous link's signed bytes and page hashes, so pages that did not
+    /// change are not hashed again.
+    previous_signature: Option<&'a (Vec<u8>, Vec<[u8; 32]>)>,
 }
 
 /// Contribution identities in the form the output crate accepts: a plain map,
@@ -2794,6 +2806,7 @@ fn assemble(request: &LinkRequest, assembly: &Assembly<'_>) -> Result<Image, Lin
         final_pass: _,
         previous: _,
         reservations: _,
+        previous_signature: _,
     } = *assembly;
     let mut builder = ImageBuilder::new();
     if !assembly.final_pass {
@@ -2804,6 +2817,9 @@ fn assemble(request: &LinkRequest, assembly: &Assembly<'_>) -> Result<Image, Lin
     // every contribution after it — which is what keeps the cache's placement
     // keys valid across an edit. A link that is not writing a cache has no
     // next link to help, so it pays nothing.
+    if let Some((image, hashes)) = assembly.previous_signature {
+        builder.reusing_signature(image.clone(), hashes.clone());
+    }
     if let Some((previous, keys)) = assembly.previous {
         builder.reusing_layout(previous.clone(), keys.clone());
         if let Some(reservations) = assembly.reservations {

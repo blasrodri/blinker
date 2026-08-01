@@ -61,7 +61,7 @@ use codec::{Decoder, Encoder};
 /// A stale layout read as a current one is the one failure mode of a cache
 /// that produces a *wrong* binary rather than a slow one, so the version is
 /// checked before any other byte is trusted.
-pub const SCHEMA: u32 = 2;
+pub const SCHEMA: u32 = 3;
 
 const MAGIC: &[u8; 8] = b"BLNKCAC\x01";
 
@@ -285,6 +285,14 @@ pub struct LinkCache {
     /// it lands the same is what finding 94 measured at 9 reused relocations
     /// out of 84 116.
     pub layout: blinker_layout::PreviousLayout,
+    /// SHA-256 of each 16 KiB page of `image`, as the code directory stores
+    /// them.
+    ///
+    /// Kept beside the image rather than parsed back out of the signature it
+    /// already contains: the reuse path then depends on a field, not on being
+    /// able to re-read a structure another crate wrote. 32 bytes per 16 KiB is
+    /// 3.5 KB on a 1.8 MB binary.
+    pub page_hashes: Vec<[u8; 32]>,
     /// The finished, signed binary.
     ///
     /// Present so that a link whose inputs are *all* unchanged can skip the
@@ -497,6 +505,11 @@ fn encode(cache: &LinkCache) -> Vec<u8> {
         out.u64(slot.capacity);
     }
 
+    out.u32(cache.page_hashes.len() as u32);
+    for hash in &cache.page_hashes {
+        out.bytes_raw(hash);
+    }
+
     out.u32(cache.image.len() as u32);
     out.bytes_raw(&cache.image);
     out.finish()
@@ -649,6 +662,11 @@ fn decode(bytes: &[u8]) -> Option<LinkCache> {
         );
     }
 
+    let mut page_hashes = Vec::new();
+    for _ in 0..input.u32()? {
+        page_hashes.push(input.bytes_raw(32)?.try_into().ok()?);
+    }
+
     let length = input.u32()? as usize;
     let image = input.bytes_raw(length)?.to_vec();
 
@@ -660,6 +678,7 @@ fn decode(bytes: &[u8]) -> Option<LinkCache> {
         inputs,
         request,
         layout,
+        page_hashes,
         image,
     })
 }
@@ -706,6 +725,7 @@ mod tests {
             sections: vec![(1, vec![0xab; 64])],
             inputs: vec![(PathBuf::from("/tmp/a.o"), InputKey::Content([1u8; 32]))],
             request: [2u8; 32],
+            page_hashes: vec![[3u8; 32], [4u8; 32]],
             layout: {
                 let mut layout = blinker_layout::PreviousLayout::default();
                 layout.sections.insert(

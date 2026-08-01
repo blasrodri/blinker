@@ -4753,3 +4753,56 @@ one run.
 
 The counter earned its keep twice over: once by catching a failure the 77% hit
 rate had averaged away, and once by refusing the story told about it.
+
+## 99. Optimising against a profile that a previous fix had already invalidated
+
+Incremental code signing was built: page hashes carried in the cache, a
+previous image paired with them, and every page whose bytes are unchanged
+taking its hash from the last link instead of being hashed again. It is
+correct, it is tested, and on the edit relink it is worth **nothing
+measurable** — emit stayed at 5.9 ms.
+
+The reason is the evidence it was chosen from. `sha256::compress256` was the
+largest single item in the profile that drove this session — 2259 samples,
+more than reading every input from disk — and that profile was taken *before*
+page hashing was threaded. Threading it measured -2.9 ms at the time. Signing
+a 1.8 MB image across ten cores is now a few tenths of a millisecond, and an
+incremental path can save at most what is being spent.
+
+So the target was picked from a number that one of this session's own commits
+had already made false. Findings 77 and 93 are both about a measurement
+expiring; this is the same failure at the smallest scale — **a profile expires
+the moment you act on it**, and the one that justifies the next change has to
+be taken after the last one.
+
+### It is kept, and why that is not sunk cost
+
+Two reasons, neither of them "it is already written":
+
+- It removes an obstacle to output patching. That milestone writes changed
+  ranges into a clone of the previous binary and never materialises the whole
+  image in memory — at which point there is nothing to hash and the page
+  hashes must come from somewhere. They now do.
+- It costs nothing to carry: no global state, no lock, one field in the cache,
+  and a comparison that is two orders of magnitude cheaper than the hash it
+  skips.
+
+Finding 91 reverted a null result because it added a global and a mutex.
+Finding 92 kept one because it added nothing. The rule is unchanged, and this
+is the second kind.
+
+### Two bugs the tests caught on the way
+
+**The pair was not checked.** The first API took an image and hashes as two
+public fields. Hand it an image from one link and hashes from another, and
+every page they happen to share takes a hash describing different content — a
+signature that will not verify, which is a binary the kernel refuses to run.
+The test wrote that mistake deliberately and the code accepted it. The fields
+are now private behind a constructor that samples the pairing.
+
+**The pair was validated against the wrong link.** The constructor required the
+previous hash count to match the *current* image's page count. That rejects
+every edit that changes the image's size, which is every edit. The reuse path
+was wired end to end and fired on nothing — and the emit time not moving is
+exactly what that looks like from outside, which is why it took a second look
+to tell it apart from the answer above.

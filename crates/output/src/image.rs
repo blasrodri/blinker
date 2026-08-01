@@ -41,7 +41,7 @@ use blinker_layout::{
 use crate::commands::{self, LinkEditLayout};
 use crate::dyld_info::{encode_bind, encode_rebase, Bind, Rebase};
 use crate::format::*;
-use crate::signature::{sign, signature_size, SignatureRequest};
+use crate::signature::{signature_size, SignatureRequest};
 use crate::symtab::{SymbolTable, SymbolTableBuilder};
 use sha2::{Digest, Sha256};
 
@@ -94,6 +94,8 @@ pub struct ImageBuilder {
     /// anything, and keys without a table have nothing to match.
     previous: Option<(PreviousLayout, PlacementKeys)>,
     reservations: PlacementReservations,
+    /// The previous link's signed bytes and the page hashes describing them.
+    previous_signature: Option<(Vec<u8>, Vec<crate::signature::PageHash>)>,
     /// Whether to compute the ad-hoc signature. See [`ImageBuilder::unsigned`].
     sign: bool,
     /// The identifier embedded in the ad-hoc signature.
@@ -171,6 +173,9 @@ pub struct Image {
     pub bytes: Vec<u8>,
     pub layout: Layout,
     pub symbols: SymbolTable,
+    /// The page hashes the signature was built from, for the next link to
+    /// reuse. Empty when the image was not signed.
+    pub page_hashes: Vec<crate::signature::PageHash>,
 }
 
 impl ImageBuilder {
@@ -179,6 +184,7 @@ impl ImageBuilder {
             slop: Slop::NONE,
             previous: None,
             reservations: PlacementReservations::new(),
+            previous_signature: None,
             sign: true,
             inputs: Vec::new(),
             contents: Vec::new(),
@@ -272,6 +278,18 @@ impl ImageBuilder {
     /// links as soon as one fewer archive member is extracted.
     pub fn reusing_layout(&mut self, previous: PreviousLayout, keys: PlacementKeys) -> &mut Self {
         self.previous = Some((previous, keys));
+        self
+    }
+
+    /// The previous link's image and page hashes, so pages that did not change
+    /// are not hashed again. Verified as a pair before any of it is trusted;
+    /// see [`crate::signature::PreviousSignature::new`].
+    pub fn reusing_signature(
+        &mut self,
+        image: Vec<u8>,
+        hashes: Vec<crate::signature::PageHash>,
+    ) -> &mut Self {
+        self.previous_signature = Some((image, hashes));
         self
     }
 
@@ -453,8 +471,16 @@ impl ImageBuilder {
             .expect("the UUID command was emitted within the header")
             .copy_from_slice(&uuid);
 
+        let mut page_hashes = Vec::new();
         if self.sign {
-            let blob = sign(&bytes, &request);
+            let previous = self
+                .previous_signature
+                .as_ref()
+                .and_then(|(image, hashes)| {
+                    crate::signature::PreviousSignature::new(image, hashes)
+                });
+            let (blob, hashes) = crate::signature::sign_reusing(&bytes, &request, previous);
+            page_hashes = hashes;
             debug_assert_eq!(blob.len(), signature_len);
             bytes.extend_from_slice(&blob);
         } else {
@@ -464,6 +490,7 @@ impl ImageBuilder {
         }
 
         Ok(Image {
+            page_hashes,
             bytes,
             layout,
             symbols,
