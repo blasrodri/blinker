@@ -4600,7 +4600,7 @@ pub fn link_to_file_in(
     output: &Path,
     session: &mut Session,
 ) -> Result<LinkTimings, LinkError> {
-    if let Some(timings) = reuse_finished_image(request, output)? {
+    if let Some(timings) = reuse_finished_image(request, output, session)? {
         return Ok(timings);
     }
     let mut timings = LinkTimings::default();
@@ -4673,13 +4673,29 @@ fn input_keys(request: &LinkRequest) -> Option<Vec<(PathBuf, blinker_cache::Inpu
 fn reuse_finished_image(
     request: &LinkRequest,
     output: &Path,
+    session: &Session,
 ) -> Result<Option<LinkTimings>, LinkError> {
     let overall = std::time::Instant::now();
     let Some(path) = request.cache_path.as_deref() else {
         return Ok(None);
     };
-    let Some(cache) = blinker_cache::load(path) else {
-        return Ok(None);
+    // The session's copy first, and not only to save a read. Once a session
+    // holds a cache, the file on disk is the one *its first* link wrote, and a
+    // link that reuses a previous layout does not produce the same bytes as one
+    // that had none (D5). Replaying the file would hand back an image two links
+    // old and then the next link would produce the current one again — an
+    // output that alternates between two valid binaries.
+    let held = session.cache_for(path).map(|(_, cache)| cache);
+    let loaded;
+    let cache = match held {
+        Some(cache) => cache,
+        None => {
+            loaded = blinker_cache::load(path);
+            match &loaded {
+                Some(cache) => cache,
+                None => return Ok(None),
+            }
+        }
     };
     let Some(inputs) = input_keys(request) else {
         // An input that cannot be examined is one that may have moved; the

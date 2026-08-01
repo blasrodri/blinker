@@ -124,8 +124,15 @@ pub struct Session {
     indexes: FastMap<PathBuf, Vec<(String, blinker_archive::MemberId)>>,
     /// Whether any input's interface differs from the one held for it.
     interfaces_changed: bool,
-    /// Whether the cache file has been written at least once by this session.
-    wrote_cache: bool,
+    /// The cache path this session has already written a file for.
+    ///
+    /// Per path, not per session. It was a single boolean, and that was wrong in
+    /// a way only a daemon shows: one resident session serves *many different
+    /// links*, and after the first of them had written its file, no other cache
+    /// path was ever written again. The no-op fast path reads the file, so
+    /// every subsequent program lost it permanently — a resident linker that
+    /// got slower the longer it ran.
+    cache_written: Option<PathBuf>,
     /// Whether this session outlives the link that is using it.
     ///
     /// Set by the daemon, and by nothing else. It is not "am I warm yet" — it
@@ -479,8 +486,8 @@ impl Session {
     /// one link old, which costs one colder link and never a wrong one, because
     /// every cache is validated against its inputs before it is believed.
     pub fn store_cache(&mut self, path: &Path, cache: blinker_cache::LinkCache) -> bool {
-        let first = !self.wrote_cache;
-        self.wrote_cache = true;
+        let first = self.cache_written.as_deref() != Some(path);
+        self.cache_written = Some(path.to_path_buf());
         self.cache = Some((path.to_path_buf(), cache));
         first
     }

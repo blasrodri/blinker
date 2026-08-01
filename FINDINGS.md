@@ -5616,3 +5616,48 @@ it visits 87,000 relocations, and it will be 0.87 ms however cheaply it visits
 them. The only thing that removes it is not visiting the 96% that belong to
 objects nothing about has changed — which is finding 114's per-object memo, and
 is a different change entirely.
+
+## 116. A resident linker that got slower the longer it ran
+
+Finding 110 had the session hold the cache and write the file only on its
+*first* link, so a restart stays warm without every link paying to serialise a
+few megabytes. The marker for "already written" was one boolean on the session.
+
+One boolean is wrong, and only a daemon shows it. A resident session serves
+**many different links** — every crate in a workspace, every project on the
+machine. After the first of them wrote its file, `wrote_cache` stayed true
+forever, so no other cache path was ever written. And the no-op fast path
+(`reuse_finished_image`) reads that file. So every program linked after the
+first one permanently lost the ability to skip a rebuild that changes nothing:
+
+```
+                              wall      link
+  no-op rebuild, no daemon    6.70 ms   1.21 ms    replayed the cached image
+  no-op rebuild, daemon      21.77 ms  15.67 ms    linked it all again
+```
+
+**The daemon was three times slower than no daemon** on the case a daemon should
+win most. It was found by mislabelling a benchmark: an arm called "cold" was in
+fact replaying a finished image, and noticing that the warm arm lost to it is
+what exposed the bug.
+
+Two fixes. The marker is now the *path* whose file has been written, so it is
+once per program per session rather than once per session. And the fast path
+consults the session's own cache before the file — which is not only cheaper but
+more correct: once a session holds a cache, the file is the one its *first* link
+wrote, and a link reusing a previous layout does not produce the same bytes as
+one that had none (D5). Replaying the file would have handed back an image two
+links old, and the next link would produce the current one again — an output
+alternating between two valid binaries.
+
+```
+  no-op rebuild, daemon       6.19 ms   0.61 ms
+```
+
+### The rule
+
+State that is "per session" and state that is "per link target" look the same
+when the session only ever serves one target, which is what every test does. The
+daemon's tests link one program; the corpus links one program; the benchmark
+links one program. It took a stray measurement of a *different* program through
+an already-warm daemon to see it.
