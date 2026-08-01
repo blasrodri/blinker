@@ -5255,3 +5255,84 @@ it costs. Patching does not copy: the previous image stays in the session, and a
 link writes only the ranges that are dirty. The work it avoids is not a memcpy,
 it is `apply` — and now that the placement invariant holds at 100%, "dirty" is a
 small and precisely known set.
+
+## 108. The unmeasured time was preparation and a diagnostic
+
+Finding 107's profile of the warm relink ended with `unmeasured 1.92 ms` — 10%
+of the link, larger than `layout`, `emit` or `read_and_parse`, and belonging to
+no stage. A budget cannot be built over a hole that size, so this closed it.
+
+It was two things, neither of them a stage:
+
+```
+    prepare           1.07 ms     placements, __eh_frame personalities,
+                                  unwind sizing, commons
+    accounting        0.46 ms     counting the placement invariant
+    unmeasured        0.31 ms
+```
+
+`prepare` is real work that fell between `dead_strip` and `layout` because it
+was never anybody's stage. It scans every object's `__eh_frame` for personality
+fields, sizes the unwind table, and collects common symbols — all of it global,
+all of it recomputed per link, and all of it as incrementalisable as the stages
+on either side.
+
+`accounting` is not link work at all. It is the counter behind
+`contributions_retained`, and it walks every contribution *and probes every
+input* — and probing an input whose path does not identify it means hashing its
+contents. A measurement that costs half a millisecond of the thing it measures.
+It is now computed only when something has asked for diagnostics.
+
+### The rule
+
+Stage timers measure the stages someone thought to name. The gap between them is
+where work accumulates precisely *because* nobody named it — every addition
+lands in `unmeasured`, and `unmeasured` is the one line a profile reader skips.
+The fix is not more timers, it is a timer that **must** sum: `unmeasured` is
+printed as a line item so that a stage nobody owns still shows up as somebody's
+problem.
+
+## 109. QoS is a 3-5x cliff and the linker cannot defend against it
+
+Darwin schedules by quality-of-service class and a process inherits its class
+from whoever spawned it, which for a linker is always someone else. This
+machine is an M5 Pro — 5 "Super" cores and 10 "Performance" cores — so the
+question is not academic: if the inherited class cannot reach the fast cores,
+every threaded stage is on the wrong ones.
+
+Same link, same machine, under `taskpolicy`:
+
+```
+  inherited              28.7 ms
+  background            141.0 ms      <-- 5x
+  utility                28.6 ms
+  user-initiated         27.6 ms
+  user-interactive       27.6 ms
+```
+
+The obvious move is for blinker to raise its own class at startup —
+`pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0)`, one syscall. It
+was written, and then A/B tested in one binary with an environment switch,
+interleaved so drift hits both arms:
+
+```
+  normal                  qos-on  28.69   qos-off  28.71
+  clamped to background   qos-on  90.38   qos-off  86.37
+```
+
+**It does nothing.** A QoS clamp is a ceiling, not a suggestion; a thread cannot
+raise itself above the task's clamp. And with no clamp, `utility` and above are
+already the same speed, so there is nothing to gain. The code was deleted.
+
+### What is worth keeping
+
+Two things. First, the cliff is real and it is *outside* the linker: a build run
+under `nice`, or as a background IDE task, or by a CI runner that clamps its
+workers, gets a linker three to five times slower and nothing in the profile
+explains it. That belongs in the documentation, not in the code.
+
+Second — the reason to write this down at all — the one-syscall fix measured as
+a 30% improvement (141 to 97 ms) on the first try, and it was noise. The
+interleaved A/B in a single binary is what caught it. A change that costs one
+line and *appears* to work is the hardest kind to reject, because nobody asks a
+free change to prove itself.

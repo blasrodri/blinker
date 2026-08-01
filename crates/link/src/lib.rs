@@ -116,6 +116,13 @@ pub struct LinkTimings {
     pub atoms_ms: f64,
     pub liveness_ms: f64,
     pub strip_build_ms: f64,
+    /// Work between the named stages that no stage owned: building placements,
+    /// scanning `__eh_frame` for personality fields, sizing the unwind table,
+    /// and collecting commons. It was 1.9 ms of "unmeasured" and the only
+    /// reason it looked small is that nothing was looking.
+    pub prepare_ms: f64,
+    /// Counting the placement invariant, which is diagnostics rather than link.
+    pub accounting_ms: f64,
     /// `__text` bytes the strip removed, as the analysis counts them.
     pub stripped_bytes: u64,
     /// Atoms the propagation left dead that something live then referred to.
@@ -312,6 +319,15 @@ pub struct LinkRequest {
     pub cache_path: Option<PathBuf>,
     /// Whether to discard input nothing reaches.
     pub dead_strip: bool,
+    /// Whether to count how many contributions kept their address.
+    ///
+    /// It is a diagnostic and it is not free: it walks every contribution and
+    /// probes every input, and probing an input whose path does not identify it
+    /// means hashing its contents. Measured at 0.46 ms of a 20 ms link — small,
+    /// and entirely paid by builds that will never read the number. So the
+    /// driver turns it on when something has asked for diagnostics, and a
+    /// production link does not compute it.
+    pub count_placement: bool,
     /// Leave padding after each contribution, so an edit that grows one does
     /// not move everything after it.
     ///
@@ -352,6 +368,7 @@ impl LinkRequest {
             stub_libraries: default_stub_library().into_iter().collect(),
             cache_path: None,
             dead_strip: false,
+            count_placement: false,
             stable_layout: false,
             reuse_relocations: false,
         }
@@ -366,6 +383,12 @@ impl LinkRequest {
     /// command line. `-dead_strip` turns it on, which is what rustc passes.
     pub fn dead_stripped(mut self, on: bool) -> Self {
         self.dead_strip = on;
+        self
+    }
+
+    /// Ask for the placement invariant to be counted; see `count_placement`.
+    pub fn counting_placement(mut self, on: bool) -> Self {
+        self.count_placement = on;
         self
     }
 
@@ -1469,7 +1492,9 @@ fn link_inner(
     timings.stripped_bytes = report.dead_bytes();
     timings.revived_atoms = report.revived as u64;
 
+    let prep = std::time::Instant::now();
     let mut placements = placements_for(&objects, &strip);
+    timings.prepare_ms = elapsed_ms(prep);
 
     if placements.is_empty() {
         return Err(LinkError::NothingToLink);
@@ -1523,6 +1548,7 @@ fn link_inner(
     // Personality routines named by CIE augmentation data — the only place they
     // appear in DWARF mode (finding 31), which is why collecting them from
     // `__compact_unwind` found none (finding 49).
+    let prep = std::time::Instant::now();
     let mut eh_personality_fields: HashMap<(u32, u32), HashSet<u64>> = HashMap::default();
     for object in &objects {
         for section in &object.parsed.sections {
@@ -1623,6 +1649,8 @@ fn link_inner(
     // previous link's placements to lay this one out on. Read before the probe
     // because the probe *is* a layout: sizing the load commands against one
     // shape and emitting another is how a reservation comes to be wrong.
+    timings.prepare_ms += elapsed_ms(prep);
+
     let cache_step = std::time::Instant::now();
     let previous_cache = request.cache_path.as_deref().and_then(blinker_cache::load);
     timings.cache_load_ms = elapsed_ms(cache_step);
@@ -1826,7 +1854,16 @@ fn link_inner(
 
     // What the allocator actually achieved, counted against the table it was
     // given rather than inferred from how fast the link was.
-    if let (Some((previous, _)), Ok(image)) = (&previous_layout, &image) {
+    //
+    // Timed separately because it is *diagnostics*, and it turned out not to be
+    // free: it walks every contribution and probes every input, and probing an
+    // input that a path cannot identify means hashing its contents. A counter
+    // that costs a millisecond to compute is a measurement changing the thing
+    // it measures.
+    let accounting = std::time::Instant::now();
+    if let (true, Some((previous, _)), Ok(image)) =
+        (request.count_placement, &previous_layout, &image)
+    {
         // Which inputs are the ones the previous link saw. An archive member
         // shares its archive's key, so an rlib that changed marks all of its
         // members changed — coarse, and the reason member-level identity is
@@ -1862,6 +1899,8 @@ fn link_inner(
             }
         }
     }
+
+    timings.accounting_ms = elapsed_ms(accounting);
 
     if let (Some(path), Some(cache), Ok(image)) = (&request.cache_path, &mut cache, &image) {
         let cache_step = std::time::Instant::now();

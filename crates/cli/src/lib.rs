@@ -207,6 +207,8 @@ pub fn run_in(
                 resolve: phases.resolve_ms,
                 layout: phases.layout_probe_ms,
                 dead_strip: phases.dead_strip_ms,
+                prepare: phases.prepare_ms,
+                accounting: phases.accounting_ms,
                 strip_breakdown: [phases.atoms_ms, phases.liveness_ms, phases.strip_build_ms],
                 relocate: phases.relocate_ms,
                 emit: phases.emit_ms,
@@ -385,7 +387,11 @@ fn internal_link(
     if options.incremental_cache {
         request = request
             .cached_at(blinker_cache::cache_path(&output))
-            .reusing_relocations(options.reuse_relocations);
+            .reusing_relocations(options.reuse_relocations)
+            // Only when something will read it: the counter costs 0.46 ms.
+            .counting_placement(
+                options.json_diagnostics.is_some() || options.verbosity == Verbosity::Verbose,
+            );
     }
     let timings = blinker_link::link_to_file_in(&request, &output, session)?;
     #[cfg(unix)]

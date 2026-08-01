@@ -86,6 +86,11 @@ pub struct PhaseTimings {
     pub link_liveness_ms: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link_strip_build_ms: Option<f64>,
+    /// Between the stages, and beside them: see `LinkTimings::prepare_ms`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_prepare_ms: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_accounting_ms: Option<f64>,
     pub link_relocate_ms: Option<f64>,
     pub link_emit_ms: Option<f64>,
     /// What the cache cost, as against what it saved.
@@ -144,6 +149,9 @@ pub struct LinkStages {
     pub relocate_breakdown: [f64; 4],
     /// Inside `dead_strip`, in order: atoms, liveness, strip build.
     pub strip_breakdown: [f64; 3],
+    /// Work that belonged to no stage: preparation, and the invariant counter.
+    pub prepare: f64,
+    pub accounting: f64,
     /// Output symbols and the debug map.
     pub symbols: f64,
     /// Surveying relocations for indirect slots.
@@ -306,6 +314,8 @@ impl LinkRecord {
             symbols,
             survey,
             strip_breakdown,
+            prepare,
+            accounting,
         } = stages;
         self.timings.internal_link_ms = Some(as_ms(total));
         self.timings.link_read_and_parse_ms = Some(read_and_parse);
@@ -323,6 +333,8 @@ impl LinkRecord {
             self.timings.link_emit_uuid_ms = Some(emit_breakdown[4]);
             self.timings.link_emit_sign_ms = Some(emit_breakdown[5]);
         }
+        self.timings.link_prepare_ms = (prepare > 0.0).then_some(prepare);
+        self.timings.link_accounting_ms = (accounting > 0.0).then_some(accounting);
         if strip_breakdown.iter().any(|v| *v > 0.0) {
             self.timings.link_atoms_ms = Some(strip_breakdown[0]);
             self.timings.link_liveness_ms = Some(strip_breakdown[1]);
@@ -449,6 +461,8 @@ impl LinkRecord {
             ("  atoms", self.timings.link_atoms_ms),
             ("  liveness", self.timings.link_liveness_ms),
             ("  strip-build", self.timings.link_strip_build_ms),
+            ("prepare", self.timings.link_prepare_ms),
+            ("accounting", self.timings.link_accounting_ms),
             ("layout", self.timings.link_layout_ms),
             ("relocate", self.timings.link_relocate_ms),
             ("emit+sign", self.timings.link_emit_ms),
