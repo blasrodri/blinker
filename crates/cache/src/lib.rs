@@ -243,7 +243,12 @@ pub struct Entry {
     pub ranges: Vec<Range>,
     /// Name hashes this object's relocations resolved against, sorted and
     /// deduplicated. Condition 3.
-    pub deps: Vec<NameHash>,
+    /// Shared, not owned. Every link clones an entry's deps twice — once when
+    /// the reuse path carries a reused object's record forward, and once when
+    /// the next cache is built from those records — and on a link that reuses
+    /// 211 objects that is 422 copies of a list this process already has. A
+    /// refcount does the same job.
+    pub deps: std::sync::Arc<[NameHash]>,
     pub binds: Vec<CachedBind>,
     pub rebases: Vec<CachedRebase>,
 }
@@ -433,7 +438,7 @@ fn encode(cache: &LinkCache) -> Vec<u8> {
             out.u64(range.len);
         }
         out.u32(entry.deps.len() as u32);
-        for dep in &entry.deps {
+        for dep in entry.deps.iter() {
             out.u64(*dep);
         }
         out.u32(entry.binds.len() as u32);
@@ -567,7 +572,7 @@ fn decode(bytes: &[u8]) -> Option<LinkCache> {
         let mut entry = Entry {
             key,
             ranges: Vec::new(),
-            deps: Vec::new(),
+            deps: Vec::new().into(),
             binds: Vec::new(),
             rebases: Vec::new(),
         };
@@ -578,9 +583,11 @@ fn decode(bytes: &[u8]) -> Option<LinkCache> {
                 len: input.u64()?,
             });
         }
+        let mut deps = Vec::new();
         for _ in 0..input.u32()? {
-            entry.deps.push(input.u64()?);
+            deps.push(input.u64()?);
         }
+        entry.deps = deps.into();
         for _ in 0..input.u32()? {
             let segment = u8::try_from(input.u32()?).ok()?;
             let offset = input.u64()?;
@@ -708,7 +715,7 @@ mod tests {
                     start: 0x40,
                     len: 0x100,
                 }],
-                deps: vec![name_hash("_main"), name_hash("_puts")],
+                deps: vec![name_hash("_main"), name_hash("_puts")].into(),
                 binds: vec![CachedBind {
                     segment: 2,
                     offset: 8,

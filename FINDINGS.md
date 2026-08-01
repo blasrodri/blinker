@@ -5863,3 +5863,24 @@ The fix is two lines — a stable sort, and taking the last match rather than th
 first — and neither is obvious from reading the code that was replaced. "Insert
 into a map" quietly encodes a last-wins policy over duplicate keys, and
 replacing it with anything ordered has to reproduce that policy on purpose.
+
+## 122. Four hundred copies of a list the process already had
+
+A reused object's `deps` — the sorted name hashes its relocations resolved
+against — was a `Vec<NameHash>` inside the cache entry, and every link copied it
+twice: once when the reuse path carries a reused object's record forward, and
+once when the next cache is built from those records. On a link reusing 211
+objects that is 422 copies of lists this process is already holding.
+
+Sharing them behind an `Arc<[NameHash]>`:
+
+```
+  cache_build   1.14 ms -> 0.93 ms
+  apply         0.96 ms -> 0.82 ms
+```
+
+The cache codec changes with it — decode collects into the `Arc`, encode
+iterates it — which is the reason to note this at all. `deps` is *only* ever
+read; nothing mutates an entry's dependency list after the link that produced
+it. A `Vec` in a structure that is cloned and never modified is an owned copy of
+something that has no owner.

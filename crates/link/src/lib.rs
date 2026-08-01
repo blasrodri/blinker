@@ -3916,7 +3916,7 @@ struct Patched {
 /// slicing serves both without duplicating either.
 struct ObjectRecord {
     object: ObjectId,
-    deps: Vec<blinker_cache::NameHash>,
+    deps: std::sync::Arc<[blinker_cache::NameHash]>,
     binds: std::ops::Range<usize>,
     rebases: std::ops::Range<usize>,
 }
@@ -4414,7 +4414,7 @@ fn apply_relocations(
         }
         records.push(ObjectRecord {
             object: object.parsed.id,
-            deps: dependency_hashes(object, addresses, &referenced),
+            deps: dependency_hashes(object, addresses, &referenced).into(),
             binds: bind_start..extra_binds.len(),
             rebases: rebase_start..extra_rebases.len(),
         });
