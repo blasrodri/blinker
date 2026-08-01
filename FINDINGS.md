@@ -5088,3 +5088,49 @@ that correctly re-read a changed archive reported reading nothing. A counter
 that undercounts misses is worse than no counter: it makes a cache look perfect
 exactly when it has stopped working, which is finding 64 with a different
 mechanism. Caught by a test asserting `inputs_read > 0` after an edit.
+
+## 105. The daemon was slower than no daemon, because of a sleep
+
+Residency measured 2.2x in-process (104). Put behind a socket and measured end
+to end — a real process spawn, a real link, the client printing and exiting:
+
+```
+  direct   38.1 ms
+  daemon   48.7 ms      +10.6 ms
+```
+
+**Worse than not having one**, and by almost exactly the average of a 20 ms
+poll interval. The first `serve` loop used a non-blocking `accept` with
+`sleep(20ms)` between attempts, so every request waited an average of 10 ms for
+the daemon to notice it had arrived.
+
+`std` has no accept timeout, and both obvious alternatives are wrong: a
+blocking `accept` never notices it should exit when idle, and a polling one
+trades latency for that. `SO_RCVTIMEO` on the listening socket gives both — an
+`accept` that returns the instant a client connects and gives up after a
+second.
+
+```
+  direct   36.5 ms
+  daemon   28.1 ms      -8.4 ms, -23%
+```
+
+### What it says
+
+The sleep was invisible in every test: the protocol tests pass, the end-to-end
+tests pass, the binary is byte-identical. It cost a third of the link and
+nothing was wrong.
+
+A linker's unit of work is tens of milliseconds. Anything in the request path
+measured in *milliseconds* — a poll interval, a retry backoff, a lock timeout,
+a sleep waiting for a file — is not a small constant, it is a large fraction.
+The instinct that a 20 ms poll is "fast enough" comes from services where the
+work takes seconds; here the work takes 19.
+
+### What is left in the 28.1 ms
+
+About 19 ms of it is the link. The rest is the client: a process spawn, dyld
+loading a 1.7 MB binary, and the socket exchange. `rustc` spawns a linker per
+crate and there is no avoiding *a* process — but there is no reason it has to
+be this one. A client that only speaks the protocol would be a fraction of the
+size, and that is the next thing worth measuring rather than assuming.
