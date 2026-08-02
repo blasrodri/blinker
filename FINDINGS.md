@@ -7113,3 +7113,69 @@ The remaining work is not a search for waste; it is that six stages need to
 learn what changed, and the measurements that say what each of them may skip —
 one object of 5,637 for liveness (133), three contributions of 9,722 for
 placement, 197 addresses of 506,405 — are already recorded.
+
+## 149. The frontier asked every archive for every name
+
+A realistic inner-loop edit — `crates/ide/src/lib.rs`, a library crate only the
+binary depends on — with everything above in place:
+
+```
+  blast radius: 2 of 341 inputs, 512 of 6079 objects (8%)
+  session: 339 inputs held, 2 read
+  link 2523 ms
+    read_and_parse   876 ms   35%
+```
+
+876 ms to read two files. Splitting the extraction loop:
+
+```
+  extract: probe 517  absorb 285  parse 0   (5637 objects)
+```
+
+`parse 0`. Every archive member came out of memory. The stage that is named
+after reading and parsing did neither — it spent its time deciding *which*
+members to pull.
+
+`probe` is the loop that answers that:
+
+```rust
+for name in &wanted {
+    for (archive_index, (_, index, _)) in archives.iter().enumerate() {
+        let Some(member_id) = index.member_defining(name) else { continue };
+        ...
+        break;
+    }
+}
+```
+
+Every name, against every archive, and `member_defining` is a binary search
+with string comparisons. 341 archives and tens of thousands of names is tens of
+millions of them.
+
+One merged table, built once — first definition wins, which is what the nested
+loop did twice over (first entry within an archive, first archive that answers,
+so inserting only when absent gives the same answer):
+
+```
+  probe            517 ms -> 13 ms
+  read_and_parse   876    -> 401
+  link            2523    -> 1993
+```
+
+Output byte-identical on the 187 MB image.
+
+### What it says about the shape of this linker
+
+This is not an incremental-linking problem and it never was. It is a linear
+search wearing a loop, in the one stage a resident linker had already made
+almost free — `parse 0` says the caching worked perfectly and the stage still
+cost 876 ms.
+
+Two things had to happen before it could be seen. The workload had to be large
+enough that 341 archives is a real multiplier, and the session had to be good
+enough that reading and parsing were no longer hiding it. On the self-link, 80
+inputs and a cold parse, this loop is invisible.
+
+`absorb` is now the largest part of extraction at 285 ms: `Frontier` holds
+owned `String`s for every defined name in the program and grows both of its
+sets from empty.

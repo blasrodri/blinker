@@ -1113,7 +1113,21 @@ fn compact_unwind_entries(
         return Vec::new();
     };
     let image_base = text.vm_address;
-    let mut entries = Vec::new();
+    // One entry per record, and the record count is `size / 32` — known from
+    // the layout without reading anything (135).
+    let mut entries = Vec::with_capacity(
+        objects
+            .iter()
+            .flat_map(|object| object.parsed.sections.iter())
+            .filter(|section| section.name == "__compact_unwind")
+            .map(|section| (section.size / COMPACT_UNWIND_RECORD) as usize)
+            .sum(),
+    );
+    // Reused across objects rather than allocated per object. There are 5,637
+    // objects in a debug rust-analyzer link and each was building two maps
+    // from empty to hold a few dozen entries.
+    let mut targets: HashMap<(u64, u64), u64> = HashMap::default();
+    let mut personality_names: HashMap<u64, String> = HashMap::default();
 
     for object in objects {
         for section in &object.parsed.sections {
@@ -1123,6 +1137,8 @@ fn compact_unwind_entries(
             let Some(file_offset) = section.file_offset else {
                 continue;
             };
+            targets.clear();
+            personality_names.clear();
 
             // Relocation targets, indexed by (record, field).
             //
@@ -1135,10 +1151,6 @@ fn compact_unwind_entries(
             // For a section target the inline value is an address in the
             // object's own coordinate space, so the offset within that section
             // has to be recovered before rebasing onto the output address.
-            let mut targets: HashMap<(u64, u64), u64> = HashMap::default();
-            // Personalities are recorded by GOT slot rather than by address,
-            // so they are collected by name and resolved separately.
-            let mut personality_names: HashMap<u64, String> = HashMap::default();
             for relocation in object
                 .parsed
                 .relocations
@@ -3129,6 +3141,34 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
         return Ok(objects);
     }
 
+    // Which archive defines each name, across all of them at once.
+    //
+    // The frontier used to ask every archive in turn for every name it wanted,
+    // and each of those is a binary search with string comparisons. On a debug
+    // rust-analyzer link — 341 archives, tens of thousands of names — that was
+    // 517 ms of the 876 ms `read_and_parse` stage, on a relink whose members
+    // all came out of memory and where `parse` measured zero.
+    //
+    // First definition wins, which is what the loop it replaces did twice
+    // over: `member_defining` takes the first entry within an archive, and the
+    // scan stopped at the first archive that answered. Iterating the archives
+    // in order and inserting only when absent gives the same answer.
+    let mut defining: HashMap<&str, (usize, blinker_archive::MemberId)> =
+        HashMap::with_capacity_and_hasher(
+            archives
+                .iter()
+                .map(|(_, index, _)| index.symbol_map.len())
+                .sum(),
+            Default::default(),
+        );
+    for (archive_index, (_, index, _)) in archives.iter().enumerate() {
+        for (name, member) in &index.symbol_map {
+            defining
+                .entry(name.as_str())
+                .or_insert((archive_index, *member));
+        }
+    }
+
     // Pull members in until nothing new is needed.
     let mut extracted: HashSet<(usize, u32)> = HashSet::default();
     let mut order: Vec<(usize, u32)> = Vec::new();
@@ -3152,16 +3192,13 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
         // position and no thread's timing can reach the output.
         let mut round: Vec<(usize, blinker_archive::MemberId)> = Vec::new();
         for name in &wanted {
-            for (archive_index, (_, index, _)) in archives.iter().enumerate() {
-                let Some(member_id) = index.member_defining(name) else {
-                    continue;
-                };
-                if !extracted.insert((archive_index, member_id.0)) {
-                    continue; // already in the link
-                }
-                round.push((archive_index, member_id));
-                break;
+            let Some(&(archive_index, member_id)) = defining.get(name.as_str()) else {
+                continue;
+            };
+            if !extracted.insert((archive_index, member_id.0)) {
+                continue; // already in the link
             }
+            round.push((archive_index, member_id));
         }
         if round.is_empty() {
             session.store_extraction(archive_paths, order);
