@@ -36,6 +36,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use blinker_macho::ParsedObject;
+use blinker_symbols::{SymbolNameId, SymbolNames};
 
 use crate::hashing::{FastMap, FastSet};
 use crate::mapping::Backing;
@@ -48,6 +49,9 @@ struct Memo {
     boundaries: FastMap<u32, Option<Arc<Vec<u64>>>>,
     /// This object's atoms and the edges leaving them, in its own numbering.
     atoms: Option<Arc<crate::reachability::ObjectAtoms>>,
+    /// Each of this object's symbol names, interned against `Session::names`.
+    /// Indexed by `SymbolId`, which is a position in `parsed.symbols`.
+    interned: Option<Arc<Vec<SymbolNameId>>>,
 }
 
 impl Memo {
@@ -56,6 +60,7 @@ impl Memo {
             _parse: Arc::clone(parse),
             boundaries: FastMap::default(),
             atoms: None,
+            interned: None,
         }
     }
 }
@@ -214,6 +219,22 @@ pub struct Session {
     /// the same, and so is this.
     strip: Option<(Vec<u64>, std::sync::Arc<crate::reachability::Strip>)>,
     memo: FastMap<usize, Memo>,
+    /// Every symbol name this session has ever seen, interned once.
+    ///
+    /// Held across links, and never renumbered, because the ids it hands out
+    /// are what makes a held object's names free the second time: the id
+    /// vector memoised beside a parse is only meaningful against the table
+    /// that produced it. A link resolves half a million distinct names out of
+    /// a million symbols, and hashing those strings was the whole cost of the
+    /// resolve stage — but only the first time each is seen.
+    ///
+    /// It therefore grows monotonically. Names belonging to inputs that are no
+    /// longer in the link stay, because dropping one would mean renumbering
+    /// and invalidating every surviving id vector. What that costs is bounded
+    /// by how many *new* names later links introduce: a Rust rebuild renames
+    /// the symbols of the crates it recompiles, so it is the edited crates'
+    /// symbols per rebuild, not the program's.
+    names: SymbolNames,
     /// Each object's reachability digest, as the last link computed it.
     ///
     /// Keyed by object id, which is positional and stable for as long as the
@@ -679,6 +700,45 @@ impl Session {
         let key = Arc::as_ptr(parse) as usize;
         let memo = self.memo.entry(key).or_insert_with(|| Memo::new(parse));
         Arc::clone(memo.atoms.get_or_insert_with(|| Arc::new(compute())))
+    }
+
+    /// This object's symbol names as ids, interning each one once ever.
+    ///
+    /// The vector is indexed by `SymbolId`, so a caller holding a symbol can
+    /// subscript rather than hash. Computed on the link that first parses the
+    /// object and reused by every link after it — which is the whole point,
+    /// since a held object's names are by definition the ones already in the
+    /// table.
+    pub(crate) fn interned(&mut self, parse: &Arc<ParsedObject>) -> Arc<Vec<SymbolNameId>> {
+        let key = Arc::as_ptr(parse) as usize;
+        // Split borrow: the memo entry and the interning table are separate
+        // fields, and filling the first needs the second.
+        let Session { memo, names, .. } = self;
+        let entry = memo.entry(key).or_insert_with(|| Memo::new(parse));
+        Arc::clone(entry.interned.get_or_insert_with(|| {
+            Arc::new(
+                parse
+                    .symbols
+                    .iter()
+                    .map(|symbol| names.intern(&symbol.name))
+                    .collect(),
+            )
+        }))
+    }
+
+    /// The interning table these ids belong to.
+    pub(crate) fn names(&self) -> &SymbolNames {
+        &self.names
+    }
+
+    /// The interning table, for a caller that needs to add to it.
+    ///
+    /// Lent rather than taken: a table that left the session and did not come
+    /// back — an error path between the two — would leave the memoised id
+    /// vectors describing names the table no longer holds, and the next link
+    /// would hand out those same ids for different names.
+    pub(crate) fn names_mut(&mut self) -> &mut SymbolNames {
+        &mut self.names
     }
 
     /// Drop derived facts about parses this link did not use.

@@ -151,6 +151,26 @@ impl SymbolTable {
         Self::default()
     }
 
+    /// A table that resolves against an interning table built elsewhere.
+    ///
+    /// The point is the ids that table has already handed out. A resident
+    /// linker interns each input's names once, when it first parses it, and
+    /// every link after that hands this table `SymbolNameId`s rather than
+    /// strings — so a name that has not changed is never hashed again. That
+    /// only works if the ids mean the same thing here as they did there, which
+    /// means it must be *the* table and not a copy of it.
+    pub fn with_names(names: SymbolNames) -> Self {
+        SymbolTable {
+            names,
+            ..Default::default()
+        }
+    }
+
+    /// Give the interning table back, ids and all.
+    pub fn into_names(self) -> SymbolNames {
+        self.names
+    }
+
     /// Offer a definition for `name`.
     ///
     /// Applies the resolution rules and records the outcome. Conflicts are
@@ -163,6 +183,23 @@ impl SymbolTable {
         strength: SymbolStrength,
         visibility: SymbolVisibility,
     ) {
+        // Interned before the visibility check, unlike `define_id` below,
+        // because a caller passing a string has no id to skip the work with.
+        if visibility == SymbolVisibility::Local {
+            return;
+        }
+        let name_id = self.names.intern(name);
+        self.define_id(name_id, provider, strength, visibility);
+    }
+
+    /// Offer a definition for an already-interned name.
+    pub fn define_id(
+        &mut self,
+        name_id: SymbolNameId,
+        provider: SymbolProvider,
+        strength: SymbolStrength,
+        visibility: SymbolVisibility,
+    ) {
         // A local definition is invisible outside its object, so it never
         // enters the global table. Two objects may legitimately define the
         // same local name, and admitting them would make those collide.
@@ -170,7 +207,6 @@ impl SymbolTable {
             return;
         }
 
-        let name_id = self.names.intern(name);
         let candidate = Candidate { provider, strength };
         match self.candidates.entry(name_id) {
             std::collections::hash_map::Entry::Occupied(mut held) => held.get_mut().push(candidate),
@@ -259,6 +295,16 @@ impl SymbolTable {
     /// otherwise it joins the undefined set until something defines it.
     pub fn reference(&mut self, name: &str, from: ObjectId, strength: SymbolStrength) {
         let name_id = self.names.intern(name);
+        self.reference_id(name_id, from, strength);
+    }
+
+    /// Record a reference to an already-interned name.
+    pub fn reference_id(
+        &mut self,
+        name_id: SymbolNameId,
+        from: ObjectId,
+        strength: SymbolStrength,
+    ) {
         if self.resolved.contains_key(&name_id) {
             return;
         }
@@ -292,6 +338,11 @@ impl SymbolTable {
     /// Record that a dynamic library provides `name`.
     pub fn define_dynamic(&mut self, name: &str, library: u32) {
         let name_id = self.names.intern(name);
+        self.define_dynamic_id(name_id, library);
+    }
+
+    /// Record that a dynamic library provides an already-interned name.
+    pub fn define_dynamic_id(&mut self, name_id: SymbolNameId, library: u32) {
         self.undefined.remove(&name_id);
 
         // A definition in an object outranks a dynamic import: the symbol is
@@ -360,8 +411,11 @@ impl SymbolTable {
                 referenced_by: referenced_by.to_vec(),
             })
             .collect();
-        // Deterministic order: diagnostics must not vary between runs.
-        out.sort_by_key(|u| u.name);
+        // By name text, not by id. Diagnostics must not vary between runs, and
+        // an id is only the order this process happened to intern things in —
+        // which, once the table is held across links, differs between the first
+        // link of a session and the next.
+        out.sort_by(|a, b| self.name_of(a.name).cmp(&self.name_of(b.name)));
         out
     }
 

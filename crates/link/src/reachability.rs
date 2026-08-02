@@ -73,6 +73,7 @@ use blinker_macho::{
     Arm64RelocationKind, InputRelocation, InputSection, ObjectId, RelocationTarget, SectionId,
     SectionKind, SymbolId, SymbolVisibility,
 };
+use blinker_symbols::SymbolNameId;
 
 /// One symbol's worth of bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -684,12 +685,13 @@ pub(crate) struct Atoms<'a> {
     /// which one wins is decided elsewhere, and guessing here would strip the
     /// one that does.
     ///
-    /// Borrowed, not cloned. Every non-local defined symbol in the link went
-    /// through `name.clone()` here — around seven thousand `String`
-    /// allocations to build a map that is discarded at the end of the same
-    /// function, and it was 0.72 ms of a 1.23 ms stage. The names live in the
-    /// parsed objects, which outlive this.
-    owners: HashMap<&'a str, Owners>,
+    /// Keyed by interned id rather than by the name's text. The map holds every
+    /// non-local definition in the link and is probed once per distinct
+    /// referenced name — hundreds of thousands of each — and the session has
+    /// already given every one of those names a number. Hashing the text again
+    /// here was paying for an answer that was worked out when the object was
+    /// first read.
+    owners: HashMap<SymbolNameId, Owners>,
 }
 
 impl<'a> Atoms<'a> {
@@ -708,8 +710,13 @@ impl<'a> Atoms<'a> {
         let mut slot = HashMap::default();
         let mut total = 0usize;
         let mut slot_of: Vec<u32> = Vec::new();
+        // Each object's names as ids, in `SymbolId` order. Held only for the
+        // length of this function: everything the traversal needs is resolved
+        // to a flat atom index before it returns.
+        let mut interned: Vec<Arc<Vec<SymbolNameId>>> = Vec::with_capacity(objects.len());
         for object in objects {
             let block = session.atoms(&object.parsed, || project(object));
+            interned.push(session.interned(&object.parsed));
             slot.insert(object.parsed.id.0, blocks.len());
             base.push(total);
             slot_of.resize(total + block.atoms.len(), blocks.len() as u32);
@@ -723,13 +730,14 @@ impl<'a> Atoms<'a> {
         // Sized up front. The map ends up holding every non-local definition
         // in the link — 77,000 of them on the debug workload — and growing
         // into that from empty is seventeen rehashes of an ever-larger table.
-        let mut owners: HashMap<&'a str, Owners> = HashMap::with_capacity_and_hasher(
+        let mut owners: HashMap<SymbolNameId, Owners> = HashMap::with_capacity_and_hasher(
             blocks.iter().map(|b| b.owned.len()).sum(),
             Default::default(),
         );
-        for (index, object) in objects.iter().enumerate() {
+        for index in 0..objects.len() {
+            let ids = &interned[index];
             for (symbol, local) in &blocks[index].owned {
-                let Some(name) = object.parsed.symbol(*symbol).map(|s| s.name.as_str()) else {
+                let Some(name) = ids.get(symbol.0 as usize).copied() else {
                     continue;
                 };
                 let atom = base[index] + *local as usize;
@@ -761,26 +769,27 @@ impl<'a> Atoms<'a> {
             owners,
             resolved: Vec::new(),
         };
-        result.resolved = result.resolve_names();
-        result.opaque = result.find_opaque();
+        result.resolved = result.resolve_names(&interned);
+        result.opaque = result.find_opaque(&interned);
         parts[2] = step.elapsed().as_secs_f64() * 1000.0;
         result
     }
 
     /// Where each block's distinct referenced names resolve to.
     ///
-    /// One string hash per (object, name) rather than per edge — 390,606
+    /// One owners probe per (object, name) rather than per edge — 390,606
     /// instead of 1,195,652 on a debug rust-analyzer link.
-    fn resolve_names(&self) -> Vec<Vec<Option<usize>>> {
+    fn resolve_names(&self, interned: &[Arc<Vec<SymbolNameId>>]) -> Vec<Vec<Option<usize>>> {
         self.blocks
             .iter()
             .enumerate()
             .map(|(slot, block)| {
+                let ids = &interned[slot];
                 block
                     .names
                     .iter()
                     .map(|symbol| {
-                        let name = self.objects[slot].parsed.symbol(*symbol)?.name.as_str();
+                        let name = ids.get(symbol.0 as usize)?;
                         self.owners.get(name).map(|owners| owners.first)
                     })
                     .collect()
@@ -789,15 +798,16 @@ impl<'a> Atoms<'a> {
     }
 
     /// Sections that must be kept whole.
-    fn find_opaque(&self) -> HashSet<(u32, u32)> {
+    fn find_opaque(&self, interned: &[Arc<Vec<SymbolNameId>>]) -> HashSet<(u32, u32)> {
         let mut opaque = HashSet::default();
         for (index, object) in self.objects.iter().enumerate() {
             let block = &self.blocks[index];
+            let ids = &interned[index];
             for section in &block.opaque {
                 opaque.insert((object.parsed.id.0, *section));
             }
             for symbol in &block.opaque_via {
-                let Some(name) = object.parsed.symbol(*symbol).map(|s| s.name.as_str()) else {
+                let Some(name) = ids.get(symbol.0 as usize) else {
                     continue;
                 };
                 for target in self.owners.get(name).into_iter().flat_map(Owners::all) {
@@ -838,8 +848,14 @@ impl<'a> Atoms<'a> {
     }
 
     /// Every atom defining `name`, for use as a root.
-    fn defining(&self, name: &str) -> impl Iterator<Item = usize> + '_ {
-        self.owners.get(name).into_iter().flat_map(Owners::all)
+    ///
+    /// `None` when nothing in the link ever mentioned the name, which is the
+    /// same case as a name no object defines: no roots, and the missing
+    /// definition is reported by resolution rather than here.
+    fn defining(&self, name: Option<SymbolNameId>) -> impl Iterator<Item = usize> + '_ {
+        name.and_then(|name| self.owners.get(&name))
+            .into_iter()
+            .flat_map(Owners::all)
     }
 }
 
@@ -932,7 +948,11 @@ impl Owners {
 }
 
 /// Which atoms a program can reach from `entry`.
-fn liveness(atoms: &Atoms<'_>, entry: &str, parts: &mut [f64; 2]) -> (LiveSet, usize) {
+fn liveness(
+    atoms: &Atoms<'_>,
+    entry: Option<SymbolNameId>,
+    parts: &mut [f64; 2],
+) -> (LiveSet, usize) {
     let step = std::time::Instant::now();
     let mut live = LiveSet::with_capacity(atoms.len());
     let mut worklist: Vec<usize> = Vec::new();
@@ -1252,6 +1272,9 @@ pub(crate) fn plan(
     let step = std::time::Instant::now();
     let mut parts = [0.0f64; 3];
     let atoms = Atoms::build(objects, &mut parts, session);
+    // Interned after the build, which is what puts every input's names in the
+    // table. An entry symbol nothing mentions has no id, and no roots.
+    let entry = session.names().get(entry);
     timings.atoms_ms = step.elapsed().as_secs_f64() * 1000.0;
 
     // How much of the graph moved, taken from the projections themselves.

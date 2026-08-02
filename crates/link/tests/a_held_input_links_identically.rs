@@ -417,3 +417,59 @@ fn an_edit_that_moves_the_graph_is_not_served_the_old_answer() {
     // helper(3) = (3 + 1) * 7 = 28, other(4) = 104.
     assert_eq!(run(&second), "132\n");
 }
+
+/// A session interns every symbol name it has ever seen and hands out ids in
+/// the order it first saw them. Those ids are what resolution, the archive
+/// frontier and the owners map are keyed by — so on the second program a
+/// session links, every id is numbered by the *first* program's names.
+///
+/// That is a real hazard and not a hypothetical one: the order the frontier
+/// wants names in decides which archive member is pulled first, which decides
+/// what object id it gets, which reaches the output. Sorting by id instead of
+/// by name would pass every test that links one program twice, because there
+/// the two orders agree — ids are handed out in parse order, and the second
+/// link parses nothing new.
+///
+/// So the warm-up below links `_other`'s definition ahead of `_helper`'s,
+/// which is the opposite of their name order. It takes two objects to do it:
+/// within one object the symbol table is already sorted, so intern order can
+/// only be reversed across objects. After it `_other` holds the lower id, and
+/// a frontier ordered by id asks the archive for its members back to front —
+/// numbering them the other way round and moving every byte after them.
+///
+/// Verified to fail when the frontier sorts by id.
+#[test]
+fn an_interner_warmed_by_another_program_does_not_reorder_the_link() {
+    let scratch = Scratch::dir("session-warm-interner").expect("scratch");
+
+    let warm_other = compile(&scratch, "warm_other.c", OTHER);
+    let warm_helper = compile(&scratch, "warm_helper.c", HELPER);
+    let warm_main = compile(&scratch, "warm_main.c", MAIN);
+
+    let mut session = Session::default();
+    let warmup = scratch.join("warmup");
+    link_to_file_in(
+        // `_other` first, so it interns first.
+        &LinkRequest::new(vec![warm_other, warm_helper, warm_main]),
+        &warmup,
+        &mut session,
+    )
+    .expect("the warmup link succeeds");
+    assert_eq!(run(&warmup), "125\n");
+
+    // Now the program under test, through the same session — whose interner
+    // numbered `_other` below `_helper` — and through a fresh one.
+    let request = LinkRequest::new(inputs(&scratch));
+    let warm = scratch.join("warm");
+    link_to_file_in(&request, &warm, &mut session).expect("the warm link succeeds");
+
+    let cold = scratch.join("cold");
+    link_to_file(&request, &cold).expect("the cold link succeeds");
+
+    assert_eq!(
+        std::fs::read(&warm).expect("warm"),
+        std::fs::read(&cold).expect("cold"),
+        "a session warmed by another program produced different bytes"
+    );
+    assert_eq!(run(&warm), "125\n");
+}

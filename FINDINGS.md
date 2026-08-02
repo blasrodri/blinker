@@ -7482,3 +7482,81 @@ taken" when the useful question is "the held answer was valid".
 A diagnostic that changes with the mode that checks it makes every test of it a
 test of the mode. Now set where the decision is made, and both runs of the
 suite agree.
+
+## 157. A name interned once per link is a name interned once per name
+
+Three separate passes over every symbol of every object were each hashing the
+name text, on every link, for a link whose inputs had not changed:
+
+- `Frontier::absorb`, in `read_and_parse` — two passes, and a `String` clone
+  per name it had not already seen.
+- `undefined_references`, in `resolve` — two more, into borrowed `&str` sets.
+- `resolve_symbols`, also in `resolve` — `SymbolNames::intern` per symbol,
+  981,253 calls of which about half miss.
+- `Atoms::build`, in `dead_strip` — the owners map, keyed by `&str`, built from
+  every non-local definition and probed once per distinct referenced name.
+
+Four data structures, four hashers, one question: *which name is this?* A
+resident linker answers it for the same 187 MB of inputs every time the
+developer saves a file.
+
+### The interner outlives the link
+
+`Session` now holds the `SymbolNames` table across links, and each parse
+carries a `Vec<SymbolNameId>` beside it — the object's names, in `SymbolId`
+order, interned when it was first read. Everything above is keyed by that id.
+A held object costs an `Arc` clone; only genuinely new bytes are hashed.
+
+The table can never be renumbered, because the ids in those memoised vectors
+are only meaningful against it. So it grows monotonically, bounded not by the
+program but by how many *new* names later links introduce — the recompiled
+crates' symbols per rebuild, which is what a rebuild changes anyway.
+
+### The order the ids come out in is not an order
+
+An id is the order this process happened to intern something, which differs
+between a session's first link and its next. Two places had been relying on a
+name ordering:
+
+- `Frontier::wanted` was a `BTreeSet<String>`, and its order decides which
+  archive member is pulled first — and therefore what `ObjectId` it gets, and
+  therefore the output bytes. It is now a hash set of ids, sorted by name text
+  at the one point it is read.
+- `SymbolTable::undefined_symbols` sorted by id under a comment saying
+  "diagnostics must not vary between runs". True when ids were per-link; false
+  the moment the table is held. Sorted by text now.
+
+`an_interner_warmed_by_another_program_does_not_reorder_the_link` links a
+different program through the session first, arranged so `_other` interns ahead
+of `_helper` — the reverse of their name order — and then requires the real
+link to equal a cold one. **Verified to fail when the frontier sorts by id**;
+the first two versions of that fixture did not, because within one object the
+symbol table is already sorted and across a single link ids come out in name
+order anyway. A test that cannot fail on the bug it names is worse than none.
+
+### Measured
+
+Same machine, same hour, debug rust-analyzer: 341 inputs, 6,079 objects,
+187 MB output. Realistic edit — `crates/ide/src/lib.rs`, 2 inputs, 8% of
+objects — through a resident linker, per-stage minima over 6:
+
+```
+                  before    after
+  read_and_parse   420.6    141.7
+  resolve          437.1     61.8
+  atoms            118.7     29.5
+  relocate         467.0    465.3      untouched
+  symbols          102.9    103.1      untouched
+  survey            73.2     73.3      untouched
+  link            1994.6   1265.0      -37%
+```
+
+The three untouched stages moving by less than half a millisecond is what says
+the machine was in the same state for both.
+
+Cold, where the interner starts empty and there is nothing to reuse:
+**2446 -> 1983 ms, -19%** — one interning pass replacing an interning pass and
+two full string-hashing passes.
+
+Output byte-identical on the 187 MB image, cold against warm-through-a-daemon;
+62 suites, 647 tests green, and green again under `BLINKER_VERIFY_LIVENESS=1`.

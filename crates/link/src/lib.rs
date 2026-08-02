@@ -35,8 +35,6 @@
 // correct, and stray diagnostics are invisible to both.
 #![deny(clippy::print_stderr, clippy::print_stdout)]
 
-use std::collections::BTreeSet;
-
 /// Every map in the link uses the fast hasher; see [`hashing`].
 use hashing::{FastMap as HashMap, FastSet as HashSet};
 use std::ffi::OsStr;
@@ -53,7 +51,7 @@ use blinker_output::image::Dylib;
 use blinker_output::symtab::OutputSymbol;
 use blinker_output::{Bind, Image, ImageBuilder, Rebase, UnwindEntry};
 use blinker_relocations::{apply, Context};
-use blinker_symbols::{SymbolProvider, SymbolTable};
+use blinker_symbols::{SymbolNameId, SymbolNames, SymbolProvider, SymbolTable};
 use reachability::Strip;
 
 mod hashing;
@@ -1488,97 +1486,101 @@ fn needs_got(kind: Arm64RelocationKind) -> bool {
 /// own binary it is **eleven rounds over 921 objects, 22.7 ms**, and the
 /// trade reverses completely. Same code, same reasoning, opposite answer,
 /// because the workload was two orders of magnitude apart (77).
+///
+/// # Why both sets hold ids rather than names
+///
+/// The sets are built by walking every symbol of every object — a million of
+/// them — and the names were `String`s so the set could outlive the objects
+/// being pushed to. Holding interned ids instead costs an integer hash per
+/// symbol and no allocation at all, because the interning already happened
+/// when each object was parsed.
+///
+/// The order the ids were handed out in is *not* usable as an ordering: it is
+/// whatever this process happened to intern first, so it differs between a
+/// cold link and a warm one. `wanted` is therefore unordered here and sorted
+/// by name where it is read, which is the point where the order reaches the
+/// output — through which archive member gets pulled, and so numbered, first.
+#[derive(Default)]
 struct Frontier {
-    defined: HashSet<String>,
-    /// Ordered, so which member is pulled first — and therefore what object id
-    /// it gets — never depends on a hash seed.
-    wanted: BTreeSet<String>,
+    defined: HashSet<SymbolNameId>,
+    wanted: HashSet<SymbolNameId>,
 }
 
 impl Frontier {
-    fn new(objects: &[LoadedObject]) -> Frontier {
-        let mut frontier = Frontier {
-            defined: HashSet::default(),
-            wanted: BTreeSet::new(),
-        };
-        for object in objects {
-            frontier.absorb(object);
-        }
-        frontier
-    }
-
-    /// Fold one newly arrived object in.
-    ///
-    /// Definitions first: a symbol defined later in the same object satisfies a
-    /// reference made earlier in it, and one pass would leave the name wanted
-    /// and pull a member to define what had just arrived.
-    /// # Why the membership test comes before the clone
-    ///
-    /// `insert(name.clone())` reads naturally and allocates a `String` for
-    /// every symbol of every object, then drops most of them on the floor: a
-    /// Rust link resolves the same names out of object after object, so the
-    /// set already holds the great majority of what is offered to it. Probing
-    /// first costs a hash the insert was going to compute anyway, and turns
-    /// the common case from allocate-and-discard into a lookup.
+    /// Fold one newly arrived object in, given its names as ids.
     ///
     /// The two loops must stay in this order — a symbol defined later in an
-    /// object satisfies a reference made earlier in it — and neither loop's
-    /// result depends on how many allocations it performed, so this is a
-    /// change of cost and not of meaning.
-    ///
-    /// **It measures zero, and now on three workloads rather than one.** Two
-    /// interleaved runs on a 60-input link gave -0.6 ms and +0.7 ms; the
-    /// defence offered at the time was that the 5.9 ms it targets had been
-    /// measured on a 921-object link (finding 83) and no such workload was set
-    /// up here. One is now (`scripts/workload.py`), and the answer did not
-    /// change: +0.5 ms at 681 objects, +0.1 ms at 745, against a noise floor
-    /// of 0.3 ms. Kept because it is a reordering with no new machinery rather
-    /// than because a number says it helps — said plainly so nobody reads a
-    /// win into it, and now so nobody re-derives the 5.9 ms either.
-    fn absorb(&mut self, object: &LoadedObject) {
+    /// object satisfies a reference made earlier in it — or one pass would
+    /// leave the name wanted and pull a member to define what had just
+    /// arrived.
+    fn absorb(&mut self, object: &LoadedObject, ids: &[SymbolNameId]) {
         for symbol in &object.parsed.symbols {
-            if !symbol.strength.is_definition() || self.defined.contains(symbol.name.as_str()) {
+            if !symbol.strength.is_definition() {
                 continue;
             }
-            self.defined.insert(symbol.name.clone());
-            self.wanted.remove(&symbol.name);
+            // Newly defined, so anything waiting on it is satisfied. A name
+            // already defined cannot still be wanted — the second loop below
+            // never admits one — so the removal is skipped with it.
+            let name = ids[symbol.id.0 as usize];
+            if self.defined.insert(name) {
+                self.wanted.remove(&name);
+            }
         }
         for symbol in &object.parsed.symbols {
-            if symbol.strength.is_definition()
-                || self.defined.contains(symbol.name.as_str())
-                || self.wanted.contains(symbol.name.as_str())
-            {
+            if symbol.strength.is_definition() {
                 continue;
             }
-            self.wanted.insert(symbol.name.clone());
+            let name = ids[symbol.id.0 as usize];
+            if self.defined.contains(&name) {
+                continue;
+            }
+            self.wanted.insert(name);
         }
     }
 }
 
-fn undefined_references(objects: &[LoadedObject]) -> Vec<String> {
-    let mut defined: HashSet<&str> = HashSet::default();
-    for object in objects {
+/// Names referenced by some object and defined by none, in name order.
+///
+/// Two passes over every symbol of every object — a million of them on a debug
+/// rust-analyzer link — which is why they are over ids rather than strings.
+/// The interning that produced the ids happened once, when each object was
+/// first parsed; here the work is an integer hash per symbol.
+fn undefined_references(
+    objects: &[LoadedObject],
+    interned: &[Arc<Vec<SymbolNameId>>],
+    names: &SymbolNames,
+) -> Vec<String> {
+    let mut defined: HashSet<SymbolNameId> = HashSet::default();
+    for (slot, object) in objects.iter().enumerate() {
         for symbol in &object.parsed.symbols {
             if symbol.strength.is_definition() {
-                defined.insert(symbol.name.as_str());
+                defined.insert(interned[slot][symbol.id.0 as usize]);
             }
         }
     }
 
-    let mut names = Vec::new();
-    let mut seen: HashSet<&str> = HashSet::default();
-    for object in objects {
+    let mut undefined = Vec::new();
+    let mut seen: HashSet<SymbolNameId> = HashSet::default();
+    for (slot, object) in objects.iter().enumerate() {
         for symbol in &object.parsed.symbols {
-            if symbol.strength.is_definition() || defined.contains(symbol.name.as_str()) {
+            let name_id = interned[slot][symbol.id.0 as usize];
+            if symbol.strength.is_definition() || defined.contains(&name_id) {
                 continue;
             }
-            if seen.insert(symbol.name.as_str()) {
-                names.push(symbol.name.clone());
+            if seen.insert(name_id) {
+                undefined.push(name_id);
             }
         }
     }
-    names.sort();
-    names
+    // Sorted by name and not by id: an id is an artefact of what this process
+    // happened to intern first, and the order here reaches the output through
+    // which archive member gets pulled — and therefore numbered — first.
+    let mut out: Vec<String> = undefined
+        .into_iter()
+        .filter_map(|id| names.resolve(id).map(str::to_string))
+        .collect();
+    out.sort();
+    out
 }
 
 /// Link the request into an image.
@@ -1663,6 +1665,15 @@ fn link_inner(
     let objects = objects?;
     timings.read_and_parse_ms = elapsed_ms(step);
 
+    // Every object's names as ids, gathered once for the whole link. A held
+    // object's vector was interned by the link that first parsed it, so this
+    // is an `Arc` clone each; a newly read one pays for its own names and
+    // nobody else's.
+    let interned: Vec<Arc<Vec<SymbolNameId>>> = objects
+        .iter()
+        .map(|object| session.interned(&object.parsed))
+        .collect();
+
     // Decided before anything is placed, because it changes how big every
     // contribution is. Everything downstream asks it where an input byte went.
     let step = std::time::Instant::now();
@@ -1718,11 +1729,12 @@ fn link_inner(
     let imports = match session.imports() {
         Some(held) => held.to_vec(),
         None => {
-            let imports = resolve_imports(&objects, exported.as_deref())?;
+            let imports =
+                resolve_imports(&objects, &interned, session.names(), exported.as_deref())?;
             // Resolution runs for its diagnostics: it is what turns a
             // genuinely missing definition into a named error rather than a
             // relocation against zero.
-            resolve_symbols(&objects, &imports)?;
+            resolve_symbols(&objects, &interned, &imports, session.names_mut())?;
             session.store_imports(&imports);
             imports
         }
@@ -2537,9 +2549,11 @@ fn elapsed_ms(start: std::time::Instant) -> f64 {
 /// Undefined references, checked against what `libSystem` actually exports.
 fn resolve_imports(
     objects: &[LoadedObject],
+    interned: &[Arc<Vec<SymbolNameId>>],
+    names: &SymbolNames,
     exported: Option<&libraries::StubExports>,
 ) -> Result<Vec<String>, LinkError> {
-    let undefined = undefined_references(objects);
+    let undefined = undefined_references(objects, interned, names);
     if undefined.is_empty() {
         return Ok(Vec::new());
     }
@@ -3188,19 +3202,36 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
     // Pull members in until nothing new is needed.
     let mut extracted: HashSet<(usize, u32)> = HashSet::default();
     let mut order: Vec<(usize, u32)> = Vec::new();
-    let mut frontier = Frontier::new(&objects);
+    let mut frontier = Frontier::default();
+    for object in &objects {
+        let ids = session.interned(&object.parsed);
+        frontier.absorb(object, &ids);
+    }
     // Names already offered to every archive. One that no archive defines will
     // still be wanted next round, and asking again cannot produce a different
     // answer — the archives do not change.
-    let mut probed: HashSet<String> = HashSet::default();
+    let mut probed: HashSet<SymbolNameId> = HashSet::default();
     loop {
-        let wanted: Vec<String> = frontier
+        let unprobed: Vec<SymbolNameId> = frontier
             .wanted
             .iter()
-            .filter(|name| !probed.contains(*name))
-            .cloned()
+            .copied()
+            .filter(|name| !probed.contains(name))
             .collect();
-        probed.extend(wanted.iter().cloned());
+        probed.extend(unprobed.iter().copied());
+        // Sorted by name, which is what decides the order members are pulled
+        // in and therefore what id each one gets. `frontier.wanted` is a hash
+        // set of ids, and neither its iteration order nor the ids' numeric
+        // order is stable across processes — this is where that is repaired.
+        let wanted: Vec<String> = {
+            let names = session.names();
+            let mut out: Vec<String> = unprobed
+                .iter()
+                .filter_map(|name| names.resolve(*name).map(str::to_string))
+                .collect();
+            out.sort_unstable();
+            out
+        };
         let mut added = false;
 
         // Which members this round wants, in the order it wants them. Chosen
@@ -3326,7 +3357,8 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
 
         for loaded in parsed {
             let loaded = loaded?;
-            frontier.absorb(&loaded);
+            let ids = session.interned(&loaded.parsed);
+            frontier.absorb(&loaded, &ids);
             objects.push(loaded);
             added = true;
         }
@@ -3339,8 +3371,19 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
 }
 
 /// Build the global symbol table and check it is complete.
-fn resolve_symbols(objects: &[LoadedObject], imports: &[String]) -> Result<SymbolTable, LinkError> {
-    let mut table = SymbolTable::new();
+///
+/// Takes the session's interning table by reference and puts it back before
+/// returning, on both the success and the failure path. It must not be moved
+/// out and dropped on an error: the id vectors in `interned` are only
+/// meaningful against this table, and a link that failed is followed by a link
+/// that reuses every one of them.
+fn resolve_symbols(
+    objects: &[LoadedObject],
+    interned: &[Arc<Vec<SymbolNameId>>],
+    imports: &[String],
+    names: &mut SymbolNames,
+) -> Result<(), LinkError> {
+    let mut table = SymbolTable::with_names(std::mem::take(names));
 
     // Dylib exports are definitions as far as resolution is concerned; dyld
     // supplies the address at load time.
@@ -3348,11 +3391,13 @@ fn resolve_symbols(objects: &[LoadedObject], imports: &[String]) -> Result<Symbo
         table.define_dynamic(name, 0);
     }
 
-    for object in objects {
+    for (slot, object) in objects.iter().enumerate() {
+        let ids = &interned[slot];
         for symbol in &object.parsed.symbols {
+            let name_id = ids[symbol.id.0 as usize];
             if symbol.strength.is_definition() {
-                table.define(
-                    &symbol.name,
+                table.define_id(
+                    name_id,
                     SymbolProvider::Object {
                         object: object.parsed.id,
                         symbol: symbol.id,
@@ -3361,21 +3406,24 @@ fn resolve_symbols(objects: &[LoadedObject], imports: &[String]) -> Result<Symbo
                     symbol.visibility,
                 );
             } else {
-                table.reference(&symbol.name, object.parsed.id, symbol.strength);
+                table.reference_id(name_id, object.parsed.id, symbol.strength);
             }
         }
     }
 
     let undefined = table.undefined_symbols();
-    if !undefined.is_empty() {
-        return Err(LinkError::UndefinedSymbols {
+    let outcome = if undefined.is_empty() {
+        Ok(())
+    } else {
+        Err(LinkError::UndefinedSymbols {
             names: undefined
                 .into_iter()
                 .filter_map(|u| table.name_of(u.name).map(str::to_string))
                 .collect(),
-        });
-    }
-    Ok(table)
+        })
+    };
+    *names = table.into_names();
+    outcome
 }
 
 /// Read and parse one archive member.
