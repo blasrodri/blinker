@@ -7073,3 +7073,43 @@ That is the same conclusion the other remaining stages reach. On a relink where
 nothing changed at all, `dead_strip` is 231 ms, `emit_linkedit` 145, `symbols`
 95, `address_table` 136, `unwind` 112. Every one of them is a complete
 recomputation, every one is correct, and none of them asks what moved.
+
+## 148. Where this leaves the long link
+
+A relink of rust-analyzer where a third of the input files were renamed and not
+one byte of any of them changed. Minima over eight links through a resident
+linker:
+
+```
+                     start of the day     now
+  link                    3645 ms         970 ms
+```
+
+The whole of that came from removing wrong invalidation rather than from making
+anything faster: the session no longer throws itself away when the input list
+changes (144), a renamed object is served from its content (145), and the
+extraction order and import set are invalidated by interfaces instead of paths
+(145). Two container-sizing fixes and a sort account for about 130 ms of it.
+
+What is left, in order:
+
+```
+    relocate         294 ms   30%     address_table 130, unwind 97, address_map 36
+    emit             201      21%     emit_linkedit 144
+    dead_strip       168      17%     traverse 135, atoms 24
+    symbols           97      10%
+    survey            69       7%
+    layout            34       4%
+    read_and_parse    25       3%
+```
+
+`read_and_parse` was 991 ms and is now 25. Nothing else has moved, because
+nothing else was invalidating wrongly — they were all simply recomputing, which
+they still are. Every stage in that list is a complete pass over the program to
+produce an answer identical to the one the previous link produced.
+
+ld64 links this program cold in 336 ms. blinker now takes 970 ms to do nothing.
+The remaining work is not a search for waste; it is that six stages need to
+learn what changed, and the measurements that say what each of them may skip —
+one object of 5,637 for liveness (133), three contributions of 9,722 for
+placement, 197 addresses of 506,405 — are already recorded.
