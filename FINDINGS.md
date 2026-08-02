@@ -6994,3 +6994,39 @@ ms. It costs 1,360, and the profile no longer has a dominant term: `dead_strip`
 231, `relocate` 391, `emit` 311. None of them consults whether anything
 changed. That is the same list finding 142 ended with, minus the two entries
 that turned out to be about reading files.
+
+## 146. A stable sort of 1.7 million symbols, sorted by three fields that
+## already order it totally
+
+With the rename handled, the zero-change relink is 1,360 ms with no dominant
+term. Splitting the symbol stage:
+
+```
+  symbols: placed 15  output 182  debug_map 52   (1689759 entries)
+```
+
+`output_symbols` is nearly all of it, and it does two things: build one
+`OutputSymbol` per definition, then sort them. The sort was `sort_by`, which is
+stable — it allocates a second buffer of 340,000 entries and merges into it.
+
+The comparator is `name`, then `value`, then `section`. Two entries that
+compare equal agree on all three, and nothing else about them reaches the
+output, so the order among them is not observable and stability is buying
+nothing.
+
+```
+  output_symbols   182 ms -> 95 ms
+```
+
+One word. Verified byte-identical on the 187 MB rust-analyzer image — which is
+the check this needed, because "the tie-break is total" is an argument and a
+187 MB binary with 1.7 million symbols is evidence.
+
+### The number underneath it
+
+1,689,759 symbol table entries for a program with 506,405 addresses. Most of
+them are the debug map: four stabs per function — `BNSYM`, `FUN`, `FUN`,
+`ENSYM` — which is what `ld` emits and what a debugger reads. It is worth
+writing down because every future measurement of this stage is really a
+measurement of that ratio, and "the symbol table" sounds like it should be
+proportional to the symbols.

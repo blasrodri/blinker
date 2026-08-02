@@ -3557,7 +3557,12 @@ fn output_symbols(placed: &[PlacedSymbol<'_>]) -> Vec<OutputSymbol> {
     // Deterministic order regardless of how the objects were traversed. Locals
     // may share a name across objects, so the name alone no longer orders the
     // table — address and section break the tie.
-    out.sort_by(|a, b| {
+    //
+    // Unstable, because those three fields are a total order: two entries that
+    // compare equal agree on name, address and section, and nothing else about
+    // them reaches the output. A stable sort of 340,000 entries allocates a
+    // second buffer of them and merges into it, which is the whole difference.
+    out.sort_unstable_by(|a, b| {
         a.name
             .cmp(&b.name)
             .then(a.value.cmp(&b.value))
