@@ -10,6 +10,7 @@
 //! compares integers rather than strings, and the storage is paid once.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// A interned symbol name.
 ///
@@ -22,11 +23,17 @@ pub struct SymbolNameId(pub u32);
 /// An interning table mapping names to [`SymbolNameId`]s and back.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SymbolNames {
-    names: Vec<String>,
+    /// Shared with `lookup`, so a name is allocated once rather than twice.
+    ///
+    /// Interning stored every name in both the vector and the map key. Half
+    /// of a debug rust-analyzer link's 981,253 `intern` calls are misses, so
+    /// that was 955,064 allocations where 477,532 will do — and interning is
+    /// the whole cost of building the symbol table (finding 152).
+    names: Vec<Arc<str>>,
     /// Reverse index. Rebuilt on deserialization rather than stored, since it
     /// is derivable and would double the cached size.
     #[serde(skip)]
-    lookup: HashMap<String, SymbolNameId>,
+    lookup: HashMap<Arc<str>, SymbolNameId>,
 }
 
 impl SymbolNames {
@@ -40,14 +47,15 @@ impl SymbolNames {
             return *id;
         }
         let id = SymbolNameId(self.names.len() as u32);
-        self.names.push(name.to_string());
-        self.lookup.insert(name.to_string(), id);
+        let shared: Arc<str> = Arc::from(name);
+        self.names.push(Arc::clone(&shared));
+        self.lookup.insert(shared, id);
         id
     }
 
     /// The name behind an ID.
     pub fn resolve(&self, id: SymbolNameId) -> Option<&str> {
-        self.names.get(id.0 as usize).map(String::as_str)
+        self.names.get(id.0 as usize).map(AsRef::as_ref)
     }
 
     /// Look up an existing name without interning it.
@@ -74,7 +82,7 @@ impl SymbolNames {
             .names
             .iter()
             .enumerate()
-            .map(|(index, name)| (name.clone(), SymbolNameId(index as u32)))
+            .map(|(index, name)| (Arc::clone(name), SymbolNameId(index as u32)))
             .collect();
     }
 }

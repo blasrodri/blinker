@@ -7255,3 +7255,62 @@ Two stages have no incremental story written down yet — `resolve` and
 third. None of them is blocked on a measurement; the numbers above are all the
 invalidation keys they need, and every one of them already exists in the
 session.
+
+## 152. Resolution is interning, and interning stored every name twice
+
+`resolve` is 424 ms on the realistic edit and had never been looked at inside.
+It splits:
+
+```
+  resolve: imports 180  table 250
+```
+
+`resolve_symbols` builds the global table by offering every symbol of every
+object to it, and each offer does an intern plus three or four map operations
+keyed by the interned id. The obvious target was the maps — `resolved`,
+`rules`, `candidates`, `undefined`, four `HashMap`s keyed by a dense `u32` that
+could be `Vec`s.
+
+Measuring first, by replacing the loop body with nothing but the intern:
+
+```
+  intern only:  table 250 ms
+  full path:    table 250 ms
+```
+
+The maps are close to free. That is not quite the clean result it looks like —
+the intern-only run interned *every* symbol, including locals, which the real
+path skips before it ever interns — so the two are not the same amount of
+interning. What it does rule out is a refactor of the four maps, which was
+where an afternoon was about to go.
+
+### What interning was doing
+
+```
+  intern: 981253 calls, 477532 distinct (51% hits)
+```
+
+Half the calls are misses, and each miss allocated the name **twice** — once
+into `names: Vec<String>` and once as the key of `lookup: HashMap<String, _>`.
+955,064 allocations to store 477,532 names.
+
+Sharing one allocation between the two, as `Arc<str>`:
+
+```
+  table   250 ms -> 225 ms
+  link   1990    -> 1863
+```
+
+Output byte-identical.
+
+### And two `Vec`s per name that a successful link never reads
+
+`candidates` records every definition offered for a name so a duplicate-symbol
+error can list the competitors; `undefined` records which objects referenced a
+name so a missing-symbol error can say who wanted it. Both were a `Vec` per
+name — a heap allocation for every distinct name in the program, to hold one
+element, on the way to an error that does not happen.
+
+Both now keep the first inline and the rest in a `Vec` that stays empty, which
+is the `Owners` shape from the atom code. `table` 293 -> 250 before the interner
+change above.

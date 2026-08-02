@@ -72,8 +72,43 @@ pub struct ResolvedSymbol {
     pub final_address: Option<u64>,
 }
 
+/// The definitions offered for one name, and the objects referencing it.
+///
+/// The first inline, the rest in a `Vec` that stays empty — and an empty `Vec`
+/// does not allocate. Nearly every name has exactly one of each, and a link
+/// that succeeds never reads either: candidates exist to name the competitors
+/// in a duplicate-symbol error, and the referencing objects to name who wanted
+/// an undefined one. Storing a `Vec` per name meant a heap allocation for
+/// every distinct name in the program to hold one element.
+#[derive(Debug, Clone)]
+struct Few<T> {
+    first: T,
+    rest: Vec<T>,
+}
+
+impl<T: Copy> Few<T> {
+    fn new(first: T) -> Few<T> {
+        Few {
+            first,
+            rest: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, item: T) {
+        self.rest.push(item);
+    }
+
+    fn all(&self) -> impl Iterator<Item = T> + '_ {
+        std::iter::once(self.first).chain(self.rest.iter().copied())
+    }
+
+    fn to_vec(&self) -> Vec<T> {
+        self.all().collect()
+    }
+}
+
 /// A definition competing to satisfy a name, kept for diagnostics.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Candidate {
     pub provider: SymbolProvider,
     pub strength: SymbolStrength,
@@ -104,10 +139,10 @@ pub struct SymbolTable {
     /// Every definition offered for a name, winner included. Kept so a
     /// duplicate-symbol error can name all the competitors, which is what
     /// makes it actionable.
-    candidates: HashMap<SymbolNameId, Vec<Candidate>>,
+    candidates: HashMap<SymbolNameId, Few<Candidate>>,
     rules: HashMap<SymbolNameId, ResolutionRule>,
     /// Names referenced but not yet defined.
-    undefined: HashMap<SymbolNameId, Vec<ObjectId>>,
+    undefined: HashMap<SymbolNameId, Few<ObjectId>>,
     errors: Vec<SymbolError>,
 }
 
@@ -136,10 +171,13 @@ impl SymbolTable {
         }
 
         let name_id = self.names.intern(name);
-        self.candidates
-            .entry(name_id)
-            .or_default()
-            .push(Candidate { provider, strength });
+        let candidate = Candidate { provider, strength };
+        match self.candidates.entry(name_id) {
+            std::collections::hash_map::Entry::Occupied(mut held) => held.get_mut().push(candidate),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(Few::new(candidate));
+            }
+        }
 
         // A definition satisfies any outstanding reference.
         self.undefined.remove(&name_id);
@@ -192,7 +230,7 @@ impl SymbolTable {
             (SymbolStrength::Strong, SymbolStrength::Strong) => {
                 self.errors.push(SymbolError::Duplicate(DuplicateSymbol {
                     name: name_id,
-                    candidates: self.candidates[&name_id].clone(),
+                    candidates: self.candidates[&name_id].to_vec(),
                 }));
             }
             // Strong displaces weak, whichever arrived first. Order-dependence
@@ -243,7 +281,12 @@ impl SymbolTable {
             return;
         }
 
-        self.undefined.entry(name_id).or_default().push(from);
+        match self.undefined.entry(name_id) {
+            std::collections::hash_map::Entry::Occupied(mut held) => held.get_mut().push(from),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(Few::new(from));
+            }
+        }
     }
 
     /// Record that a dynamic library provides `name`.
@@ -299,12 +342,12 @@ impl SymbolTable {
     }
 
     /// Every definition offered for `name`, winner included.
-    pub fn candidates_for(&self, name: &str) -> &[Candidate] {
+    pub fn candidates_for(&self, name: &str) -> Vec<Candidate> {
         self.names
             .get(name)
             .and_then(|id| self.candidates.get(&id))
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
+            .map(Few::to_vec)
+            .unwrap_or_default()
     }
 
     /// Names still referenced but never defined.
@@ -314,7 +357,7 @@ impl SymbolTable {
             .iter()
             .map(|(name, referenced_by)| UndefinedSymbol {
                 name: *name,
-                referenced_by: referenced_by.clone(),
+                referenced_by: referenced_by.to_vec(),
             })
             .collect();
         // Deterministic order: diagnostics must not vary between runs.
