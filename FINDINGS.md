@@ -7209,3 +7209,49 @@ the names live in the parsed objects, but the frontier is built while the
 object list is still growing, so it cannot borrow from a `Vec` that is being
 pushed to. Every other place this pattern was fixed today (134, 136) had a
 finished collection to borrow from.
+
+## 151. Where the realistic edit stands
+
+The fixture that matters: `crates/ide/src/lib.rs` edited — a library crate only
+the binary depends on, which is what an inner loop looks like. Minima over six
+relinks through a resident linker.
+
+```
+  blast radius   2 of 341 inputs, 512 of 6079 objects (8%)
+  session        339 inputs held, 2 read
+  placement      23736/23739 contributions kept their address
+  addresses      38 of 506404 changed (0.01%)
+  reachability   1 of 5637 objects' projection moved
+
+                          before today's last stretch      now
+  link                            2868 ms                 2078 ms
+    read_and_parse                 934                     409
+    resolve                        495                     454
+    relocate                       474                     463
+    emit                           227                     212
+    dead_strip                     217                     203
+```
+
+ld64 links this program cold in 336 ms.
+
+Nearly all of the 790 ms came from one loop (149). The rest of the profile is
+unchanged, and unchanged for the same reason it has been all day: every stage
+still computes its answer from the whole program.
+
+What each of them could skip, measured:
+
+```
+    relocate       463 ms    38 addresses of 506,404 moved; 83% of
+                             relocations are already reused
+    resolve        454       2 interfaces of 341 moved
+    read_and_parse 409       parse measures 0; it is `Frontier::absorb`
+                             walking every symbol twice and cloning names
+    emit           212       the image is 187 MB and 3 contributions moved
+    dead_strip     203       1 object of 5,637
+```
+
+Two stages have no incremental story written down yet — `resolve` and
+`symbols`/`emit_linkedit` — and `DESIGN-incremental-liveness.md` covers the
+third. None of them is blocked on a measurement; the numbers above are all the
+invalidation keys they need, and every one of them already exists in the
+session.
