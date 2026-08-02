@@ -243,7 +243,19 @@ impl SymbolTableBuilder {
 
         // The string table opens with a NUL so index 0 is the empty string,
         // which is what an unnamed symbol points at.
-        let mut strings = vec![0u8];
+        //
+        // Sized before it is filled. rust-analyzer's debug image comes to 82 MB
+        // of names, and growing there from one byte is twenty-seven doublings
+        // that copy about 160 MB on the way (135). The bound is the total
+        // length of every name; interning brings the real size below it, and
+        // the difference is transient.
+        let bytes: usize = self
+            .symbols
+            .iter()
+            .map(|symbol| symbol.name.len() + 1)
+            .sum();
+        let mut strings = Vec::with_capacity(bytes + 1);
+        strings.push(0u8);
         let mut entries = Vec::with_capacity(self.symbols.len());
         // Names repeat: the debug map names every function a second time, so
         // half the string table would otherwise be a copy of the other half.
@@ -254,7 +266,15 @@ impl SymbolTableBuilder {
         // worst-scaling stage in the link — 7.2x when the work grew 3.7x
         // (finding 130). The reasoning is the one in `blinker_hashing`: every
         // key here comes from an object file the linker was told to read.
-        let mut interned: blinker_hashing::FastMap<&str, u32> = blinker_hashing::FastMap::default();
+        // Sized too, for the same reason: it is probed once per symbol and ends
+        // up holding one entry per distinct name, and 1.7 million inserts into
+        // a table that starts empty rehash everything already in it once per
+        // doubling.
+        let mut interned: blinker_hashing::FastMap<&str, u32> =
+            blinker_hashing::FastMap::with_capacity_and_hasher(
+                self.symbols.len(),
+                Default::default(),
+            );
 
         for symbol in &self.symbols {
             let name_offset = if symbol.name.is_empty() {
@@ -278,11 +298,16 @@ impl SymbolTableBuilder {
             });
         }
 
-        let count =
-            |group: SymbolGroup| self.symbols.iter().filter(|s| s.group == group).count() as u32;
-        let locals = count(SymbolGroup::Local);
-        let externals = count(SymbolGroup::ExternalDefined);
-        let undefined = count(SymbolGroup::Undefined);
+        // One pass, not three. The table is 1.7 million entries and each of
+        // these was a separate scan of all of them.
+        let (mut locals, mut externals, mut undefined) = (0u32, 0u32, 0u32);
+        for symbol in &self.symbols {
+            match symbol.group {
+                SymbolGroup::Local => locals += 1,
+                SymbolGroup::ExternalDefined => externals += 1,
+                SymbolGroup::Undefined => undefined += 1,
+            }
+        }
 
         SymbolTable {
             entries,

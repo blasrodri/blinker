@@ -7030,3 +7030,46 @@ them are the debug map: four stabs per function — `BNSYM`, `FUN`, `FUN`,
 writing down because every future measurement of this stage is really a
 measurement of that ratio, and "the symbol table" sounds like it should be
 proportional to the symbols.
+
+## 147. Eighty-two megabytes of string table, grown from one byte
+
+Inside `emit_linkedit`, on the rust-analyzer image:
+
+```
+  symtab: sort 8  intern 135  counts 3   (1689759 syms, 82153095 string bytes)
+```
+
+The interning loop is nearly all of it. Two of finding 135's shape, and a third
+of a different kind:
+
+- **The string table** starts as `vec![0u8]` and reaches 82 MB. Twenty-seven
+  doublings, copying about 160 MB on the way. The bound is the total length of
+  every name — one pass over data already in hand.
+- **The intern map** is probed once per symbol and ends up holding one entry
+  per distinct name, growing into 1.7 million inserts from empty.
+- **The group counts** were three separate `filter().count()` scans of all 1.7
+  million entries to produce three numbers that one pass produces.
+
+Minima over eight links each:
+
+```
+              before   after
+  intern       135 ms   98 ms
+  counts         3       1
+  sort           8       9
+```
+
+Output byte-identical on the 187 MB image.
+
+### What it does not fix, and that is the interesting part
+
+Sizing the containers is worth 27%, not 70%. The rest is inherent to the shape:
+1.7 million hash lookups of names averaging 48 bytes, over a table too large to
+sit in any cache. That work does not go away by allocating better — it goes
+away by not doing it, which means the encoded symbol table has to survive a
+link the way parses now do.
+
+That is the same conclusion the other remaining stages reach. On a relink where
+nothing changed at all, `dead_strip` is 231 ms, `emit_linkedit` 145, `symbols`
+95, `address_table` 136, `unwind` 112. Every one of them is a complete
+recomputation, every one is correct, and none of them asks what moved.
