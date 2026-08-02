@@ -65,6 +65,23 @@ impl Memo {
     }
 }
 
+/// Hash whatever names the interning table has gained since the last call.
+///
+/// `SymbolNames` only ever appends, so the length difference *is* the set of
+/// new names — no bookkeeping beyond the two lengths.
+fn catch_up(digests: &mut Arc<Vec<blinker_cache::NameHash>>, names: &SymbolNames) {
+    if digests.len() == names.len() {
+        return;
+    }
+    let digests = Arc::make_mut(digests);
+    while digests.len() < names.len() {
+        let name = names
+            .resolve(SymbolNameId(digests.len() as u32))
+            .unwrap_or("");
+        digests.push(blinker_cache::name_digest(name));
+    }
+}
+
 /// One input, as this process last saw it.
 enum Entry {
     Object(Arc<ParsedObject>, Arc<Backing>),
@@ -235,6 +252,14 @@ pub struct Session {
     /// the symbols of the crates it recompiles, so it is the edited crates'
     /// symbols per rebuild, not the program's.
     names: SymbolNames,
+    /// `blake3(name)` per interned name, indexed by `SymbolNameId`.
+    ///
+    /// Kept in step with `names` and filled at the same moment, so it is the
+    /// same "once per distinct name, ever" as the interning itself. The
+    /// address table asks for half a million of these per link and the cache's
+    /// dependency lists for as many again; computing them from the text each
+    /// time was 140 ms of a link whose point is that the text did not change.
+    digests: Arc<Vec<blinker_cache::NameHash>>,
     /// Each object's reachability digest, as the last link computed it.
     ///
     /// Keyed by object id, which is positional and stable for as long as the
@@ -713,9 +738,14 @@ impl Session {
         let key = Arc::as_ptr(parse) as usize;
         // Split borrow: the memo entry and the interning table are separate
         // fields, and filling the first needs the second.
-        let Session { memo, names, .. } = self;
+        let Session {
+            memo,
+            names,
+            digests,
+            ..
+        } = self;
         let entry = memo.entry(key).or_insert_with(|| Memo::new(parse));
-        Arc::clone(entry.interned.get_or_insert_with(|| {
+        let ids = Arc::clone(entry.interned.get_or_insert_with(|| {
             Arc::new(
                 parse
                     .symbols
@@ -723,12 +753,28 @@ impl Session {
                     .map(|symbol| names.intern(&symbol.name))
                     .collect(),
             )
-        }))
+        }));
+        // Every name the table has and this vector does not is one this object
+        // just introduced, and `SymbolNames` only ever appends — so catching
+        // up by length is the same as hashing exactly the new names.
+        catch_up(digests, names);
+        ids
     }
 
     /// The interning table these ids belong to.
     pub(crate) fn names(&self) -> &SymbolNames {
         &self.names
+    }
+
+    /// `blake3(name)` for every interned name, indexed by `SymbolNameId`.
+    ///
+    /// Handed out as an `Arc` rather than borrowed: the two callers sit either
+    /// side of a step that needs the session mutably, and a shared count is
+    /// cheaper than arranging the borrows around it. The clone is released at
+    /// the end of the link, so the next one extends in place.
+    pub(crate) fn digests(&mut self) -> Arc<Vec<blinker_cache::NameHash>> {
+        catch_up(&mut self.digests, &self.names);
+        Arc::clone(&self.digests)
     }
 
     /// The interning table, for a caller that needs to add to it.

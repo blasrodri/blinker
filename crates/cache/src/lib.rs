@@ -61,7 +61,7 @@ use codec::{Decoder, Encoder};
 /// A stale layout read as a current one is the one failure mode of a cache
 /// that produces a *wrong* binary rather than a slow one, so the version is
 /// checked before any other byte is trusted.
-pub const SCHEMA: u32 = 3;
+pub const SCHEMA: u32 = 4;
 
 const MAGIC: &[u8; 8] = b"BLNKCAC\x01";
 
@@ -111,15 +111,43 @@ pub fn name_hash(name: &str) -> NameHash {
 /// Where the linker would find a local definition, this must scope to that
 /// object; where it would fall through to the global map, this must not.
 pub fn dep_hash(scope: u32, table: Table, name: &str) -> NameHash {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(&scope.to_le_bytes());
-    hasher.update(&[table as u8]);
-    hasher.update(name.as_bytes());
+    combine(name_digest(name), scope, table)
+}
+
+/// The expensive half: BLAKE3 of the name, and of nothing else.
+///
+/// Split out from [`dep_hash`] so it can be computed once per *distinct name*
+/// rather than once per address. A debug rust-analyzer link asks for 506,405
+/// address hashes, and hashing the name text for each was 140 ms of a 1,265 ms
+/// link — for names that had not changed, in a linker whose whole premise is
+/// that they usually have not. The linker holds these beside its interning
+/// table, so a held input's names are never hashed twice.
+pub fn name_digest(name: &str) -> NameHash {
     u64::from_le_bytes(
-        hasher.finalize().as_bytes()[..8]
+        blake3::hash(name.as_bytes()).as_bytes()[..8]
             .try_into()
             .expect("8 bytes"),
     )
+}
+
+/// The cheap half: fold the scope and table into a name's digest.
+///
+/// Mixed in *after* the name rather than hashed before it, which is what makes
+/// the digest reusable across every scope and table the same name appears in.
+///
+/// The finaliser is a bijection for any fixed `(scope, table)`, so two triples
+/// collide exactly when their names' 64-bit digests collide under the xor —
+/// the same birthday bound the concatenated hash had. Nothing here is a
+/// cheaper hash of the name: BLAKE3 still runs over the text, once. See
+/// finding 153 for why that is not negotiable.
+pub fn combine(digest: NameHash, scope: u32, table: Table) -> NameHash {
+    let mut x = digest ^ (((scope as u64) << 3) | table as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    x ^= x >> 33;
+    x
 }
 
 /// Where one object's patched bytes live in an output section.

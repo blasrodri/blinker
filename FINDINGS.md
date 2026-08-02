@@ -7560,3 +7560,74 @@ two full string-hashing passes.
 
 Output byte-identical on the 187 MB image, cold against warm-through-a-daemon;
 62 suites, 647 tests green, and green again under `BLINKER_VERIFY_LIVENESS=1`.
+
+## 158. The name was hashed with the scope, so it was hashed half a million times
+
+`dep_hash(scope, table, name)` is `blake3(scope || table || name)`, truncated
+to 64 bits. Putting the scope first is the natural way to write it and it makes
+the expensive part — BLAKE3 over a Rust mangled name that routinely runs past
+a hundred bytes — depend on the cheap part:
+
+```
+  address_table: hash+collect 149 ms   sort+dedup 10 ms   (506,405 entries)
+```
+
+Every one of those names had been hashed on the previous link too, and the
+previous link's inputs differ from this one's by 8% of objects.
+
+`dependency_hashes` pays it again, per object, for every symbol its relocations
+read — inside `apply`.
+
+### Split the hash where the reuse boundary is
+
+```rust
+pub fn dep_hash(scope: u32, table: Table, name: &str) -> NameHash {
+    combine(name_digest(name), scope, table)
+}
+```
+
+`name_digest` is BLAKE3 of the name alone, so it is a pure function of the
+name and is held beside the interning table from finding 157 — one `u64` per
+`SymbolNameId`, computed when the object introducing it was first parsed.
+`combine` folds in the scope and table with a splitmix finaliser, which is a
+bijection for any fixed `(scope, table)`: two triples collide exactly when
+their names' 64-bit digests collide under the xor, which is the birthday bound
+the concatenated hash already had.
+
+This is not finding 153 being reversed. BLAKE3 still runs over the name text —
+the refusal there was to hash the *name* with fxhash, and that still stands.
+What changed is only where the scope enters.
+
+`AddressMap` now carries each entry's `SymbolNameId` beside its address, since
+finding the id by name would be the string hash the id exists to avoid.
+
+### Measured
+
+Same edit, same machine, resident linker, per-stage minima over 6:
+
+```
+                  before    after
+  address_table    133.9     11.1
+  apply            146.7     99.4      the dependency lists
+  relocate         465.3    286.4
+  link            1265.0   1027.8      -19%
+```
+
+Cold is unchanged at ~2.0 s, correctly: a cold link hashes every name once
+either way.
+
+`SCHEMA` bumped to 4 — the hashes a cache stores are now different numbers,
+and a stale layout read as a current one is the cache's one wrong-binary
+failure mode.
+
+Output byte-identical on the 187 MB image, cold against warm-through-a-daemon;
+62 suites, 647 tests green, and green again under `BLINKER_VERIFY_LIVENESS=1`.
+
+### An aside that looked like a bug
+
+Comparing a `--blinker-cache` link against one without produced different
+bytes, which reads as "reuse changed the output" — the one thing that must
+never happen. It is not: `--blinker-cache` also turns on `with_stable_layout`,
+deliberately, so that a cold link and a cached one lay out the same way. The
+flag changes two things and only one of them is the cache. Worth knowing
+before the next person diffs those two runs.

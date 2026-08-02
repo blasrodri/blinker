@@ -1943,13 +1943,18 @@ fn link_inner(
     // Built once from the layout, and consulted a few hundred thousand times.
     let sub = std::time::Instant::now();
     let placed = Placed::index(&probe);
-    let mut addresses = address_map(&objects, &placed, &strip);
+    let mut addresses = address_map(&objects, &interned, &placed, &strip);
     // Commons have no section of their own in any input, so `address_map` —
     // which walks each symbol's defining section — cannot see them. They are
     // definitions all the same, and every reference resolves here.
-    for (name, address) in common_addresses(&commons, &probe) {
-        addresses.global.insert(name, address);
+    for (name, value) in common_addresses(&commons, &probe) {
+        // Interned rather than looked up: a common's name reaches the address
+        // table like any other, and the table indexes digests by id.
+        let id = session.names_mut().intern(name);
+        addresses.global.insert(name, Address { name: id, value });
     }
+    // Taken after the last name is interned, so it covers every id above.
+    let name_digests = session.digests();
     let got_slots = got_slot_addresses(&got, &probe);
     let stub_slots = stub_addresses(&stubs, &probe);
     let tlv_slots = pointer_slot_addresses(&tlv, &probe, "__thread_ptrs");
@@ -2016,10 +2021,15 @@ fn link_inner(
     // before relocation because it is what decides which objects can skip it —
     // and not built at all when nothing will ask.
     let table_step = std::time::Instant::now();
-    let current_addresses = request
-        .cache_path
-        .as_ref()
-        .map(|_| address_table(&addresses, &got_slots, &stub_slots, &tlv_slots));
+    let current_addresses = request.cache_path.as_ref().map(|_| {
+        address_table(
+            &addresses,
+            &name_digests,
+            &got_slots,
+            &stub_slots,
+            &tlv_slots,
+        )
+    });
     timings.address_table_ms = elapsed_ms(table_step);
 
     // How much of the program's addressing actually moved. Not used to decide
@@ -2057,6 +2067,10 @@ fn link_inner(
     let sub = std::time::Instant::now();
     let patched = apply_relocations(
         &objects,
+        &Names {
+            interned: &interned,
+            digests: &name_digests,
+        },
         &probe,
         &Placement {
             addresses: &addresses,
@@ -2492,22 +2506,37 @@ fn object_ranges_index(image: &Image) -> HashMap<u32, Vec<blinker_cache::Range>>
 /// independently of them: inserting a GOT entry shifts every slot after it
 /// while leaving every symbol address untouched, and an entry whose bytes
 /// reference the shifted slot must not look unchanged.
+///
+/// The names are not hashed here. Each one's BLAKE3 digest was taken when the
+/// object introducing it was first parsed, and all that is left per entry is
+/// folding in the scope and the table — which is what turned 140 ms of BLAKE3
+/// over half a million unchanged names into a subscript (finding 158).
 fn address_table(
     addresses: &AddressMap<'_>,
+    digests: &[blinker_cache::NameHash],
     got_slots: &HashMap<String, u64>,
     stub_slots: &HashMap<String, u64>,
     tlv_slots: &HashMap<String, u64>,
 ) -> Vec<(blinker_cache::NameHash, u64)> {
-    use blinker_cache::{dep_hash, Table, GLOBAL};
+    use blinker_cache::{combine, Table, GLOBAL};
+    let digest = |name: SymbolNameId| digests[name.0 as usize];
     let _t = std::time::Instant::now();
     let mut table: Vec<_> = addresses
         .global
-        .iter()
-        .map(|(name, address)| (dep_hash(GLOBAL, Table::Symbol, name), *address))
+        .values()
+        .map(|address| {
+            (
+                combine(digest(address.name), GLOBAL, Table::Symbol),
+                address.value,
+            )
+        })
         .chain(addresses.local.iter().flat_map(|(object, names)| {
-            names
-                .iter()
-                .map(move |(name, address)| (dep_hash(*object, Table::Symbol, name), *address))
+            names.values().map(move |address| {
+                (
+                    combine(digest(address.name), *object, Table::Symbol),
+                    address.value,
+                )
+            })
         }))
         .chain(indirect_entries(got_slots, Table::Got))
         .chain(indirect_entries(stub_slots, Table::Stub))
@@ -4259,6 +4288,8 @@ fn note_reference(
 /// `__eh_frame` LSDAs.
 fn dependency_hashes(
     object: &LoadedObject,
+    ids: &[SymbolNameId],
+    digests: &[blinker_cache::NameHash],
     addresses: &AddressMap<'_>,
     referenced: &HashSet<(u32, u8)>,
 ) -> Vec<blinker_cache::NameHash> {
@@ -4272,10 +4303,12 @@ fn dependency_hashes(
                 3 => blinker_cache::Table::ThreadLocal,
                 _ => blinker_cache::Table::Symbol,
             };
-            Some(blinker_cache::dep_hash(
+            // The scope still needs the text — it is a membership test against
+            // the borrowed address map — but the digest does not.
+            Some(blinker_cache::combine(
+                digests[ids.get(*symbol as usize)?.0 as usize],
                 addresses.scope_of(object.parsed.id, name),
                 table,
-                name,
             ))
         })
         .collect();
@@ -4339,8 +4372,13 @@ struct Placement<'a> {
     placed: &'a Placed,
 }
 
+// Eight, and each one is a distinct thing the pass consults. The two already
+// bundled — `Placement` and `IndirectTables` — group parameters that belong
+// together; grouping the rest would only be hiding the count.
+#[allow(clippy::too_many_arguments)]
 fn apply_relocations(
     objects: &[LoadedObject],
+    names: &Names<'_>,
     image: &Image,
     placement: &Placement<'_>,
     tables: &IndirectTables<'_>,
@@ -4391,7 +4429,7 @@ fn apply_relocations(
     let mut records: Vec<ObjectRecord> = Vec::new();
     let mut reused = 0u64;
     let mut reused_relocations = 0u64;
-    for object in objects {
+    for (slot, object) in objects.iter().enumerate() {
         // Where this object's fixups start. Binds and rebases are produced as
         // a side effect of relocating, so an object whose bytes are later
         // reused from the cache must carry its own away with it — and the
@@ -4715,7 +4753,14 @@ fn apply_relocations(
         }
         records.push(ObjectRecord {
             object: object.parsed.id,
-            deps: dependency_hashes(object, addresses, &referenced).into(),
+            deps: dependency_hashes(
+                object,
+                &names.interned[slot],
+                names.digests,
+                addresses,
+                &referenced,
+            )
+            .into(),
             binds: bind_start..extra_binds.len(),
             rebases: rebase_start..extra_rebases.len(),
         });
@@ -4832,13 +4877,36 @@ fn target_address(
 /// allocations, for strings that already existed a pointer away.
 #[derive(Default)]
 struct AddressMap<'a> {
-    global: HashMap<&'a str, u64>,
+    global: HashMap<&'a str, Address>,
     /// Locals, by object and then by name.
     ///
     /// Nested rather than keyed by `(u32, &str)`, because a tuple key cannot
     /// be *borrowed*: looking one up meant building the tuple, on a path asked
     /// once per relocation. Two lookups in two maps beat one lookup plus that.
-    local: HashMap<u32, HashMap<&'a str, u64>>,
+    local: HashMap<u32, HashMap<&'a str, Address>>,
+}
+
+/// Every name in the link, as ids and as digests.
+///
+/// The two always travel together — an id is how you find a digest — and
+/// bundling them keeps the relocation pass's signature to the things it
+/// relocates.
+struct Names<'a> {
+    /// Per object, its symbols' interned names, indexed by `SymbolId`.
+    interned: &'a [Arc<Vec<SymbolNameId>>],
+    /// Per interned name, `blake3(name)`. See `Session::digests`.
+    digests: &'a [blinker_cache::NameHash],
+}
+
+/// An address, and the interned name it belongs to.
+///
+/// The id is carried rather than looked up because `address_table` walks this
+/// map to hash half a million names, and finding each one's id would be the
+/// string hash the id exists to avoid.
+#[derive(Debug, Clone, Copy)]
+struct Address {
+    name: SymbolNameId,
+    value: u64,
 }
 
 impl AddressMap<'_> {
@@ -4865,12 +4933,17 @@ impl AddressMap<'_> {
             .get(&object.0)
             .and_then(|names| names.get(name))
             .or_else(|| self.global.get(name))
-            .copied()
+            .map(|address| address.value)
     }
 }
 
 /// Compute the output address of every definition.
-fn address_map<'a>(objects: &'a [LoadedObject], placed: &Placed, strip: &Strip) -> AddressMap<'a> {
+fn address_map<'a>(
+    objects: &'a [LoadedObject],
+    interned: &[Arc<Vec<SymbolNameId>>],
+    placed: &Placed,
+    strip: &Strip,
+) -> AddressMap<'a> {
     let mut map = AddressMap::default();
     // Sized once rather than grown into: the global map ends up holding every
     // non-local definition in the link, and growing there from empty rehashes
@@ -4885,7 +4958,8 @@ fn address_map<'a>(objects: &'a [LoadedObject], placed: &Placed, strip: &Strip) 
 
     // Split so the two maps can be borrowed independently below.
     let AddressMap { global, local } = &mut map;
-    for object in objects {
+    for (slot, object) in objects.iter().enumerate() {
+        let ids = &interned[slot];
         // Hoisted: the object is the same for every symbol below, so finding
         // its sub-map inside the loop is one hash per local definition to
         // answer a question that changes once per object.
@@ -4917,6 +4991,13 @@ fn address_map<'a>(objects: &'a [LoadedObject], placed: &Placed, strip: &Strip) 
             };
             let address = chunk + offset;
 
+            let Some(name) = ids.get(symbol.id.0 as usize).copied() else {
+                continue;
+            };
+            let address = Address {
+                name,
+                value: address,
+            };
             if symbol.visibility == SymbolVisibility::Local {
                 locals.insert(symbol.name.as_str(), address);
             } else {
