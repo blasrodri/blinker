@@ -7179,3 +7179,33 @@ inputs and a cold parse, this loop is invisible.
 `absorb` is now the largest part of extraction at 285 ms: `Frontier` holds
 owned `String`s for every defined name in the program and grows both of its
 sets from empty.
+
+## 150. The frontier's `BTreeSet` was not the cost
+
+With the archive probe fixed (149), `absorb` is the largest part of extraction
+at 285 ms. The obvious suspect: `wanted` is a `BTreeSet<String>`, ordered so
+that the extraction order — and every member's object id — cannot depend on a
+hash seed, and touched once per undefined symbol in the program.
+
+Replacing it with a `HashSet` and sorting the per-round list instead, which
+gives the identical order:
+
+```
+  read_and_parse   401 ms -> 394 ms
+```
+
+Nothing, against a noise floor larger than the difference. Reverted: it adds a
+sort and a paragraph explaining why the sort is safe, in exchange for a number
+that did not move.
+
+Recorded because the reasoning was good and wrong, which is the useful kind.
+`absorb` walks every symbol of every object *twice* — definitions first, so a
+symbol defined later in an object satisfies a reference made earlier in it —
+and clones a `String` for every name it has not seen. At 5,637 objects that is
+the cost, and the ordered set was never more than a small part of it.
+
+The fix would be to stop cloning, and that is blocked on something structural:
+the names live in the parsed objects, but the frontier is built while the
+object list is still growing, so it cannot borrow from a `Vec` that is being
+pushed to. Every other place this pattern was fixed today (134, 136) had a
+finished collection to borrow from.
