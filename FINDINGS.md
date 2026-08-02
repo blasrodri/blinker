@@ -7412,3 +7412,24 @@ equal a cold link byte for byte *and* the binary must still print the right
 number; and an edit that adds a function and calls it must not be served the
 old answer. The second failed first time on my arithmetic rather than on the
 linker, which is the right way round.
+
+## 155. Two digests of the same thing
+
+With the projection carrying its own digest (154), the older
+`reachability_digest` was a second hash of the same object computed before the
+projection existed — and it was the one with the hole. Deleted, along with the
+per-parse memo slot that held it, and `reach_moved` now comes from the
+projections:
+
+```
+  digest       21 ms -> 0.05 ms
+  dead_strip  203    -> 190
+```
+
+`reachability: 1/5637 objects' projection moved` is unchanged, which is the
+check that mattered: the surviving digest is at least as precise as the one it
+replaced.
+
+The 21 ms was not the hashing — that was memoised per parse. It was collecting
+5,637 memo lookups keyed by `Arc` pointer, to build a vector the projections
+already had.

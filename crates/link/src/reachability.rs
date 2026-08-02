@@ -29,7 +29,7 @@
 //! [`ObjectAtoms`] holds everything the traversal reads about an object: its
 //! atoms, the edges leaving each one, which of them are roots, and how its
 //! unwind metadata points back at the code it describes. That set is exactly
-//! what [`reachability_digest`] hashes, so the memo and the invalidation key
+//! what its digest hashes, so the memo and the invalidation key
 //! describe the same thing rather than two things that have to be kept in
 //! agreement.
 //!
@@ -772,66 +772,6 @@ impl<'a> Atoms<'a> {
     }
 }
 
-/// A digest of everything about one object that reachability reads.
-///
-/// Which atoms it has, and which name each of its relocations points at. That
-/// is the whole of what the traversal consults — so an object whose digest did
-/// not move contributes exactly the edges it contributed last time.
-///
-/// Deliberately *not* a hash of the object's bytes. An ordinary edit changes
-/// the bytes of every function it touches while leaving the call graph exactly
-/// where it was, which is the case this exists to catch.
-pub(crate) fn reachability_digest(object: &LoadedObject) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = blinker_hashing::FastHasher::default();
-
-    for section in &object.parsed.sections {
-        section.name.hash(&mut hasher);
-        section.no_dead_strip.hash(&mut hasher);
-        // Atom boundaries: where this section divides.
-        if let Some(offsets) = boundaries(object, section) {
-            offsets.hash(&mut hasher);
-        } else {
-            u64::MAX.hash(&mut hasher);
-        }
-    }
-
-    // Edges, by the name they resolve through rather than by any index: an
-    // index is a position in this link and moves for reasons that are not
-    // about this object.
-    for relocation in &object.parsed.relocations {
-        relocation.section.0.hash(&mut hasher);
-        relocation.offset.hash(&mut hasher);
-        match relocation.target {
-            RelocationTarget::Symbol(id) => match object.parsed.symbol(id) {
-                Some(symbol) => {
-                    symbol.name.hash(&mut hasher);
-                    symbol.strength.is_definition().hash(&mut hasher);
-                }
-                None => 0u8.hash(&mut hasher),
-            },
-            RelocationTarget::Section(id) => {
-                1u8.hash(&mut hasher);
-                id.0.hash(&mut hasher);
-            }
-        }
-    }
-
-    for symbol in &object.parsed.symbols {
-        if symbol.strength.is_definition() && symbol.visibility != SymbolVisibility::Local {
-            symbol.name.hash(&mut hasher);
-            symbol.value.hash(&mut hasher);
-            symbol
-                .section
-                .map(|s| s.0)
-                .unwrap_or(u32::MAX)
-                .hash(&mut hasher);
-        }
-    }
-
-    hasher.finish()
-}
-
 /// The relocations of one object, grouped by section and sorted by offset.
 type ByOffset<'a> = HashMap<u32, Vec<&'a InputRelocation>>;
 
@@ -1238,26 +1178,28 @@ pub(crate) fn plan(
 ) -> (Strip, Report, StripTimings) {
     let mut timings = StripTimings::default();
 
-    // How much of the graph moved. Not consulted by anything below yet; it is
-    // the invalidation key an incremental traversal needs, and it is reported
-    // so that the size of the dirty set is a measurement rather than a guess.
-    let digest_step = std::time::Instant::now();
-    let digests: Vec<(u32, u64)> = objects
-        .iter()
-        .map(|o| {
-            let digest = session.digest(&o.parsed, || reachability_digest(o));
-            (o.parsed.id.0, digest)
-        })
-        .collect();
-    let (moved, total) = session.note_reachability(&digests);
-    timings.digest_ms = digest_step.elapsed().as_secs_f64() * 1000.0;
-    timings.reach_moved = moved;
-    timings.reach_total = total;
-
     let step = std::time::Instant::now();
     let mut parts = [0.0f64; 3];
     let atoms = Atoms::build(objects, &mut parts, session);
     timings.atoms_ms = step.elapsed().as_secs_f64() * 1000.0;
+
+    // How much of the graph moved, taken from the projections themselves.
+    //
+    // This used to be a second digest, computed before the projections existed
+    // and hashing what it believed reachability reads. Two digests of the same
+    // thing is one digest and one claim about it, and the claim was already
+    // wrong (154). The projection is built by now and carries its own.
+    let digest_step = std::time::Instant::now();
+    let projections: Vec<u64> = atoms.blocks.iter().map(|block| block.digest).collect();
+    let identified: Vec<(u32, u64)> = objects
+        .iter()
+        .zip(&projections)
+        .map(|(object, digest)| (object.parsed.id.0, *digest))
+        .collect();
+    let (moved, total) = session.note_reachability(&identified);
+    timings.digest_ms = digest_step.elapsed().as_secs_f64() * 1000.0;
+    timings.reach_moved = moved;
+    timings.reach_total = total;
 
     // Every object contributes what it contributed last time, so the owners
     // map, the opaque set, the live set and the compaction are all the same as
@@ -1265,7 +1207,6 @@ pub(crate) fn plan(
     // recomputes and compares: stripping an atom that is still reachable
     // produces a binary that links, runs, and crashes somewhere else later, so
     // this is not a place to trust an argument.
-    let projections: Vec<u64> = atoms.blocks.iter().map(|block| block.digest).collect();
     let held = session.strip(&projections);
     if let Some(strip) = held.as_ref() {
         if !verify_liveness() {

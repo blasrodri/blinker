@@ -46,8 +46,6 @@ struct Memo {
     _parse: Arc<ParsedObject>,
     /// Atom boundaries by section id; `None` for a section that is not split.
     boundaries: FastMap<u32, Option<Arc<Vec<u64>>>>,
-    /// This object's reachability digest, which is also a pure function of it.
-    digest: Option<u64>,
     /// This object's atoms and the edges leaving them, in its own numbering.
     atoms: Option<Arc<crate::reachability::ObjectAtoms>>,
 }
@@ -57,7 +55,6 @@ impl Memo {
         Memo {
             _parse: Arc::clone(parse),
             boundaries: FastMap::default(),
-            digest: None,
             atoms: None,
         }
     }
@@ -682,18 +679,6 @@ impl Session {
         let key = Arc::as_ptr(parse) as usize;
         let memo = self.memo.entry(key).or_insert_with(|| Memo::new(parse));
         Arc::clone(memo.atoms.get_or_insert_with(|| Arc::new(compute())))
-    }
-
-    /// This object's reachability digest, computing it once per parse.
-    ///
-    /// The digest reads only the object — its atom boundaries, its relocations'
-    /// targets by name, its defined symbols — so it is valid for exactly as
-    /// long as the parse is. Computing all of them cost 5.8 ms of a 73 ms debug
-    /// relink; 78 of 80 inputs are the same parse as last time.
-    pub fn digest(&mut self, parse: &Arc<ParsedObject>, compute: impl FnOnce() -> u64) -> u64 {
-        let key = Arc::as_ptr(parse) as usize;
-        let memo = self.memo.entry(key).or_insert_with(|| Memo::new(parse));
-        *memo.digest.get_or_insert_with(compute)
     }
 
     /// Drop derived facts about parses this link did not use.
