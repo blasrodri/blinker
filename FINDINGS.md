@@ -7357,3 +7357,58 @@ are 64-bit change-detection keys whose failure mode is a silently wrong binary.
 Either one is over-built or two are under-built, and nothing in the repository
 says which. Recorded rather than resolved: it is a decision about what this
 linker is willing to be wrong about, not a measurement.
+
+## 154. Liveness reuse, and a digest taken from the projection instead of about it
+
+The first half of incremental liveness, and the half that has to exist before
+the second can be trusted.
+
+### The key had a hole in it
+
+`reachability_digest` walked the object and hashed what it believed reachability
+reads: section names, atom boundaries, relocation targets by name, defined
+symbols. That is a *claim* about the projection, maintained by hand, and it was
+already wrong — opacity is decided by whether a relocation stores a non-zero
+inline addend, which is read out of the object's bytes and was not hashed. An
+edit that changed an addend from zero to non-zero would have moved the answer
+without moving the digest.
+
+The digest is now taken from `ObjectAtoms` itself — the atoms, the edge lists,
+the roots, the unwind edges, the opaque sets. "The digest did not move" and
+"this object contributes what it contributed last time" are now the same
+statement rather than two that have to be kept in agreement.
+
+### The reuse
+
+If every object's projection digest is unchanged, then the owners map, the
+opaque set, the live set and the compaction are all unchanged, and the previous
+`Strip` is the answer. Held in the session against the digest vector that
+produced it.
+
+```
+  link 0 (cold)   dead_strip 520.5 ms   atoms 171  liveness 197  strip_build 3.5
+  link 1          dead_strip  34.4      atoms  25  liveness   0  strip_build 0
+  link 2          dead_strip  33.8      atoms  25  liveness   0  strip_build 0
+```
+
+### It does not fire on an edit, which was known
+
+Finding 133 measured the dirty set at one object of 5,637 and said this
+all-or-nothing version would not fire. It does not. What it is, is the skeleton
+the bounded re-derivation slots into, with the invalidation key and the
+verification already in place.
+
+### The verification
+
+`BLINKER_VERIFY_LIVENESS=1` makes every link compute the answer twice and
+assert the held one equals a fresh one. It runs clean on the rust-analyzer
+workload. This exists because the failure mode is silent — an atom stripped
+that is still reachable produces a binary that links, runs, and crashes
+somewhere unrelated — so the reuse is a claim that gets checked rather than
+argued.
+
+Two tests, on a fixture small enough to run the program: the reused answer must
+equal a cold link byte for byte *and* the binary must still print the right
+number; and an edit that adds a function and calls it must not be served the
+old answer. The second failed first time on my arithmetic rather than on the
+linker, which is the right way round.

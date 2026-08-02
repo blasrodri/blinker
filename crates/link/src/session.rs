@@ -208,6 +208,14 @@ pub struct Session {
     /// reason: without it a resident linker's memory grows with every build
     /// rather than with the program.
     used_content: crate::hashing::FastSet<[u8; 32]>,
+    /// The last link's dead-strip answer, and the per-object projection
+    /// digests it was computed from.
+    ///
+    /// Whole-link state, so it is keyed by the whole vector: if every object
+    /// contributes the atoms, edges and roots it contributed last time, then
+    /// the owners map, the opaque set, the live set and the compaction are all
+    /// the same, and so is this.
+    strip: Option<(Vec<u64>, std::sync::Arc<crate::reachability::Strip>)>,
     memo: FastMap<usize, Memo>,
     /// Each object's reachability digest, as the last link computed it.
     ///
@@ -695,6 +703,24 @@ impl Session {
     /// every rebuild rather than with the program being linked.
     pub fn forget_unused_memos(&mut self, used: &FastMap<usize, ()>) {
         self.memo.retain(|key, _| used.contains_key(key));
+    }
+
+    /// The previous link's strip, if every object's projection is unchanged.
+    pub(crate) fn strip(
+        &self,
+        digests: &[u64],
+    ) -> Option<std::sync::Arc<crate::reachability::Strip>> {
+        let (recorded, strip) = self.strip.as_ref()?;
+        (recorded == digests).then(|| std::sync::Arc::clone(strip))
+    }
+
+    /// Remember this link's strip against the projections that produced it.
+    pub(crate) fn store_strip(
+        &mut self,
+        digests: Vec<u64>,
+        strip: std::sync::Arc<crate::reachability::Strip>,
+    ) {
+        self.strip = Some((digests, strip));
     }
 
     /// Record this link's reachability digests and report how many moved.

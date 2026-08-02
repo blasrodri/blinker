@@ -338,3 +338,82 @@ fn an_input_that_kept_its_place_is_kept_across_a_changed_list() {
     );
     assert_eq!(run(&second), "125\n");
 }
+
+/// Dead-stripping reuses the previous link's answer when no object's
+/// projection into reachability moved, and the answer must be the same one.
+///
+/// This is the cheapest case of incremental liveness and the one whose failure
+/// is quietest: an atom stripped that is still reachable produces a binary that
+/// links, runs, and crashes somewhere unrelated. So the check is not "it was
+/// faster" — it is that the bytes equal a cold link's, and that the program
+/// still runs.
+#[test]
+fn a_reused_dead_strip_answer_equals_a_cold_one() {
+    let scratch = Scratch::dir("session-strip-reuse").expect("scratch");
+    let request = LinkRequest::new(inputs(&scratch)).dead_stripped(true);
+
+    let cold = scratch.join("cold");
+    link_to_file(&request, &cold).expect("the cold link succeeds");
+
+    let mut session = Session::default();
+    let first = scratch.join("first");
+    link_to_file_in(&request, &first, &mut session).expect("the first link");
+    let second = scratch.join("second");
+    let timings = link_to_file_in(&request, &second, &mut session).expect("the second link");
+
+    assert!(
+        timings.reused_strip,
+        "the second link recomputed dead-stripping although nothing moved, \
+         so this proves nothing about reuse"
+    );
+    assert_eq!(
+        std::fs::read(&second).expect("second"),
+        std::fs::read(&cold).expect("cold"),
+        "the reused strip produced a different binary from a cold link"
+    );
+    assert_eq!(run(&second), "125\n");
+}
+
+/// And it must stop reusing when an object's projection does move.
+///
+/// The edit adds a function and calls it, so the changed object's atoms and
+/// edges both differ. If the digest missed that, the second link would strip
+/// against the old graph.
+#[test]
+fn an_edit_that_moves_the_graph_is_not_served_the_old_answer() {
+    let scratch = Scratch::dir("session-strip-invalidate").expect("scratch");
+    let inputs = inputs(&scratch);
+    let request = LinkRequest::new(inputs.clone()).dead_stripped(true);
+
+    let mut session = Session::default();
+    let first = scratch.join("first");
+    link_to_file_in(&request, &first, &mut session).expect("the first link");
+
+    // `helper` gains a call to a function that did not exist before, so its
+    // atoms and its edges both change.
+    let helper = compile(
+        &scratch,
+        "helper.c",
+        "static int added(int n) { return n + 1; }\n\
+         int helper(int n) { return added(n) * 7; }\n",
+    );
+    let other = compile(&scratch, "other.c", OTHER);
+    let edited = vec![inputs[0].clone(), archive(&scratch, &[helper, other])];
+    let request = LinkRequest::new(edited).dead_stripped(true);
+
+    let second = scratch.join("second");
+    let timings = link_to_file_in(&request, &second, &mut session).expect("the second link");
+    assert!(
+        !timings.reused_strip,
+        "an object whose call graph changed was served the previous answer"
+    );
+
+    let cold = scratch.join("cold");
+    link_to_file(&request, &cold).expect("the cold link succeeds");
+    assert_eq!(
+        std::fs::read(&second).expect("second"),
+        std::fs::read(&cold).expect("cold"),
+    );
+    // helper(3) = (3 + 1) * 7 = 28, other(4) = 104.
+    assert_eq!(run(&second), "132\n");
+}

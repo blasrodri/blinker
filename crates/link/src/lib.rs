@@ -222,6 +222,8 @@ pub struct LinkTimings {
     pub survey_ms: f64,
     /// Inputs served from memory, and inputs that had to be read. Both zero
     /// for a one-shot link, which holds nothing.
+    /// Whether dead-stripping reused the previous link's answer whole.
+    pub reused_strip: bool,
     pub inputs_held: u64,
     pub inputs_read: u64,
     /// Whether the archive extraction order was replayed rather than computed.
@@ -1689,6 +1691,7 @@ fn link_inner(
     timings.group_ms = strip_timings.group_ms;
     timings.traverse_ms = strip_timings.traverse_ms;
     timings.digest_ms = strip_timings.digest_ms;
+    timings.reused_strip = strip_timings.reused_strip;
     timings.reach_moved = strip_timings.reach_moved;
     timings.reach_total = strip_timings.reach_total;
     timings.stripped_bytes = report.dead_bytes();

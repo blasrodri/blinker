@@ -297,6 +297,15 @@ pub(crate) struct ObjectAtoms {
     opaque_via: Vec<SymbolId>,
     /// Non-local definitions, and the atom that owns each.
     owned: Vec<(SymbolId, u32)>,
+    /// A hash of everything above.
+    ///
+    /// Taken from the projection rather than from the object, so "the digest
+    /// did not move" means "this object contributes exactly the atoms, edges
+    /// and roots it contributed last time" by construction. The earlier digest
+    /// walked the object separately and hashed what it believed reachability
+    /// read, which is a claim that has to stay true as the projection changes —
+    /// and was already false for the inline addends that decide opacity.
+    digest: u64,
 }
 
 /// Project one object into the form the traversal consumes.
@@ -527,7 +536,7 @@ pub(crate) fn project(object: &LoadedObject) -> ObjectAtoms {
         }
     }
 
-    ObjectAtoms {
+    let mut block = ObjectAtoms {
         atoms,
         by_section,
         spans,
@@ -540,6 +549,69 @@ pub(crate) fn project(object: &LoadedObject) -> ObjectAtoms {
         opaque,
         opaque_via,
         owned,
+        digest: 0,
+    };
+    block.digest = block.compute_digest();
+    block
+}
+
+impl ObjectAtoms {
+    /// Hash every field that the traversal reads.
+    fn compute_digest(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = blinker_hashing::FastHasher::default();
+        self.atoms.len().hash(&mut hasher);
+        for atom in &self.atoms {
+            atom.section.0.hash(&mut hasher);
+            atom.offset.hash(&mut hasher);
+            atom.size.hash(&mut hasher);
+        }
+        // `by_section` is derived from `atoms` and the section ids above, so
+        // it is not hashed separately.
+        self.spans.hash(&mut hasher);
+        hash_edges(&self.edges, &mut hasher);
+        self.suppress.hash(&mut hasher);
+        hash_edges(&self.unsplit, &mut hasher);
+        self.never_strip.hash(&mut hasher);
+        for record in &self.eh_frame {
+            record.atom.hash(&mut hasher);
+            record.cie.hash(&mut hasher);
+            hash_edge(record.function, &mut hasher);
+        }
+        for (function, lsda) in &self.unwind {
+            hash_edge(*function, &mut hasher);
+            hash_edge(Some(*lsda), &mut hasher);
+        }
+        self.opaque.hash(&mut hasher);
+        for symbol in &self.opaque_via {
+            symbol.0.hash(&mut hasher);
+        }
+        for (symbol, local) in &self.owned {
+            symbol.0.hash(&mut hasher);
+            local.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+}
+
+fn hash_edges(edges: &[Edge], hasher: &mut impl std::hash::Hasher) {
+    for edge in edges {
+        hash_edge(Some(*edge), hasher);
+    }
+}
+
+fn hash_edge(edge: Option<Edge>, hasher: &mut impl std::hash::Hasher) {
+    use std::hash::Hash;
+    match edge {
+        None => 0u8.hash(hasher),
+        Some(Edge::Local(local)) => {
+            1u8.hash(hasher);
+            local.hash(hasher);
+        }
+        Some(Edge::Name(id)) => {
+            2u8.hash(hasher);
+            id.0.hash(hasher);
+        }
     }
 }
 
@@ -988,7 +1060,7 @@ pub(crate) struct Piece {
 }
 
 /// A section that lost bytes, and the map from old offsets to new ones.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 struct Compacted {
     /// Ascending by `from`, non-overlapping.
     pieces: Vec<Piece>,
@@ -1000,7 +1072,7 @@ struct Compacted {
 /// An absent section is one that lost nothing, and maps to itself. That is the
 /// common case even in a link that strips heavily, and it keeps the lookup on
 /// the relocation path to one failed hash probe.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct Strip {
     sections: crate::hashing::FastMap<(u32, u32), Compacted>,
 }
@@ -1154,6 +1226,8 @@ pub(crate) struct StripTimings {
     pub digest_ms: f64,
     pub reach_moved: u64,
     pub reach_total: u64,
+    /// Whether the previous link's answer was reused whole.
+    pub reused_strip: bool,
 }
 
 /// Decide what a link keeps.
@@ -1185,6 +1259,25 @@ pub(crate) fn plan(
     let atoms = Atoms::build(objects, &mut parts, session);
     timings.atoms_ms = step.elapsed().as_secs_f64() * 1000.0;
 
+    // Every object contributes what it contributed last time, so the owners
+    // map, the opaque set, the live set and the compaction are all the same as
+    // last time. Verified rather than asserted under `--blinker-verify`, which
+    // recomputes and compares: stripping an atom that is still reachable
+    // produces a binary that links, runs, and crashes somewhere else later, so
+    // this is not a place to trust an argument.
+    let projections: Vec<u64> = atoms.blocks.iter().map(|block| block.digest).collect();
+    let held = session.strip(&projections);
+    if let Some(strip) = held.as_ref() {
+        if !verify_liveness() {
+            timings.reused_strip = true;
+            return (
+                Strip::clone(strip),
+                report_from(objects, &atoms, strip),
+                timings,
+            );
+        }
+    }
+
     let step = std::time::Instant::now();
     let mut live_parts = [0.0f64; 2];
     let (live, revived) = liveness(&atoms, entry, &mut live_parts);
@@ -1196,7 +1289,51 @@ pub(crate) fn plan(
     let strip = Strip::build(objects, &atoms, &live);
     timings.build_ms = step.elapsed().as_secs_f64() * 1000.0;
 
+    if let Some(held) = held {
+        assert_eq!(
+            *held, strip,
+            "the held strip differs from a freshly computed one: reachability \
+             reused an answer that the graph no longer supports"
+        );
+    }
+    session.store_strip(projections, std::sync::Arc::new(strip.clone()));
+
     (strip, report(objects, &atoms, &live, revived), timings)
+}
+
+/// Whether to recompute liveness and compare it against the held answer.
+///
+/// The reuse above is a claim about what an object's projection determines,
+/// and the cost of it being wrong is a binary that links and runs and fails
+/// somewhere unrelated. `BLINKER_VERIFY_LIVENESS=1` makes every link do the
+/// work twice and assert the two agree.
+fn verify_liveness() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BLINKER_VERIFY_LIVENESS").is_some())
+}
+
+/// The `__text` numbers, recovered from a reused strip rather than a live set.
+///
+/// A reused strip carries which bytes survived but not which atoms did, and
+/// the report is counted over atoms. `Strip::remap` answers the same question:
+/// an atom whose offset still maps somewhere is one that survived.
+///
+/// `revived` is reported as zero rather than recomputed. It counts atoms the
+/// propagation left dead that a live atom then referred to, which is a check
+/// on the model and not a property of the answer — and the answer being reused
+/// is precisely the case where the check already passed.
+fn report_from(objects: &[LoadedObject], atoms: &Atoms<'_>, strip: &Strip) -> Report {
+    let mut live = LiveSet::with_capacity(atoms.len());
+    for index in 0..atoms.len() {
+        let atom = atoms.atom(index);
+        if strip
+            .remap(atom.object, atom.section, atom.offset)
+            .is_some()
+        {
+            live.insert(index);
+        }
+    }
+    report(objects, atoms, &live, 0)
 }
 
 /// Report what analysis alone can say, without changing any output.
