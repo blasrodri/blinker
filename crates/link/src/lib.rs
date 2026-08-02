@@ -2484,6 +2484,7 @@ fn address_table(
     tlv_slots: &HashMap<String, u64>,
 ) -> Vec<(blinker_cache::NameHash, u64)> {
     use blinker_cache::{dep_hash, Table, GLOBAL};
+    let _t = std::time::Instant::now();
     let mut table: Vec<_> = addresses
         .global
         .iter()
@@ -2497,8 +2498,20 @@ fn address_table(
         .chain(indirect_entries(stub_slots, Table::Stub))
         .chain(indirect_entries(tlv_slots, Table::ThreadLocal))
         .collect();
+    let collect_ms = _t.elapsed().as_secs_f64() * 1000.0;
+    let _s = std::time::Instant::now();
     table.sort_unstable();
     table.dedup();
+    if std::env::var_os("BLINKER_ADDR_PARTS").is_some() {
+        #[allow(clippy::print_stderr)]
+        {
+            eprintln!(
+                "address_table: hash+collect {collect_ms:.0} sort+dedup {:.0}  ({} entries)",
+                _s.elapsed().as_secs_f64() * 1000.0,
+                table.len()
+            );
+        }
+    }
     table
 }
 

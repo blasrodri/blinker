@@ -7314,3 +7314,46 @@ element, on the way to an error that does not happen.
 Both now keep the first inline and the rest in a `Vec` that stays empty, which
 is the `Owners` shape from the atom code. `table` 293 -> 250 before the interner
 change above.
+
+## 153. The address table is a cryptographic hash, 506,405 times
+
+`address_table` is 133 ms. The shape suggested the sort — half a million pairs.
+
+```
+  address_table: hash+collect 127  sort+dedup 8   (506405 entries)
+```
+
+It is the hashing, and the sort is nothing. `dep_hash` is BLAKE3.
+
+Rewriting it as one `blake3::hash` over a stack buffer instead of three
+`update` calls into an incremental hasher — byte-for-byte the same input, so
+every hash it has ever produced is unchanged and no cache is invalidated:
+
+```
+  hash+collect   127 ms -> 126 ms
+```
+
+Nothing. The cost is BLAKE3's compression on a 50-byte input, not the builder
+around it. Reverted.
+
+### Why the obvious fix is refused
+
+`blinker_hashing::FastHasher` would be twenty times faster and it is already in
+this codebase. It is fxhash — multiply-xor-rotate, one round per word, no
+finalisation — and mangled Rust symbols share long prefixes and differ in the
+middle, which is the input shape fxhash is weakest on.
+
+This hash decides whether an object may reuse a previous link's patched bytes.
+A collision is two different names agreeing that an address did not move, which
+is a wrong binary produced silently. 127 ms is not worth that, and the right
+way to spend it is to stop calling the function half a million times rather
+than to make each call cheaper.
+
+### An inconsistency worth naming
+
+`dep_hash` is cryptographic. `interface_digest` and `reachability_digest` —
+which gate extraction replay and, soon, liveness reuse — are fxhash. All three
+are 64-bit change-detection keys whose failure mode is a silently wrong binary.
+Either one is over-built or two are under-built, and nothing in the repository
+says which. Recorded rather than resolved: it is a decision about what this
+linker is willing to be wrong about, not a measurement.
