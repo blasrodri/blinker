@@ -2125,7 +2125,7 @@ fn link_inner(
     // contents but not the load commands' *sizes* — so the section addresses
     // the relocations were computed against still hold.
     let sub = std::time::Instant::now();
-    let placed_symbols = placed_symbols(&objects, &placed, &strip);
+    let placed_symbols = placed_symbols(&objects, &interned, &placed, &strip);
     let mut symbols = output_symbols(&placed_symbols);
     // After the ordinary locals, which is where `ld` puts them and where a
     // consumer walking the local range expects the debug map to begin.
@@ -3516,7 +3516,7 @@ struct Assembly<'a> {
     /// and signing what it produces hashes megabytes that are then dropped.
     final_pass: bool,
     placements: &'a [InputPlacement],
-    symbols: &'a [OutputSymbol],
+    symbols: &'a [OutputSymbol<'a>],
     contents: Option<&'a HashMap<usize, Vec<u8>>>,
     rebases: &'a [Rebase],
     binds: &'a [Bind],
@@ -3666,19 +3666,22 @@ fn is_temporary_label(name: &str) -> bool {
 /// of uncertainty. `crates/cli/tests/backtraces_name_the_right_function.rs`
 /// has the observed output: four frames inside a private recursive function
 /// reported as `core::fmt::rt::Argument::new_display`.
-fn output_symbols(placed: &[PlacedSymbol<'_>]) -> Vec<OutputSymbol> {
+fn output_symbols<'a>(placed: &[PlacedSymbol<'a>]) -> Vec<OutputSymbol<'a>> {
     let mut out: Vec<OutputSymbol> = placed
         .iter()
         .map(|symbol| match symbol.visibility {
             SymbolVisibility::Local => {
                 OutputSymbol::local(symbol.name, symbol.section_number, symbol.address)
+                    .keyed(symbol.key)
             }
             SymbolVisibility::Global => {
                 OutputSymbol::exported(symbol.name, symbol.section_number, symbol.address)
+                    .keyed(symbol.key)
             }
             SymbolVisibility::PrivateExternal => {
                 let mut exported =
-                    OutputSymbol::exported(symbol.name, symbol.section_number, symbol.address);
+                    OutputSymbol::exported(symbol.name, symbol.section_number, symbol.address)
+                        .keyed(symbol.key);
                 exported.private_external = true;
                 exported
             }
@@ -3710,6 +3713,9 @@ fn output_symbols(placed: &[PlacedSymbol<'_>]) -> Vec<OutputSymbol> {
 /// a name with no source, or to a source with the wrong name.
 struct PlacedSymbol<'a> {
     name: &'a str,
+    /// The interned id of `name`, so the string table can deduplicate it
+    /// without hashing the text. See `OutputSymbol::key`.
+    key: u32,
     visibility: SymbolVisibility,
     /// Index into the `objects` slice this came from.
     object: usize,
@@ -3742,6 +3748,7 @@ struct PlacedSymbol<'a> {
 /// reported as `core::fmt::rt::Argument::new_display`.
 fn placed_symbols<'a>(
     objects: &'a [LoadedObject],
+    interned: &[Arc<Vec<SymbolNameId>>],
     placed: &Placed,
     strip: &Strip,
 ) -> Vec<PlacedSymbol<'a>> {
@@ -3781,6 +3788,7 @@ fn placed_symbols<'a>(
             };
             out.push(PlacedSymbol {
                 name: &symbol.name,
+                key: interned[index][symbol.id.0 as usize].0,
                 visibility: symbol.visibility,
                 object: index,
                 section: section_id,
@@ -3838,7 +3846,10 @@ fn placed_symbols<'a>(
 /// this is a place where a silent wrong answer is easy. Objects with no debug
 /// sections are skipped entirely rather than given an entry that points at
 /// nothing.
-fn debug_map(objects: &[LoadedObject], placed: &[PlacedSymbol<'_>]) -> Vec<OutputSymbol> {
+fn debug_map<'a>(
+    objects: &'a [LoadedObject],
+    placed: &[PlacedSymbol<'a>],
+) -> Vec<OutputSymbol<'a>> {
     use blinker_output::symtab::stab;
 
     // The map is per compilation unit, and sorted by address within one so a
@@ -3915,33 +3926,29 @@ fn debug_map(objects: &[LoadedObject], placed: &[PlacedSymbol<'_>]) -> Vec<Outpu
                 let size = end.saturating_sub(symbol.address);
                 let n = symbol.section_number;
                 out.push(OutputSymbol::stab(stab::BNSYM, "", n, 0, symbol.address));
-                out.push(OutputSymbol::stab(
-                    stab::FUN,
-                    symbol.name,
-                    n,
-                    0,
-                    symbol.address,
-                ));
+                out.push(
+                    OutputSymbol::stab(stab::FUN, symbol.name, n, 0, symbol.address)
+                        .keyed(symbol.key),
+                );
                 out.push(OutputSymbol::stab(stab::FUN, "", NO_SECTION, 0, size));
                 out.push(OutputSymbol::stab(stab::ENSYM, "", n, 0, symbol.address));
             } else if symbol.visibility == SymbolVisibility::Local {
-                out.push(OutputSymbol::stab(
-                    stab::STSYM,
-                    symbol.name,
-                    symbol.section_number,
-                    0,
-                    symbol.address,
-                ));
+                out.push(
+                    OutputSymbol::stab(
+                        stab::STSYM,
+                        symbol.name,
+                        symbol.section_number,
+                        0,
+                        symbol.address,
+                    )
+                    .keyed(symbol.key),
+                );
             } else {
                 // A global's address is already in the symbol table, so the
                 // stab carries the name alone — which is what `ld` emits.
-                out.push(OutputSymbol::stab(
-                    stab::GSYM,
-                    symbol.name,
-                    NO_SECTION,
-                    0,
-                    0,
-                ));
+                out.push(
+                    OutputSymbol::stab(stab::GSYM, symbol.name, NO_SECTION, 0, 0).keyed(symbol.key),
+                );
             }
         }
 

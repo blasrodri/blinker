@@ -7631,3 +7631,62 @@ never happen. It is not: `--blinker-cache` also turns on `with_stable_layout`,
 deliberately, so that a cold link and a cached one lay out the same way. The
 flag changes two things and only one of them is the cache. Worth knowing
 before the next person diffs those two runs.
+
+## 159. The symbol table was allocated a name at a time, then hashed a name at a time
+
+`emit_linkedit` and `symbols` together came to 281 ms of a 1,028 ms link.
+Instrumented:
+
+```
+  symbols: placed 8 ms (379,857 placed)  output_symbols 65  debug_map 46
+  symtab.build: group-sort 16   strings 146   (1,689,759 symbols, 82 MB of names)
+```
+
+1,689,759 symbols out of 379,857 definitions, because the debug map names every
+function again — as a `FUN` stab, and often as `GSYM` or `STSYM` too.
+
+### Two costs, both paid per symbol rather than per name
+
+**`OutputSymbol.name` was a `String`.** Every one of those 1.69 million entries
+allocated and copied a name that already existed, in the parsed object it came
+out of, which outlives the link — to hand the same bytes to a string table that
+copies them again. It is now `Cow<'a, str>`: borrowed for the names that exist,
+owned for the few thousand the debug map synthesises (a compilation unit's
+directory, file and object path).
+
+**The string table deduplicated by text.** One hash of a mangled name per
+symbol, 1.69 million times, plus a `memcmp` on every hit — and the hits are the
+common case, since the debug map's repeat is exactly what the dedup is for.
+`OutputSymbol` now carries a `key`: an opaque identity for the name that the
+caller supplies, which for this linker is the interned id from finding 157.
+Keyed names deduplicate through a `u32` map; `UNKEYED` falls back to the text.
+
+The contract is *equal keys mean equal names*, and it is the caller's to keep —
+a wrong key points a symbol at another symbol's string. What is *not* required
+is the converse: a name that appears both keyed and unkeyed simply gets two
+copies in the string table, which is a size question and not a correctness one.
+`a_keyed_name_and_a_text_matched_one_both_read_back` pins the property that
+matters — every symbol's offset points at its own name — across all four paths.
+
+### Measured
+
+```
+                  before    after
+  output_symbols    65        —       (folded into the numbers below)
+  symbols           94.4     77.7
+  emit_linkedit    126.8     37.4
+  emit             173.5     87.4
+  link            1027.8    881.7     -14%
+```
+
+Output byte-identical on the 187 MB image — the same SHA-256 as before the
+change — which also says the keyed and unkeyed name sets do not overlap on a
+real Rust link. 62 suites, 648 tests green, and green under
+`BLINKER_VERIFY_LIVENESS=1`.
+
+### The shape, for the third time today
+
+Findings 157, 158 and this one are one mistake made in three places: a question
+about a *name* answered once per *occurrence of that name*. Interning, hashing,
+allocating. In each case the fix was to move the answer to where the name is
+first seen and hand out a subscript. Worth looking for a fourth.

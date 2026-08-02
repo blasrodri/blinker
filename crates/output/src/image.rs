@@ -75,10 +75,10 @@ pub struct SectionContent {
 
 /// Everything needed to produce an image.
 #[derive(Debug)]
-pub struct ImageBuilder {
+pub struct ImageBuilder<'a> {
     inputs: Vec<InputPlacement>,
     contents: Vec<SectionContent>,
-    symbols: SymbolTableBuilder,
+    symbols: SymbolTableBuilder<'a>,
     dylibs: Vec<Dylib>,
     rebases: Vec<Rebase>,
     binds: Vec<Bind>,
@@ -202,7 +202,7 @@ pub struct EmitTimings {
     pub sign_ms: f64,
 }
 
-impl ImageBuilder {
+impl<'a> ImageBuilder<'a> {
     pub fn new() -> Self {
         ImageBuilder {
             slop: Slop::NONE,
@@ -245,7 +245,7 @@ impl ImageBuilder {
         self
     }
 
-    pub fn symbols(&mut self) -> &mut SymbolTableBuilder {
+    pub fn symbols(&mut self) -> &mut SymbolTableBuilder<'a> {
         &mut self.symbols
     }
 
@@ -735,7 +735,7 @@ fn content_uuid(
     uuid
 }
 
-impl Default for ImageBuilder {
+impl Default for ImageBuilder<'_> {
     fn default() -> Self {
         Self::new()
     }

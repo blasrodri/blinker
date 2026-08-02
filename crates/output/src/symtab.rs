@@ -59,9 +59,33 @@ pub enum SymbolGroup {
 }
 
 /// One symbol to place in the table.
+///
+/// # Why the name is borrowed
+///
+/// Almost every name here already exists, in the parsed object the symbol came
+/// out of, and that outlives the link. Owning them meant 1,689,759 `String`
+/// allocations and 82 MB of copying per link on a debug rust-analyzer image —
+/// to hand the same bytes to a string table that copies them again (finding
+/// 159). A `Cow` because the debug map also synthesises a few thousand names
+/// that belong to nothing: the compilation unit's directory, file and object
+/// path.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OutputSymbol {
-    pub name: String,
+pub struct OutputSymbol<'a> {
+    pub name: std::borrow::Cow<'a, str>,
+    /// An identity for `name`, when the caller already has one.
+    ///
+    /// The string table deduplicates names, and probing it by text meant
+    /// hashing 1.69 million mangled names — most of them twice, since the
+    /// debug map names every function again — for a comparison the caller
+    /// could answer with an integer. A linker that interns its symbol names
+    /// puts the interned id here.
+    ///
+    /// **Two symbols with the same key must have the same name.** Nothing
+    /// checks it, and a wrong key points a symbol at another symbol's string.
+    /// [`OutputSymbol::UNKEYED`] means "no identity" and falls back to the
+    /// text, which is what a synthesised name — a source path, an empty stab —
+    /// gets.
+    pub key: u32,
     pub group: SymbolGroup,
     /// One-based output section number; `None` for undefined symbols.
     pub section: Option<u8>,
@@ -112,11 +136,19 @@ pub mod stab {
     pub const ENSYM: u8 = 0x4e;
 }
 
-impl OutputSymbol {
+impl<'a> OutputSymbol<'a> {
+    /// No caller-supplied identity for this name; deduplicate it by text.
+    ///
+    /// A sentinel rather than `Option<u32>` because this struct is built
+    /// 1.7 million times per link and sorted twice, and the niche would cost
+    /// four bytes in every one of them.
+    pub const UNKEYED: u32 = u32::MAX;
+
     /// A local definition.
-    pub fn local(name: impl Into<String>, section: u8, value: u64) -> Self {
+    pub fn local(name: impl Into<std::borrow::Cow<'a, str>>, section: u8, value: u64) -> Self {
         OutputSymbol {
             name: name.into(),
+            key: OutputSymbol::UNKEYED,
             group: SymbolGroup::Local,
             section: Some(section),
             value,
@@ -127,9 +159,10 @@ impl OutputSymbol {
     }
 
     /// An exported definition.
-    pub fn exported(name: impl Into<String>, section: u8, value: u64) -> Self {
+    pub fn exported(name: impl Into<std::borrow::Cow<'a, str>>, section: u8, value: u64) -> Self {
         OutputSymbol {
             name: name.into(),
+            key: OutputSymbol::UNKEYED,
             group: SymbolGroup::ExternalDefined,
             section: Some(section),
             value,
@@ -140,9 +173,10 @@ impl OutputSymbol {
     }
 
     /// A reference satisfied by `library_ordinal`.
-    pub fn undefined(name: impl Into<String>, library_ordinal: u8) -> Self {
+    pub fn undefined(name: impl Into<std::borrow::Cow<'a, str>>, library_ordinal: u8) -> Self {
         OutputSymbol {
             name: name.into(),
+            key: OutputSymbol::UNKEYED,
             group: SymbolGroup::Undefined,
             section: None,
             value: 0,
@@ -159,9 +193,16 @@ impl OutputSymbol {
     /// can live in is the first one. `ld` emits them after the ordinary
     /// locals, and [`SymbolTableBuilder::build`] preserves insertion order
     /// within a group, so callers control that by when they add them.
-    pub fn stab(kind: u8, name: impl Into<String>, section: u8, desc: u16, value: u64) -> Self {
+    pub fn stab(
+        kind: u8,
+        name: impl Into<std::borrow::Cow<'a, str>>,
+        section: u8,
+        desc: u16,
+        value: u64,
+    ) -> Self {
         OutputSymbol {
             name: name.into(),
+            key: OutputSymbol::UNKEYED,
             group: SymbolGroup::Local,
             section: Some(section),
             value,
@@ -169,6 +210,12 @@ impl OutputSymbol {
             private_external: false,
             stab: Some((kind, desc)),
         }
+    }
+
+    /// Give this symbol's name a caller-supplied identity. See [`Self::key`].
+    pub fn keyed(mut self, key: u32) -> Self {
+        self.key = key;
+        self
     }
 
     /// The `n_type` byte for this symbol.
@@ -209,16 +256,16 @@ impl OutputSymbol {
 
 /// Builds a correctly grouped symbol table and its string table.
 #[derive(Debug, Default)]
-pub struct SymbolTableBuilder {
-    symbols: Vec<OutputSymbol>,
+pub struct SymbolTableBuilder<'a> {
+    symbols: Vec<OutputSymbol<'a>>,
 }
 
-impl SymbolTableBuilder {
+impl<'a> SymbolTableBuilder<'a> {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn add(&mut self, symbol: OutputSymbol) -> &mut Self {
+    pub fn add(&mut self, symbol: OutputSymbol<'a>) -> &mut Self {
         self.symbols.push(symbol);
         self
     }
@@ -275,17 +322,36 @@ impl SymbolTableBuilder {
                 self.symbols.len(),
                 Default::default(),
             );
+        // The same map, for names whose identity the caller already knows.
+        // Separate rather than one map over an enum key: the whole point is
+        // that this one hashes four bytes instead of a hundred.
+        let mut by_key: blinker_hashing::FastMap<u32, u32> =
+            blinker_hashing::FastMap::with_capacity_and_hasher(
+                self.symbols.len(),
+                Default::default(),
+            );
 
         for symbol in &self.symbols {
             let name_offset = if symbol.name.is_empty() {
                 0
-            } else if let Some(offset) = interned.get(symbol.name.as_str()) {
+            } else if symbol.key != OutputSymbol::UNKEYED {
+                match by_key.entry(symbol.key) {
+                    std::collections::hash_map::Entry::Occupied(held) => *held.get(),
+                    std::collections::hash_map::Entry::Vacant(slot) => {
+                        let offset = strings.len() as u32;
+                        strings.extend_from_slice(symbol.name.as_bytes());
+                        strings.push(0);
+                        slot.insert(offset);
+                        offset
+                    }
+                }
+            } else if let Some(offset) = interned.get(symbol.name.as_ref()) {
                 *offset
             } else {
                 let offset = strings.len() as u32;
                 strings.extend_from_slice(symbol.name.as_bytes());
                 strings.push(0);
-                interned.insert(symbol.name.as_str(), offset);
+                interned.insert(symbol.name.as_ref(), offset);
                 offset
             };
 
@@ -397,6 +463,50 @@ mod tests {
             .add(OutputSymbol::local("ltmp1", 1, 0x1_0000_1100))
             .add(OutputSymbol::undefined("_free", 1));
         builder.build()
+    }
+
+    /// Every symbol reads back the name it was given, whichever way its
+    /// string-table offset was found.
+    ///
+    /// The keyed path exists so the debug map's repeat of a function's name
+    /// costs an integer hash instead of hashing the mangled text again. Its
+    /// precondition — equal keys mean equal names — is the caller's, and the
+    /// thing that must hold here is weaker and more important: a symbol's
+    /// offset points at *its own* name.
+    #[test]
+    fn a_keyed_name_and_a_text_matched_one_both_read_back() {
+        let mut builder = SymbolTableBuilder::new();
+        builder
+            // Two entries sharing a key: one string between them.
+            .add(OutputSymbol::local("_shared", 1, 0x1000).keyed(7))
+            .add(OutputSymbol::stab(stab::FUN, "_shared", 1, 0, 0x1000).keyed(7))
+            // The same text with no key at all — deduplicated by text, and
+            // against the *other* unkeyed entry rather than the keyed one.
+            .add(OutputSymbol::local("_shared", 1, 0x2000))
+            .add(OutputSymbol::local("_shared", 1, 0x3000))
+            // A different key must not share the first one's string.
+            .add(OutputSymbol::local("_other", 1, 0x4000).keyed(8));
+        let table = builder.build();
+
+        for entry in &table.entries {
+            let name = table.name_at(entry.name_offset).expect("a name");
+            let expected = if entry.value == 0x4000 {
+                "_other"
+            } else {
+                "_shared"
+            };
+            assert_eq!(name, expected, "at {:#x}", entry.value);
+        }
+
+        // And the keyed pair really did share, which is the point.
+        let keyed: Vec<u32> = table
+            .entries
+            .iter()
+            .filter(|e| e.value == 0x1000)
+            .map(|e| e.name_offset)
+            .collect();
+        assert_eq!(keyed.len(), 2);
+        assert_eq!(keyed[0], keyed[1], "a shared key wrote the name twice");
     }
 
     /// The property `LC_DYSYMTAB` depends on: three contiguous ranges, in
