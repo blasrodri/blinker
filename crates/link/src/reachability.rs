@@ -251,8 +251,15 @@ fn offset_of(
 enum Edge {
     /// An atom of this same object, by its index within it.
     Local(u32),
-    /// Whatever defines this symbol's name, decided globally.
-    Name(SymbolId),
+    /// Whatever defines a name, decided globally.
+    ///
+    /// An index into the block's `names`, not the symbol id itself. The same
+    /// name is referred to 3.1 times on average within one object — 1,195,652
+    /// name edges over 390,606 distinct ones on a debug rust-analyzer link —
+    /// and resolving one costs a string hash into the owners map. Indexing a
+    /// deduplicated list lets the link resolve each *distinct* name once and
+    /// then answer every edge by subscript.
+    Name(u32),
 }
 
 /// One `__eh_frame` record and the function it describes.
@@ -297,6 +304,8 @@ pub(crate) struct ObjectAtoms {
     opaque_via: Vec<SymbolId>,
     /// Non-local definitions, and the atom that owns each.
     owned: Vec<(SymbolId, u32)>,
+    /// The distinct symbols `Edge::Name` refers to, in first-use order.
+    names: Vec<SymbolId>,
     /// A hash of everything above.
     ///
     /// Taken from the projection rather than from the object, so "the digest
@@ -355,7 +364,7 @@ pub(crate) fn project(object: &LoadedObject) -> ObjectAtoms {
             }
         }
         // A reference resolves to whatever object defines the name.
-        Some(Edge::Name(id))
+        Some(Edge::Name(id.0))
     };
 
     let grouped = group_relocations(object);
@@ -536,6 +545,37 @@ pub(crate) fn project(object: &LoadedObject) -> ObjectAtoms {
         }
     }
 
+    // Deduplicate the names the edges refer to, and rewrite the edges to index
+    // that list. Built here rather than while the edges are: the edge closure
+    // is called from five places and threading mutable state through all of
+    // them buys nothing over one pass at the end.
+    let mut names: Vec<SymbolId> = Vec::new();
+    let mut index_of: HashMap<u32, u32> = HashMap::default();
+    let mut intern = |edge: &mut Edge| {
+        if let Edge::Name(symbol) = edge {
+            let next = names.len() as u32;
+            let at = *index_of.entry(*symbol).or_insert_with(|| {
+                names.push(SymbolId(*symbol));
+                next
+            });
+            *edge = Edge::Name(at);
+        }
+    };
+    for edge in edges.iter_mut().chain(unsplit.iter_mut()) {
+        intern(edge);
+    }
+    for record in &mut eh_frame {
+        if let Some(edge) = record.function.as_mut() {
+            intern(edge);
+        }
+    }
+    for (function, lsda) in &mut unwind {
+        if let Some(edge) = function.as_mut() {
+            intern(edge);
+        }
+        intern(lsda);
+    }
+
     let mut block = ObjectAtoms {
         atoms,
         by_section,
@@ -549,6 +589,7 @@ pub(crate) fn project(object: &LoadedObject) -> ObjectAtoms {
         opaque,
         opaque_via,
         owned,
+        names,
         digest: 0,
     };
     block.digest = block.compute_digest();
@@ -590,6 +631,11 @@ impl ObjectAtoms {
             symbol.0.hash(&mut hasher);
             local.hash(&mut hasher);
         }
+        // The edges above hash as indices into this, so the list itself has to
+        // be hashed for the digest to mean anything about which names they are.
+        for symbol in &self.names {
+            symbol.0.hash(&mut hasher);
+        }
         hasher.finish()
     }
 }
@@ -608,9 +654,9 @@ fn hash_edge(edge: Option<Edge>, hasher: &mut impl std::hash::Hasher) {
             1u8.hash(hasher);
             local.hash(hasher);
         }
-        Some(Edge::Name(id)) => {
+        Some(Edge::Name(at)) => {
             2u8.hash(hasher);
-            id.0.hash(hasher);
+            at.hash(hasher);
         }
     }
 }
@@ -626,6 +672,8 @@ pub(crate) struct Atoms<'a> {
     slot_of: Vec<u32>,
     /// Object id -> block index.
     slot: HashMap<u32, usize>,
+    /// Per block, where each of its distinct referenced names resolves to.
+    resolved: Vec<Vec<Option<usize>>>,
     total: usize,
     /// Sections kept whole because a reference into their middle would not
     /// survive their atoms being moved.
@@ -711,10 +759,33 @@ impl<'a> Atoms<'a> {
             total,
             opaque: HashSet::default(),
             owners,
+            resolved: Vec::new(),
         };
+        result.resolved = result.resolve_names();
         result.opaque = result.find_opaque();
         parts[2] = step.elapsed().as_secs_f64() * 1000.0;
         result
+    }
+
+    /// Where each block's distinct referenced names resolve to.
+    ///
+    /// One string hash per (object, name) rather than per edge — 390,606
+    /// instead of 1,195,652 on a debug rust-analyzer link.
+    fn resolve_names(&self) -> Vec<Vec<Option<usize>>> {
+        self.blocks
+            .iter()
+            .enumerate()
+            .map(|(slot, block)| {
+                block
+                    .names
+                    .iter()
+                    .map(|symbol| {
+                        let name = self.objects[slot].parsed.symbol(*symbol)?.name.as_str();
+                        self.owners.get(name).map(|owners| owners.first)
+                    })
+                    .collect()
+            })
+            .collect()
     }
 
     /// Sections that must be kept whole.
@@ -759,10 +830,10 @@ impl<'a> Atoms<'a> {
     fn resolve(&self, slot: usize, edge: Edge) -> Option<usize> {
         match edge {
             Edge::Local(local) => Some(self.base[slot] + local as usize),
-            Edge::Name(id) => {
-                let name = self.objects[slot].parsed.symbol(id)?.name.as_str();
-                self.owners.get(name).map(|o| o.first)
-            }
+            // Answered by subscript. Every distinct name was resolved once,
+            // below; doing it here meant a string hash per edge walked, and
+            // the traversal walks 1.2 million of them.
+            Edge::Name(at) => self.resolved[slot][at as usize],
         }
     }
 
@@ -1208,9 +1279,13 @@ pub(crate) fn plan(
     // produces a binary that links, runs, and crashes somewhere else later, so
     // this is not a place to trust an argument.
     let held = session.strip(&projections);
+    // "The held answer was valid", not "the shortcut was taken". Under
+    // verification the work is done anyway and the two answers compared, and a
+    // flag that flipped with the verification mode would mean every test of it
+    // measured the mode rather than the linker — which is how this was found.
+    timings.reused_strip = held.is_some();
     if let Some(strip) = held.as_ref() {
         if !verify_liveness() {
-            timings.reused_strip = true;
             return (
                 Strip::clone(strip),
                 report_from(objects, &atoms, strip),

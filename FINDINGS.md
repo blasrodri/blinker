@@ -7433,3 +7433,52 @@ replaced.
 The 21 ms was not the hashing — that was memoised per parse. It was collecting
 5,637 memo lookups keyed by `Arc` pointer, to build a vector the projections
 already had.
+
+## 156. The traversal was resolving the same name three times over
+
+Before building the bounded re-derivation, a measurement of what it would be
+worth. `traverse` is 133 ms, and 44% of the edges it walks resolve by *name* —
+a symbol dereference and a string hash into the owners map, per edge walked.
+How many are distinct:
+
+```
+  edges: 1503616 local, 1195652 by name, 390606 distinct per object (3.1x reuse)
+```
+
+An object refers to the same name 3.1 times on average. `Edge::Name` now holds
+an index into a per-object deduplicated list, and each *distinct* name is
+resolved once per link rather than once per edge:
+
+```
+  traverse    133 ms -> 21 ms
+  atoms        44    -> 116        (the resolution now happens here, once)
+  dead_strip  190    -> 151
+```
+
+Output byte-identical on the 187 MB image; 62 suites green, and green again
+with `BLINKER_VERIFY_LIVENESS=1` so every link computed liveness twice and
+compared.
+
+### What this does to the plan
+
+The bounded re-derivation was to be worth 133 ms. **The traversal is now 21 ms**,
+so it is worth 21. The cost did not disappear, it moved to `resolve_names`,
+which is a global resolution against the owners map — a different problem, and
+one the all-or-nothing reuse already skips entirely.
+
+Two hours of careful fixed-point work, with the only silent failure mode in the
+linker, for 21 ms. That is no longer the right next thing, and the way to find
+that out was to make the cheap version first and re-measure rather than to
+build the expensive one against a number taken before it.
+
+### The verification mode caught its own flaw
+
+`a_reused_dead_strip_answer_equals_a_cold_one` passed normally and failed under
+`BLINKER_VERIFY_LIVENESS=1`. Not a liveness bug: `reused_strip` was set on the
+early-return path, so turning verification on — which deliberately does the
+work anyway — made the flag read false. The flag meant "the shortcut was
+taken" when the useful question is "the held answer was valid".
+
+A diagnostic that changes with the mode that checks it makes every test of it a
+test of the mode. Now set where the decision is made, and both runs of the
+suite agree.
