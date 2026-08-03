@@ -7768,3 +7768,68 @@ name* — and every one was invisible until the workload was large enough for th
 occurrences to outnumber the names by two orders of magnitude.
 
 Together, on the same edit and the same machine: **1,994.6 ms -> 838.7 ms**.
+
+## 161. Fifteen cores, and everything after `read_and_parse` ran on one
+
+Reading and parsing the inputs has been parallel since early on. Nothing after
+it was. On the debug rust-analyzer link that left roughly 300 ms of an 830 ms
+link — surveying relocations, placing symbols, building the unwind table,
+computing addresses — running on one core of fifteen, over 5,637 objects that
+do not read each other.
+
+### Chunks, not work stealing
+
+`load_objects` hands inputs out through an atomic cursor. That balances itself,
+but it gives each worker an arbitrary *set* of inputs, which is fine there
+because every result is filed under its own index.
+
+It is not fine for a pass whose results are concatenated. Which GOT slot a
+symbol gets is decided by the order the survey saw it, and that decides every
+address after it. So `parallel::map_chunks` cuts the objects into contiguous
+chunks, hands out *chunk indices* through the cursor, and merges in chunk
+order — the order fixed before any thread starts. Four chunks per thread keeps
+it balanced without making the merge the cost.
+
+Each pass then has to state what its merge preserves:
+
+- **survey** — each chunk reports what it saw first, in its own order; the
+  global "have I seen this name" is answered once, walking chunks in order. A
+  name's place is still where the first object wanting it sits.
+- **address_map** — globals merge in chunk order, because two objects may
+  define one name and the later one overwrote sequentially. Locals are keyed by
+  object, so their keys are disjoint.
+- **fde offsets** — merged in order for the same reason.
+- **placed symbols, debug map, compact unwind** — concatenated in object order.
+
+### The sort had to be merged, not just parallelised
+
+`output_symbols` sorts 379,857 entries by name. Sorting the chunks in parallel
+took it to 4.9 ms — and then a k-way heap merge took **41 ms**, more than the
+sequential sort had. A heap pays a sift per element on one core.
+
+Replaced with a tree of two-way merges: the same `n log k` comparisons, but one
+comparison per element instead of a sift, and the early rounds — nearly all the
+work — run on every core. Ties take the earlier run at every level, which
+composes to exactly the order a single sort of the concatenation gives.
+
+### Measured
+
+Same edit, resident linker, per-stage minima:
+
+```
+                  before    after
+  survey            71.3      7.6      9.4x
+  symbols           74.7     29.9
+  unwind            61.7     19.1
+  address_map       11.0      6.8
+  relocate         177.0    126.0
+  link             838.7    603.3     -28%
+```
+
+Output byte-identical on the 187 MB image at every step — which is the only
+thing that says the chunk boundaries did not reach the output. 62 suites, 648
+tests green.
+
+One incidental fix on the way past: `survey_relocations` built a
+`std::collections::HashSet<SectionId>` — SipHash, not the fast hasher — once
+per object, 5,637 times, to hold at most one element. It is a `Vec` now.
