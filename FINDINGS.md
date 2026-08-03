@@ -9107,3 +9107,62 @@ deletes the output before every iteration, so the clone path never ran. A real
 build leaves the previous binary in place. A benchmark that removes the artifact
 under test is measuring a case the product does not have — and it reported
 "no change" rather than "not exercised", which is the reading that costs a day.
+
+## 187. What the incremental output model is actually worth
+
+Finding 186 removed a patching writer because comparing costs more than
+copying, and said the mechanism should be rebuilt once the linker can name the
+dirty ranges without comparing. Before building that, the size of the prize:
+
+```
+total            178.6 MB
+  __TEXT          71.5 MB
+  __DATA_CONST     1.9 MB
+  __DATA           0.1 MB
+  __LINKEDIT     105.1 MB     of which  82.2 MB string table
+                                        27.0 MB nlist (1,689,759 symbols)
+```
+
+**59% of the output is `__LINKEDIT`, and 46% of it is symbol-name text.** The
+string table is built by deduplicating names in order, so one symbol added or
+removed near the front shifts every offset after it: `__LINKEDIT` is dirty in
+full on essentially any edit. What a perfect dirty-range mechanism could keep
+clean is the 41% that is mapped segments — and only the part of it whose
+objects did not move.
+
+So the ceiling is:
+
+```
+write        12.0 ms  ->  ~7 ms
+emit_uuid    12.3 ms  ->  ~8 ms
+```
+
+about 9 ms, for a mechanism that has to thread byte ranges from layout and
+relocation through emit, the writer and the signature. That is not the shape
+the README's "the image is rebuilt whole" item implied, and this entry replaces
+it: the image being rebuilt whole is not what costs, because more than half of
+what it rebuilds genuinely changed.
+
+### The page-hash reuse is the counter-example, and it is worth 18 ms
+
+The same reasoning that failed for the writer succeeds one stage earlier:
+
+```
+emit_uuid   12.0 ms  with the previous image to compare against
+            29.8 ms  hashing all 43,600 pages
+```
+
+Comparing a page is cheaper than SHA-256 of it by enough to pay for itself
+twice over, where comparing a page is *more* expensive than writing it. The two
+results look contradictory and are not — the question is always what the
+comparison replaces, and nothing about "most of this is unchanged" answers it.
+`BLINKER_NO_PAGE_REUSE` now exists so this stays a measurement.
+
+### The stage table was adding three things twice
+
+`cache_build`, `address_diff` and `cache_load` run inside the `relocate` and
+`layout` timers and were also being summed at the top level. `unmeasured`
+absorbed the error and stayed positive, so the table looked consistent — and
+the header comment in `scripts/relink.py` explains that a negative `unmeasured`
+is how this announces itself, which is exactly why a *positive* one hid it.
+Corrected, `unmeasured` is 14.6 ms rather than 1.6.

@@ -19,7 +19,7 @@ programs.
 | Cold link, small (238 objects) | **1.09×** `ld-prime` — inside the spread |
 | Cold link, large (5,637 objects) | **1.75×** `ld-prime` |
 | Edit relink, small, resident | **11.4 ms** against `ld-prime`'s 29.7 ms cold |
-| Edit relink, large, resident | **357 ms** against `ld-prime`'s 311 ms cold |
+| Edit relink, large, resident | **347 ms** against `ld-prime`'s 311 ms cold |
 
 The last two rows are the metric the product exists for, and they are where the
 two scales disagree: on a small link the resident linker is comfortably faster
@@ -31,7 +31,7 @@ to link internally.
 
 See [PRODUCT_SPEC.md](PRODUCT_SPEC.md) for the product definition,
 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for the milestone sequence,
-and **[FINDINGS.md](FINDINGS.md)** for the 191 places reality contradicted the
+and **[FINDINGS.md](FINDINGS.md)** for the 192 places reality contradicted the
 plan — several of them contradicting earlier entries in the same file.
 
 ## What is not done
@@ -64,6 +64,13 @@ plan — several of them contradicting earlier entries in the same file.
   (9,719 of 9,722 contributions keep their address on an ordinary edit) — but
   unchanged bytes are still copied and re-emitted rather than left where they
   are.
+
+  Worth less than it sounds, and measured rather than assumed: 59% of the
+  output is `__LINKEDIT` and 46% of it is symbol-name text, and one symbol
+  added near the front shifts every string offset after it. The ceiling on
+  never touching an unchanged byte is about 9 ms of a 347 ms link — see
+  finding 187, and finding 186 for the version of it that measured slower than
+  writing the file whole.
 - **`x86_64`, universal binaries, LTO.**
 
 ## A note on the numbers
