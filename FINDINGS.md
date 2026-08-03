@@ -8568,3 +8568,42 @@ comparison standing in for 3,373 parses, and both of those numbers are
 proportional to the whole program rather than to the edit — the second one was
 just smaller. It showed up because the instrumentation from finding 171 was
 still in the tree and got re-run after the change rather than before it.
+
+## 177. The image was hashed twice, and the second pass was the whole signature
+
+`content_uuid`'s own doc explains that it is built "from the same page hashes
+the signature uses rather than from a second pass over the whole image" — a
+finding in its own right, worth 4 ms when it was made. It then calls
+`page_hashes` itself, and `sign_reusing` calls `page_hashes` again a few lines
+later. Both hash 187 MB. The profile said so plainly and had for a long time:
+
+```
+emit_uuid   12.56 ms
+emit_sign   11.65 ms
+```
+
+Two numbers that close together, for two things that hash the same bytes, is
+the shape of the same work done twice.
+
+They cannot simply share, because the UUID is stamped into the image *between*
+them — so the second pass is hashing a genuinely different image. Different by
+sixteen bytes, in one page, of about forty-five thousand. So the hashes are
+computed once, the page the UUID landed in is re-hashed, and the signature is
+built from the result.
+
+```
+emit_sign   11.65 ms -> 0.06 ms
+```
+
+Output byte-identical, and `codesign --verify` still accepts the image — which
+is the check that matters here, because a stale page hash is not a wrong number
+in a report, it is a binary the kernel refuses to run.
+
+### Why it survived so long
+
+The doc comment describes the design that was intended, and the design is
+right: derive the UUID from the page hashes instead of a second full pass. What
+it does not say is who computes them, and the answer turned out to be "both
+callers, separately". A comment that describes an optimisation is not evidence
+the optimisation is still in force, and this one was load-bearing enough to read
+as one.

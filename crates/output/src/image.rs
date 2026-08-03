@@ -503,23 +503,24 @@ impl<'a> ImageBuilder<'a> {
             .previous_signature
             .as_ref()
             .and_then(|(image, hashes)| crate::signature::PreviousSignature::new(image, hashes));
-        let uuid = content_uuid(&bytes, &request, previous_pages);
+        let (uuid, mut hashes) = content_uuid(&bytes, &request, previous_pages);
         timings.uuid_ms = started.elapsed().as_secs_f64() * 1000.0;
         let started = std::time::Instant::now();
         bytes
             .get_mut(uuid_offset..uuid_offset + 16)
             .expect("the UUID command was emitted within the header")
             .copy_from_slice(&uuid);
+        // Stamping the UUID changed sixteen bytes of one page, and every hash
+        // above still describes the image as it was a moment ago. Re-hash that
+        // page; the other forty-five thousand are unaffected and are what the
+        // signature is about to be built from.
+        let moved =
+            crate::signature::slots_covering(uuid_offset..uuid_offset + 16, request.code_limit);
+        crate::signature::rehash_slots(&bytes, &request, &mut hashes, moved);
 
         let mut page_hashes = Vec::new();
         if self.sign {
-            let previous = self
-                .previous_signature
-                .as_ref()
-                .and_then(|(image, hashes)| {
-                    crate::signature::PreviousSignature::new(image, hashes)
-                });
-            let (blob, hashes) = crate::signature::sign_reusing(&bytes, &request, previous);
+            let (blob, hashes) = crate::signature::sign_with(&bytes, &request, hashes);
             page_hashes = hashes;
             debug_assert_eq!(blob.len(), signature_len);
             bytes.extend_from_slice(&blob);
@@ -720,7 +721,7 @@ fn content_uuid(
     bytes: &[u8],
     request: &SignatureRequest,
     previous: Option<crate::signature::PreviousSignature<'_>>,
-) -> [u8; 16] {
+) -> ([u8; 16], Vec<crate::signature::PageHash>) {
     let slots = crate::signature::code_slot_count(request.code_limit);
     let pages = crate::signature::page_hashes(bytes, request, slots, previous);
     let mut hasher = Sha256::new();
@@ -732,7 +733,7 @@ fn content_uuid(
     uuid.copy_from_slice(&digest[..16]);
     uuid[6] = (uuid[6] & 0x0f) | 0x50;
     uuid[8] = (uuid[8] & 0x3f) | 0x80;
-    uuid
+    (uuid, pages)
 }
 
 impl Default for ImageBuilder<'_> {

@@ -271,13 +271,59 @@ pub fn sign_reusing(
     request: &SignatureRequest,
     previous: Option<PreviousSignature<'_>>,
 ) -> (Vec<u8>, Vec<PageHash>) {
+    let code_slots = code_slot_count(request.code_limit);
+    let hashes = page_hashes(image, request, code_slots, previous);
+    sign_with(image, request, hashes)
+}
+
+/// Which code slots a byte range falls in.
+///
+/// Empty when the range is outside the signed region entirely.
+pub fn slots_covering(range: std::ops::Range<usize>, code_limit: u64) -> std::ops::Range<usize> {
+    if range.is_empty() || range.start >= code_limit as usize {
+        return 0..0;
+    }
+    let end = range.end.min(code_limit as usize);
+    range.start / PAGE_SIZE..(end - 1) / PAGE_SIZE + 1
+}
+
+/// Re-hash the given slots of `image`, in place.
+///
+/// For a caller that hashed the image, changed a few bytes of it, and knows
+/// exactly which pages those bytes were in.
+pub fn rehash_slots(
+    image: &[u8],
+    request: &SignatureRequest,
+    hashes: &mut [PageHash],
+    slots: std::ops::Range<usize>,
+) {
+    let limit = request.code_limit as usize;
+    for slot in slots {
+        let Some(out) = hashes.get_mut(slot) else {
+            continue;
+        };
+        let start = slot * PAGE_SIZE;
+        let end = ((slot + 1) * PAGE_SIZE).min(limit);
+        out.copy_from_slice(&Sha256::digest(&image[start..end]));
+    }
+}
+
+/// Sign with page hashes the caller has already worked out.
+///
+/// The image is hashed once per link and not twice. `LC_UUID` is derived from
+/// these same hashes, and stamping it changes sixteen bytes of one page — so
+/// the caller re-hashes that page rather than the other 45,000 (finding 177).
+pub fn sign_with(
+    image: &[u8],
+    request: &SignatureRequest,
+    hashes: Vec<PageHash>,
+) -> (Vec<u8>, Vec<PageHash>) {
     assert!(
         image.len() >= request.code_limit as usize,
         "the image is shorter than the region the signature must cover"
     );
 
     let code_slots = code_slot_count(request.code_limit);
-    let hashes = page_hashes(image, request, code_slots, previous);
     let code_directory = build_code_directory(request, code_slots, &hashes);
 
     // The special slots hash the *other* blobs, so they must be built first.
