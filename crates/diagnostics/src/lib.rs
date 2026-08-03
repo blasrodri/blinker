@@ -117,6 +117,8 @@ pub struct PhaseTimings {
     pub link_unwind_ms: Option<f64>,
     pub link_relocate_ms: Option<f64>,
     pub link_emit_ms: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_write_ms: Option<f64>,
     /// What the cache cost, as against what it saved.
     ///
     /// Absent when no cache was asked for. Reported because reuse counters
@@ -164,6 +166,7 @@ pub struct LinkStages {
     pub dead_strip: f64,
     pub relocate: f64,
     pub emit: f64,
+    pub write: f64,
     /// Parsing `.tbd` stubs, which happens on its own thread inside
     /// `read_and_parse` rather than after it.
     pub stub_parse: f64,
@@ -372,6 +375,7 @@ impl LinkRecord {
             dead_strip,
             relocate,
             emit,
+            write: write_ms,
             cache,
             stub_parse,
             emit_breakdown,
@@ -451,6 +455,7 @@ impl LinkRecord {
         self.timings.link_survey_ms = (survey > 0.0).then_some(survey);
         self.timings.link_relocate_ms = Some(relocate);
         self.timings.link_emit_ms = Some(emit);
+        self.timings.link_write_ms = (write_ms > 0.0).then_some(write_ms);
         if cache.ran() {
             self.timings.link_cache_load_ms = Some(cache.load);
             self.timings.link_cache_plan_ms = Some(cache.plan);
@@ -579,6 +584,7 @@ impl LinkRecord {
             ("layout", self.timings.link_layout_ms),
             ("relocate", self.timings.link_relocate_ms),
             ("emit+sign", self.timings.link_emit_ms),
+            ("write", self.timings.link_write_ms),
             // Last, and named for what they are rather than folded into the
             // stage they happen to run inside: these are the cache's price,
             // and a reader comparing them against the reuse counters above is

@@ -404,7 +404,7 @@ def main():
                   "address_map", "contents", "synthetic", "apply"}
     for name in ["read_and_parse", "stub_parse", "resolve", "layout", "dead_strip",
                  "digest", "atoms", "liveness", "group", "traverse", "strip_build",
-                 "prepare", "placements", "personality", "unwind_size", "commons", "accounting", "address_table", "address_diff", "relocate", "emit", "emit_layout", "emit_contents",
+                 "prepare", "placements", "personality", "unwind_size", "commons", "accounting", "address_table", "address_diff", "relocate", "emit", "write", "emit_layout", "emit_contents",
                  "emit_linkedit", "emit_assemble", "emit_uuid", "emit_sign",
                  "address_map", "contents", "synthetic", "eh_frame", "tables", "unwind", "apply", "symbols", "survey",
                  "cache_load", "cache_plan",

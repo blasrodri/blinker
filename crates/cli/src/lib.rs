@@ -227,6 +227,7 @@ pub fn run_in(
                 strip_breakdown: [phases.atoms_ms, phases.liveness_ms, phases.strip_build_ms],
                 relocate: phases.relocate_ms,
                 emit: phases.emit_ms,
+                write: phases.write_ms,
                 stub_parse: phases.stub_parse_ms,
                 emit_breakdown: [
                     phases.emit_breakdown.layout_ms,

@@ -79,6 +79,8 @@ pub struct LinkTimings {
     pub layout_probe_ms: f64,
     pub relocate_ms: f64,
     pub emit_ms: f64,
+    /// Writing the finished image to the output path.
+    pub write_ms: f64,
     pub total_ms: f64,
     /// Objects whose patched bytes came from the cache rather than from
     /// relocating them again. Zero on a cold link, and on every link that did
@@ -6160,7 +6162,6 @@ pub fn link_to_file_in(
     let mut timings = LinkTimings::default();
     let overall = std::time::Instant::now();
     let image = link_inner(request, &mut timings, session)?;
-    timings.total_ms = elapsed_ms(overall);
     let (held, read) = session.counts();
     timings.inputs_held = held as u64;
     timings.inputs_read = read as u64;
@@ -6170,7 +6171,16 @@ pub fn link_to_file_in(
     let (changes, first) = session.interface_changes();
     timings.interface_changes = changes;
     timings.first_interface_change = first.map(Path::to_path_buf);
+
+    // Inside the total, and timed. It was outside it, and 195 MB reached the
+    // filesystem in 19-151 ms depending on what else the machine was doing —
+    // so every "link" figure in FINDINGS before 186 excluded the largest and
+    // least predictable thing a link does. `wall` had been carrying it all
+    // along, which is why `wall` and `link` disagreed by more than a spawn.
+    let write = std::time::Instant::now();
     write_output(&image.bytes, output)?;
+    timings.write_ms = elapsed_ms(write);
+    timings.total_ms = elapsed_ms(overall);
     Ok(timings)
 }
 
@@ -6286,6 +6296,27 @@ fn reuse_finished_image(
 /// it, which POSIX guarantees is atomic within a filesystem. Beside it, rather
 /// than in `/tmp`, because a rename across filesystems is not a rename — it is
 /// a copy, and the guarantee is lost exactly where the output is large.
+/// Write the finished image to `output`, atomically.
+///
+/// # It is a copy, and that is the cheap end
+///
+/// 195 MB reaching the filesystem looks like the obvious thing to make
+/// incremental: 9,719 of 9,722 contributions keep their address, so almost
+/// every byte written is the byte already there. `clonefile` makes a
+/// copy-on-write clone of the previous output in constant time, and writing
+/// only the blocks that differ into it would dirty a few hundred kilobytes
+/// instead of 195 MB.
+///
+/// It was built, and it is slower. Finding out which blocks differ means
+/// reading the old 195 MB and the new 195 MB — 390 MB — where writing the file
+/// whole moves 195 MB once, into the page cache, at memory speed. On a link
+/// whose output had not changed at all, the patching writer took 47 ms against
+/// 22 (finding 186).
+///
+/// The comparison is the cost, so the incremental write is worth building only
+/// once the linker can say which ranges moved *without* comparing — which is
+/// the same information the incremental-output model needs anyway. Until then
+/// this is a copy, deliberately.
 fn write_output(bytes: &[u8], output: &Path) -> Result<(), LinkError> {
     let failed = |source: std::io::Error| LinkError::Write {
         path: output.to_path_buf(),
