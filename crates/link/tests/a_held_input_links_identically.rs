@@ -473,3 +473,89 @@ fn an_interner_warmed_by_another_program_does_not_reorder_the_link() {
     );
     assert_eq!(run(&warm), "125\n");
 }
+
+/// An archive rebuilt with its members under new names, holding the same
+/// bytes, is served from the session — and says so in the output.
+///
+/// This is what rustc does to every crate downstream of an edit: the codegen
+/// units are recompiled to identical bytes and named with a fresh per-build
+/// component, so the rlib differs and its members do not. Dropping a re-read
+/// archive's members threw away 3,373 of a rust-analyzer link's 5,637 objects
+/// and parsed them all again (finding 174).
+///
+/// Two things have to hold at once, and the second is why this test compares
+/// bytes rather than counting hits: the parse must be reused, *and* the
+/// `OSO` stab must name the member that exists now rather than the one the
+/// parse remembers. A held parse carries the old member name inside it.
+#[test]
+fn an_archive_whose_members_were_renamed_reuses_their_parses() {
+    let scratch = Scratch::dir("session-member-renamed").expect("scratch");
+    // With debug information, because the `OSO` stab is what carries the member
+    // name into the output. Without `-g` there is no debug map, and this test
+    // passes whatever the name is taken from — which is how it was written the
+    // first time.
+    let compile_g = |name: &str, source: &str| {
+        let path = scratch.join(name);
+        std::fs::write(&path, source).expect("source written");
+        let object = path.with_extension("o");
+        let status = Command::new("cc")
+            .args(["-g", "-c", "-o"])
+            .arg(&object)
+            .arg(&path)
+            .status()
+            .expect("cc runs");
+        assert!(status.success(), "compiling {name} failed");
+        object
+    };
+    let main = compile_g("main.c", MAIN);
+    let helper = compile_g("helper.c", HELPER);
+    let other = compile_g("other.c", OTHER);
+
+    // The archive rustc would produce on the first build.
+    let first_names: Vec<PathBuf> = [("h-1aaa.o", &helper), ("o-1aaa.o", &other)]
+        .iter()
+        .map(|(name, from)| {
+            let renamed = scratch.join(name);
+            std::fs::copy(from, &renamed).expect("copy");
+            renamed
+        })
+        .collect();
+    let library = archive(&scratch, &first_names);
+    let request = LinkRequest::new(vec![main.clone(), library.clone()]);
+
+    let mut session = Session::default();
+    let first = scratch.join("first");
+    link_to_file_in(&request, &first, &mut session).expect("the first link succeeds");
+
+    // The same bytes, under the names a rebuild would give them.
+    for (was, now) in [("h-1aaa.o", "h-2bbb.o"), ("o-1aaa.o", "o-2bbb.o")] {
+        std::fs::rename(scratch.join(was), scratch.join(now)).expect("rename");
+    }
+    std::fs::remove_file(&library).expect("the old archive is replaced");
+    let rebuilt = archive(
+        &scratch,
+        &[scratch.join("h-2bbb.o"), scratch.join("o-2bbb.o")],
+    );
+    assert_eq!(
+        rebuilt, library,
+        "the archive keeps its path, as an rlib does"
+    );
+
+    let second = scratch.join("second");
+    let timings = link_to_file_in(&request, &second, &mut session).expect("the second link");
+    assert!(
+        timings.inputs_held > 0,
+        "nothing was held, so this proves nothing"
+    );
+
+    // The decisive comparison: a cold link of the *rebuilt* archive. A reused
+    // parse serving a stale member name would differ here and nowhere else.
+    let cold = scratch.join("cold");
+    link_to_file(&request, &cold).expect("the cold link succeeds");
+    assert_eq!(
+        std::fs::read(&second).expect("second"),
+        std::fs::read(&cold).expect("cold"),
+        "a link over renamed members differs from a cold link of the same bytes"
+    );
+    assert_eq!(run(&second), "125\n");
+}

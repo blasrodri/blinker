@@ -73,7 +73,7 @@ impl ContributionKeys {
             // a contribution's identity depend on whether the session happened
             // to be holding it — so a warm link and a cold one would disagree
             // about what the same bytes are called.
-            let input = input_identity(object.path.as_ref(), &object.parsed.metadata);
+            let input = input_identity(object.path.as_ref(), object.member.as_deref());
             for (ordinal, section) in numbered_sections(&object.parsed) {
                 keys.insert(
                     (object.parsed.id.0, section.id.0),
@@ -134,10 +134,17 @@ fn numbered_sections(
 /// An archive member is its archive's path *and* its member name: the path
 /// alone names an rlib holding two hundred objects, and keying on it would
 /// give every one of them the same identity.
-fn input_identity(path: &std::path::Path, metadata: &blinker_macho::ObjectMetadata) -> u64 {
+///
+/// Both come from the *link*, never from the parse. A held parse can now
+/// outlive the archive it was read from — rustc renames every codegen unit of
+/// a recompiled crate, and the member cache proves the bytes are unchanged and
+/// serves the old parse under the new name — so taking the member name from
+/// `metadata` would make a warm link and a cold one disagree about what the
+/// same bytes are called.
+fn input_identity(path: &std::path::Path, member: Option<&str>) -> u64 {
     let mut hasher = FastHasher::default();
     path.hash(&mut hasher);
-    match &metadata.member {
+    match member {
         Some(member) => {
             1u8.hash(&mut hasher);
             member.hash(&mut hasher);
@@ -202,7 +209,10 @@ mod tests {
     /// earlier version of this helper recomputed the hash itself, which would
     /// have kept passing had the real one changed underneath it.
     fn key(object: &ParsedObject, section: u32) -> ContributionKey {
-        let input = input_identity(&object.metadata.path.clone(), &object.metadata);
+        let input = input_identity(
+            &object.metadata.path.clone(),
+            object.metadata.member.as_deref(),
+        );
         let (ordinal, section) = numbered_sections(object)
             .find(|(_, s)| s.id.0 == section)
             .expect("the section exists");

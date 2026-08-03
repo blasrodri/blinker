@@ -680,6 +680,14 @@ struct LoadedObject {
     /// Anything that names the file to a consumer — the debug map's `OSO`,
     /// the cache's record of what it read — must use this one.
     path: std::sync::Arc<Path>,
+    /// The archive member name this link read it under, for the same reason
+    /// `path` exists and with the same rule: never `parsed.metadata.member`.
+    ///
+    /// rustc renames every codegen unit of a recompiled crate, so an rlib whose
+    /// members are byte-for-byte what they were still lists them under new
+    /// names. The parse held for those bytes carries whatever name they had the
+    /// first time; the `OSO` stab has to name the member that exists *now*.
+    member: Option<std::sync::Arc<str>>,
 }
 
 /// Sections that exist for the linker's benefit and must not reach the output.
@@ -3216,6 +3224,7 @@ fn load_one(path: &Path, id: Option<ObjectId>) -> Result<Loaded, LinkError> {
                 parsed: std::sync::Arc::new(parsed),
                 data: SourceBytes::whole(data),
                 path: Arc::from(path),
+                member: None,
             }))
         }
     }
@@ -3270,6 +3279,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
                         parsed,
                         data: SourceBytes::whole_shared(&data),
                         path: Arc::from(path.as_path()),
+                        member: None,
                     })
                 })
             }),
@@ -3382,11 +3392,19 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
             let (path, index, data) = &archives[*archive_index];
             let id = ObjectId(first_member_id + position as u32);
             let member_id = blinker_archive::MemberId(*member);
-            let loaded = match session.member(path, *member) {
-                Some((parsed, range)) if parsed.id == id => LoadedObject {
+            let entry = index.member(member_id);
+            let fresh = entry
+                .and_then(|entry| blinker_archive::member_data(data, entry, path).ok())
+                .unwrap_or_default();
+            let window = entry
+                .map(|entry| entry.offset as usize..entry.offset as usize + fresh.len())
+                .unwrap_or(0..0);
+            let loaded = match session.member(path, *member, fresh) {
+                Some((parsed, _)) if parsed.id == id => LoadedObject {
                     parsed,
-                    data: SourceBytes::window(data, range),
+                    data: SourceBytes::window(data, window),
                     path: Arc::from(path.as_path()),
+                    member: entry.map(|entry| Arc::from(entry.name.as_str())),
                 },
                 // A member the session lost — it can only have been dropped
                 // with its archive, and its archive cannot have changed, so
@@ -3518,17 +3536,25 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
         // now means something else.
         let mut held: Vec<Option<LoadedObject>> = (0..round.len()).map(|_| None).collect();
         for (at, (archive_index, member_id)) in round.iter().enumerate() {
-            let (path, _, data) = &archives[*archive_index];
-            let Some((parsed, range)) = session.member(path, member_id.0) else {
+            let (path, index, data) = &archives[*archive_index];
+            let Some(entry) = index.member(*member_id) else {
+                continue;
+            };
+            let Ok(fresh) = blinker_archive::member_data(data, entry, path) else {
+                continue;
+            };
+            let Some((parsed, _)) = session.member(path, member_id.0, fresh) else {
                 continue;
             };
             if parsed.id != ObjectId(base + at as u32) {
                 continue;
             }
+            let start = entry.offset as usize;
             held[at] = Some(LoadedObject {
                 parsed,
-                data: SourceBytes::window(data, range),
+                data: SourceBytes::window(data, start..start + fresh.len()),
                 path: Arc::from(path.as_path()),
+                member: Some(Arc::from(entry.name.as_str())),
             });
         }
         let todo: Vec<usize> = (0..round.len()).filter(|at| held[*at].is_none()).collect();
@@ -3617,8 +3643,14 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
             }
             fresh.next();
             if let Ok(loaded) = loaded {
-                let (path, _, _) = &archives[round[at].0];
-                session.store_member(path, round[at].1 .0, &loaded.parsed, loaded.data.range());
+                let (path, _, data) = &archives[round[at].0];
+                session.store_member(
+                    path,
+                    round[at].1 .0,
+                    &loaded.parsed,
+                    loaded.data.range(),
+                    data,
+                );
             }
         }
 
@@ -3771,6 +3803,7 @@ fn parse_member(
         parsed: std::sync::Arc::new(parsed),
         data: SourceBytes::window(data, start..start + bytes.len()),
         path: Arc::from(path),
+        member: Some(Arc::from(member.name.as_str())),
     })
 }
 
@@ -4354,7 +4387,10 @@ fn debug_map_of<'a>(
         // An archive member is named the way `ld` names it, and carries a
         // timestamp of zero: the member has no mtime of its own, and the
         // archive's would go stale for reasons unrelated to this member.
-        let (oso, mtime) = match &object.parsed.metadata.member {
+        // `object.member`, not `parsed.metadata.member`, for the reason `path`
+        // is used above: the parse may be one held from before the crate was
+        // recompiled, and rustc renames every codegen unit when it is.
+        let (oso, mtime) = match &object.member {
             Some(member) => (format!("{}({member})", path.display()), 0),
             None => (path.display().to_string(), object_mtime(path)),
         };

@@ -114,6 +114,12 @@ enum Entry {
 /// what the generation counter below does in one assignment.
 type MemberKey = (PathBuf, u32);
 
+/// A parsed member, where it sits in its archive, and the archive's bytes.
+///
+/// The bytes travel with the parse because that is what lets a later link prove
+/// the member is still the same member. See [`Session::member`].
+type HeldMember = (Arc<ParsedObject>, std::ops::Range<usize>, Arc<Backing>);
+
 /// The archives an extraction order is indexed against, and the order itself.
 ///
 /// `(archive position, member)` means nothing against a different set of
@@ -151,7 +157,9 @@ pub struct Session {
     /// relocation on the second link — which is the good case; a member whose
     /// sections happened to land at plausible offsets would have produced a
     /// binary instead.
-    members: FastMap<MemberKey, (Arc<ParsedObject>, std::ops::Range<usize>)>,
+    /// The archive's bytes travel with the parse so a later link can prove the
+    /// member is still the same bytes. See [`Session::member`].
+    members: FastMap<MemberKey, HeldMember>,
     /// Which archive members the last link pulled in, in the order it pulled
     /// them.
     ///
@@ -489,14 +497,27 @@ impl Session {
     /// entry, and [`Session::store_archive`] drops every member of an archive
     /// whose bytes changed. Probing here would `stat` the same rlib once per
     /// member pulled out of it — several hundred times on a Rust link.
+    /// A member of `archive` this process has already parsed, if `fresh` is
+    /// byte-for-byte the bytes it was parsed from.
+    ///
+    /// The comparison is the whole of the safety argument, and it replaces
+    /// throwing every member away when its archive was re-read. rustc renames
+    /// every codegen unit of a recompiled crate, so a crate *downstream* of an
+    /// edit produces an rlib that differs from the last one only in the names
+    /// inside it — 256 of 256 members byte-identical, at the same index. That
+    /// dropped 3,373 of a link's 5,637 objects and re-parsed them all.
+    ///
+    /// A `memcmp` and not a digest because both sides are already mapped: there
+    /// is nothing to gain by hashing 400 MB to avoid comparing it, and a
+    /// comparison cannot collide.
     pub fn member(
         &self,
         archive: &Path,
         member: u32,
+        fresh: &[u8],
     ) -> Option<(Arc<ParsedObject>, std::ops::Range<usize>)> {
-        self.members
-            .get(&(archive.to_path_buf(), member))
-            .map(|(parsed, range)| (Arc::clone(parsed), range.clone()))
+        let (parsed, range, backing) = self.members.get(&(archive.to_path_buf(), member))?;
+        (backing.get(range.clone())? == fresh).then(|| (Arc::clone(parsed), range.clone()))
     }
 
     /// Remember a freshly parsed archive member and where it sits.
@@ -506,13 +527,16 @@ impl Session {
         member: u32,
         parsed: &Arc<ParsedObject>,
         range: std::ops::Range<usize>,
+        data: &Arc<Backing>,
     ) {
         // A member's interface is noted under a path of its own, so two
         // members of one archive cannot overwrite each other's digest.
         let named = member_path(archive, member);
         self.note_interface(&named, parsed);
-        self.members
-            .insert((archive.to_path_buf(), member), (Arc::clone(parsed), range));
+        self.members.insert(
+            (archive.to_path_buf(), member),
+            (Arc::clone(parsed), range, Arc::clone(data)),
+        );
     }
 
     /// Remember a freshly indexed archive.
@@ -525,9 +549,11 @@ impl Session {
         let Some(key) = blinker_cache::InputKey::probe(path) else {
             return;
         };
-        // Storing an archive means it was just read, which means its previous
-        // contents are gone and so is anything parsed out of them.
-        self.members.retain(|(archive, _), _| archive != path);
+        // The members are *not* dropped here. They used to be, on the argument
+        // that a re-read archive's contents are gone — which is true of the
+        // bytes and not of what was parsed out of them. Each one now carries
+        // the bytes it was parsed from, and [`Session::member`] serves it only
+        // after proving the new archive holds the same bytes at that index.
         // The archive's *index* is one of the frontier's two inputs: it decides
         // which member defines a name. If it moved, no replay can be trusted;
         // if it did not, the replay is still on the hook for the other input —

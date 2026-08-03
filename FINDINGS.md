@@ -8439,3 +8439,64 @@ link — a stage already perfect and not worth touching. They were 86 ms. The
 numbers were right and the sentence about them was wrong, which is the failure
 mode instrumentation is *least* protected against: a wrong reading of a correct
 measurement looks exactly like a correct one.
+
+## 174. A re-read archive threw away 3,373 of 5,637 parses, and all but one were unchanged
+
+Finding 171 said the warm link was proportional to the program rather than to
+the edit, and named dead stripping as the clearest case. It was not the biggest
+one. `Atoms::build` was asked for 5,637 projections and found **3,373 of them
+missing from the memo** — on a link where one object's projection had moved.
+
+The 3,373 are exactly the objects the report already called not-reused. They
+were missing because `store_archive` dropped every member of a re-read archive,
+on the argument that a re-read archive's contents are gone. That is true of the
+bytes and false of what was parsed out of them:
+
+```
+store_archive libhir-853dac6d2ed02627.rlib      drops 256 members
+store_archive libhir_ty-2b5c28c55eb666cd.rlib   drops 256 members
+store_archive libhir_def-0e34e4ac5d6b156a.rlib  drops 256 members
+...15 archives, 3,373 members
+```
+
+Those fifteen are the crates downstream of the edited one, so rustc did
+recompile them all. What it produced is the point:
+
+```
+libhir      256 vs 256 objects; 256/256 identical at the SAME index
+libhir_def  256 vs 256 objects; 256/256 identical at the SAME index
+libbase_db  225 vs 225 objects; 224/225 identical   <- the edited crate itself
+```
+
+Byte-for-byte the same objects, at the same index, under different names —
+`hir-853dac...98hqlx8xschvz3oynqv2fng6t.195puae.rcgu.o` became
+`...98hqlx8xschvz3oynqv2fng6t.1i137y1.rcgu.o`. The trailing component is
+rustc's per-build session id. This is finding 144 exactly, the phenomenon the
+content index was built for — happening *inside* archives, where nobody had
+applied it. Even the crate that was actually edited changed one codegen unit of
+225.
+
+So the members are kept, and served only after proving the new archive holds
+the same bytes at that index. A `memcmp` rather than a digest: both sides are
+already mapped, there is nothing to gain by hashing 400 MB to avoid comparing
+it, and a comparison cannot collide.
+
+**Warm relink of debug rust-analyzer: 610 ms to 515 ms.**
+
+### The half that was nearly a silent wrong answer
+
+A held parse carries the member name it was parsed under, and that name reaches
+the output: the `OSO` stab names the object file a debugger will open. Serving
+the old parse under the new name would have emitted a member that no longer
+exists — a debug map pointing at nothing, in a binary that links and runs.
+
+`identity.rs` already had the rule written down for the *path*: take it from the
+link, never from the parse, "so a warm link and a cold one would disagree about
+what the same bytes are called". The member name needed the same rule and did
+not have it, because until now a held parse could never outlive its archive.
+
+The regression test compiles with `-g`, and the first version of it did not.
+Without debug information there is no debug map, so it passed with the name
+taken from either place — a test of the thing that cannot fail. It now fails
+against exactly that sabotage, which is also what proves the reuse is happening
+at all.
