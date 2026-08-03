@@ -16,10 +16,10 @@ programs.
 | Debug information | `SO`/`OSO`/`FUN` debug map emitted; `dsymutil` reads it back |
 | Dylibs, bundles, partial links | delegated to the system linker, with a recorded reason |
 | Output size | **0.85×** `ld-prime`'s on a large link, with dead-stripping |
-| Cold link, small (238 objects) | **1.10×** `ld-prime` — inside the spread |
-| Cold link, large (5,637 objects) | **1.94×** `ld-prime` |
-| Edit relink, small, resident | **12.1 ms** against `ld-prime`'s 31.6 ms cold |
-| Edit relink, large, resident | **346 ms** against `ld-prime`'s 323 ms cold |
+| Cold link, small (238 objects) | **1.09×** `ld-prime` — inside the spread |
+| Cold link, large (5,637 objects) | **1.75×** `ld-prime` |
+| Edit relink, small, resident | **11.2 ms** against `ld-prime`'s 29.7 ms cold |
+| Edit relink, large, resident | **346 ms** against `ld-prime`'s 311 ms cold |
 
 The last two rows are the metric the product exists for, and they are where the
 two scales disagree: on a small link the resident linker is comfortably faster
@@ -36,12 +36,14 @@ plan — several of them contradicting earlier entries in the same file.
 
 ## What is not done
 
-- **Speed at scale.** 1.94× the system linker on a large cold link, against
-  1.10× on a small one, and the resident relink of a large program is still
-  slower than a cold `ld-prime`. The reason is that several stages are still
-  proportional to the whole program rather than to the edit — dead stripping
-  rebuilds the reachability graph, and the output image is assembled from
-  scratch even when 98% of relocations are reused.
+- **Speed at scale.** 1.75× the system linker on a large cold link, against
+  1.09× on a small one, and the resident relink of a large program is still
+  slower than a cold `ld-prime` — by 11%, where it was 51% at the start of the
+  work recorded in findings 179-185. The reason is that the stages left are
+  proportional to the whole program rather than to the edit: dead stripping
+  rebuilds the reachability graph even when one object in 5,637 moved, and the
+  image is assembled, hashed and written whole even when 98% of relocations
+  were reused.
 
   Not the reason, though it was believed to be for a long time and this file
   said so: materialising every symbol name into an owned `String`. Removing that
