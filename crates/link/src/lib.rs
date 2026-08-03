@@ -1950,23 +1950,29 @@ fn link_inner(
     let prep = std::time::Instant::now();
     let personality_step = std::time::Instant::now();
     let mut eh_personality_fields: HashMap<(u32, u32), HashSet<u64>> = HashMap::default();
+    // Which names the table already holds. `got.iter().any(...)` compared every
+    // entry's text against every personality symbol — a scan of a table that
+    // grows, inside a loop over every object, to answer a membership question.
+    let mut in_got: HashSet<&str> = got.iter().map(|entry| entry.name.as_str()).collect();
+    let mut personalities: Vec<(ObjectId, &str)> = Vec::new();
     for object in &objects {
         for section in &object.parsed.sections {
             if section.name != "__eh_frame" {
                 continue;
             }
             let fields = eh_frame_personality_fields(object, section);
-            for relocation in &object.parsed.relocations {
-                if relocation.section != section.id || !fields.contains(&relocation.offset) {
+            // This section's relocations, not the object's. Asking for all of
+            // them and skipping the ones belonging elsewhere walks every
+            // relocation of the object once per `__eh_frame` section — and the
+            // parse indexes them by section already.
+            for relocation in object.parsed.relocations_for(section.id) {
+                if !fields.contains(&relocation.offset) {
                     continue;
                 }
                 if let RelocationTarget::Symbol(id) = relocation.target {
                     if let Some(symbol) = object.parsed.symbol(id) {
-                        if !got.iter().any(|e| e.name == symbol.name) {
-                            got.push(TableEntry {
-                                object: object.parsed.id,
-                                name: symbol.name.clone(),
-                            });
+                        if in_got.insert(symbol.name.as_str()) {
+                            personalities.push((object.parsed.id, symbol.name.as_str()));
                         }
                     }
                 }
@@ -1976,6 +1982,12 @@ fn link_inner(
             }
         }
     }
+    // Appended after the walk, in the order the walk found them, because the
+    // set above borrows the names from the parses and `got` owns copies.
+    got.extend(personalities.into_iter().map(|(object, name)| TableEntry {
+        object,
+        name: name.to_string(),
+    }));
 
     if !stubs.is_empty() {
         placements.push(InputPlacement {
@@ -2924,18 +2936,25 @@ fn resolve_imports(
 /// layout needs the size before any address exists. Building it twice would
 /// need addresses that do not exist yet.
 fn unwind_table_size(objects: &[LoadedObject], strip: &Strip) -> u64 {
-    let records: usize = objects
-        .iter()
-        .map(|object| {
-            object
-                .parsed
-                .sections
-                .iter()
-                .filter(|s| s.name == "__compact_unwind")
-                .map(|s| live_unwind_records(object, s, strip))
-                .sum::<usize>()
-        })
-        .sum();
+    // On every core: counting a section's live records reads that object's
+    // relocations and the strip map, and writes nothing. It is a reduction, so
+    // the chunking cannot reach the answer.
+    let records: usize = crate::parallel::map_chunks(objects, |_, chunk| {
+        chunk
+            .iter()
+            .map(|object| {
+                object
+                    .parsed
+                    .sections
+                    .iter()
+                    .filter(|s| s.name == "__compact_unwind")
+                    .map(|s| live_unwind_records(object, s, strip))
+                    .sum::<usize>()
+            })
+            .sum::<usize>()
+    })
+    .into_iter()
+    .sum();
     if records == 0 {
         return 0;
     }
