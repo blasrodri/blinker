@@ -407,33 +407,49 @@ impl Session {
     /// changed archive reported reading nothing. A counter that undercounts
     /// misses is worse than no counter: it makes a cache look perfect exactly
     /// when it is not working.
-    fn current(&mut self, path: &Path) -> Option<&Entry> {
-        let known = self.entries.contains_key(path);
-        let current = known
-            && blinker_cache::InputKey::probe(path)
-                .is_some_and(|now| self.entries.get(path).is_some_and(|(key, _)| *key == now));
+    fn current(&mut self, path: &Path, now: Option<&blinker_cache::InputKey>) -> Option<&Entry> {
+        let current =
+            now.is_some_and(|now| self.entries.get(path).is_some_and(|(key, _)| key == now));
         self.count(current);
         current.then(|| &self.entries.get(path).expect("just checked").1)
     }
 
     /// A parsed object for `path`, or `None` to parse it.
-    pub fn object(&mut self, path: &Path) -> Option<(Arc<ParsedObject>, Arc<Backing>)> {
+    ///
+    /// `key` is what probing `path` produced, which the caller supplies rather
+    /// than this working it out. A probe is a `stat` for a content-addressed
+    /// path and a read and a BLAKE3 for one of rustc's, and 133 loose objects
+    /// is 22 MB hashed — on one thread, before anything else can start,
+    /// because the session cannot be shared across the readers that follow.
+    /// Hashing a file touches nothing shared, so the caller does every probe
+    /// at once and this is left with the map work (finding 182).
+    ///
+    /// It also stops the file being probed *twice*. The comment below has
+    /// always said `current` has just probed it — and then the code probed it
+    /// again, hashing the same bytes a second time, for every object whose
+    /// path had moved. rustc renames every object of a recompiled crate, so
+    /// "every object whose path had moved" is the ordinary case.
+    pub fn object(
+        &mut self,
+        path: &Path,
+        key: Option<&blinker_cache::InputKey>,
+    ) -> Option<(Arc<ParsedObject>, Arc<Backing>)> {
         if let Some((blinker_cache::InputKey::Content(hash), _)) = self.entries.get(path) {
             let hash = *hash;
             self.used_content.insert(hash);
         }
-        if let Some(entry) = self.current(path) {
+        if let Some(entry) = self.current(path, key) {
             return match entry {
                 Entry::Object(parsed, backing) => Some((Arc::clone(parsed), Arc::clone(backing))),
                 Entry::Archive(..) => None,
             };
         }
         // Missed by path — which for one of rustc's objects means very little,
-        // because it renames them all on every build. `current` has just
-        // probed this file, and for a path that is not evidence that probe is
-        // a hash of its bytes, so asking the content index costs nothing more
+        // because it renames them all on every build. The probe the caller
+        // made is in hand, and for a path that is not evidence that probe is a
+        // hash of its bytes, so asking the content index costs nothing more
         // than the lookup.
-        let blinker_cache::InputKey::Content(hash) = blinker_cache::InputKey::probe(path)? else {
+        let Some(blinker_cache::InputKey::Content(hash)) = key.cloned() else {
             return None;
         };
         let (parsed, backing) = self.by_content.get(&hash)?;
@@ -457,8 +473,9 @@ impl Session {
     pub fn archive(
         &mut self,
         path: &Path,
+        key: Option<&blinker_cache::InputKey>,
     ) -> Option<(Arc<blinker_archive::ArchiveIndex>, Arc<Backing>)> {
-        match self.current(path)? {
+        match self.current(path, key)? {
             Entry::Archive(index, backing) => Some((Arc::clone(index), Arc::clone(backing))),
             Entry::Object(..) => None,
         }
@@ -1249,7 +1266,12 @@ mod tests {
             relocations: Vec::new(),
         });
         session.store_object(&path, &parsed, &backing);
-        assert!(session.object(&path).is_some(), "it was not held");
+        assert!(
+            session
+                .object(&path, blinker_cache::InputKey::probe(&path).as_ref())
+                .is_some(),
+            "it was not held"
+        );
 
         // A changed input list no longer throws the session away. rustc
         // renames every object of a recompiled crate on every debug build, so
@@ -1259,7 +1281,9 @@ mod tests {
         // link would assign it.
         session.begin(&[path.clone(), scratch.join("b.o")]);
         assert!(
-            session.object(&path).is_some(),
+            session
+                .object(&path, blinker_cache::InputKey::probe(&path).as_ref())
+                .is_some(),
             "an input that is still in the list was discarded with the list"
         );
 
@@ -1271,7 +1295,9 @@ mod tests {
         session.begin(&[scratch.join("b.o")]);
         session.begin(&[scratch.join("b.o")]);
         assert!(
-            session.object(&path).is_none(),
+            session
+                .object(&path, blinker_cache::InputKey::probe(&path).as_ref())
+                .is_none(),
             "an input nothing has linked for two links was still held — the \
              content index grows with every build rather than with the program"
         );
@@ -1311,7 +1337,7 @@ mod tests {
         session.store_object(&first, &parsed, &backing);
 
         session.begin(std::slice::from_ref(&second));
-        let held = session.object(&second);
+        let held = session.object(&second, blinker_cache::InputKey::probe(&second).as_ref());
         assert!(
             held.is_some(),
             "a renamed object with identical bytes was parsed again"
@@ -1389,7 +1415,9 @@ mod tests {
 
         std::fs::write(&path, vec![2u8; 256]).expect("rewritten");
         assert!(
-            session.object(&path).is_none(),
+            session
+                .object(&path, blinker_cache::InputKey::probe(&path).as_ref())
+                .is_none(),
             "a rewritten object was served from memory"
         );
     }

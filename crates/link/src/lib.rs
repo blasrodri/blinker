@@ -3375,6 +3375,21 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
     // a `stat` (or a read and a hash for the inputs whose paths do not identify
     // them), and the session is not shareable across the worker threads below.
     // What is left is what has to be read.
+    // Every input probed at once, before the serial pass below can ask about
+    // any of them. A probe is a `stat` for a content-addressed path and a read
+    // and a BLAKE3 for one of rustc's; a debug rust-analyzer link has 133 loose
+    // objects and 22 MB of them, and hashing that on one thread is the whole of
+    // this phase. Nothing here touches the session, which is what makes it
+    // possible — the serial pass exists because the session is not shareable,
+    // not because the probing is not.
+    let probes = parallel::map_chunks(paths, |_, chunk| {
+        chunk
+            .iter()
+            .map(|path| blinker_cache::InputKey::probe(path))
+            .collect::<Vec<_>>()
+    });
+    let probes: Vec<Option<blinker_cache::InputKey>> = probes.into_iter().flatten().collect();
+
     let mut todo: Vec<usize> = Vec::with_capacity(paths.len());
     for (at, path) in paths.iter().enumerate() {
         let held = match ids[at] {
@@ -3385,19 +3400,21 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
             // This is the check that lets `Session::begin` keep anything at
             // all (finding 144), and it is the same argument the archive
             // member cache has always made.
-            Some(id) => session.object(path).and_then(|(parsed, data)| {
-                (parsed.id == id).then(|| {
-                    Loaded::Object(LoadedObject {
-                        parsed,
-                        data: SourceBytes::whole_shared(&data),
-                        path: Arc::from(path.as_path()),
-                        member: None,
-                        unchanged: false,
+            Some(id) => session
+                .object(path, probes[at].as_ref())
+                .and_then(|(parsed, data)| {
+                    (parsed.id == id).then(|| {
+                        Loaded::Object(LoadedObject {
+                            parsed,
+                            data: SourceBytes::whole_shared(&data),
+                            path: Arc::from(path.as_path()),
+                            member: None,
+                            unchanged: false,
+                        })
                     })
-                })
-            }),
+                }),
             None => session
-                .archive(path)
+                .archive(path, probes[at].as_ref())
                 .map(|(index, data)| Loaded::Archive(path.clone(), index, data, 0)),
         };
         match held {
