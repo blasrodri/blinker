@@ -244,21 +244,49 @@ fn parse_symbol_map<'d>(
         return Vec::new();
     };
 
+    // Data offset -> id, sorted, so resolving a symbol's member is a binary
+    // search and not a scan of every member.
+    //
+    // It was `members.iter().find(...)`, once per symbol. rust-analyzer's
+    // largest rlib lists 73,095 symbols across 258 members, which is 18.9
+    // million comparisons to answer 73,095 questions — finding 77's shape,
+    // inside a function that reads like a lookup.
+    let mut by_offset: Vec<(u64, MemberId)> = members.iter().map(|m| (m.offset, m.id)).collect();
+    by_offset.sort_unstable();
+
     let mut map = Vec::new();
+    // The archive symbol table lists a member's symbols together, so the
+    // previous answer is the right one 257 times out of 258. Keeping it skips
+    // both the header parse and the search.
+    let mut last: Option<(u64, MemberId)> = None;
     for symbol in symbols.flatten() {
         let Ok(name) = std::str::from_utf8(symbol.name()) else {
             continue;
         };
-        // The table addresses members by the offset of their *header*, while
-        // our IDs index the member list. Resolve through `object` and match on
-        // the member's data range, which is the one identity both sides agree
-        // on.
-        let Ok(member) = archive.member(symbol.offset()) else {
-            continue;
+        let header = symbol.offset();
+        // `ArchiveOffset` is opaque and not comparable; its `.0` is the file
+        // offset, which is what identifies the member here.
+        let header_at = header.0;
+        let id = match last {
+            Some((at, id)) if at == header_at => Some(id),
+            _ => {
+                // The table addresses members by the offset of their *header*,
+                // while our IDs index the member list. Resolve through
+                // `object` and match on the member's data range, which is the
+                // one identity both sides agree on.
+                let found = archive.member(header).ok().and_then(|member| {
+                    let (offset, _) = member.file_range();
+                    by_offset
+                        .binary_search_by_key(&offset, |(at, _)| *at)
+                        .ok()
+                        .map(|at| by_offset[at].1)
+                });
+                last = found.map(|id| (header_at, id));
+                found
+            }
         };
-        let (offset, _) = member.file_range();
-        if let Some(found) = members.iter().find(|m| m.offset == offset) {
-            map.push((name.to_string(), found.id));
+        if let Some(id) = id {
+            map.push((name.to_string(), id));
         }
     }
     map

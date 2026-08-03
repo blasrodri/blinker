@@ -3593,7 +3593,9 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
                 .iter()
                 .filter_map(|name| names.resolve(*name))
                 .collect();
+            gap!(_lap, "pick: collect");
             wanted.sort_unstable();
+            gap!(_lap, "pick: sort");
 
             // Which archive defines each wanted name, asked on every core.
             //
