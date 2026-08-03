@@ -926,6 +926,11 @@ fn eh_frame_fde_offsets(
     let chunks = crate::parallel::map_chunks(objects, |base, chunk| {
         fde_offsets_of(chunk, base, interned, placed, addresses, strip, &offsets_of)
     });
+    // Sized before it is filled. The merge is 265,308 entries and the map
+    // started empty, which is eighteen doublings and every entry already in it
+    // reinserted at each one — finding 135's pattern, in the tail of a pass
+    // whose parallel half costs 6 ms.
+    offsets.reserve(chunks.iter().map(HashMap::len).sum());
     for chunk in chunks {
         offsets.extend(chunk);
     }
