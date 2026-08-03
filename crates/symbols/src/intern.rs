@@ -65,7 +65,7 @@ pub struct SymbolNames {
 /// every object — and it was the one map `blinker_hashing`'s conversion
 /// missed, despite that module's own note that names were the reason it was
 /// written. Switching it alone was 87 ms of a cold link.
-fn hash_of(name: &str) -> u64 {
+pub fn hash_of(name: &str) -> u64 {
     use std::hash::Hasher;
     let mut hasher = blinker_hashing::FastHasher::default();
     hasher.write(name.as_bytes());
@@ -79,7 +79,22 @@ impl SymbolNames {
 
     /// Intern `name`, returning its existing ID if already present.
     pub fn intern(&mut self, name: &str) -> SymbolNameId {
-        let hash = hash_of(name);
+        self.intern_hashed(name, hash_of(name))
+    }
+
+    /// Intern `name`, whose [`hash_of`] the caller has already worked out.
+    ///
+    /// Interning splits into two halves that want opposite things. Hashing a
+    /// name reads sixty-odd bytes and touches nothing shared, so it belongs on
+    /// every core; the table probe that follows mutates one structure and has
+    /// to be serial. Passing the hash in is what lets a caller separate them —
+    /// hash a whole round's names in parallel, then walk them through the table
+    /// with no hashing left to do.
+    ///
+    /// `hash` is not checked against `name`. A wrong one does not corrupt the
+    /// table — the text comparison below still decides — it just files the name
+    /// where no lookup will find it, so the same name would intern twice.
+    pub fn intern_hashed(&mut self, name: &str, hash: u64) -> SymbolNameId {
         if let Some(found) = self.lookup.get(&hash) {
             // Copied out before the table is touched, and cheap to copy: the
             // common case is one id.
@@ -215,6 +230,23 @@ mod tests {
         let id = names.intern("");
         assert_eq!(names.resolve(id), Some(""));
         assert_eq!(names.len(), 1);
+    }
+
+    /// Interning with the hash worked out elsewhere must be indistinguishable
+    /// from interning without it — the whole point is that a caller can hash a
+    /// batch of names ahead of the walk that files them.
+    #[test]
+    fn interning_with_a_precomputed_hash_matches_interning_without() {
+        let (mut ahead, mut plain) = (SymbolNames::new(), SymbolNames::new());
+        for name in ["_main", "_malloc", "", "_main", "_free", "_malloc"] {
+            assert_eq!(
+                ahead.intern_hashed(name, hash_of(name)),
+                plain.intern(name),
+                "{name}"
+            );
+        }
+        assert_eq!(ahead.len(), plain.len());
+        assert_eq!(ahead, plain);
     }
 
     /// The index is derivable, so it is not cached — but a table read back

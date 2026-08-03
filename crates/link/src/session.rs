@@ -845,6 +845,61 @@ impl Session {
         }))
     }
 
+    /// Intern a batch of parses' names, hashing them on every core first.
+    ///
+    /// [`Session::interned`] hashes each name where it interns it, so a cold
+    /// link's 976,000 names were hashed one at a time on the thread driving the
+    /// extraction — 117 ms, most of it reading sixty bytes of mangled name and
+    /// mixing them. The table itself has to be walked serially, since interning
+    /// one name decides what id the next gets; the hashing does not, and it is
+    /// the larger half.
+    ///
+    /// So a whole round is hashed at once and then walked through the table
+    /// with nothing left to compute. The ids come out in the same order and by
+    /// the same rule as before — `parses` is in the order the round settled on
+    /// before any thread started, and the walk below follows it.
+    ///
+    /// Seeding is not required for correctness: a parse that misses is interned
+    /// where it is asked for, exactly as before.
+    pub(crate) fn seed_interned(&mut self, parses: &[Arc<ParsedObject>]) {
+        let missing: Vec<&Arc<ParsedObject>> = parses
+            .iter()
+            .filter(|parse| {
+                !self
+                    .memo
+                    .get(&(Arc::as_ptr(parse) as usize))
+                    .is_some_and(|held| held.interned.is_some())
+            })
+            .collect();
+        if missing.len() < 2 {
+            return;
+        }
+        let hashed = crate::parallel::map_chunks(&missing, |_, chunk| {
+            chunk
+                .iter()
+                .map(|parse| {
+                    parse
+                        .symbols
+                        .iter()
+                        .map(|symbol| blinker_symbols::hash_of(&symbol.name))
+                        .collect::<Vec<u64>>()
+                })
+                .collect::<Vec<_>>()
+        });
+        let Session { memo, names, .. } = self;
+        for (parse, hashes) in missing.iter().zip(hashed.into_iter().flatten()) {
+            let ids: Vec<SymbolNameId> = parse
+                .symbols
+                .iter()
+                .zip(hashes)
+                .map(|(symbol, hash)| names.intern_hashed(&symbol.name, hash))
+                .collect();
+            let key = Arc::as_ptr(*parse) as usize;
+            let entry = memo.entry(key).or_insert_with(|| Memo::new(parse));
+            entry.interned = Some(Arc::new(ids));
+        }
+    }
+
     /// The interning table these ids belong to.
     pub(crate) fn names(&self) -> &SymbolNames {
         &self.names

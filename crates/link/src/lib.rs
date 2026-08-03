@@ -3432,6 +3432,11 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
     let mut extracted: HashSet<(usize, u32)> = HashSet::default();
     let mut order: Vec<(usize, u32)> = Vec::new();
     let mut frontier = Frontier::default();
+    let internable: Vec<Arc<ParsedObject>> = objects
+        .iter()
+        .map(|object| Arc::clone(&object.parsed))
+        .collect();
+    session.seed_interned(&internable);
     for object in &objects {
         let ids = session.interned(&object.parsed);
         frontier.absorb(object, &ids);
@@ -3571,8 +3576,15 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
                 .collect()
         };
 
-        // Every member's interface digest at once, while there are still
-        // fifteen cores to do it on — `store_member` below wants one each.
+        // The round's names and interface digests at once, while there are
+        // still fifteen cores to do it on. Both are wanted one object at a time
+        // below — `store_member` needs a digest each, `interned` an id vector.
+        let derivable: Vec<Arc<ParsedObject>> = parsed
+            .iter()
+            .filter_map(|loaded| loaded.as_ref().ok())
+            .map(|loaded| Arc::clone(&loaded.parsed))
+            .collect();
+        session.seed_interned(&derivable);
         let digestible: Vec<Arc<ParsedObject>> = todo
             .iter()
             .filter_map(|at| parsed[*at].as_ref().ok())

@@ -8211,3 +8211,49 @@ The seeding is not load-bearing: a parse whose digest is not held is digested
 where it is asked for, exactly as before. That is the property worth keeping —
 the fast path is an optimisation of the slow one, not a replacement that the
 slow one has to stay consistent with.
+
+## 169. Interning is not hashing, and precomputing the hash paid for the wrong reason
+
+Interning was 117 ms of the cold link and the obvious read of that is "976,000
+names, sixty bytes each, hashed one at a time on one core while fifteen sit
+idle". Finding 167 had already built and reverted a sharded table on that
+premise. So this time the split was measured before anything was designed:
+hash every name of a round in parallel, hand the hash to `intern_hashed`, and
+time the two halves.
+
+```
+hash    7-10 ms   every name of the link, on fifteen cores
+probe  89-109 ms  the table walk that follows
+```
+
+Hashing is 7% of interning. The 110 ms is not computation at all — it is three
+*dependent* cache misses per name: the bucket in a 477,532-entry index, the span
+it names, and the arena text the span points at, each address unknown until the
+previous load returns. That is also the missing half of finding 167's autopsy:
+sharding the index could not help because the index was never the cost.
+
+### The change was still worth 50 ms, for a reason that was not the plan
+
+Interleaved, twelve runs each: 734 ms against 791 ms. Fifty milliseconds from
+moving seven milliseconds of work. The hashing was never the point.
+
+What changed is the *shape of the serial loop*. It used to be
+
+```text
+load the name pointer -> read 60 bytes -> hash them -> probe the table
+```
+
+— one dependency chain per symbol, and the probe's address is not known until
+the hash finishes, so the machine cannot start the next miss until this one has
+landed. With the hashes already sitting in a contiguous `Vec<u64>`, the bucket
+address for symbol *i+k* is available immediately and the out-of-order window
+fills with overlapping misses. Same instructions, same order, same cache
+misses — issued concurrently instead of one after another.
+
+### The rule this is an instance of
+
+A serial loop over a large structure is limited by its *dependency chain*, not
+its instruction count, and precomputing the head of that chain into a dense
+array is a way to break it that has nothing to do with the parallelism it looks
+like. It is why the win survived being 15× larger than the work that was moved,
+and why measuring the halves before designing was worth more than the design.

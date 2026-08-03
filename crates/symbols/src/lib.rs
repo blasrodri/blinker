@@ -25,7 +25,7 @@ use std::collections::HashMap;
 use blinker_macho::{ObjectId, SymbolId, SymbolStrength, SymbolVisibility};
 
 mod intern;
-pub use intern::{SymbolNameId, SymbolNames};
+pub use intern::{hash_of, SymbolNameId, SymbolNames};
 
 mod diagnostics;
 pub use diagnostics::{DuplicateSymbol, SymbolError, UndefinedSymbol};
