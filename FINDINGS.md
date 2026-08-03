@@ -8114,3 +8114,56 @@ same one every time.
 ```
 
 Output byte-identical on the 187 MB image; 62 suites, 649 tests green.
+
+## 167. Sharding the interner measured zero, and the reason is worth keeping
+
+Cold `read_and_parse` is 340 ms of an 820 ms link, and interning is 128 of it —
+sequential, while everything around it now runs on fifteen cores. The obvious
+move is to shard the table so threads can fill it without a lock.
+
+Built it: 64 shards, id encoding the shard as `index * SHARDS + shard`,
+digests moved into the shard beside the spans. Then measured it back to back
+against the single table, twice, on the same machine:
+
+```
+  sharded      836 ms
+  one table    827 ms
+```
+
+Zero. **Reverted.**
+
+### What the detour taught, which is why it is written down
+
+**The first number was 1003 ms, and that was a real bug.** The shard was taken
+from the *top* eight bits of the hash and the same hash was handed to the
+shard's table. `hashbrown` keeps a seven-bit tag from the top of the key, so
+every name in a shard carried the same tag, every probe matched every entry's
+tag, and each lookup degenerated into comparing the text of the whole bucket.
+Taking the shard from the low bits and the key from what is left above them cost
+one line and 84 ms. Two hash functions derived from one hash must not want the
+same bits.
+
+**The second number was 934 ms at every shard count**, including eight — which
+should have been indistinguishable from one. That ruled sharding out as the
+cause and pointed at what else the rewrite had changed: the BLAKE3 digests had
+moved *into* `intern`, one name at a time, undoing the parallel batch of
+finding 164. 114 ms, and nothing to do with shards.
+
+**The third number was the honest one**, and it says the cache theory was
+wrong. Sixty-four tables of seven thousand names are 120 KB each and should be
+L2-resident where one table of 477,532 is 8 MB and never is. It made no
+difference, because the *table* was never the working set — the arena is, and
+comparing a candidate name touches 60 bytes of it wherever it happens to live.
+Splitting the index does not split the text it points at.
+
+### The rule this is an instance of
+
+Machinery whose only justification is a change not yet made does not earn its
+place. Parallel interning is worth about 110 ms and it does need a shardable
+table — but the table is worth building when the parallel phase is built, not
+before, and on today's evidence the two have to land together or not at all.
+
+Three measurements, two of them measuring my own mistakes rather than the
+design. That is the normal ratio, and the alternative — keeping it because the
+argument was good — is how a codebase fills up with machinery nobody can
+justify later.
