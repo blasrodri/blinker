@@ -9,8 +9,7 @@
 //! Interning gives each distinct name one [`SymbolNameId`], so resolution
 //! compares integers rather than strings, and the storage is paid once.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use blinker_hashing::FastMap;
 
 /// A interned symbol name.
 ///
@@ -21,19 +20,56 @@ use std::sync::Arc;
 pub struct SymbolNameId(pub u32);
 
 /// An interning table mapping names to [`SymbolNameId`]s and back.
+///
+/// # One allocation, not one per name
+///
+/// This held `Vec<Arc<str>>` plus a `HashMap<Arc<str>, _>` sharing the same
+/// allocations — an improvement on holding the text twice (finding 152), and
+/// still an allocation for every distinct name in the program: 477,532 of them
+/// on a debug rust-analyzer link.
+///
+/// Worse than the allocations was what they did to the map. `HashMap` does not
+/// store the hash it computed, so every growth of the table rehashes every key
+/// already in it — and rehashing a key meant chasing an `Arc` pointer into
+/// scattered memory and hashing sixty bytes of mangled name again. Growing to
+/// 477,532 entries from empty is nineteen doublings, and the sum of them is
+/// about a million string hashes nobody asked for. That is finding 135's
+/// pattern, in the one container where it costs the most.
+///
+/// So the names live end to end in one buffer, an id is a span in it, and the
+/// index is keyed by the *hash* rather than by the text. A `u64` key rehashes
+/// in two instructions and dereferences nothing, so growth is nearly free;
+/// comparing a candidate reads a contiguous slice rather than following a
+/// pointer. Distinct names that hash alike are kept together and told apart by
+/// their text, so the table is a lookup structure and not a claim that the
+/// hash is unique.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct SymbolNames {
-    /// Shared with `lookup`, so a name is allocated once rather than twice.
+    /// Every name, concatenated.
+    arena: Vec<u8>,
+    /// Per id, where its bytes start in `arena` and how many there are.
+    spans: Vec<(u32, u32)>,
+    /// Name hash -> the ids whose text hashes there. Almost always exactly
+    /// one, which is why `Few` keeps the first inline.
     ///
-    /// Interning stored every name in both the vector and the map key. Half
-    /// of a debug rust-analyzer link's 981,253 `intern` calls are misses, so
-    /// that was 955,064 allocations where 477,532 will do — and interning is
-    /// the whole cost of building the symbol table (finding 152).
-    names: Vec<Arc<str>>,
-    /// Reverse index. Rebuilt on deserialization rather than stored, since it
-    /// is derivable and would double the cached size.
+    /// Rebuilt on deserialization rather than stored, since it is derivable
+    /// and would grow the cached size.
     #[serde(skip)]
-    lookup: HashMap<Arc<str>, SymbolNameId>,
+    lookup: FastMap<u64, crate::Few<SymbolNameId>>,
+}
+
+/// Hash a name to the key the index is bucketed by.
+///
+/// Fast-hashed, not `std`'s SipHash. This is the most probed name map in the
+/// linker — 981,253 times on a debug rust-analyzer link, once per symbol of
+/// every object — and it was the one map `blinker_hashing`'s conversion
+/// missed, despite that module's own note that names were the reason it was
+/// written. Switching it alone was 87 ms of a cold link.
+fn hash_of(name: &str) -> u64 {
+    use std::hash::Hasher;
+    let mut hasher = blinker_hashing::FastHasher::default();
+    hasher.write(name.as_bytes());
+    hasher.finish()
 }
 
 impl SymbolNames {
@@ -43,32 +79,52 @@ impl SymbolNames {
 
     /// Intern `name`, returning its existing ID if already present.
     pub fn intern(&mut self, name: &str) -> SymbolNameId {
-        if let Some(id) = self.lookup.get(name) {
-            return *id;
+        let hash = hash_of(name);
+        if let Some(found) = self.lookup.get(&hash) {
+            // Copied out before the table is touched, and cheap to copy: the
+            // common case is one id.
+            for id in found.all() {
+                if self.text(id) == Some(name) {
+                    return id;
+                }
+            }
         }
-        let id = SymbolNameId(self.names.len() as u32);
-        let shared: Arc<str> = Arc::from(name);
-        self.names.push(Arc::clone(&shared));
-        self.lookup.insert(shared, id);
+        let id = SymbolNameId(self.spans.len() as u32);
+        let start = self.arena.len() as u32;
+        self.arena.extend_from_slice(name.as_bytes());
+        self.spans.push((start, name.len() as u32));
+        match self.lookup.entry(hash) {
+            std::collections::hash_map::Entry::Occupied(mut held) => held.get_mut().push(id),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(crate::Few::new(id));
+            }
+        }
         id
     }
 
     /// The name behind an ID.
     pub fn resolve(&self, id: SymbolNameId) -> Option<&str> {
-        self.names.get(id.0 as usize).map(AsRef::as_ref)
+        self.text(id)
+    }
+
+    fn text(&self, id: SymbolNameId) -> Option<&str> {
+        let &(start, len) = self.spans.get(id.0 as usize)?;
+        let bytes = self.arena.get(start as usize..(start + len) as usize)?;
+        std::str::from_utf8(bytes).ok()
     }
 
     /// Look up an existing name without interning it.
     pub fn get(&self, name: &str) -> Option<SymbolNameId> {
-        self.lookup.get(name).copied()
+        let found = self.lookup.get(&hash_of(name))?;
+        found.all().find(|id| self.text(*id) == Some(name))
     }
 
     pub fn len(&self) -> usize {
-        self.names.len()
+        self.spans.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.names.is_empty()
+        self.spans.is_empty()
     }
 
     /// Rebuild the reverse index after deserialization.
@@ -78,12 +134,20 @@ impl SymbolNames {
     /// behave, and forgetting to call this would silently produce duplicate
     /// IDs for names already in the table.
     pub fn rebuild_index(&mut self) {
-        self.lookup = self
-            .names
-            .iter()
-            .enumerate()
-            .map(|(index, name)| (Arc::clone(name), SymbolNameId(index as u32)))
-            .collect();
+        self.lookup = FastMap::default();
+        for index in 0..self.spans.len() {
+            let id = SymbolNameId(index as u32);
+            let Some(name) = self.text(id) else {
+                continue;
+            };
+            let hash = hash_of(name);
+            match self.lookup.entry(hash) {
+                std::collections::hash_map::Entry::Occupied(mut held) => held.get_mut().push(id),
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(crate::Few::new(id));
+                }
+            }
+        }
     }
 }
 

@@ -7944,3 +7944,82 @@ the one this session started in, where `resolve` and `read_and_parse` were each
 a fifth of the link and one nested loop was worth 790 ms. From here on, every
 remaining win is either structural — making a stage's work proportional to what
 changed — or it is nothing.
+
+## 164. The interner was the one name map that never got the fast hasher
+
+`blinker_hashing`'s module documentation has a section headed **"Names too"**,
+written after a profile showed 1136 samples still in `SipHasher::write` once
+the `(object, section)` maps had been converted. Every name-keyed map in the
+linker was moved over.
+
+Except the interner, which is *the* name map — probed 981,253 times on a debug
+rust-analyzer link, once per symbol of every object. `crates/symbols` did not
+depend on `blinker_hashing` at all, so `HashMap<Arc<str>, SymbolNameId>` had
+`std`'s SipHash the whole time.
+
+```
+  intern, 981,253 symbols     481 ms
+  after one line and one dep  394 ms
+```
+
+### Then the same thing finding 135 keeps being about
+
+`HashMap` does not store the hash it computed, so every growth rehashes every
+key already in it — and rehashing a key here meant chasing an `Arc` pointer
+into scattered memory and hashing sixty bytes of mangled name again. Growing to
+477,532 entries from empty is nineteen doublings; the sum is about a million
+string hashes nobody asked for.
+
+`SymbolNames` now holds every name end to end in one buffer, an id is a span in
+it, and the index is keyed by the name's **hash** rather than its text:
+
+```rust
+arena:  Vec<u8>,                        // all names, concatenated
+spans:  Vec<(u32, u32)>,                // id -> where its bytes are
+lookup: FastMap<u64, Few<SymbolNameId>> // hash -> the ids that hash there
+```
+
+A `u64` key rehashes in two instructions and dereferences nothing, so growth is
+nearly free. Comparing a candidate reads a contiguous slice instead of
+following a pointer. And 477,532 `Arc` allocations become zero.
+
+Names that hash alike are kept together and told apart by their text, so this
+is a lookup structure and not a claim that the hash is unique — the distinction
+finding 153 turns on.
+
+```
+  intern, 981,253 symbols     394 ms -> 256 ms
+```
+
+### The digests moved to where they could be spread
+
+`catch_up` hashes each new name with BLAKE3 for the address table — 147 ms
+cold — and it ran inside `interned()`, once per object, in increments of about
+a hundred and seventy names. Far too few to start a thread for.
+
+It runs once per link now, from `digests()`, where the increment is the whole
+link's new names: 477,532 cold and about 90,000 on an edit. That is enough to
+hand to `map_chunks`, and it is the same deferral in kind as the one in finding
+162 — do the work where its size makes the right technique obvious, not where
+the data happens to arrive.
+
+### Measured
+
+Back to back on one machine, cold link of debug rust-analyzer:
+
+```
+  cold   2786 ms -> 1916 ms    -31%
+```
+
+Warm is unchanged, correctly: a held object's names were never re-interned in
+the first place. Output byte-identical on the 187 MB image; 62 suites, 649
+tests green.
+
+### Why it took until now to see
+
+A cold link's interning was invisible while `resolve` was 437 ms and
+`read_and_parse` was 991: it *was* those numbers, attributed to the stages that
+called it. It only became a name of its own once both had been taken apart, and
+the instrumentation that found it took two minutes to write. The lesson is not
+"profile more" — it is that a cost hides inside whichever stage is currently
+the biggest, and it keeps hiding until that stage stops being the biggest.

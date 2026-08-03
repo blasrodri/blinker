@@ -189,6 +189,7 @@ name = "blinker-symbols"
 version = "0.1.0"
 dependencies = [
  "blinker-archive",
+ "blinker-hashing",
  "blinker-macho",
  "serde",
  "serde_json",

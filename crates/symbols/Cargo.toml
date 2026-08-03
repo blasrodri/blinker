@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 blinker-archive = { workspace = true }
+blinker-hashing = { workspace = true }
 blinker-macho = { workspace = true }
 serde = { workspace = true }
 

@@ -80,25 +80,25 @@ pub struct ResolvedSymbol {
 /// in a duplicate-symbol error, and the referencing objects to name who wanted
 /// an undefined one. Storing a `Vec` per name meant a heap allocation for
 /// every distinct name in the program to hold one element.
-#[derive(Debug, Clone)]
-struct Few<T> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Few<T> {
     first: T,
     rest: Vec<T>,
 }
 
 impl<T: Copy> Few<T> {
-    fn new(first: T) -> Few<T> {
+    pub(crate) fn new(first: T) -> Few<T> {
         Few {
             first,
             rest: Vec::new(),
         }
     }
 
-    fn push(&mut self, item: T) {
+    pub(crate) fn push(&mut self, item: T) {
         self.rest.push(item);
     }
 
-    fn all(&self) -> impl Iterator<Item = T> + '_ {
+    pub(crate) fn all(&self) -> impl Iterator<Item = T> + '_ {
         std::iter::once(self.first).chain(self.rest.iter().copied())
     }
 
