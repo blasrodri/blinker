@@ -13,38 +13,55 @@ programs.
 | C programs | work; behaviour matches the system linker |
 | Rust, `panic=abort` and `panic=unwind` | work, including caught panics, destructors and symbolized backtraces |
 | `cargo test` binaries | work |
+| Debug information | `SO`/`OSO`/`FUN` debug map emitted; `dsymutil` reads it back |
 | Dylibs, bundles, partial links | delegated to the system linker, with a recorded reason |
-| Output size | **0.73–0.79×** `ld-prime`'s, with dead-stripping |
-| Speed, small link (47 objects) | **0.92×** `ld-prime` |
-| Speed, large link (921 objects) | **2.92×** `ld-prime` |
-| Unchanged relink | 10.4 ms — the whole image comes from cache |
-| One-line edit | 16.1 ms, reusing 24 of 26 objects and 100% of relocations |
+| Output size | **0.85×** `ld-prime`'s on a large link, with dead-stripping |
+| Cold link, small (238 objects) | **1.10×** `ld-prime` — inside the spread |
+| Cold link, large (5,637 objects) | **2.28×** `ld-prime` |
+| Edit relink, small, resident | **12.1 ms** against `ld-prime`'s 31.6 ms cold |
+| Edit relink, large, resident | **596 ms** against `ld-prime`'s 332 ms cold |
+
+The last two rows are the metric the product exists for, and they are where the
+two scales disagree: on a small link the resident linker is comfortably faster
+than a cold `ld-prime`, and on a large one it is still slower. Everything in
+"what is not done" below follows from that gap.
 
 Delegation to the system linker remains the default; pass `--blinker-internal`
 to link internally.
 
 See [PRODUCT_SPEC.md](PRODUCT_SPEC.md) for the product definition,
 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for the milestone sequence,
-and **[FINDINGS.md](FINDINGS.md)** for the 78 places reality contradicted the
+and **[FINDINGS.md](FINDINGS.md)** for the 175 places reality contradicted the
 plan — several of them contradicting earlier entries in the same file.
 
 ## What is not done
 
-- **Debug information.** No `N_OSO` debug-map stabs and no local symbols in the
-  output, so breakpoints by function name and source-line display do not work.
-  Panic backtraces do, and match the system linker frame for frame. This is the
-  largest missing feature.
+- **Speed at scale.** 2.28× the system linker on a large cold link, against
+  1.10× on a small one, and the resident relink of a large program is still
+  slower than a cold `ld-prime`. The reason is that several stages are still
+  proportional to the whole program rather than to the edit — dead stripping
+  rebuilds the reachability graph, and the output image is assembled from
+  scratch even when 96% of relocations are reused.
+
+  Not the reason, though it was believed to be for a long time and this file
+  said so: materialising every symbol name into an owned `String`. Removing that
+  allocation was measured at about 4 ms of a 780 ms link, because the parse has
+  been on every core since finding 161 and 976,000 allocations spread over
+  fifteen cores are not 976,000 allocations (finding 168).
 - **Dynamic library output.** Proc-macro crates and `cdylib`s are delegated
   rather than linked. Correct, but it means a workspace is only partly linked
   by blinker.
-- **Speed at scale.** 2.92× the system linker on a large link, against 0.92× on
-  a small one. `read+parse` is the largest remaining stage, and the reason is
-  structural: every symbol and relocation is materialised into owned `String`s,
-  a representation chosen for a parse cache that was later measured and
-  abandoned (finding 41).
-- **The daemon, dirty-range output rewriting, stable addresses across edits.**
-  The layout machinery for the last of these exists and is tested, but nothing
-  calls it.
+- **One session per resident linker.** The daemon holds a single `Session` and
+  empties it when the top-level input list changes, so a workspace that
+  alternates between targets — a test binary, a build script, the executable —
+  evicts one target's held inputs to serve the next. What the parsed inputs
+  actually want is to be shared across targets and keyed by content, with the
+  per-link state separate.
+- **Incremental output.** The image is rebuilt and rewritten whole. The layout
+  machinery for stable addresses across edits exists, is tested, and holds
+  (9,719 of 9,722 contributions keep their address on an ordinary edit) — but
+  unchanged bytes are still copied and re-emitted rather than left where they
+  are.
 - **`x86_64`, universal binaries, LTO.**
 
 ## A note on the numbers
@@ -55,6 +72,12 @@ lot: blinker was measured at 0.92× on a 47-object fixture and turned out to be
 **7.44×** on a real binary, because a linear scan that was invisible at small
 scale was quadratic at large. See finding 77 — and treat any single-fixture
 number here, including these, as a claim about one workload.
+
+They also go stale. This table said 2.92× and "the daemon is not implemented"
+for long enough that a review of the project reasoned from it and recommended
+work that had already been done. The numbers here are re-measured when they
+change; if they disagree with FINDINGS.md, the finding with the higher number
+is the one that was measured last.
 
 ## Measuring it
 
