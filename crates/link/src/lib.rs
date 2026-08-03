@@ -3222,6 +3222,8 @@ fn load_one(path: &Path, id: Option<ObjectId>) -> Result<Loaded, LinkError> {
 }
 
 fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedObject>, LinkError> {
+    #[allow(unused_mut)]
+    let mut _lap = std::time::Instant::now();
     // Object ids are assigned by position, before anything is read, so that
     // running the reads out of order cannot change them. `is_archive` looks
     // only at the path, so the assignment needs no I/O.
@@ -3361,6 +3363,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
     // and so cannot have changed what any archive is asked for. Replaying it
     // skips the frontier entirely: with the parses held, those rounds are the
     // whole of what this stage still costs.
+    gap!(_lap, "load: archive indexes");
     if let Some(order) = session.extraction(&archive_paths) {
         let order = order.to_vec();
         for (position, (archive_index, member)) in order.iter().enumerate() {
@@ -3395,6 +3398,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
     // over: `member_defining` takes the first entry within an archive, and the
     // scan stopped at the first archive that answered. Iterating the archives
     // in order and inserting only when absent gives the same answer.
+    gap!(_lap, "load: probe + read + parse");
     let mut defining: HashMap<&str, (usize, blinker_archive::MemberId)> =
         HashMap::with_capacity_and_hasher(
             archives
@@ -3411,6 +3415,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
         }
     }
 
+    gap!(_lap, "load: defining map");
     // Pull members in until nothing new is needed.
     let mut extracted: HashSet<(usize, u32)> = HashSet::default();
     let mut order: Vec<(usize, u32)> = Vec::new();
@@ -3460,6 +3465,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
             round.push((archive_index, member_id));
         }
         if round.is_empty() {
+            gap!(_lap, "load: extraction rounds");
             session.store_extraction(archive_paths, order);
             return Ok(objects);
         }
@@ -3576,6 +3582,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
         }
 
         if !added {
+            gap!(_lap, "load: extraction rounds");
             session.store_extraction(archive_paths, order);
             return Ok(objects);
         }
