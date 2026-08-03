@@ -191,17 +191,21 @@ pub struct Session {
     /// common case rather than a corner: an edit that changes nothing else
     /// still changes something.
     interfaces: FastMap<PathBuf, u64>,
-    /// Each archive's symbol index as last read. Compared rather than trusted:
-    /// it is what decides which member defines a name.
-    /// Each archive's symbol table as last read: name to defining member, and
-    /// nothing else.
+    /// A digest of each archive's symbol table as last read: name to defining
+    /// member, and nothing else.
     ///
     /// Not the whole `ArchiveIndex`. That carries every member's offset and
     /// size, which move whenever any member's *content* changes — so comparing
     /// it rejected every edit, which is correct and useless. What the frontier
     /// asks an archive is "which member defines this name", and that is this
     /// table.
-    indexes: FastMap<PathBuf, Vec<(String, blinker_archive::MemberId)>>,
+    ///
+    /// A digest and not the table, because the only question ever asked of it
+    /// is whether it is the one held. Keeping the table meant cloning every
+    /// symbol name of every re-read archive to build the copy to compare
+    /// against — and then keeping that copy for the next link to compare
+    /// against in turn.
+    indexes: FastMap<PathBuf, u64>,
     /// Whether any input's interface differs from the one held for it.
     interfaces_changed: bool,
     /// The cache path this session has already written a file for.
@@ -545,6 +549,7 @@ impl Session {
         path: &Path,
         index: &Arc<blinker_archive::ArchiveIndex>,
         data: &Arc<Backing>,
+        symbols: u64,
     ) {
         let Some(key) = blinker_cache::InputKey::probe(path) else {
             return;
@@ -564,15 +569,14 @@ impl Session {
         // that had re-read eleven archives, back when neither input was
         // checked. Nothing failed, because none of the eleven had changed a
         // symbol — the bug was invisible, waiting for the edit that added one.
-        let symbol_map = external_symbol_map(&index.symbol_map);
-        if self.indexes.get(path) != Some(&symbol_map) {
+        if self.indexes.get(path) != Some(&symbols) {
             self.interfaces_changed = true;
             self.interface_changes += 1;
             if self.first_interface_change.is_none() {
                 self.first_interface_change = Some(path.to_path_buf());
             }
         }
-        self.indexes.insert(path.to_path_buf(), symbol_map);
+        self.indexes.insert(path.to_path_buf(), symbols);
         self.entries.insert(
             path.to_path_buf(),
             (key, Entry::Archive(Arc::clone(index), Arc::clone(data))),
@@ -1098,19 +1102,25 @@ fn is_module_unique(name: &str) -> bool {
     name.contains(".llvm.")
 }
 
-/// An archive's symbol table, less the names only its own crate can use.
+/// A digest of an archive's symbol table, less the names only its own crate
+/// can use.
 ///
 /// What the frontier asks an archive is "which member defines this name", and
 /// it only ever asks about names some *other* input left undefined. A
 /// module-unique name can have no such reference, so its entry is noise that
 /// changes on every edit. See `is_module_unique`.
-fn external_symbol_map(
-    map: &[(String, blinker_archive::MemberId)],
-) -> Vec<(String, blinker_archive::MemberId)> {
-    map.iter()
-        .filter(|(name, _)| !is_module_unique(name))
-        .cloned()
-        .collect()
+///
+/// Order-sensitive, unlike [`interface_digest`]: this table is sorted by name
+/// and the first entry for a name is the one that defines it, so two tables
+/// holding the same pairs in a different order are not the same answer.
+pub(crate) fn external_symbol_digest(map: &[(String, blinker_archive::MemberId)]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = crate::hashing::FastHasher::default();
+    for (name, member) in map.iter().filter(|(name, _)| !is_module_unique(name)) {
+        name.hash(&mut hasher);
+        member.0.hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 fn interface_digest(parsed: &ParsedObject) -> u64 {

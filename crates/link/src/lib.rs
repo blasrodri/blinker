@@ -3197,6 +3197,11 @@ enum Loaded {
         PathBuf,
         std::sync::Arc<blinker_archive::ArchiveIndex>,
         std::sync::Arc<mapping::Backing>,
+        /// A digest of the archive's external symbol table, worked out here
+        /// because this runs on a worker thread and the alternative was
+        /// hashing every symbol name of fifteen re-read rlibs in a row on the
+        /// one thread that had just indexed them in parallel.
+        u64,
     ),
 }
 
@@ -3211,10 +3216,12 @@ fn load_one(path: &Path, id: Option<ObjectId>) -> Result<Loaded, LinkError> {
         None => {
             let index = blinker_archive::index_archive(&data, path)
                 .map_err(|source| LinkError::Archive(Box::new(source)))?;
+            let symbols = crate::session::external_symbol_digest(&index.symbol_map);
             Ok(Loaded::Archive(
                 path.to_path_buf(),
                 std::sync::Arc::new(index),
                 std::sync::Arc::new(data),
+                symbols,
             ))
         }
         Some(id) => {
@@ -3285,7 +3292,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
             }),
             None => session
                 .archive(path)
-                .map(|(index, data)| Loaded::Archive(path.clone(), index, data)),
+                .map(|(index, data)| Loaded::Archive(path.clone(), index, data, 0)),
         };
         match held {
             Some(entry) => loaded[at] = Some(Ok(entry)),
@@ -3351,7 +3358,9 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
             Some(Loaded::Object(object)) => {
                 session.store_object(&paths[at], &object.parsed, object.data.backing())
             }
-            Some(Loaded::Archive(path, index, data)) => session.store_archive(path, index, data),
+            Some(Loaded::Archive(path, index, data, symbols)) => {
+                session.store_archive(path, index, data, *symbols)
+            }
             None => {}
         }
     }
@@ -3365,7 +3374,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
     for slot in loaded {
         match slot.expect("every input was visited")? {
             Loaded::Object(object) => objects.push(object),
-            Loaded::Archive(path, index, data) => archives.push((path, index, data)),
+            Loaded::Archive(path, index, data, _) => archives.push((path, index, data)),
         }
     }
 

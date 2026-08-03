@@ -8500,3 +8500,37 @@ Without debug information there is no debug map, so it passed with the name
 taken from either place — a test of the thing that cannot fail. It now fails
 against exactly that sabotage, which is also what proves the reuse is happening
 at all.
+
+## 175. Two changes to one line: one was a memory fix, the other was the speed fix
+
+`store_archive` was 26 ms of a warm link, all of it for fifteen re-read rlibs —
+1.7 ms each. It held each archive's external symbol table so the next link could
+compare against it, which meant cloning every symbol name of every re-read
+archive to build the copy, comparing the two, and keeping the new one.
+
+Replacing the stored table with a digest of it is the obvious fix and it
+**measured nothing**: 25-37 ms before, 25-37 ms after. The clone was never the
+cost. What both versions have in common is a pass over every name — hashing it,
+or copying it, plus `is_module_unique`'s substring scan for `.llvm.` — and
+fifteen large rlibs is on the order of ninety megabytes of names.
+
+The digest is a pure function of the index, and the index is built on a worker
+thread, in parallel, immediately before. Moving the digest there costs nothing
+that was not already being paid in parallel.
+
+```
+read_and_parse   145 ms -> 131 ms
+```
+
+### Keeping the change that measured zero
+
+By finding 167's rule the digest should have been reverted. It was kept, for a
+reason that has nothing to do with time: the table it replaces was **held for
+the life of the session** — 208 archives' worth of symbol names, around forty
+megabytes of `String`, retained so that a comparison could be made against it
+once per link. A `u64` per archive answers the same question.
+
+That is a different justification and it is worth stating as one rather than
+letting a speed number that does not exist stand in for it. A resident linker
+that holds forty megabytes it does not need is a real cost; it is just not a
+cost the stopwatch was measuring.
