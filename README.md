@@ -31,7 +31,7 @@ to link internally.
 
 See [PRODUCT_SPEC.md](PRODUCT_SPEC.md) for the product definition,
 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for the milestone sequence,
-and **[FINDINGS.md](FINDINGS.md)** for the 192 places reality contradicted the
+and **[FINDINGS.md](FINDINGS.md)** for the 193 places reality contradicted the
 plan — several of them contradicting earlier entries in the same file.
 
 ## What is not done
@@ -53,12 +53,13 @@ plan — several of them contradicting earlier entries in the same file.
 - **Dynamic library output.** Proc-macro crates and `cdylib`s are delegated
   rather than linked. Correct, but it means a workspace is only partly linked
   by blinker.
-- **One session per resident linker.** The daemon holds a single `Session` and
-  empties it when the top-level input list changes, so a workspace that
-  alternates between targets — a test binary, a build script, the executable —
-  evicts one target's held inputs to serve the next. What the parsed inputs
-  actually want is to be shared across targets and keyed by content, with the
-  per-link state separate.
+- **Bounded, not unbounded, sharing across targets.** A session now holds an
+  input for four links after the last one that mentioned it, and keeps the
+  per-link answers for three targets and the finished images for three. That
+  fixed alternating targets going cold (finding 188 — it was a 2x penalty, and
+  no benchmark here linked more than one program so nothing said so), but the
+  windows are constants rather than a memory budget, and a workspace with more
+  concurrent targets than that still thrashes.
 - **Incremental output.** The image is rebuilt and rewritten whole. The layout
   machinery for stable addresses across edits exists, is tested, and holds
   (9,719 of 9,722 contributions keep their address on an ordinary edit) — but

@@ -9166,3 +9166,81 @@ absorbed the error and stayed positive, so the table looked consistent — and
 the header comment in `scripts/relink.py` explains that a negative `unmeasured`
 is how this announces itself, which is exactly why a *positive* one hid it.
 Corrected, `unmeasured` is 14.6 ms rather than 1.6.
+
+## 188. The session held a program, and a daemon serves a workspace
+
+`Session::begin` dropped every held input not in the link's argument vector.
+That is right for a linker serving one program and wrong for the thing it
+became. A workspace alternates between targets — a test binary, a build script,
+the executable — and two targets with different inputs empty each other on
+every switch.
+
+Measured, by alternating two real programs through one daemon and touching one
+input of each so neither could take the finished-image path:
+
+```
+alternating   radbg  held   0  read 341   link 494-676 ms
+              self   held   0  read  69   link  63- 93 ms
+radbg alone   radbg  held 340  read   1   link 259-301 ms
+```
+
+**Every link cold, and a 2x penalty on the metric the product exists for.** It
+had been there since the daemon existed. Every benchmark in this repository
+links one program, so the number that would have shown it was never taken.
+
+### It was four single slots, not one
+
+Holding the parses was the first half. The second was everything derived from
+them, each of which was an `Option` holding whichever target linked last:
+`extraction`, `strip`, `stubs`, `imports`, and `reach` keyed by object id. With
+the parses held and those still thrashing, radbg alternating was 540 ms against
+274 alone — the parses were warm and everything computed from them was not.
+
+The held `LinkCache` was the worst of them, and the most embarrassing: the
+comment above `cache_written` explains that it used to be a `bool` and that
+this "was wrong in a way only a daemon shows" — and the field beside it, the
+cache itself, was still a single slot. So every alternating link decoded a
+cache file off disk (29 ms) and wrote it back out (76-91 ms).
+
+### `imports` was a correctness bug the eviction was hiding
+
+```rust
+if self.interfaces_changed || self.stubs_reparsed { return None; }
+```
+
+Both conditions ask whether anything *moved*. Neither can tell that this is a
+different program — and a link whose inputs are all held reports that nothing
+moved, because nothing was re-parsed to notice. So the moment inputs survived a
+target switch, the second program could be handed the first's resolved imports.
+
+What had been preventing that was the eviction: a different target emptied the
+session, so there was nothing held to serve wrongly. Removing a performance
+problem exposed a correctness one that had been latent behind it, which is the
+argument for the byte-identity harness comparing *two different programs*
+through one session rather than two versions of one.
+
+### The key is the request, not the inputs
+
+Keying those answers by a digest of the input list was the obvious move and it
+broke `the_extraction_order_survives_a_rename_but_not_a_changed_archive_set`
+immediately. rustc renames every object of a recompiled crate, so the input
+list changes on every debug build — a key that moved with it would discard the
+extraction order on exactly the link it exists for (144). The key is
+`request_hash`: the output's identifier, the entry symbol, the options, the
+dylibs, and deliberately not the objects.
+
+That test was written for finding 144 and caught this three findings later,
+which is the whole argument for writing the failure down as a test rather than
+as a paragraph.
+
+### What bounds it now
+
+An input survives four links without being mentioned; the per-link answers keep
+three targets; the held images keep three, because each one is a finished
+binary and the unit is 178 MB rather than a mapped file the page cache owns
+anyway. A session that never forgets holds every program the daemon has ever
+linked.
+
+```
+alternating radbg + self   560 ms -> 271 ms, level with linking radbg alone
+```
