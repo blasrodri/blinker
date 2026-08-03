@@ -10,7 +10,7 @@
 //! So this spawns a real daemon, links a real program through it, and compares
 //! bytes with a link that never touched it.
 
-use blinker_test_support::{workspace_binary, Scratch};
+use blinker_test_support::{blinker, workspace_binary, Scratch};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -48,46 +48,78 @@ fn link_args(objects: &[PathBuf], output: &Path) -> Vec<String> {
     argv
 }
 
-/// A daemon that is killed when the test ends, however the test ends.
-struct Daemon(Child);
+/// A daemon of this test's own, and the directory its socket lives in.
+///
+/// Both halves are the point. Two tests sharing the ambient temporary
+/// directory share a socket name, so one of them binds and the other exits —
+/// and then the winner is killed by whichever test owns it while the other is
+/// still using it. A short directory per test gives each its own daemon, and
+/// short because a socket path has to fit in `sockaddr_un`.
+struct Daemon {
+    child: Child,
+    sockets: PathBuf,
+}
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.sockets);
     }
 }
 
-fn start_daemon() -> Daemon {
-    let child = Command::new(workspace_binary("blinker"))
-        .arg("--blinker-daemon-serve")
-        .spawn()
-        .expect("the daemon starts");
-    Daemon(child)
-}
+impl Daemon {
+    /// Start one, and do not return until it is answering.
+    ///
+    /// Waiting is not politeness. A client that finds no daemon starts one and
+    /// links in-process, so a test that raced its own daemon would measure the
+    /// fallback and leave behind a second daemon that nothing owns.
+    fn start(tag: &str) -> Daemon {
+        let sockets = PathBuf::from(format!("/tmp/bd-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sockets);
+        std::fs::create_dir_all(&sockets).expect("socket directory");
+        let child = Command::new(workspace_binary("blinker"))
+            .env("TMPDIR", &sockets)
+            .arg("--blinker-daemon-serve")
+            .spawn()
+            .expect("the daemon starts");
+        let daemon = Daemon { child, sockets };
 
-/// Link through the daemon, waiting for it to come up.
-///
-/// The client falls back to linking in-process when no daemon answers, which
-/// is the right behaviour and the wrong thing for this test: a fallback would
-/// pass every assertion below while proving nothing. So the daemon is required
-/// to have answered, which is what the marker file checks.
-fn link_via_daemon(argv: &[String], output: &Path) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    while Instant::now() < deadline {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline && daemon.socket().is_none() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(daemon.socket().is_some(), "the daemon never came up");
+        daemon
+    }
+
+    /// The socket it bound, once it has bound one.
+    fn socket(&self) -> Option<PathBuf> {
+        let entries = std::fs::read_dir(&self.sockets).ok()?;
+        entries.flatten().map(|entry| entry.path()).find(|path| {
+            path.extension().is_some_and(|kind| kind == "sock")
+                && blinker_cli::daemon::is_alive(path)
+        })
+    }
+
+    /// Link through this daemon.
+    ///
+    /// The client falls back to linking in-process when no daemon answers,
+    /// which is the right behaviour and the wrong thing here: a fallback would
+    /// pass every assertion below while proving nothing. [`Daemon::start`] has
+    /// already established that one is answering, and `TMPDIR` is what points
+    /// the client at this test's rather than another's.
+    fn link(&self, argv: &[String], output: &Path) -> bool {
         let _ = std::fs::remove_file(output);
         let mut full = vec!["--blinker-daemon".to_string()];
         full.extend(argv.iter().cloned());
         let status = Command::new(workspace_binary("blinker"))
+            .env("TMPDIR", &self.sockets)
             .args(&full)
             .output()
             .expect("blinker runs");
-        if status.status.success() && output.exists() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(100));
+        status.status.success() && output.exists()
     }
-    false
 }
 
 /// A distinct directory holding an output with a *fixed* name.
@@ -116,17 +148,19 @@ fn a_daemon_served_link_is_byte_identical() {
         compile(&scratch, "helper.c", HELPER),
     ];
 
+    // `blinker()` and not a bare command: a link that engaged a daemon would
+    // not be the direct half of this comparison.
     let direct = output_in(&scratch, "direct");
-    let status = Command::new(workspace_binary("blinker"))
+    let status = blinker()
         .args(link_args(&objects, &direct))
         .status()
         .expect("blinker runs");
     assert!(status.success(), "the direct link failed");
 
-    let _daemon = start_daemon();
+    let daemon = Daemon::start("identical");
     let served = output_in(&scratch, "served");
     assert!(
-        link_via_daemon(&link_args(&objects, &served), &served),
+        daemon.link(&link_args(&objects, &served), &served),
         "the daemon never produced an output"
     );
 
@@ -153,10 +187,10 @@ fn a_second_link_through_the_daemon_sees_an_edit() {
         compile(&scratch, "helper.c", HELPER),
     ];
 
-    let _daemon = start_daemon();
+    let daemon = Daemon::start("edit");
     let first = output_in(&scratch, "first");
     assert!(
-        link_via_daemon(&link_args(&objects, &first), &first),
+        daemon.link(&link_args(&objects, &first), &first),
         "the daemon never produced an output"
     );
     assert_eq!(run(&first), "42\n");
@@ -167,12 +201,12 @@ fn a_second_link_through_the_daemon_sees_an_edit() {
         "int helper(int n) { return n * 8; }\n",
     );
     let second = output_in(&scratch, "second");
-    assert!(link_via_daemon(&link_args(&objects, &second), &second));
+    assert!(daemon.link(&link_args(&objects, &second), &second));
     assert_eq!(run(&second), "48\n", "the daemon served a stale object");
 
     // And it matches a linker with no memory of the first build.
     let cold = output_in(&scratch, "cold");
-    let status = Command::new(workspace_binary("blinker"))
+    let status = blinker()
         .args(link_args(&objects, &cold))
         .status()
         .expect("blinker runs");
@@ -184,23 +218,37 @@ fn a_second_link_through_the_daemon_sees_an_edit() {
     );
 }
 
-/// Asking for a daemon when none is running links anyway.
+/// A link with no daemon running links anyway — and starts one.
 ///
-/// A build configured with `--blinker-daemon` must not fail because nobody
-/// started one; the flag asks for a resident linker, it does not require one.
+/// Both halves matter. The first is the older promise: a resident linker is an
+/// optimisation, and a build must not fail because nobody started one. The
+/// second is what makes the optimisation reach anybody. A user's whole setup is
+/// one line of `.cargo/config.toml`, so if the first link does not arrange for
+/// the second to find a daemon, no link ever does.
+///
+/// `TMPDIR` moves the socket into the scratch directory, which is the only way
+/// to observe a start without touching a daemon the developer running the test
+/// is using — and the only way to be sure the one this starts is stopped again.
 #[test]
-fn asking_for_a_daemon_that_is_absent_still_links() {
+fn a_link_with_no_daemon_links_and_starts_one() {
     let scratch = Scratch::dir("daemon-absent-link").expect("scratch");
     let objects = vec![
         compile(&scratch, "main.c", MAIN),
         compile(&scratch, "helper.c", HELPER),
     ];
-    let output = scratch.join("program");
-    let mut argv = vec!["--blinker-daemon".to_string()];
-    argv.extend(link_args(&objects, &output));
+    // Not inside the scratch directory: a Unix socket path must fit in
+    // `sockaddr_un`, and the scratch directory's own name — under a macOS
+    // temporary directory that is already fifty characters — leaves no room
+    // for one. Short, and removed below.
+    let sockets = PathBuf::from(format!("/tmp/bd{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&sockets);
+    std::fs::create_dir_all(&sockets).expect("socket directory");
 
+    let output = scratch.join("program");
     let result = Command::new(workspace_binary("blinker"))
-        .args(&argv)
+        .env("TMPDIR", &sockets)
+        .env_remove("BLINKER_NO_DAEMON")
+        .args(link_args(&objects, &output))
         .output()
         .expect("blinker runs");
     assert!(
@@ -209,4 +257,46 @@ fn asking_for_a_daemon_that_is_absent_still_links() {
         String::from_utf8_lossy(&result.stderr)
     );
     assert_eq!(run(&output), "42\n");
+
+    let started = wait_for_socket(&sockets);
+    let Some(socket) = started else {
+        let _ = std::fs::remove_dir_all(&sockets);
+        panic!(
+            "the link did not start a daemon for the next one; it said:\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    };
+    // Whatever else this test proves, it must not leave a process behind. A
+    // daemon removes its socket on the way out, so the file going away is the
+    // acknowledgement — and it happens just after the reply, not with it.
+    blinker_cli::daemon::stop(&socket);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while socket.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let stopped = !socket.exists();
+    let _ = std::fs::remove_dir_all(&sockets);
+    assert!(stopped, "the daemon ignored the request to stop");
+}
+
+/// The socket a daemon binds, once it has bound it.
+///
+/// Starting is asynchronous by design — the link that starts a daemon does not
+/// wait for it — so the file appears some milliseconds after the link returns.
+fn wait_for_socket(directory: &Path) -> Option<PathBuf> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline {
+        if let Ok(entries) = std::fs::read_dir(directory) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_some_and(|kind| kind == "sock")
+                    && blinker_cli::daemon::is_alive(&path)
+                {
+                    return Some(path);
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    None
 }

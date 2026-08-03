@@ -30,13 +30,16 @@ The three arms
 --------------
 
     ld64 (cc)            what happens without this project
-    blinker, no daemon   what happens after `linker = "…/blinker"`, which is
+    blinker              what happens after `linker = "…/blinker"`, which is
                          all most users will do
-    blinker + daemon     what the product is for
+    blinker one-shot     the same links with `--blinker-no-daemon`
 
-The middle arm is the one that matters for adoption and the one no benchmark
-here had. The daemon is opt-in and nothing starts it, so it is what a user
-gets.
+The middle arm is the one that matters for adoption, and it is the reason this
+harness exists. It used to be the *slow* one: the daemon was opt-in behind a
+flag nothing set, so a user who followed the setup instructions got 484 ms
+where 294 ms was available. blinker now engages a resident linker by default
+and starts one if there is none, which is finding 190. The third arm is what
+that default is worth, measured by turning it off.
 """
 
 import argparse
@@ -152,28 +155,26 @@ def main():
 
     # Warmup discarded on every arm: the first pass pays the page cache for
     # 800 MB of inputs, and attributing that to whichever arm ran first is how
-    # a harness reports an ordering as a result.
-    arms = [("ld64 (cc)", with_cc), ("blinker, no daemon", with_blinker([]))]
+    # a harness reports an ordering as a result. The warmup on the default arm
+    # is also what starts the daemon — a user's first build pays the same, and
+    # measuring it as part of the steady state would be reporting a one-time
+    # cost as a recurring one.
+    arms = [
+        ("ld64 (cc)", with_cc),
+        ("blinker", with_blinker([])),
+        ("blinker one-shot", with_blinker(["--blinker-no-daemon"])),
+    ]
     for label, run in arms:
         run()
         for _ in range(options.iterations):
             print(f"  {label:<22} {timed(run):7.0f} ms")
-
-    daemon = subprocess.Popen(
-        [str(BLINKER), "--blinker-daemon-serve"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        time.sleep(1.2)
-        run = with_blinker(["--blinker-daemon"])
-        run()
-        for _ in range(options.iterations):
-            print(f"  {'blinker + daemon':<22} {timed(run):7.0f} ms")
-    finally:
-        daemon.terminate()
-        daemon.wait(timeout=5)
     print()
+
+    # Left running would be a background process holding a session for a
+    # measurement that is over.
+    subprocess.run(
+        [str(BLINKER), "--blinker-daemon-stop"], capture_output=True, check=False
+    )
 
 
 if __name__ == "__main__":

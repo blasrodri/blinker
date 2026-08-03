@@ -39,6 +39,25 @@
 //! result that no test can distinguish from a correct one. The socket path
 //! includes a hash of the executable's path, size and mtime, so a new linker
 //! simply cannot find the old one's socket.
+//!
+//! The name carries those two hashes *separately* — path, then content — so a
+//! daemon can recognise its own predecessors: same path, different content is
+//! exactly "the executable I was started from has been replaced". Those are
+//! told to exit, which is the difference between rebuilding blinker twenty
+//! times and having twenty daemons.
+//!
+//! # Engaging without being asked
+//!
+//! [`engage`] is the default path: every link looks for a resident linker, and
+//! starts one for the *next* link if there is none. Finding 189 is why. A
+//! build's links took 484 ms without a daemon and 294 ms with one, and the
+//! daemon was opt-in behind a flag that nothing set — so the mechanism this
+//! project is built around was off for everyone who followed the setup
+//! instructions. A linker that starts a background process is a real
+//! imposition, so it is bounded on every side: the daemon exits after
+//! [`IDLE_TIMEOUT`], it is replaced rather than duplicated when blinker is
+//! rebuilt, and `BLINKER_NO_DAEMON` or `--blinker-no-daemon` turns the whole
+//! thing off.
 
 use std::io::{Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -61,31 +80,59 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(20 * 60);
 /// is already generous.
 const MAX_FRAME: u32 = 1 << 20;
 
+/// How long a start is presumed to be in progress.
+///
+/// A daemon takes milliseconds to bind. This is the window in which a second
+/// link that finds no daemon assumes one is already on its way rather than
+/// starting another.
+const STARTUP_WINDOW: Duration = Duration::from_secs(10);
+
 /// Where this linker's daemon listens.
 ///
 /// Per user and per executable: see the module docs on why the executable's
-/// identity is in the name.
+/// identity is in the name, and why the two halves of that identity are
+/// separable.
 pub fn socket_path(executable: &Path) -> PathBuf {
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(executable.as_os_str().as_encoded_bytes());
+    let (_, name) = socket_name(executable);
+    std::env::temp_dir().join(name)
+}
+
+/// The socket's file name, and the prefix every daemon for this *path* shares.
+///
+/// Splitting them is what makes a superseded daemon recognisable: everything
+/// under the same prefix was started from the same executable path, and
+/// everything under the same prefix with a different suffix was started from
+/// different bytes at that path.
+fn socket_name(executable: &Path) -> (String, String) {
+    let mut path = blake3::Hasher::new();
+    path.update(executable.as_os_str().as_encoded_bytes());
+    let mut content = blake3::Hasher::new();
     if let Ok(meta) = std::fs::metadata(executable) {
-        hasher.update(&meta.len().to_le_bytes());
+        content.update(&meta.len().to_le_bytes());
         if let Ok(modified) = meta.modified() {
             if let Ok(since) = modified.duration_since(std::time::UNIX_EPOCH) {
-                hasher.update(&since.as_nanos().to_le_bytes());
+                content.update(&since.as_nanos().to_le_bytes());
             }
         }
     }
-    let digest = hasher.finalize();
-    let name = format!(
-        "blinker-{}-{}.sock",
+    // Short on purpose. A Unix socket path has to fit in `sockaddr_un`, which
+    // is 104 bytes on macOS, and the temporary directory it sits in is already
+    // around fifty of them — `/var/folders/xx/<24 characters>/T/`. Two sixteen-
+    // character hashes fit, but only just, and "only just" is a linker that
+    // works for me and not for the next person. Thirty-two bits of path is a
+    // grouping key, and a collision costs one unnecessary retirement; forty-
+    // eight bits of content is the identity that must not collide, and its
+    // input includes an mtime in nanoseconds.
+    let prefix = format!(
+        "blinker-{}-{}-",
         // The uid keeps two users on one machine from sharing a socket, which
         // the directory permissions would prevent anyway — but a collision
         // there is a confusing permission error rather than a clean miss.
         unsafe { libc::getuid() },
-        &digest.to_hex()[..16]
+        &path.finalize().to_hex()[..8]
     );
-    std::env::temp_dir().join(name)
+    let name = format!("{prefix}{}.sock", &content.finalize().to_hex()[..12]);
+    (prefix, name)
 }
 
 fn write_frame(stream: &mut UnixStream, payload: &[u8]) -> std::io::Result<()> {
@@ -118,6 +165,13 @@ fn read_frame(stream: &mut UnixStream) -> std::io::Result<Vec<u8>> {
 /// what made the first version of `serve` refuse to start after a crash, for
 /// as long as the stale file existed.
 const PING: &[u8] = b"";
+
+/// A request asking the daemon to stop after answering.
+///
+/// Sent by a newly started daemon to the ones it supersedes. It cannot collide
+/// with a real request: the first field of one is a working directory, and a
+/// working directory is an absolute path.
+const QUIT: &[u8] = b"\x1bquit";
 
 /// Encode a working directory and argument vector into a request frame.
 fn encode_request(cwd: &Path, argv: &[String]) -> Vec<u8> {
@@ -254,11 +308,18 @@ where
             Ok((mut stream, _)) => {
                 idle_since = Instant::now();
                 stream.set_nonblocking(false)?;
-                if let Err(error) = serve_one(&mut stream, &mut handle) {
+                match serve_one(&mut stream, &mut handle) {
+                    Ok(Served::Continue) => {}
+                    Ok(Served::Stop) => {
+                        let _ = std::fs::remove_file(socket);
+                        return Ok(());
+                    }
                     // One client's failure is not the daemon's. The next
                     // request gets a fresh connection, and the client that
                     // failed falls back to linking in-process.
-                    let _ = error;
+                    Err(error) => {
+                        let _ = error;
+                    }
                 }
             }
             // The timeout expiring, which is how idleness is noticed.
@@ -311,13 +372,26 @@ fn accept_timeout(listener: &UnixListener, timeout: Duration) -> std::io::Result
     Ok(())
 }
 
-fn serve_one<F>(stream: &mut UnixStream, handle: &mut F) -> std::io::Result<()>
+/// Whether the daemon should keep listening after answering a request.
+enum Served {
+    Continue,
+    Stop,
+}
+
+fn serve_one<F>(stream: &mut UnixStream, handle: &mut F) -> std::io::Result<Served>
 where
     F: FnMut(&Path, &[String]) -> (i32, Vec<u8>),
 {
     let payload = read_frame(stream)?;
     if payload == PING {
-        return write_frame(stream, &0i32.to_le_bytes());
+        write_frame(stream, &0i32.to_le_bytes())?;
+        return Ok(Served::Continue);
+    }
+    if payload == QUIT {
+        // Answered before stopping, so the sender knows this daemon is gone
+        // rather than merely unreachable.
+        write_frame(stream, &0i32.to_le_bytes())?;
+        return Ok(Served::Stop);
     }
     let Some((cwd, argv)) = decode_request(&payload) else {
         return Err(std::io::Error::new(
@@ -328,7 +402,50 @@ where
     let (code, stderr) = handle(&cwd, &argv);
     let mut response = code.to_le_bytes().to_vec();
     response.extend_from_slice(&stderr);
-    write_frame(stream, &response)
+    write_frame(stream, &response)?;
+    Ok(Served::Continue)
+}
+
+/// Tell the daemon at `socket` to stop, and wait for it to acknowledge.
+///
+/// Every failure is ignored on purpose: the only reason to send this is that
+/// the daemon is superseded, and a superseded daemon that has already died is
+/// the outcome being asked for.
+pub fn stop(socket: &Path) {
+    let Ok(mut stream) = UnixStream::connect(socket) else {
+        // Nothing listening, and the file is this daemon's to clean up.
+        let _ = std::fs::remove_file(socket);
+        return;
+    };
+    // A daemon mid-link answers when that link is done. Waiting is what makes
+    // this an orderly handover rather than a race with a process still writing
+    // an output file.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+    if write_frame(&mut stream, QUIT).is_ok() {
+        let _ = read_frame(&mut stream);
+    }
+}
+
+/// Stop every daemon started from this executable's path but not its bytes.
+///
+/// Rebuilding blinker orphans its daemon: the socket name changes, so nothing
+/// will ever connect to the old one again, and it sits holding a session's
+/// worth of parsed objects until its idle timeout. Under active development
+/// that is one abandoned process per rebuild.
+pub fn retire_superseded(executable: &Path) {
+    let (prefix, current) = socket_name(executable);
+    let directory = std::env::temp_dir();
+    let Ok(entries) = std::fs::read_dir(&directory) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(&prefix) || !name.ends_with(".sock") || name == current {
+            continue;
+        }
+        stop(&directory.join(name));
+    }
 }
 
 /// Serve links from this process until it goes idle.
@@ -338,6 +455,10 @@ where
 pub fn serve_links() -> std::io::Result<()> {
     let executable = std::env::current_exe()?;
     let socket = socket_path(&executable);
+    // Before binding, not after: if this process loses the race to bind, the
+    // daemon that won is this same executable and the sweep was still the
+    // right thing to have done.
+    retire_superseded(&executable);
     let mut session = blinker_link::Session::default();
     // The one thing that distinguishes this from a one-shot link: there will be
     // another one. See `Session::resident`.
@@ -383,6 +504,132 @@ pub fn link_via_daemon(argv: &[String]) -> std::io::Result<Option<i32>> {
         let _ = std::io::stderr().write_all(&stderr);
     }
     Ok(Some(code))
+}
+
+/// Stop every resident linker started from this executable's path.
+///
+/// Nobody starts a daemon deliberately any more, so nobody has a process to
+/// kill: it has no terminal, and its name is the linker's. This is the way
+/// back out — of a build that is behaving strangely, of a machine that should
+/// be idle, of an experiment.
+pub fn stop_resident() -> std::io::Result<()> {
+    let executable = std::env::current_exe()?;
+    stop(&socket_path(&executable));
+    // The current build's daemon is one of possibly several: every previous
+    // build of blinker at this path may have left one, and "stop the linker"
+    // should not mean "stop the newest of them".
+    retire_superseded(&executable);
+    // A marker left behind would suppress the next start for its whole window.
+    let _ = std::fs::remove_file(starting(&socket_path(&executable)));
+    Ok(())
+}
+
+/// Use a resident linker if there is one, and arrange for there to be one.
+///
+/// `Some(code)` means the link is done and this process should exit with that
+/// code. `None` means link here — either because a daemon was not wanted, or
+/// because none was running, in which case one has just been started for the
+/// links that follow.
+///
+/// Nothing here can make a link fail. Every failure path returns `None`, which
+/// is the behaviour blinker had before any of this existed.
+pub fn engage(argv: &[String]) -> Option<i32> {
+    if !wanted(argv) {
+        return None;
+    }
+    let executable = std::env::current_exe().ok()?;
+    let socket = socket_path(&executable);
+    match link_via_daemon(argv) {
+        Ok(Some(code)) => Some(code),
+        Ok(None) => {
+            // The first link of a build is the one that pays for the rest: it
+            // links here, and by the time the second arrives there is a daemon
+            // to answer it.
+            start(&executable, &socket);
+            None
+        }
+        // Quiet unless the daemon was asked for by name. It is the default
+        // path now, and something that happens on every link has to be silent
+        // when it does not work: the link still happened, correctly, and a
+        // warning printed into a build's output for a socket that could not be
+        // reached is noise the user cannot act on. `--blinker-daemon` is a
+        // request, and a request that fails is worth saying so.
+        Err(error) => {
+            if argv.iter().any(|arg| arg == "--blinker-daemon") {
+                eprintln!("blinker: daemon unavailable ({error}); linking in process");
+            }
+            None
+        }
+    }
+}
+
+/// Whether this invocation should look for a resident linker at all.
+fn wanted(argv: &[String]) -> bool {
+    // The environment variable exists because the linker is not invoked by
+    // hand: it is spawned by `rustc`, and adding a flag to that argument vector
+    // means editing a cargo config. Turning the daemon off has to be possible
+    // from the shell that runs the build.
+    if std::env::var_os("BLINKER_NO_DAEMON").is_some() {
+        return false;
+    }
+    !argv.iter().any(|arg| arg == "--blinker-no-daemon")
+}
+
+/// Start a daemon for subsequent links, without waiting for it.
+///
+/// Waiting would hand this link to it, which sounds like a saving and is not:
+/// the daemon's value is entirely in the state it accumulates, and it has none
+/// yet. Starting it costs a fork; linking here costs what it always did.
+fn start(executable: &Path, socket: &Path) {
+    if !claim(&starting(socket)) {
+        return;
+    }
+    use std::process::Stdio;
+    // Detached from this process's streams. A daemon inheriting them would
+    // write into whatever `rustc` is reading, and would keep a pipe open long
+    // after the build that started it finished.
+    let _ = std::process::Command::new(executable)
+        .arg("--blinker-daemon-serve")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
+/// The marker saying a start is in progress.
+fn starting(socket: &Path) -> PathBuf {
+    socket.with_extension("starting")
+}
+
+/// Whether this process is the one that should start the daemon.
+///
+/// `cargo` links several crates at once, and none of them finds a daemon in the
+/// window before the first one binds. Without this, every link in that window
+/// starts a server, and all but one of them exits immediately on `AddrInUse` —
+/// harmless, but a build that spawns a dozen doomed processes is a build that
+/// looks like it is doing something wrong.
+fn claim(marker: &Path) -> bool {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker)
+    {
+        Ok(_) => true,
+        // A marker from a start that never completed would suppress every
+        // future one, and the daemon would never come back. It is only
+        // evidence of a start in progress for as long as a start takes.
+        Err(_) => match std::fs::metadata(marker).and_then(|meta| meta.modified()) {
+            Ok(at) if at.elapsed().is_ok_and(|since| since > STARTUP_WINDOW) => {
+                let _ = std::fs::remove_file(marker);
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(marker)
+                    .is_ok()
+            }
+            _ => false,
+        },
+    }
 }
 
 #[cfg(test)]
@@ -481,6 +728,88 @@ mod tests {
         // the test does not wait out the idle timeout.
         let _ = std::fs::remove_file(&socket);
         drop(served);
+    }
+
+    /// A superseded daemon stops when told to, and takes its socket with it.
+    #[test]
+    fn a_daemon_stops_when_asked() {
+        let scratch = Scratch::dir("daemon-quit").expect("scratch");
+        let socket = scratch.join("quit.sock");
+
+        let served = {
+            let socket = socket.clone();
+            std::thread::spawn(move || serve(&socket, |_, _| (0, Vec::new())))
+        };
+        // Bound, not merely spawned: `stop` on a path nothing is listening to
+        // removes the file and returns, which would pass this test without a
+        // daemon ever having existed.
+        let mut alive = false;
+        for _ in 0..400 {
+            if is_alive(&socket) {
+                alive = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(alive, "the daemon never came up");
+
+        stop(&socket);
+        served
+            .join()
+            .expect("the daemon thread finished")
+            .expect("it stopped cleanly");
+        assert!(!socket.exists(), "it left its socket behind");
+    }
+
+    /// Only one of several links starts a daemon.
+    #[test]
+    fn a_start_is_claimed_once() {
+        let scratch = Scratch::dir("daemon-claim").expect("scratch");
+        let marker = scratch.join("start.marker");
+        assert!(claim(&marker), "the first link should start one");
+        assert!(!claim(&marker), "the second link should not");
+    }
+
+    /// But a claim that never produced a daemon expires, or the daemon could
+    /// never come back.
+    #[test]
+    fn a_stale_claim_expires() {
+        let scratch = Scratch::dir("daemon-claim-stale").expect("scratch");
+        let marker = scratch.join("start.marker");
+        assert!(claim(&marker));
+
+        // Backdated past the window rather than waiting it out.
+        let long_ago = std::fs::FileTimes::new()
+            .set_modified(std::time::SystemTime::now() - STARTUP_WINDOW * 2);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&marker)
+            .expect("marker")
+            .set_times(long_ago)
+            .expect("backdated");
+        assert!(claim(&marker), "an abandoned start should not be permanent");
+    }
+
+    /// The two halves of the socket name are independent: same path and
+    /// different bytes is what "superseded" means, and it has to be visible in
+    /// the name for a daemon to recognise its predecessors.
+    #[test]
+    fn the_socket_name_separates_path_from_content() {
+        let scratch = Scratch::dir("daemon-name").expect("scratch");
+        let executable = scratch.join("blinker");
+        std::fs::write(&executable, b"one").expect("written");
+        let (prefix, first) = socket_name(&executable);
+
+        // Rebuilt in place: a different size, so a different content hash.
+        std::fs::write(&executable, b"a longer build").expect("rewritten");
+        let (again, second) = socket_name(&executable);
+
+        assert_eq!(prefix, again, "the path half moved");
+        assert_ne!(first, second, "the content half did not");
+        assert!(second.starts_with(&prefix) && second.ends_with(".sock"));
+
+        let (elsewhere, _) = socket_name(&scratch.join("other/blinker"));
+        assert_ne!(prefix, elsewhere, "two paths shared a prefix");
     }
 
     /// A length field larger than the cap is refused rather than allocated.

@@ -24,7 +24,7 @@ pub enum Verbosity {
 }
 
 /// blinker's own configuration for one invocation.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct ProjectOptions {
     /// Explicit fallback linker path.
     pub fallback_linker: Option<PathBuf>,
@@ -36,10 +36,14 @@ pub struct ProjectOptions {
     pub json_diagnostics: Option<PathBuf>,
     /// Perform the link internally instead of delegating.
     ///
-    /// Opt-in rather than default: delegation is the behaviour that is known
-    /// to work for every input, and the internal path is still narrower than
-    /// ld64's. Flipping the default is a decision to make from evidence, not
-    /// a side effect of the path existing.
+    /// On by default. It was opt-in for a long time, on the reasoning that
+    /// delegation is known to work for every input and flipping the default
+    /// should come from evidence rather than from the path existing. The
+    /// evidence arrived, and so did the cost of waiting for it: a user who
+    /// followed the setup instructions got a linker that delegated every link,
+    /// so blinker was installed and doing nothing. An output kind blinker
+    /// cannot produce is still delegated automatically — see
+    /// `unsupported_output_kind` — which is what makes the default safe.
     pub internal_link: bool,
     /// Reuse relocated output from a previous link, and record this one.
     ///
@@ -67,6 +71,29 @@ pub struct ProjectOptions {
     pub version: bool,
     /// Print help and exit.
     pub help: bool,
+}
+
+impl Default for ProjectOptions {
+    /// Written out rather than derived, for the one field whose default is not
+    /// `false`. Deriving it is how `internal_link` stayed off: nothing in the
+    /// code said "delegate", so nothing had to be revisited when the internal
+    /// path became the better one.
+    fn default() -> Self {
+        ProjectOptions {
+            fallback_linker: None,
+            record_invocation: None,
+            replay_invocation: None,
+            json_diagnostics: None,
+            internal_link: true,
+            incremental_cache: false,
+            reuse_relocations: false,
+            print_stats: false,
+            strict_fingerprints: false,
+            verbosity: Verbosity::default(),
+            version: false,
+            help: false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -172,9 +199,15 @@ pub fn split_args(argv: &[String]) -> Result<SplitArgs, OptionError> {
                 };
             }
             "--blinker-internal" => options.internal_link = true,
+            // The way back to the old default, for a build that has hit
+            // something blinker gets wrong and needs to keep moving.
+            "--blinker-delegate" => options.internal_link = false,
             // Handled in `main` before the driver runs, and accepted here so
             // they are not reported as unrecognized and forwarded to `ld`.
-            "--blinker-daemon" | "--blinker-daemon-serve" => {}
+            "--blinker-daemon"
+            | "--blinker-daemon-serve"
+            | "--blinker-daemon-stop"
+            | "--blinker-no-daemon" => {}
             "--blinker-cache" => options.incremental_cache = true,
             "--blinker-cache-relocations" => {
                 options.incremental_cache = true;
@@ -212,12 +245,15 @@ OPTIONS:
     --blinker-replay-invocation <FILE> Replay a previously recorded invocation
     --blinker-json-diagnostics <PATH>  Write the machine-readable record to PATH
     --blinker-diagnostics <LEVEL>      quiet | normal | verbose
-    --blinker-internal                 Link internally instead of delegating
+    --blinker-internal                 Link internally instead of delegating (the default)
+    --blinker-delegate                 Hand every link to the system linker
     --blinker-cache                    Replay an unchanged image from a previous link
     --blinker-cache-relocations        Force per-object relocation reuse. Automatic
                                        under --blinker-daemon; a loss for one-shot links
-    --blinker-daemon                   Link via a resident linker, if one is running
+    --blinker-daemon                   Link via a resident linker (the default)
+    --blinker-no-daemon                Link in this process, and start no daemon
     --blinker-daemon-serve             Become the resident linker
+    --blinker-daemon-stop              Stop the resident linker, if any
     --blinker-print-stats              Print the human-readable summary
     --blinker-strict-fingerprints      Hash every input (slower, exact identity)
     --blinker-version                  Print version

@@ -41,6 +41,7 @@ fn build(tag: &str, main_rs: &str) -> Built {
     // what it is testing rather than depending on a default.
     let strip_flag = " -C link-arg=-Wl,-dead_strip";
     let output = Command::new("cargo")
+        .env("BLINKER_NO_DAEMON", "1")
         .arg("build")
         .arg("--offline")
         .current_dir(scratch.path())
@@ -176,6 +177,7 @@ fn the_reachability_model_needs_no_repairs_on_a_rust_link() {
     let blinker = workspace_binary("blinker");
     let records = scratch.join("records");
     let output = Command::new("cargo")
+        .env("BLINKER_NO_DAEMON", "1")
         .arg("build")
         .arg("--offline")
         .current_dir(scratch.path())
@@ -259,6 +261,7 @@ fn stripping_removes_most_of_a_rust_binarys_text() {
     let blinker = workspace_binary("blinker");
     let records = scratch.join("records");
     let output = Command::new("cargo")
+        .env("BLINKER_NO_DAEMON", "1")
         .arg("build")
         .arg("--offline")
         .current_dir(scratch.path())
@@ -311,6 +314,7 @@ fn stripping_removes_most_of_a_rust_binarys_text() {
         let at = arguments.iter().position(|a| a == "-o").expect("an -o");
         arguments[at + 1] = out.display().to_string();
         let status = Command::new(&blinker)
+            .env("BLINKER_NO_DAEMON", "1")
             .arg("--blinker-internal")
             .args(&arguments)
             .output()

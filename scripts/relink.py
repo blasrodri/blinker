@@ -324,9 +324,13 @@ def main():
 
         output, record = scratch / "relink-out", scratch / "record.json"
         argv[argv.index("-o") + 1] = str(output)
+        # Explicit on both sides. blinker engages a resident linker by default
+        # and starts one if none is running, so the absence of `--daemon` here
+        # is not the absence of a daemon — without the refusal, the first
+        # iteration would start one and every iteration after it would be
+        # measuring a different linker than the flag says.
         cmd = [str(BLINKER)]
-        if options.daemon:
-            cmd.append("--blinker-daemon")
+        cmd.append("--blinker-daemon" if options.daemon else "--blinker-no-daemon")
         cmd.append("--blinker-internal")
         if not options.no_cache:
             cmd.append("--blinker-cache-relocations"

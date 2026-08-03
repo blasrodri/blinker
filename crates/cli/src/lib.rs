@@ -408,6 +408,50 @@ fn stub_libraries(parsed: &ParsedInvocation) -> Vec<PathBuf> {
     found
 }
 
+/// Every input the link reads, in the order the command line gave them.
+///
+/// Named inputs and `-l` requests interleave, and the order is not decoration:
+/// an archive supplies a member only for a symbol that is undefined when the
+/// linker reaches it, so moving `-ladder` past the objects that need it changes
+/// what comes out.
+///
+/// `-l` that resolves to a `.tbd` is left to [`stub_libraries`]; a `.dylib` is
+/// dropped, as it was before. What is new here is the static library. A build
+/// script that compiles C and hands rustc `-ladder -L …/out` is the standard
+/// shape of `cc`/`cmake` crates, and until the internal path became the default
+/// nothing linked one: the request resolved to a `libadder.a` that was found
+/// and then discarded, and the link failed on `_adder_add` undefined.
+fn link_inputs(parsed: &ParsedInvocation) -> Vec<PathBuf> {
+    let mut library_paths = Vec::new();
+    for (_, arg) in &parsed.args {
+        if let LinkerArg::LibrarySearchPath(path) = arg {
+            library_paths.push(path.clone());
+        }
+    }
+    let sdk = blinker_link::sdk_root();
+
+    let mut inputs = Vec::new();
+    for (_, arg) in &parsed.args {
+        if let Some(path) = arg.input_path() {
+            inputs.push(path.to_path_buf());
+            continue;
+        }
+        let LinkerArg::Library(name) = arg else {
+            continue;
+        };
+        // Only the static case. A `.tbd` describes a dylib to link against, not
+        // an input to read, and it travels the other path.
+        if let Some(found) =
+            blinker_link::libraries::find_library(name, &library_paths, sdk.as_deref())
+        {
+            if found.extension().is_some_and(|kind| kind == "a") {
+                inputs.push(found);
+            }
+        }
+    }
+    inputs
+}
+
 /// Perform the link with blinker's own linker.
 ///
 /// Only object files are accepted so far. An archive or a dylib on the command
@@ -423,11 +467,7 @@ fn internal_link(
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("a.out"));
 
-    let objects: Vec<PathBuf> = parsed
-        .input_paths()
-        .into_iter()
-        .map(Path::to_path_buf)
-        .collect();
+    let objects: Vec<PathBuf> = link_inputs(parsed);
 
     let identifier = output
         .file_name()

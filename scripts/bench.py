@@ -115,7 +115,7 @@ def profile(args, options):
     import json
     import tempfile
 
-    blinker_args = [str(BLINKER), "--blinker-internal"] + args
+    blinker_args = [str(BLINKER), "--blinker-no-daemon", "--blinker-internal"] + args
     out_index = blinker_args.index("-o") + 1
     blinker_args[out_index] = "/tmp/bench_profile"
 
@@ -197,7 +197,7 @@ def main():
     ld_out_index = ld.index("-o") + 1
     ld_cmd = with_output(ld, ld_out_index, "/tmp/bench_ld64")
 
-    blinker_args = [str(BLINKER), "--blinker-internal"] + args
+    blinker_args = [str(BLINKER), "--blinker-no-daemon", "--blinker-internal"] + args
     bl_out_index = blinker_args.index("-o") + 1
     bl_cmd = with_output(blinker_args, bl_out_index, "/tmp/bench_blinker")
 

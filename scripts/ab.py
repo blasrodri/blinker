@@ -58,7 +58,15 @@ def load_argv(path, output):
 def run(binary, argv, output, record):
     if os.path.exists(output):
         os.remove(output)
-    cmd = [str(binary), "--blinker-internal", "--blinker-json-diagnostics", str(record)]
+    cmd = [
+        str(binary),
+        # A one-shot link, measured as one: the default would engage a
+        # resident linker and compare two arms through shared state.
+        "--blinker-no-daemon",
+        "--blinker-internal",
+        "--blinker-json-diagnostics",
+        str(record),
+    ]
     start = time.perf_counter()
     result = subprocess.run(cmd + argv, capture_output=True)
     wall = (time.perf_counter() - start) * 1000

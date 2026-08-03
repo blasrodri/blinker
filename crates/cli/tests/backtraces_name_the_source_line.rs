@@ -64,6 +64,7 @@ fn build(tag: &str, internal: bool) -> Built {
         .expect("source");
 
     let mut build = Command::new("cargo");
+    build.env("BLINKER_NO_DAEMON", "1");
     build
         .arg("build")
         .arg("--offline")

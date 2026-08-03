@@ -42,6 +42,7 @@ fn build_and_run_with(tag: &str, main_rs: &str, extra_flags: &str) -> (RunResult
 
     let blinker = workspace_binary("blinker");
     let output = Command::new("cargo")
+        .env("BLINKER_NO_DAEMON", "1")
         .arg("build")
         .current_dir(scratch.path())
         // Offline and target-local: the fixture has no dependencies, and a

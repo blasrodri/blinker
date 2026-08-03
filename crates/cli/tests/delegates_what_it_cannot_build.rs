@@ -11,7 +11,7 @@
 //! the fallback carries a structured reason so the delegation is visible
 //! rather than silent.
 
-use blinker_test_support::{workspace_binary, Scratch};
+use blinker_test_support::{blinker, Scratch};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -34,7 +34,7 @@ fn compile(scratch: &Scratch, name: &str, code: &str) -> PathBuf {
 /// Run blinker, returning its exit status and the diagnostics record.
 fn link(scratch: &Scratch, tag: &str, extra: &[&str], object: &PathBuf, out: &PathBuf) -> String {
     let record = scratch.join(format!("{tag}.json"));
-    let status = Command::new(workspace_binary("blinker"))
+    let status = blinker()
         .arg("--blinker-internal")
         .arg("--blinker-json-diagnostics")
         .arg(&record)

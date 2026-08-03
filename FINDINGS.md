@@ -9300,3 +9300,76 @@ The large link remains the case where the developer waits, and it is still a
 loss: 350 ms warm against 311 ms cold. But it is one link of sixteen, and the
 work needed to win it is structural (187) where the work needed to win the
 build is plumbing.
+
+## 190. The mechanism was off, and so was the linker
+
+Finding 189 ended by naming the daemon's opt-in default as worth more than
+everything before it. Turning it on found something worse underneath.
+
+### The daemon now engages by default
+
+`daemon::engage` runs on every link: it looks for a resident linker, uses one
+if it answers, and starts one for the *next* link if none does. The link that
+starts a daemon does not wait for it — the daemon's whole value is the state it
+accumulates, and it has none yet, so waiting would buy nothing and add a fork
+to the critical path.
+
+Bounded on every side, because a linker that starts a background process is a
+real imposition:
+
+- it exits after twenty minutes idle, as it always did;
+- its socket name carries the executable's path and content as *separate*
+  hashes, so a newly started daemon can recognise its own predecessors — same
+  path, different bytes — and tell them to exit. Before this, every rebuild of
+  blinker orphaned a daemon holding a session;
+- one link of the several that start together claims the start, via an
+  `O_EXCL` marker with a ten-second window, so a build does not spawn a dozen
+  servers that lose the race to bind and exit;
+- `BLINKER_NO_DAEMON` or `--blinker-no-daemon` turns it off, and
+  `--blinker-daemon-stop` stops one. The environment variable is not optional
+  ergonomics: the linker is spawned by `rustc`, so a flag means editing a cargo
+  config, and turning this off has to be possible from the shell;
+- failure is silent. It is the default path now, and something that happens on
+  every link cannot print a warning the user cannot act on. `--blinker-daemon`
+  is a request, and a request that fails still says so.
+
+The socket name is also shorter — 32 bits of path, 48 of content, not two
+64-bit hashes. `sockaddr_un` is 104 bytes on macOS and a temporary directory is
+already about fifty of them; the old name fit, but only just, and "only just"
+is a linker that works here and not on the next machine.
+
+### And underneath it: blinker was not linking
+
+`--blinker-internal` was opt-in, and it is what makes blinker *link*. Without
+it every invocation delegated to ld64. So the setup the README documents —
+`linker = "…/blinker"` and nothing else — installed a program that recorded a
+link and handed it to Apple's linker. Every measurement in this file passed
+`--blinker-internal` explicitly, because every harness was written by someone
+who knew to.
+
+That is finding 189's shape again, one level down. 189 found the benchmark
+measuring a link nobody runs; this found the *product* being a thing nobody
+ran. Both were invisible for the same reason: the people measuring knew which
+flags to pass.
+
+Internal linking is now the default, with automatic delegation for output kinds
+blinker cannot produce (`-dynamiclib`, still). `--blinker-delegate` is the way
+back.
+
+### What the default had been hiding
+
+The `cdep` fixture — a C static library built by a build script, which is what
+every `cc`-crate looks like — had never linked. `-ladder -L …/out` resolved to
+a `libadder.a`, and `stub_libraries` kept `.tbd` files and dropped everything
+else, so the archive was found and discarded and the link failed on
+`_adder_add` undefined.
+
+It had never been noticed because the integration test asserted
+`mode == "delegated"` for every fixture. The assertion was true, deliberate,
+and describing a linker that did not link. `link_inputs` now walks the argument
+vector in order and takes both named inputs and `-l` requests that resolve to a
+static library — in order, because an archive supplies a member only for a
+symbol undefined when the linker reaches it.
+
+A test that asserts the current behaviour will keep asserting it after the
+behaviour becomes the bug.

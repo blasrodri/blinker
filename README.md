@@ -33,16 +33,25 @@ the shape. Across a build's worth of links:
 
 ```
 ld64 (cc)             732-812 ms
-blinker, no daemon    484-495 ms
-blinker + daemon      294-301 ms
+blinker              283-305 ms
+blinker one-shot      470-498 ms
 ```
 
-`scripts/build-links.py` produces that. Note the middle arm: the daemon is
-opt-in and nothing starts it, so 484 ms is what setting `linker = "…/blinker"`
-actually gets you today.
+`scripts/build-links.py` produces that. The middle row is what
+`linker = "…/blinker"` gets you, with no other configuration: blinker links
+internally by default and engages a resident linker by default, starting one
+for the next link if none is running. The third row is what that second default
+is worth, measured by turning it off with `--blinker-no-daemon`.
 
-Delegation to the system linker remains the default; pass `--blinker-internal`
-to link internally.
+Both of those were opt-in until finding 190, which means the documented setup
+used to install a program that delegated every link to Apple's linker and never
+started the daemon it was built around.
+
+Output kinds blinker cannot produce — `-dynamiclib`, so every proc-macro crate
+— are still delegated automatically, with the reason recorded.
+`--blinker-delegate` delegates everything, and `--blinker-no-daemon` or
+`BLINKER_NO_DAEMON=1` links in-process. `--blinker-daemon-stop` stops a
+resident linker.
 
 See [PRODUCT_SPEC.md](PRODUCT_SPEC.md) for the product definition,
 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for the milestone sequence,
@@ -162,10 +171,13 @@ cargo build
 cargo test
 ```
 
+That is the whole of the setup. Blinker links internally, and the first link
+starts a resident linker that the rest of the build reaches.
+
 **To restore the default linker**, delete that `[target.aarch64-apple-darwin]`
-section (or just the `linker` key). Nothing else is left behind — blinker keeps
-no global state, and without `--blinker-internal` every link is performed by
-the system linker anyway.
+section (or just the `linker` key), then run `blinker --blinker-daemon-stop` —
+the daemon is the one piece of state a build leaves behind, and it would go on
+its own twenty minutes later regardless.
 
 ## Corpus tooling
 

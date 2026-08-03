@@ -15,7 +15,7 @@
 //! working produces a correct binary and a slower link, which no correctness
 //! test can see.
 
-use blinker_test_support::{workspace_binary, Scratch};
+use blinker_test_support::{blinker, workspace_binary, Scratch};
 use std::path::Path;
 use std::process::Command;
 
@@ -51,6 +51,7 @@ fn capture_link_arguments(scratch: &Scratch) -> Vec<String> {
     let blinker = workspace_binary("blinker");
     let records = scratch.join("records");
     let output = Command::new("cargo")
+        .env("BLINKER_NO_DAEMON", "1")
         .arg("build")
         .arg("--offline")
         .current_dir(scratch.path())
@@ -100,7 +101,7 @@ fn link(arguments: &[String], output: &Path, record: &Path) -> serde_json::Value
     let at = arguments.iter().position(|a| a == "-o").expect("an -o");
     arguments[at + 1] = output.display().to_string();
 
-    let status = Command::new(workspace_binary("blinker"))
+    let status = blinker()
         .args([
             "--blinker-internal",
             // The per-object path specifically: these tests are about reusing

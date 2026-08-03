@@ -33,15 +33,24 @@ fn main() -> ExitCode {
         };
     }
 
-    // Using one is not. `--blinker-daemon` asks for the link to be performed by
-    // a resident process if there is one, and performs it here if there is not
-    // — so a build configured to use a daemon still links when none is running.
-    if argv.iter().any(|a| a == "--blinker-daemon") {
-        match blinker_cli::daemon::link_via_daemon(&argv) {
-            Ok(Some(code)) => return exit_code(code),
-            Ok(None) => {}
-            Err(error) => eprintln!("blinker: daemon unavailable ({error}); linking in process"),
-        }
+    // Stopping one is a mode too, and the only one a user can reach: a daemon
+    // nobody started by hand is a process nobody knows the name of.
+    if argv.iter().any(|a| a == "--blinker-daemon-stop") {
+        return match blinker_cli::daemon::stop_resident() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("blinker: daemon: {error}");
+                ExitCode::from(1)
+            }
+        };
+    }
+
+    // Using one is not, and is what happens unless it is refused. A resident
+    // linker performs this link if one is running, and one is started for the
+    // next link if not — see `daemon::engage`. `--blinker-daemon` is still
+    // accepted and now says nothing new.
+    if let Some(code) = blinker_cli::daemon::engage(&argv) {
+        return exit_code(code);
     }
 
     match blinker_cli::run(&argv) {

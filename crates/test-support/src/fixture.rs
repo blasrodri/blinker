@@ -184,6 +184,7 @@ impl RustFixture {
             // linker we are trying to exercise.
             .env_remove("CARGO_BUILD_RUSTFLAGS")
             .env_remove("CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER");
+        crate::no_daemon(&mut cmd);
 
         match rustflags {
             Some(flags) => {

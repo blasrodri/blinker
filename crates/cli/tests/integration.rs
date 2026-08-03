@@ -9,10 +9,12 @@
 //! adding a shape there gets it built, recorded, and checked here without a new
 //! test being written by hand.
 
-use blinker_test_support::{catalog, workspace_binary, Network, RustFixture, MULTI_MODULE_MAIN};
+use blinker_test_support::{
+    blinker, catalog, workspace_binary, Network, RustFixture, MULTI_MODULE_MAIN,
+};
 use std::path::Path;
 
-fn blinker() -> std::path::PathBuf {
+fn blinker_path() -> std::path::PathBuf {
     workspace_binary("blinker")
 }
 
@@ -58,7 +60,7 @@ fn every_project_shape_builds_and_fully_classifies() {
 
         let fixture = kind.build().expect("fixture is creatable");
         let build = fixture
-            .build_with_linker(&blinker(), &record_into(&fixture.recording_dir()))
+            .build_with_linker(&blinker_path(), &record_into(&fixture.recording_dir()))
             .expect("cargo runs");
 
         assert!(
@@ -78,7 +80,18 @@ fn every_project_shape_builds_and_fully_classifies() {
                  option's arity before assuming it takes no value.",
                 kind.tag
             );
-            assert_eq!(record["mode"], "delegated");
+            // Internal unless blinker said why not. This assertion used to
+            // read `mode == "delegated"`, which was true of every link a real
+            // project produced and was the product's whole problem: blinker
+            // was installed, invoked, and handing every link to ld64. A
+            // delegated link is still allowed — a proc-macro crate is a
+            // `-dynamiclib` and always will be — but it has to name a reason.
+            let mode = record["mode"].as_str().expect("records carry a mode");
+            assert!(
+                mode != "delegated" || record["fallback_reason"].is_string(),
+                "fixture `{}` delegated without saying why",
+                kind.tag
+            );
             assert_eq!(record["exit_code"], 0);
             assert_eq!(record["arch"], "arm64");
 
@@ -121,7 +134,7 @@ fn produced_binaries_run_and_unwind() {
         .expect("fixture is creatable");
 
     let build = fixture
-        .build_with_linker(&blinker(), &[])
+        .build_with_linker(&blinker_path(), &[])
         .expect("cargo runs");
     assert!(build.success, "stderr:\n{}", build.stderr);
 
@@ -152,7 +165,7 @@ fn recorded_invocation_captures_the_real_link_configuration() {
         .expect("fixture is creatable");
 
     let build = fixture
-        .build_with_linker(&blinker(), &record_into(&fixture.recording_dir()))
+        .build_with_linker(&blinker_path(), &record_into(&fixture.recording_dir()))
         .expect("cargo runs");
     assert!(build.success, "stderr:\n{}", build.stderr);
 
@@ -191,11 +204,11 @@ fn recorded_invocation_can_be_replayed() {
         .expect("fixture is creatable");
 
     let build = fixture
-        .build_with_linker(&blinker(), &record_into(&fixture.recording_dir()))
+        .build_with_linker(&blinker_path(), &record_into(&fixture.recording_dir()))
         .expect("cargo runs");
     assert!(build.success, "stderr:\n{}", build.stderr);
 
-    let out = std::process::Command::new(blinker())
+    let out = blinker()
         .arg(format!(
             "--blinker-replay-invocation={}",
             build.recordings[0].display()
@@ -212,10 +225,7 @@ fn recorded_invocation_can_be_replayed() {
 #[test]
 fn version_and_help_work_without_a_link_configuration() {
     for flag in ["--blinker-version", "--blinker-help"] {
-        let out = std::process::Command::new(blinker())
-            .arg(flag)
-            .output()
-            .expect("blinker runs");
+        let out = blinker().arg(flag).output().expect("blinker runs");
         assert!(out.status.success(), "{flag} failed");
         assert!(!out.stdout.is_empty(), "{flag} printed nothing");
     }
@@ -223,7 +233,7 @@ fn version_and_help_work_without_a_link_configuration() {
 
 #[test]
 fn unknown_blinker_option_fails_loudly_rather_than_being_forwarded() {
-    let out = std::process::Command::new(blinker())
+    let out = blinker()
         .arg("--blinker-not-a-real-option")
         .output()
         .expect("blinker runs");
@@ -233,7 +243,7 @@ fn unknown_blinker_option_fails_loudly_rather_than_being_forwarded() {
 
 #[test]
 fn fallback_linker_failure_propagates_its_exit_code() {
-    let out = std::process::Command::new(blinker())
+    let out = blinker()
         .arg("/nonexistent/blinker/input.o")
         .arg("-o")
         .arg("/nonexistent/blinker/output")
