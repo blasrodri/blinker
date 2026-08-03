@@ -8052,3 +8052,65 @@ by about 70%, and this file should not be read as if they were not.
 
 Quoting a number without the machine's state is how a measurement stops being
 one.
+
+## 166. The relocation pass writes to disjoint bytes, and the compiler could not see it
+
+`apply_relocations` is 252.7 ms of a 1047 ms cold link — the largest single
+sub-stage, and the last one still running on one core.
+
+It is embarrassingly parallel and always was. A relocation patches at
+`chunk_offset + field`: the chunk is *that object's contribution*, and the
+field is bounded by the input section's size. Two objects never touch the same
+byte. What stopped it was that all of them wrote through one `Vec<u8>` per
+output section, and no amount of that being true lets `&mut` be handed to
+fifteen threads.
+
+### Cut the buffers where the layout already cuts them
+
+`carve` splits every output section's buffer into its contributions, in offset
+order, by repeated `split_at_mut`. Each object gets a small `ObjectBytes`
+holding one `&mut [u8]` per contribution it owns. The property the layout
+guarantees becomes one the borrow checker holds, and nothing is copied — the
+slices are the same bytes.
+
+It also simplifies the write: the field's offset within the slice is just
+`field`, because the slice starts where `chunk_offset` pointed.
+
+`carve` returns `None` if any section's contributions overlap or run past its
+end, and the caller then has no slices to hand out. That has never happened. It
+is checked because the alternative is trusting the layout to be an invariant it
+merely is.
+
+### Landed in two steps, because this is the code that must not be wrong
+
+First the carving, with the loop still sequential — output byte-identical,
+which says the slices cover exactly what the whole buffers did. Only then the
+threads. A single commit doing both would have left "the bytes changed" with
+two possible causes.
+
+### What the merge has to preserve
+
+Each chunk accumulates its own binds, rebases and records, and an
+`ObjectRecord`'s `binds`/`rebases` ranges are *chunk-local* — they mean nothing
+except against the vector they are appended to. The merge sorts the chunks back
+into object order and rebases every range as it concatenates.
+
+Chunks are handed out through a queue rather than split evenly. An object whose
+bytes came from the cache costs nothing and one that is relocated costs
+everything, and on an edit the expensive ones are the objects of the crate that
+changed — which are consecutive. A static split would put all of them on one
+thread.
+
+An error is no longer returned by whichever thread found it first: the chunks
+are ordered before the first `?`, so a link with two bad relocations reports the
+same one every time.
+
+### Measured
+
+```
+  apply       252.7 ms -> 27.6 ms    9.2x
+  relocate    312.9    -> 83.0
+  cold link      987   -> 820
+```
+
+Output byte-identical on the 187 MB image; 62 suites, 649 tests green.

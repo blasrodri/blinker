@@ -2421,7 +2421,7 @@ fn link_inner(
 fn copy_cached_bytes(
     entry: &blinker_cache::Entry,
     plan: &ReusePlan<'_>,
-    contents: &mut SectionContents,
+    bytes: &mut ObjectBytes<'_>,
 ) -> bool {
     for range in &entry.ranges {
         let source = plan.sections.get(&range.section);
@@ -2431,20 +2431,21 @@ fn copy_cached_bytes(
         // is why a first version reused nothing at all on a Rust link: every
         // object that touched `__bss` failed the copy and fell back, which
         // looked exactly like a cache that never matched.
-        if !contents.contains_key(&(range.section as usize)) {
+        let (start, len) = (range.start as usize, range.len as usize);
+        let destination = bytes.covering(range.section as usize, start, len);
+        // A zero-filled section — `__bss` and the thread-local block — has a
+        // contribution with a real length and no bytes anywhere, in this link
+        // or the cached one. There is nothing to copy and nothing wrong.
+        if destination.is_none() {
             if source.is_none() {
                 continue;
             }
             return false;
         }
-        let (Some(source), Some(destination)) =
-            (source, contents.get_mut(&(range.section as usize)))
-        else {
+        let (Some(source), Some(to)) = (source, destination) else {
             return false;
         };
-        let (start, end) = (range.start as usize, (range.start + range.len) as usize);
-        let (Some(from), Some(to)) = (source.get(start..end), destination.get_mut(start..end))
-        else {
+        let Some(from) = source.get(start..start + len) else {
             return false;
         };
         to.copy_from_slice(from);
@@ -4641,6 +4642,15 @@ struct Patched {
 /// The fixups are ranges into `Patched`'s flat vectors rather than copies: the
 /// link needs them flat to encode, and the cache needs them attributed, and
 /// slicing serves both without duplicating either.
+struct Patch {
+    binds: Vec<Bind>,
+    rebases: Vec<Rebase>,
+    records: Vec<ObjectRecord>,
+    reused: u64,
+    reused_relocations: u64,
+}
+
+/// What one object read and produced, for the cache.
 struct ObjectRecord {
     object: ObjectId,
     deps: std::sync::Arc<[blinker_cache::NameHash]>,
@@ -4770,6 +4780,98 @@ struct Placement<'a> {
     placed: &'a Placed,
 }
 
+/// The bytes one object is allowed to write, one slice per contribution.
+///
+/// # Why the buffers are cut up
+///
+/// A relocation only ever patches inside the contribution it belongs to: the
+/// field's place is `chunk_offset + field`, where the chunk is that object's
+/// contribution and the field is bounded by the input section's size. So the
+/// objects write to disjoint bytes, and the pass could run on every core — but
+/// only if the compiler can see that, and it cannot see it through one shared
+/// `Vec<u8>` per output section.
+///
+/// Cutting each section buffer into its contributions, in offset order, turns
+/// the property the layout already guarantees into one the borrow checker
+/// holds. Nothing is copied; the slices are the same bytes.
+struct ObjectBytes<'a> {
+    /// Per contribution: its input section, which output section it landed in,
+    /// where it starts there, and the bytes themselves.
+    spans: Vec<(u32, usize, usize, &'a mut [u8])>,
+}
+
+impl ObjectBytes<'_> {
+    /// This object's contribution from `section`, which is where a relocation
+    /// against that section patches.
+    ///
+    /// A linear scan: an object has a couple of dozen sections, and this used
+    /// to be a hash of the output section index into a map of every section in
+    /// the image.
+    fn contribution(&mut self, section: SectionId) -> Option<&mut [u8]> {
+        self.spans
+            .iter_mut()
+            .find(|(input, ..)| *input == section.0)
+            .map(|(.., bytes)| &mut **bytes)
+    }
+
+    /// The contribution covering `[start, start + len)` of output section
+    /// `index`, for a cached copy that names output ranges rather than inputs.
+    fn covering(&mut self, index: usize, start: usize, len: usize) -> Option<&mut [u8]> {
+        let (_, _, base, bytes) = self.spans.iter_mut().find(|(_, section, base, bytes)| {
+            *section == index && start >= *base && start + len <= *base + bytes.len()
+        })?;
+        let from = start - *base;
+        bytes.get_mut(from..from + len)
+    }
+}
+
+/// Cut every output section's buffer into its objects' contributions.
+///
+/// `None` if the contributions of some section overlap or run past its end,
+/// which would make the slices unsound — the caller then keeps the buffers
+/// whole and works sequentially. It has never happened; it is checked because
+/// the alternative is trusting the layout to be an invariant it merely is.
+fn carve<'a>(
+    buffers: &'a mut [(usize, Vec<u8>)],
+    image: &Image,
+    slot_of: &HashMap<u32, usize>,
+    objects: usize,
+) -> Option<Vec<ObjectBytes<'a>>> {
+    let mut per_object: Vec<ObjectBytes<'a>> = (0..objects)
+        .map(|_| ObjectBytes { spans: Vec::new() })
+        .collect();
+    for (index, buffer) in buffers.iter_mut() {
+        let section = image.layout.section(*index)?;
+        let mut ordered: Vec<&blinker_layout::Contribution> = section
+            .contributions
+            .iter()
+            .filter(|c| c.object != SYNTHETIC_OBJECT)
+            .collect();
+        ordered.sort_by_key(|c| c.offset);
+
+        let total = buffer.len();
+        let mut rest: &mut [u8] = buffer;
+        let mut consumed = 0usize;
+        for contribution in ordered {
+            let start = contribution.offset as usize;
+            let len = contribution.size as usize;
+            // Out of order, overlapping, or off the end.
+            if start < consumed || start + len > total {
+                return None;
+            }
+            let (_, tail) = rest.split_at_mut(start - consumed);
+            let (mine, tail) = tail.split_at_mut(len);
+            rest = tail;
+            consumed = start + len;
+            let slot = *slot_of.get(&contribution.object.0)?;
+            per_object[slot]
+                .spans
+                .push((contribution.section.0, *index, start, mine));
+        }
+    }
+    Some(per_object)
+}
+
 // Eight, and each one is a distinct thing the pass consults. The two already
 // bundled — `Placement` and `IndirectTables` — group parameters that belong
 // together; grouping the rest would only be hiding the count.
@@ -4790,7 +4892,7 @@ fn apply_relocations(
     // Objects whose patched bytes a previous link already produced.
     reuse: Option<&ReusePlan<'_>>,
 ) -> Result<Patched, LinkError> {
-    let mut extra_rebases = Vec::new();
+    let mut extra_rebases: Vec<Rebase> = Vec::new();
     let Placement {
         addresses,
         strip,
@@ -4823,163 +4925,349 @@ fn apply_relocations(
             let symbol = object.parsed.symbol(id)?;
             got_slots.get(&symbol.name).copied()
         };
-    let mut extra_binds = Vec::new();
-    let mut records: Vec<ObjectRecord> = Vec::new();
-    let mut reused = 0u64;
-    let mut reused_relocations = 0u64;
-    for (slot, object) in objects.iter().enumerate() {
-        let ids = &names.interned[slot];
-        // Where this object's fixups start. Binds and rebases are produced as
-        // a side effect of relocating, so an object whose bytes are later
-        // reused from the cache must carry its own away with it — and the
-        // cheapest way to attribute them is to remember where its run began
-        // rather than to thread a second collection through every push site.
-        let bind_start = extra_binds.len();
-        let rebase_start = extra_rebases.len();
-        // Addresses this object read, deduplicated by (symbol, table) so the
-        // hashing below is proportional to distinct references rather than to
-        // relocations — an object typically has several times more of the
-        // latter.
-        let mut referenced: HashSet<(u32, u8)> = HashSet::default();
+    // Out of the map and into a vector so the buffers can be borrowed
+    // independently of one another; `contents` is rebuilt from it at the end.
+    let mut buffers: Vec<(usize, Vec<u8>)> = contents.drain().collect();
+    buffers.sort_unstable_by_key(|(index, _)| *index);
+    let slot_of: HashMap<u32, usize> = objects
+        .iter()
+        .enumerate()
+        .map(|(slot, object)| (object.parsed.id.0, slot))
+        .collect();
+    let mut carved =
+        carve(&mut buffers, image, &slot_of, objects.len()).ok_or(LinkError::NothingToLink)?;
 
-        // The whole point of the cache: this object's bytes were relocated by
-        // a previous link, nothing it reads has moved, and it has not moved
-        // itself — so copy them and skip every relocation it holds.
-        if let Some(entry) = reuse.and_then(|plan| plan.entry(object.parsed.id)) {
-            let plan = reuse.expect("just matched");
-            if copy_cached_bytes(entry, plan, &mut contents) {
-                reused += 1;
-                reused_relocations += object.parsed.relocations.len() as u64;
-                extra_binds.extend(entry.binds.iter().map(|bind| Bind {
-                    segment: bind.segment,
-                    offset: bind.offset,
-                    symbol: bind.symbol.clone(),
-                    library_ordinal: bind.library_ordinal,
-                    addend: bind.addend,
-                }));
-                extra_rebases.extend(entry.rebases.iter().map(|rebase| Rebase {
-                    segment: rebase.segment,
-                    offset: rebase.offset,
-                }));
-                if record {
-                    records.push(ObjectRecord {
-                        object: object.parsed.id,
-                        deps: entry.deps.clone(),
-                        binds: bind_start..extra_binds.len(),
-                        rebases: rebase_start..extra_rebases.len(),
-                    });
+    // One chunk of objects, relocated into its own slices and its own
+    // accumulators. Everything it produces is chunk-local — including the
+    // `binds`/`rebases` ranges each `ObjectRecord` carries — and is rebased
+    // onto the whole link's vectors when the chunks are merged in order.
+    let run_chunk = |base: usize, mine: &mut [ObjectBytes<'_>]| -> Result<Patch, LinkError> {
+        let mut extra_binds: Vec<Bind> = Vec::new();
+        let mut extra_rebases: Vec<Rebase> = Vec::new();
+        let mut records: Vec<ObjectRecord> = Vec::new();
+        let mut reused = 0u64;
+        let mut reused_relocations = 0u64;
+        for (at, bytes) in mine.iter_mut().enumerate() {
+            let slot = base + at;
+            let object = &objects[slot];
+            let ids = &names.interned[slot];
+            // Where this object's fixups start. Binds and rebases are produced as
+            // a side effect of relocating, so an object whose bytes are later
+            // reused from the cache must carry its own away with it — and the
+            // cheapest way to attribute them is to remember where its run began
+            // rather than to thread a second collection through every push site.
+            let bind_start = extra_binds.len();
+            let rebase_start = extra_rebases.len();
+            // Addresses this object read, deduplicated by (symbol, table) so the
+            // hashing below is proportional to distinct references rather than to
+            // relocations — an object typically has several times more of the
+            // latter.
+            let mut referenced: HashSet<(u32, u8)> = HashSet::default();
+
+            // The whole point of the cache: this object's bytes were relocated by
+            // a previous link, nothing it reads has moved, and it has not moved
+            // itself — so copy them and skip every relocation it holds.
+            if let Some(entry) = reuse.and_then(|plan| plan.entry(object.parsed.id)) {
+                let plan = reuse.expect("just matched");
+                if copy_cached_bytes(entry, plan, bytes) {
+                    reused += 1;
+                    reused_relocations += object.parsed.relocations.len() as u64;
+                    extra_binds.extend(entry.binds.iter().map(|bind| Bind {
+                        segment: bind.segment,
+                        offset: bind.offset,
+                        symbol: bind.symbol.clone(),
+                        library_ordinal: bind.library_ordinal,
+                        addend: bind.addend,
+                    }));
+                    extra_rebases.extend(entry.rebases.iter().map(|rebase| Rebase {
+                        segment: rebase.segment,
+                        offset: rebase.offset,
+                    }));
+                    if record {
+                        records.push(ObjectRecord {
+                            object: object.parsed.id,
+                            deps: entry.deps.clone(),
+                            binds: bind_start..extra_binds.len(),
+                            rebases: rebase_start..extra_rebases.len(),
+                        });
+                    }
+                    continue;
                 }
-                continue;
-            }
-            // The cached bytes did not fit where they claimed to. Nothing is
-            // wrong with the link, only with the cache, so fall through and
-            // relocate this object as though there had been no entry at all.
-        }
-
-        // Indexed rather than iterated: `SUBTRACTOR` is one half of a pair and
-        // needs the relocation that follows it, so the loop has to be able to
-        // consume two entries at once.
-        let relocations = &object.parsed.relocations;
-        let mut index = 0;
-        while index < relocations.len() {
-            let relocation = &relocations[index];
-            index += 1;
-
-            // Where the patched field lives in the output.
-            let Some((section_index, chunk_address)) = placed
-                .chunk(object.parsed.id, relocation.section)
-                .and_then(|(index, address)| image.layout.section(index).map(|_| (index, address)))
-            else {
-                // The relocation patches a section that was dropped as
-                // linker-internal; nothing in the output refers to it.
-                continue;
-            };
-
-            // Recorded before any branch, so no relocation kind can be added
-            // later that reads an address without declaring it. Over-recording
-            // only costs an unnecessary rebuild; under-recording reuses bytes
-            // that are wrong.
-            if record {
-                note_reference(&mut referenced, relocation);
+                // The cached bytes did not fit where they claimed to. Nothing is
+                // wrong with the link, only with the cache, so fall through and
+                // relocate this object as though there had been no entry at all.
             }
 
-            let output_section = image.layout.section(section_index).expect("just matched");
-            let chunk_offset = chunk_address - output_section.vm_address;
-            // Where the field moved to. `None` means the bytes holding it were
-            // stripped, so there is nothing to patch — and, for a `SUBTRACTOR`,
-            // its partner must be stepped over with it.
-            let Some(field) = strip.remap(object.parsed.id, relocation.section, relocation.offset)
-            else {
-                if relocation.kind == Arm64RelocationKind::Subtractor {
-                    index += 1;
-                }
-                continue;
-            };
-            let place = chunk_address + field;
-
-            // `SUBTRACTOR` computes a *difference* between two addresses, so
-            // it is meaningless alone: the pair is emitted as SUBTRACTOR (the
-            // value being subtracted) immediately followed by UNSIGNED (the
-            // value being subtracted from). Relative pointers in unwind and
-            // exception tables are built this way, which is why Rust hits it
-            // and simple C does not.
-            if relocation.kind == Arm64RelocationKind::Subtractor {
-                let Some(pair) = relocations.get(index) else {
-                    return Err(LinkError::UnpairedSubtractor {
-                        object: object.parsed.id,
-                        offset: relocation.offset,
-                    });
-                };
+            // Indexed rather than iterated: `SUBTRACTOR` is one half of a pair and
+            // needs the relocation that follows it, so the loop has to be able to
+            // consume two entries at once.
+            let relocations = &object.parsed.relocations;
+            let mut index = 0;
+            while index < relocations.len() {
+                let relocation = &relocations[index];
                 index += 1;
 
-                if record {
-                    note_reference(&mut referenced, pair);
-                }
-                let subtrahend = target_address(object, ids, placed, addresses, relocation.target)?;
-                let minuend = match indirect_personality(object, pair) {
-                    Some(slot) => slot,
-                    None => target_address(object, ids, placed, addresses, pair.target)?,
-                };
-
-                // Mach-O relocations carry their addend **in the bytes being
-                // patched**, not in the relocation entry — `addend` is zero on
-                // every one of them. For a pair that difference is not a small
-                // correction: the subtrahend is the section's own anchor label
-                // (`ltmpN`), so `minuend - subtrahend` is measured from the
-                // start of the contribution, while the field wants it measured
-                // from the field. The inline value is exactly that gap.
-                //
-                // Which makes the stored gap wrong the moment stripping moves
-                // either end of it, so it is re-measured against where the two
-                // ended up.
-                let anchor = anchor_offset(object, relocation);
-                let correction = anchor
-                    .map(|anchor| {
-                        strip.pair_correction(
-                            object.parsed.id,
-                            relocation.section,
-                            pair.offset,
-                            anchor,
-                        )
-                    })
-                    .unwrap_or(0);
-                let addend = pair.addend + inline_addend(object, pair) + correction;
-
-                let Some(pair_field) =
-                    strip.remap(object.parsed.id, relocation.section, pair.offset)
+                // Where the patched field lives in the output.
+                let Some((section_index, chunk_address)) =
+                    placed.chunk(object.parsed.id, relocation.section).and_then(
+                        |(index, address)| image.layout.section(index).map(|_| (index, address)),
+                    )
                 else {
+                    // The relocation patches a section that was dropped as
+                    // linker-internal; nothing in the output refers to it.
                     continue;
                 };
-                let Some(buffer) = contents.get_mut(&section_index) else {
+
+                // Recorded before any branch, so no relocation kind can be added
+                // later that reads an address without declaring it. Over-recording
+                // only costs an unnecessary rebuild; under-recording reuses bytes
+                // that are wrong.
+                if record {
+                    note_reference(&mut referenced, relocation);
+                }
+
+                let output_section = image.layout.section(section_index).expect("just matched");
+                // Where the field moved to. `None` means the bytes holding it were
+                // stripped, so there is nothing to patch — and, for a `SUBTRACTOR`,
+                // its partner must be stepped over with it.
+                let Some(field) =
+                    strip.remap(object.parsed.id, relocation.section, relocation.offset)
+                else {
+                    if relocation.kind == Arm64RelocationKind::Subtractor {
+                        index += 1;
+                    }
                     continue;
                 };
-                blinker_relocations::apply_pair(
-                    pair.length,
-                    chunk_offset + pair_field,
-                    subtrahend,
-                    minuend,
-                    addend,
-                    place,
+                let place = chunk_address + field;
+
+                // `SUBTRACTOR` computes a *difference* between two addresses, so
+                // it is meaningless alone: the pair is emitted as SUBTRACTOR (the
+                // value being subtracted) immediately followed by UNSIGNED (the
+                // value being subtracted from). Relative pointers in unwind and
+                // exception tables are built this way, which is why Rust hits it
+                // and simple C does not.
+                if relocation.kind == Arm64RelocationKind::Subtractor {
+                    let Some(pair) = relocations.get(index) else {
+                        return Err(LinkError::UnpairedSubtractor {
+                            object: object.parsed.id,
+                            offset: relocation.offset,
+                        });
+                    };
+                    index += 1;
+
+                    if record {
+                        note_reference(&mut referenced, pair);
+                    }
+                    let subtrahend =
+                        target_address(object, ids, placed, addresses, relocation.target)?;
+                    let minuend = match indirect_personality(object, pair) {
+                        Some(slot) => slot,
+                        None => target_address(object, ids, placed, addresses, pair.target)?,
+                    };
+
+                    // Mach-O relocations carry their addend **in the bytes being
+                    // patched**, not in the relocation entry — `addend` is zero on
+                    // every one of them. For a pair that difference is not a small
+                    // correction: the subtrahend is the section's own anchor label
+                    // (`ltmpN`), so `minuend - subtrahend` is measured from the
+                    // start of the contribution, while the field wants it measured
+                    // from the field. The inline value is exactly that gap.
+                    //
+                    // Which makes the stored gap wrong the moment stripping moves
+                    // either end of it, so it is re-measured against where the two
+                    // ended up.
+                    let anchor = anchor_offset(object, relocation);
+                    let correction = anchor
+                        .map(|anchor| {
+                            strip.pair_correction(
+                                object.parsed.id,
+                                relocation.section,
+                                pair.offset,
+                                anchor,
+                            )
+                        })
+                        .unwrap_or(0);
+                    let addend = pair.addend + inline_addend(object, pair) + correction;
+
+                    let Some(pair_field) =
+                        strip.remap(object.parsed.id, relocation.section, pair.offset)
+                    else {
+                        continue;
+                    };
+                    let Some(buffer) = bytes.contribution(relocation.section) else {
+                        continue;
+                    };
+                    blinker_relocations::apply_pair(
+                        pair.length,
+                        pair_field,
+                        subtrahend,
+                        minuend,
+                        addend,
+                        place,
+                        buffer,
+                    )
+                    .map_err(|source| LinkError::Relocation {
+                        object: object.parsed.id,
+                        kind: relocation.kind,
+                        source: Box::new(source),
+                    })?;
+                    continue;
+                }
+
+                // GOT-based kinds are patched with the address of the *slot*, not
+                // of the symbol; the symbol's address is what the slot contains.
+                let got = if needs_got(relocation.kind) {
+                    match relocation.target {
+                        RelocationTarget::Symbol(id) => object
+                            .parsed
+                            .symbol(id)
+                            .and_then(|s| got_slots.get(&s.name))
+                            .copied(),
+                        RelocationTarget::Section(_) => None,
+                    }
+                } else {
+                    None
+                };
+
+                let tlv = if needs_tlv(relocation.kind) {
+                    match relocation.target {
+                        RelocationTarget::Symbol(id) => object
+                            .parsed
+                            .symbol(id)
+                            .and_then(|s| tlv_slots.get(&s.name))
+                            .copied(),
+                        RelocationTarget::Section(_) => None,
+                    }
+                } else {
+                    None
+                };
+
+                // A branch to an imported function goes to its stub: dyld has not
+                // filled anything in yet, and a BRANCH26 cannot reach an address
+                // that does not exist until load time.
+                let stub = if relocation.kind == Arm64RelocationKind::Branch26 {
+                    match relocation.target {
+                        RelocationTarget::Symbol(id) => object
+                            .parsed
+                            .symbol(id)
+                            .and_then(|s| stub_slots.get(&s.name))
+                            .copied(),
+                        RelocationTarget::Section(_) => None,
+                    }
+                } else {
+                    None
+                };
+
+                // A pointer-sized data reference to an imported symbol cannot be
+                // patched at all: the address does not exist until dyld supplies
+                // it. The field stays zero and a bind entry tells dyld where to
+                // write. TLV descriptors are built this way — their first word is
+                // a pointer to `__tlv_bootstrap`, which lives in libdyld.
+                if relocation.kind == Arm64RelocationKind::Unsigned {
+                    if let RelocationTarget::Symbol(id) = relocation.target {
+                        if let Some(symbol) = object.parsed.symbol(id) {
+                            if imports.contains(&symbol.name) {
+                                if let Some((segment_index, segment)) = image
+                                    .layout
+                                    .segments
+                                    .iter()
+                                    .enumerate()
+                                    .find(|(_, seg)| seg.name == output_section.segment)
+                                {
+                                    extra_binds.push(Bind {
+                                        segment: segment_index as u8,
+                                        offset: place - segment.vm_address,
+                                        symbol: symbol.name.clone(),
+                                        library_ordinal: exports
+                                            .map(|e| e.ordinal(&symbol.name))
+                                            .unwrap_or(1),
+                                        addend: relocation.addend,
+                                    });
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                // A descriptor's pointer to its variable is stored as an offset
+                // into the per-thread block rather than as an address.
+                let thread_local_offset = if relocation.kind == Arm64RelocationKind::Unsigned
+                    && output_section.name == "__thread_vars"
+                {
+                    thread_local_base(image)
+                } else {
+                    None
+                };
+
+                let target = match (stub, got.or(tlv)) {
+                    (Some(address), _) => address,
+                    // A GOT-based reference to an *imported* symbol has no address
+                    // of its own — that is the point of importing it. The
+                    // instruction is patched from the slot's address, and `target`
+                    // is unused for these kinds, so a failed lookup here is
+                    // expected rather than an error.
+                    (None, Some(_)) => {
+                        target_address(object, ids, placed, addresses, relocation.target)
+                            .unwrap_or(0)
+                    }
+                    (None, None) => {
+                        target_address(object, ids, placed, addresses, relocation.target)?
+                    }
+                };
+
+                let Some(buffer) = bytes.contribution(relocation.section) else {
+                    continue; // zero-filled section: nothing to patch
+                };
+
+                // Rewrite an address into a block-relative offset where the
+                // descriptor expects one. Only targets that actually land in the
+                // block are converted: a descriptor also holds a bound thunk
+                // pointer and a key, and those are not offsets.
+                let target = match thread_local_offset {
+                    Some(base) if in_thread_local_block(image, target) => target - base,
+                    _ => target,
+                };
+
+                // An absolute pointer stored in data has to be slid by dyld.
+                // Excluded: fields in read-only segments (nothing writes them),
+                // and thread-local descriptor offsets, which are offsets rather
+                // than addresses and must not move.
+                if relocation.kind == Arm64RelocationKind::Unsigned
+                    && relocation.length == blinker_macho::RelocationLength::Long
+                    && thread_local_offset.is_none()
+                    && output_section.segment != "__TEXT"
+                {
+                    if let Some((segment_index, segment)) = image
+                        .layout
+                        .segments
+                        .iter()
+                        .enumerate()
+                        .find(|(_, seg)| seg.name == output_section.segment)
+                    {
+                        extra_rebases.push(Rebase {
+                            segment: segment_index as u8,
+                            offset: place - segment.vm_address,
+                        });
+                    }
+                }
+
+                // Relative to this object's contribution, which is what `buffer`
+                // now is — the field was `chunk_offset + field` into the whole
+                // output section, and the chunk is where the slice begins.
+                let field_offset = field;
+                apply(
+                    relocation.kind,
+                    relocation.length,
+                    field_offset,
+                    Context {
+                        place,
+                        target,
+                        addend: relocation.addend,
+                        got,
+                        tlv,
+                        pc_relative: relocation.pc_relative,
+                    },
                     buffer,
                 )
                 .map_err(|source| LinkError::Relocation {
@@ -4987,183 +5275,102 @@ fn apply_relocations(
                     kind: relocation.kind,
                     source: Box::new(source),
                 })?;
+            }
+
+            if !record {
                 continue;
             }
-
-            // GOT-based kinds are patched with the address of the *slot*, not
-            // of the symbol; the symbol's address is what the slot contains.
-            let got = if needs_got(relocation.kind) {
-                match relocation.target {
-                    RelocationTarget::Symbol(id) => object
-                        .parsed
-                        .symbol(id)
-                        .and_then(|s| got_slots.get(&s.name))
-                        .copied(),
-                    RelocationTarget::Section(_) => None,
-                }
-            } else {
-                None
-            };
-
-            let tlv = if needs_tlv(relocation.kind) {
-                match relocation.target {
-                    RelocationTarget::Symbol(id) => object
-                        .parsed
-                        .symbol(id)
-                        .and_then(|s| tlv_slots.get(&s.name))
-                        .copied(),
-                    RelocationTarget::Section(_) => None,
-                }
-            } else {
-                None
-            };
-
-            // A branch to an imported function goes to its stub: dyld has not
-            // filled anything in yet, and a BRANCH26 cannot reach an address
-            // that does not exist until load time.
-            let stub = if relocation.kind == Arm64RelocationKind::Branch26 {
-                match relocation.target {
-                    RelocationTarget::Symbol(id) => object
-                        .parsed
-                        .symbol(id)
-                        .and_then(|s| stub_slots.get(&s.name))
-                        .copied(),
-                    RelocationTarget::Section(_) => None,
-                }
-            } else {
-                None
-            };
-
-            // A pointer-sized data reference to an imported symbol cannot be
-            // patched at all: the address does not exist until dyld supplies
-            // it. The field stays zero and a bind entry tells dyld where to
-            // write. TLV descriptors are built this way — their first word is
-            // a pointer to `__tlv_bootstrap`, which lives in libdyld.
-            if relocation.kind == Arm64RelocationKind::Unsigned {
-                if let RelocationTarget::Symbol(id) = relocation.target {
-                    if let Some(symbol) = object.parsed.symbol(id) {
-                        if imports.contains(&symbol.name) {
-                            if let Some((segment_index, segment)) = image
-                                .layout
-                                .segments
-                                .iter()
-                                .enumerate()
-                                .find(|(_, seg)| seg.name == output_section.segment)
-                            {
-                                extra_binds.push(Bind {
-                                    segment: segment_index as u8,
-                                    offset: place - segment.vm_address,
-                                    symbol: symbol.name.clone(),
-                                    library_ordinal: exports
-                                        .map(|e| e.ordinal(&symbol.name))
-                                        .unwrap_or(1),
-                                    addend: relocation.addend,
-                                });
-                            }
-                            continue;
-                        }
-                    }
-                }
-            }
-
-            // A descriptor's pointer to its variable is stored as an offset
-            // into the per-thread block rather than as an address.
-            let thread_local_offset = if relocation.kind == Arm64RelocationKind::Unsigned
-                && output_section.name == "__thread_vars"
-            {
-                thread_local_base(image)
-            } else {
-                None
-            };
-
-            let target = match (stub, got.or(tlv)) {
-                (Some(address), _) => address,
-                // A GOT-based reference to an *imported* symbol has no address
-                // of its own — that is the point of importing it. The
-                // instruction is patched from the slot's address, and `target`
-                // is unused for these kinds, so a failed lookup here is
-                // expected rather than an error.
-                (None, Some(_)) => {
-                    target_address(object, ids, placed, addresses, relocation.target).unwrap_or(0)
-                }
-                (None, None) => target_address(object, ids, placed, addresses, relocation.target)?,
-            };
-
-            let Some(buffer) = contents.get_mut(&section_index) else {
-                continue; // zero-filled section: nothing to patch
-            };
-
-            // Rewrite an address into a block-relative offset where the
-            // descriptor expects one. Only targets that actually land in the
-            // block are converted: a descriptor also holds a bound thunk
-            // pointer and a key, and those are not offsets.
-            let target = match thread_local_offset {
-                Some(base) if in_thread_local_block(image, target) => target - base,
-                _ => target,
-            };
-
-            // An absolute pointer stored in data has to be slid by dyld.
-            // Excluded: fields in read-only segments (nothing writes them),
-            // and thread-local descriptor offsets, which are offsets rather
-            // than addresses and must not move.
-            if relocation.kind == Arm64RelocationKind::Unsigned
-                && relocation.length == blinker_macho::RelocationLength::Long
-                && thread_local_offset.is_none()
-                && output_section.segment != "__TEXT"
-            {
-                if let Some((segment_index, segment)) = image
-                    .layout
-                    .segments
-                    .iter()
-                    .enumerate()
-                    .find(|(_, seg)| seg.name == output_section.segment)
-                {
-                    extra_rebases.push(Rebase {
-                        segment: segment_index as u8,
-                        offset: place - segment.vm_address,
-                    });
-                }
-            }
-
-            let field_offset = chunk_offset + field;
-            apply(
-                relocation.kind,
-                relocation.length,
-                field_offset,
-                Context {
-                    place,
-                    target,
-                    addend: relocation.addend,
-                    got,
-                    tlv,
-                    pc_relative: relocation.pc_relative,
-                },
-                buffer,
-            )
-            .map_err(|source| LinkError::Relocation {
+            records.push(ObjectRecord {
                 object: object.parsed.id,
-                kind: relocation.kind,
-                source: Box::new(source),
-            })?;
+                deps: dependency_hashes(
+                    object,
+                    &names.interned[slot],
+                    names.digests,
+                    addresses,
+                    &referenced,
+                )
+                .into(),
+                binds: bind_start..extra_binds.len(),
+                rebases: rebase_start..extra_rebases.len(),
+            });
         }
+        Ok(Patch {
+            binds: extra_binds,
+            rebases: extra_rebases,
+            records,
+            reused,
+            reused_relocations,
+        })
+    };
 
-        if !record {
-            continue;
+    // Handed out a chunk at a time rather than split evenly: an object whose
+    // bytes came from the cache costs almost nothing and one that is relocated
+    // costs everything, and on an edit the expensive ones are the objects of
+    // the crate that changed — which are consecutive. A static split would put
+    // all of them on one thread.
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    let size = carved.len().div_ceil(threads * 4).max(1);
+    let pieces: Vec<(usize, &mut [ObjectBytes<'_>])> = carved
+        .chunks_mut(size)
+        .enumerate()
+        .map(|(index, slice)| (index * size, slice))
+        .collect();
+    let queue = std::sync::Mutex::new(pieces.into_iter());
+    let (queue, run_chunk) = (&queue, &run_chunk);
+    let claimed: Vec<Vec<(usize, Result<Patch, LinkError>)>> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(move || {
+                    let mut mine = Vec::new();
+                    loop {
+                        // The lock is held for the length of a `next`, once
+                        // per chunk — not once per object, and never while any
+                        // relocation is applied.
+                        let next = queue.lock().expect("the queue is not poisoned").next();
+                        let Some((base, slice)) = next else {
+                            return mine;
+                        };
+                        mine.push((base, run_chunk(base, slice)));
+                    }
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().expect("a relocation worker panicked"))
+            .collect()
+    });
+
+    // Back into object order, and only then merged: a record's `binds` range
+    // means nothing except against the vector it is appended to.
+    let mut patches: Vec<(usize, Result<Patch, LinkError>)> =
+        claimed.into_iter().flatten().collect();
+    patches.sort_by_key(|(base, _)| *base);
+    let mut extra_binds: Vec<Bind> = Vec::new();
+    let mut records: Vec<ObjectRecord> = Vec::new();
+    let mut reused = 0u64;
+    let mut reused_relocations = 0u64;
+    for (_, patch) in patches {
+        let patch = patch?;
+        let bind_base = extra_binds.len();
+        let rebase_base = extra_rebases.len();
+        for record in patch.records {
+            records.push(ObjectRecord {
+                binds: record.binds.start + bind_base..record.binds.end + bind_base,
+                rebases: record.rebases.start + rebase_base..record.rebases.end + rebase_base,
+                ..record
+            });
         }
-        records.push(ObjectRecord {
-            object: object.parsed.id,
-            deps: dependency_hashes(
-                object,
-                &names.interned[slot],
-                names.digests,
-                addresses,
-                &referenced,
-            )
-            .into(),
-            binds: bind_start..extra_binds.len(),
-            rebases: rebase_start..extra_rebases.len(),
-        });
+        extra_binds.extend(patch.binds);
+        extra_rebases.extend(patch.rebases);
+        reused += patch.reused;
+        reused_relocations += patch.reused_relocations;
     }
+    // The slices go out of scope here, which is what releases the buffers.
+    drop(carved);
+    contents.extend(buffers);
     Ok(Patched {
         contents,
         binds: extra_binds,
