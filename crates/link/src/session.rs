@@ -845,19 +845,29 @@ impl Session {
         }))
     }
 
-    /// Intern a batch of parses' names, hashing them on every core first.
+    /// Intern a batch of parses' names, answering everything answerable on
+    /// every core first.
     ///
-    /// [`Session::interned`] hashes each name where it interns it, so a cold
-    /// link's 976,000 names were hashed one at a time on the thread driving the
-    /// extraction — 117 ms, most of it reading sixty bytes of mangled name and
-    /// mixing them. The table itself has to be walked serially, since interning
-    /// one name decides what id the next gets; the hashing does not, and it is
-    /// the larger half.
+    /// [`Session::interned`] interns one name at a time, and that loop is 117 ms
+    /// of a cold link's 976,000 names. Almost none of it is work: hashing all
+    /// of them takes 7 ms, and the other 110 is *waiting* — a name's bucket, the
+    /// span that bucket names, and the arena text that span points at are three
+    /// loads that each need the last one's answer, and an iteration that may
+    /// insert into the table is a barrier the next name's chain cannot start
+    /// across. One name in flight at a time, a million times over.
     ///
-    /// So a whole round is hashed at once and then walked through the table
-    /// with nothing left to compute. The ids come out in the same order and by
-    /// the same rule as before — `parses` is in the order the round settled on
-    /// before any thread started, and the walk below follows it.
+    /// So the answerable half is lifted out. Hashing a name and asking
+    /// [`SymbolNames::get_hashed`] for it touch nothing and depend on nothing,
+    /// so a whole round's worth goes to every core at once; what comes back is
+    /// an id for every name the table already held. Only the names that were new
+    /// are left, and those are filed in order, serially, because which id each
+    /// one gets depends on how many came before it.
+    ///
+    /// The ids come out exactly as they did. `parses` is in the order the round
+    /// settled on before any thread started, the walk below follows it, and a
+    /// name that was absent when the cores looked is interned here in that same
+    /// order — including the second occurrence of a name this batch introduces,
+    /// which finds the id the first occurrence just created.
     ///
     /// Seeding is not required for correctness: a parse that misses is interned
     /// where it is asked for, exactly as before.
@@ -874,25 +884,31 @@ impl Session {
         if missing.len() < 2 {
             return;
         }
-        let hashed = crate::parallel::map_chunks(&missing, |_, chunk| {
+        let Session { memo, names, .. } = self;
+        let held: &SymbolNames = names;
+        let probed = crate::parallel::map_chunks(&missing, |_, chunk| {
             chunk
                 .iter()
                 .map(|parse| {
                     parse
                         .symbols
                         .iter()
-                        .map(|symbol| blinker_symbols::hash_of(&symbol.name))
-                        .collect::<Vec<u64>>()
+                        .map(|symbol| {
+                            let hash = blinker_symbols::hash_of(&symbol.name);
+                            (hash, held.get_hashed(&symbol.name, hash))
+                        })
+                        .collect::<Vec<_>>()
                 })
                 .collect::<Vec<_>>()
         });
-        let Session { memo, names, .. } = self;
-        for (parse, hashes) in missing.iter().zip(hashed.into_iter().flatten()) {
+        for (parse, answers) in missing.iter().zip(probed.into_iter().flatten()) {
             let ids: Vec<SymbolNameId> = parse
                 .symbols
                 .iter()
-                .zip(hashes)
-                .map(|(symbol, hash)| names.intern_hashed(&symbol.name, hash))
+                .zip(answers)
+                .map(|(symbol, (hash, found))| {
+                    found.unwrap_or_else(|| names.intern_hashed(&symbol.name, hash))
+                })
                 .collect();
             let key = Arc::as_ptr(*parse) as usize;
             let entry = memo.entry(key).or_insert_with(|| Memo::new(parse));

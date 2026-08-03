@@ -8257,3 +8257,38 @@ its instruction count, and precomputing the head of that chain into a dense
 array is a way to break it that has nothing to do with the parallelism it looks
 like. It is why the win survived being 15× larger than the work that was moved,
 and why measuring the halves before designing was worth more than the design.
+
+## 170. The interner's probe was a barrier, and lifting it was the other half
+
+Finding 169 established that interning 976,000 names is 7 ms of hashing and 110
+ms of waiting: three dependent loads per name — the bucket, the span it names,
+the arena text the span points at. It moved the hashing out and got 50 ms, not
+from the parallelism but from letting the probes overlap.
+
+The probe itself stayed serial for a reason that turned out not to be one.
+`intern_hashed` *may* insert, and an iteration that may insert is a barrier: the
+next name's chain cannot start until this one has finished with the table. So
+the loop ran one name in flight, a million times over.
+
+But the question "does the table already hold this name?" touches nothing. Split
+out as `get_hashed`, a whole round's worth goes to every core at once, and what
+comes back is an id for every name the table already had. Only names that were
+new are left to file away in order — and *those* have to be serial, because
+which id each one gets depends on how many came before it.
+
+```
+before   976,000 serial probes + 477,532 serial inserts
+after    976,000 parallel probes + 477,532 serial probes + 477,532 serial inserts
+```
+
+Predicted about 35 ms; measured -33.8, -52.2 and -33.1 ms over three interleaved
+runs, against a noise floor of -15.4, -3.7 and +6.6 on the same loaded machine.
+The prediction agreeing with the measurement is what makes three noisy runs
+worth believing.
+
+### Why this one gets better warm, not worse
+
+A cold link is the *bad* case for this split: half of what the cores answer is
+"no", and the serial phase does that half again. A warm link's names are almost
+all in the table already, so the serial phase is nearly empty and the whole
+probe is parallel. The usual shape of an optimisation is the opposite.

@@ -95,14 +95,8 @@ impl SymbolNames {
     /// table — the text comparison below still decides — it just files the name
     /// where no lookup will find it, so the same name would intern twice.
     pub fn intern_hashed(&mut self, name: &str, hash: u64) -> SymbolNameId {
-        if let Some(found) = self.lookup.get(&hash) {
-            // Copied out before the table is touched, and cheap to copy: the
-            // common case is one id.
-            for id in found.all() {
-                if self.text(id) == Some(name) {
-                    return id;
-                }
-            }
+        if let Some(id) = self.get_hashed(name, hash) {
+            return id;
         }
         let id = SymbolNameId(self.spans.len() as u32);
         let start = self.arena.len() as u32;
@@ -128,10 +122,25 @@ impl SymbolNames {
         std::str::from_utf8(bytes).ok()
     }
 
+    /// Look up an already-hashed name without interning it.
+    ///
+    /// The half of [`SymbolNames::intern_hashed`] that touches nothing. Answering
+    /// it is three loads that each have to wait for the last — the bucket, the
+    /// span it names, and the arena text the span points at — and a loop that
+    /// interned as it went could not start one name's chain until the previous
+    /// name's insert had finished with the table. Split out, a caller can ask
+    /// this of a whole batch at once, on every core, and be left with only the
+    /// names that were new to file away in order.
+    pub fn get_hashed(&self, name: &str, hash: u64) -> Option<SymbolNameId> {
+        let found = self.lookup.get(&hash)?;
+        // The common case is one id; distinct names that hash alike are told
+        // apart here rather than by trusting the hash.
+        found.all().find(|id| self.text(*id) == Some(name))
+    }
+
     /// Look up an existing name without interning it.
     pub fn get(&self, name: &str) -> Option<SymbolNameId> {
-        let found = self.lookup.get(&hash_of(name))?;
-        found.all().find(|id| self.text(*id) == Some(name))
+        self.get_hashed(name, hash_of(name))
     }
 
     pub fn len(&self) -> usize {
