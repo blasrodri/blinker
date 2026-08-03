@@ -1709,12 +1709,27 @@ pub fn link(request: &LinkRequest) -> Result<Image, LinkError> {
     )
 }
 
+macro_rules! gap {
+    ($t:expr, $name:expr) => {{
+        #[allow(clippy::print_stderr)]
+        if std::env::var_os("BLINKER_GAP_PARTS").is_some() {
+            let ms = $t.elapsed().as_secs_f64() * 1000.0;
+            if ms > 1.0 {
+                eprintln!("  gap {:>28}: {ms:6.1} ms", $name);
+            }
+        }
+        $t = std::time::Instant::now();
+    }};
+}
+
 fn link_inner(
     request: &LinkRequest,
     timings: &mut LinkTimings,
     session: &mut Session,
 ) -> Result<Image, LinkError> {
     let overall = std::time::Instant::now();
+    #[allow(unused_mut)]
+    let mut _gap = std::time::Instant::now();
 
     // The stub library's export list is a pure function of a file on disk —
     // it depends on nothing the objects produce — and parsing it costs 5.6 ms
@@ -1781,6 +1796,7 @@ fn link_inner(
     timings.stub_parse_ms = stub_ms;
     let objects = objects?;
     timings.read_and_parse_ms = elapsed_ms(step);
+    gap!(_gap, "after read_and_parse");
 
     // Every object's names as ids, gathered once for the whole link. A held
     // object's vector was interned by the link that first parsed it, so this
@@ -1813,6 +1829,7 @@ fn link_inner(
     session.forget_unused_memos(&live_parses);
 
     timings.dead_strip_ms = elapsed_ms(step);
+    gap!(_gap, "after dead_strip");
     timings.atoms_ms = strip_timings.atoms_ms;
     timings.liveness_ms = strip_timings.liveness_ms;
     timings.strip_build_ms = strip_timings.build_ms;
@@ -1828,6 +1845,7 @@ fn link_inner(
     let prep = std::time::Instant::now();
     let mut placements = placements_for(&objects, &strip);
     timings.prepare_ms = elapsed_ms(prep);
+    gap!(_gap, "after prepare");
     timings.placements_ms = timings.prepare_ms;
 
     if placements.is_empty() {
@@ -1872,10 +1890,12 @@ fn link_inner(
         }
     };
     timings.resolve_ms = elapsed_ms(step);
+    gap!(_gap, "after resolve");
 
     let sub = std::time::Instant::now();
     let survey = survey_relocations(&objects, &imports, &strip);
     timings.survey_ms = elapsed_ms(sub);
+    gap!(_gap, "after survey");
     let stubs = survey.stubs;
     // Synthesise `__got` before layout, so it is placed and addressed like any
     // other section rather than appended afterwards. Internal targets and
@@ -2006,6 +2026,7 @@ fn link_inner(
     // because the probe *is* a layout: sizing the load commands against one
     // shape and emitting another is how a reservation comes to be wrong.
     timings.prepare_ms += elapsed_ms(prep);
+    gap!(_gap, "got+prepare");
 
     let cache_step = std::time::Instant::now();
     // From this process first. A resident linker wrote this structure a moment
@@ -2070,6 +2091,7 @@ fn link_inner(
 
     timings.layout_probe_ms = elapsed_ms(step);
 
+    gap!(_gap, "probe layout + cache load");
     // With addresses known, copy content and patch it.
     let step = std::time::Instant::now();
     // Built once from the layout, and consulted a few hundred thousand times.
@@ -2265,6 +2287,7 @@ fn link_inner(
     let contents = patched.contents;
     let entry_offset = entry_offset(request, &objects, &probe, &strip)?;
     timings.relocate_ms = elapsed_ms(step);
+    gap!(_gap, "after relocate");
 
     // Pass two: the same layout, with real bytes.
     //
@@ -2288,6 +2311,7 @@ fn link_inner(
     rebases.extend(patched.rebases);
 
     timings.symbols_ms = elapsed_ms(sub);
+    gap!(_gap, "after symbols");
 
     let step = std::time::Instant::now();
     let image = assemble(
@@ -2307,6 +2331,7 @@ fn link_inner(
         },
     );
     timings.emit_ms = elapsed_ms(step);
+    gap!(_gap, "after emit");
     if let Ok(image) = &image {
         timings.emit_breakdown = image.timings;
     }
@@ -2360,11 +2385,14 @@ fn link_inner(
     }
 
     timings.accounting_ms = elapsed_ms(accounting);
+    gap!(_gap, "after accounting");
 
     if let (Some(path), Some(cache), Ok(image)) = (&request.cache_path, &mut cache, &image) {
         let cache_step = std::time::Instant::now();
         cache.image = image.bytes.clone();
+        gap!(_gap, "image bytes clone");
         cache.page_hashes.clone_from(&image.page_hashes);
+        gap!(_gap, "page hashes clone");
         // Written on this session's first link and held in memory thereafter;
         // see `Session::store_cache`. A cache that cannot be written is not an
         // error: the link succeeded, and the only consequence is that a future
@@ -2379,6 +2407,7 @@ fn link_inner(
         timings.cache_store_ms = elapsed_ms(cache_step);
     }
 
+    gap!(_gap, "cache store tail");
     timings.total_ms = elapsed_ms(overall);
     image
 }

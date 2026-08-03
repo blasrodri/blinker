@@ -7900,3 +7900,47 @@ built by repeated insertion from empty". This is its sibling: **a container
 built to be searched once, for something that is almost never there.** The fix
 is the same shape as an exception path — do the cheap test always, pay for the
 explanation only when you owe one.
+
+## 163. There was no hidden fifty milliseconds
+
+The stage table reported 36–50 ms "unmeasured", and a review of the data flow
+pointed at three quadratic `got.iter().any(...)` scans in the untimed region as
+the likely cause. Both were wrong, and finding out cost a `gap!` macro and two
+runs.
+
+The GOT assembly, with the loops still in it: **0.3 ms**, 2,520 entries against
+265 imports. Quadratic in shape, negligible in size — worth fixing for the
+shape, worth nothing for the clock.
+
+Bracketing every untimed region of `link_inner` accounts for the rest:
+
+```
+  read_and_parse             145.2 ms
+  dead_strip                  67.0
+  prepare                      1.2
+  resolve                      9.5
+  survey                       8.6
+  got + prepare (part two)    12.5
+  probe layout + cache load   50.6      <- the "unmeasured" time
+  relocate                   134.9
+  symbols                     32.6
+  emit                        82.9
+  accounting                  10.7
+  image bytes into the cache   3.6
+```
+
+The "unmeasured" number was an artefact of the harness's stage list, not work
+hiding from it: the probe layout is a real stage that the table reports
+separately, and the arithmetic double-counted the gap around it.
+
+`gap!` is kept, env-gated on `BLINKER_GAP_PARTS`, because the question it
+answers — *is there work between the stages?* — is one worth being able to ask
+in one command rather than by argument.
+
+### What the profile looks like now
+
+Nothing is above 25% and nothing is hiding. That is a different situation from
+the one this session started in, where `resolve` and `read_and_parse` were each
+a fifth of the link and one nested loop was worth 790 ms. From here on, every
+remaining win is either structural — making a stage's work proportional to what
+changed — or it is nothing.
