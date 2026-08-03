@@ -8996,3 +8996,44 @@ None of them is a hard problem. What made them invisible is that each one lives
 inside something that had already been optimised — parallelised, memoised,
 given a fast hasher — and a stage that has been worked on reads as a stage that
 has been dealt with.
+
+## 185. Two more parallel passes, and one that was not the problem
+
+`prepare` sizes the synthetic sections before layout runs, and two of its four
+parts cost 6 ms each.
+
+**`unwind_size` is a reduction and ran on one thread.** It counts how many of
+every object's compact-unwind records describe a function that survived
+stripping — reading that object's relocations and the strip map, writing
+nothing. `map_chunks` and a sum: **5.9 ms -> 0.73 ms**.
+
+**`personality` was not what it looked like.** Two things in it read as the
+cost and neither was:
+
+```rust
+for relocation in &object.parsed.relocations {
+    if relocation.section != section.id || ... { continue }
+```
+
+every relocation of the object walked to find the ones in one section, when the
+parse indexes them by section already; and
+
+```rust
+if !got.iter().any(|e| e.name == symbol.name)
+```
+
+a linear scan of a table that grows, comparing mangled names, to answer a
+membership question. Both were fixed — a `relocations_for` and a set — and the
+number did not move: 6.2 ms before, 6.2 ms after. What that pass costs is
+`eh_frame_personality_fields` parsing CIE augmentation data, which is neither
+of the two things that looked wrong.
+
+The changes are kept because they are less work and because the next person to
+read that loop should not have to rediscover that they are not the cost. But
+the entry is here for the other half: *"this is obviously quadratic"* is a
+hypothesis, and this file now has two of them in a row that measured zero (181's
+symbol-table pass was the first). The number moves or it does not.
+
+```
+prepare  14.4 ms -> 8.9 ms
+```

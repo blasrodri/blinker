@@ -2722,6 +2722,8 @@ fn build_cache(
         &identity::ContributionKeys,
     ),
 ) -> blinker_cache::LinkCache {
+    #[allow(unused_mut)]
+    let mut _g = std::time::Instant::now();
     let (session, ranges_of, identities) = known;
     // Input keys, one probe per distinct file. Archive members share their
     // archive's path and therefore its key: an rlib is proven unchanged once,
@@ -2771,11 +2773,13 @@ fn build_cache(
         })
         .collect();
 
+    gap!(_g, "cache: entries");
     let mut sections: Vec<_> = contents
         .into_iter()
         .flatten()
         .map(|(index, bytes)| (*index as u32, bytes.clone()))
         .collect();
+    gap!(_g, "cache: sections");
     sections.sort_unstable_by_key(|(index, _)| *index);
 
     blinker_cache::LinkCache {
