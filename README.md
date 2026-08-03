@@ -17,9 +17,9 @@ programs.
 | Dylibs, bundles, partial links | delegated to the system linker, with a recorded reason |
 | Output size | **0.85×** `ld-prime`'s on a large link, with dead-stripping |
 | Cold link, small (238 objects) | **1.10×** `ld-prime` — inside the spread |
-| Cold link, large (5,637 objects) | **2.28×** `ld-prime` |
+| Cold link, large (5,637 objects) | **2.11×** `ld-prime` |
 | Edit relink, small, resident | **12.1 ms** against `ld-prime`'s 31.6 ms cold |
-| Edit relink, large, resident | **596 ms** against `ld-prime`'s 332 ms cold |
+| Edit relink, large, resident | **610 ms** against `ld-prime`'s 322 ms cold |
 
 The last two rows are the metric the product exists for, and they are where the
 two scales disagree: on a small link the resident linker is comfortably faster
@@ -31,12 +31,12 @@ to link internally.
 
 See [PRODUCT_SPEC.md](PRODUCT_SPEC.md) for the product definition,
 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for the milestone sequence,
-and **[FINDINGS.md](FINDINGS.md)** for the 175 places reality contradicted the
+and **[FINDINGS.md](FINDINGS.md)** for the 178 places reality contradicted the
 plan — several of them contradicting earlier entries in the same file.
 
 ## What is not done
 
-- **Speed at scale.** 2.28× the system linker on a large cold link, against
+- **Speed at scale.** 2.11× the system linker on a large cold link, against
   1.10× on a small one, and the resident relink of a large program is still
   slower than a cold `ld-prime`. The reason is that several stages are still
   proportional to the whole program rather than to the edit — dead stripping
