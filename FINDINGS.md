@@ -9037,3 +9037,73 @@ symbol-table pass was the first). The number moves or it does not.
 ```
 prepare  14.4 ms -> 8.9 ms
 ```
+
+## 186. The write was never counted, and making it incremental made it slower
+
+Two things about `write_output`, one of them a measurement error that has been
+in every number this file records.
+
+### It ran after the clock stopped
+
+```rust
+let image = link_inner(request, &mut timings, session)?;
+timings.total_ms = elapsed_ms(overall);
+...
+write_output(&image.bytes, output)?;
+```
+
+195 MB reaching the filesystem, outside the total. Every "link" figure in this
+file excluded the largest single thing a link does and the one with by far the
+widest spread — instrumented, it ranged from 19 ms to 151 ms depending on what
+else the machine was doing.
+
+`wall` had been carrying it the whole time, which is the part that should have
+been noticed earlier: `scripts/relink.py` prints `wall` and `link` on adjacent
+lines specifically so the process around the link can be seen, and they
+disagreed by far more than a spawn and a page cache. A gap between two numbers
+you print next to each other is a question, and this one went unasked for a
+long time.
+
+### And the obvious optimisation is a pessimisation
+
+9,719 of 9,722 contributions keep their address, so nearly every byte written is
+the byte already at that offset. `clonefile` clones the previous output in
+constant time without copying a block, so the temporary can start as the last
+binary, take only the blocks that differ, and be renamed as before. It was
+built: clone first and compare the *clone* rather than `output`, so the bytes
+examined and the bytes patched are the same bytes; a mutable `MAP_SHARED`
+mapping so only dirtied pages are written back; parallel across blocks; falling
+back to a whole write at every step.
+
+It is slower, and not marginally. On a link whose output had not changed at all:
+
+```
+clone + patch   47 ms
+write whole     22 ms
+```
+
+Finding out which blocks differ reads the old 195 MB and the new 195 MB. Writing
+the file whole moves 195 MB once, into the page cache, at memory speed. **The
+comparison costs twice what the copy costs**, so no amount of skipped writing
+can pay for it.
+
+That is worth stating plainly because the reasoning that motivated it — "almost
+none of this changed, so almost none of it should be written" — is exactly the
+reasoning behind findings 174 and 179, where it was right. What is different
+here is that the previous stages could *identify* what changed as a by-product
+of work they were doing anyway, and the writer cannot: it has two byte arrays
+and no other information.
+
+So the incremental write is worth building only once the linker can say which
+ranges moved without comparing them — which is the same thing the incremental
+output model has to produce anyway. It was reverted, and the measurement is
+here so the next attempt starts from 47 against 22 rather than from the
+argument.
+
+### The harness was hiding it
+
+The first comparison showed no difference at all, because `scripts/relink.py`
+deletes the output before every iteration, so the clone path never ran. A real
+build leaves the previous binary in place. A benchmark that removes the artifact
+under test is measuring a case the product does not have — and it reported
+"no change" rather than "not exercised", which is the reading that costs a day.
