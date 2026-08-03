@@ -15,23 +15,38 @@ programs.
 | `cargo test` binaries | work |
 | Debug information | `SO`/`OSO`/`FUN` debug map emitted; `dsymutil` reads it back |
 | Dylibs, bundles, partial links | delegated to the system linker, with a recorded reason |
+| A whole `cargo build`'s links | **2.7×** the system toolchain resident, **1.6×** without a daemon |
 | Output size | **0.85×** `ld-prime`'s on a large link, with dead-stripping |
 | Cold link, small (238 objects) | **1.09×** `ld-prime` — inside the spread |
 | Cold link, large (5,637 objects) | **1.75×** `ld-prime` |
 | Edit relink, small, resident | **11.4 ms** against `ld-prime`'s 29.7 ms cold |
 | Edit relink, large, resident | **347 ms** against `ld-prime`'s 311 ms cold |
 
-The last two rows are the metric the product exists for, and they are where the
-two scales disagree: on a small link the resident linker is comfortably faster
-than a cold `ld-prime`, and on a large one it is still slower. Everything in
-"what is not done" below follows from that gap.
+The per-link rows are where the two scales disagree: on a small link the
+resident linker is comfortably faster than a cold `ld-prime`, and on a large one
+it is still slower.
+
+The first row is the one a developer feels, and it took until finding 189 to
+measure. `cargo build` on this workspace performs sixteen links with a median of
+23 inputs — the 5,637-object link the rows below are taken from is the tail, not
+the shape. Across a build's worth of links:
+
+```
+ld64 (cc)             732-812 ms
+blinker, no daemon    484-495 ms
+blinker + daemon      294-301 ms
+```
+
+`scripts/build-links.py` produces that. Note the middle arm: the daemon is
+opt-in and nothing starts it, so 484 ms is what setting `linker = "…/blinker"`
+actually gets you today.
 
 Delegation to the system linker remains the default; pass `--blinker-internal`
 to link internally.
 
 See [PRODUCT_SPEC.md](PRODUCT_SPEC.md) for the product definition,
 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for the milestone sequence,
-and **[FINDINGS.md](FINDINGS.md)** for the 193 places reality contradicted the
+and **[FINDINGS.md](FINDINGS.md)** for the 194 places reality contradicted the
 plan — several of them contradicting earlier entries in the same file.
 
 ## What is not done

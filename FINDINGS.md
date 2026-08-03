@@ -9244,3 +9244,59 @@ linked.
 ```
 alternating radbg + self   560 ms -> 271 ms, level with linking radbg alone
 ```
+
+## 189. Every benchmark here measured one link; a developer runs sixteen
+
+The question was what would justify using this linker. Answering it needed a
+number nothing in this repository produced: not how fast one link is, but how
+fast a *build* is.
+
+`cargo build` on this workspace performs sixteen links. Their input counts:
+
+```
+22 22 22 22 22 22 22 23 23 23 23 25 44 79 81 132
+```
+
+A median of 23. Every number in this file is taken from a 5,637-object
+rust-analyzer link, which is not the typical case — it is the tail. Three days
+of work went into the tail because it was the only workload the harnesses knew
+how to measure.
+
+Replaying those fifteen internal links (`scripts/build-links.py`):
+
+```
+ld64 (cc)             732-812 ms
+blinker, no daemon    484-495 ms     1.6x faster
+blinker + daemon      294-301 ms     2.7x faster
+```
+
+Against the number this file has been quoting — 350 ms warm against
+`ld-prime`'s 311 ms cold, a 13% *loss* — that is a different product. Both are
+true. They are answers to different questions, and only one of them is the
+question a developer asks.
+
+### The comparison is against `cc`, and that is not a handicap
+
+`rustc` invokes the C compiler driver, and this project occupies that position.
+So the substitution a user makes is `cc <argv>` -> `blinker <argv>`, and the
+driver's own spawn is on both sides. Part of why blinker wins cold is that `cc`
+spawns `ld` as a second process and blinker is one; that is a real saving to a
+real user and not an artefact.
+
+### The daemon is opt-in, and nothing turns it on
+
+The middle arm is what a user gets. `linker = "…/blinker"` in
+`.cargo/config.toml` is the whole of what most people will do, and it does not
+use the resident linker: `--blinker-daemon` is a flag, and nothing starts a
+server. 484 ms -> 294 ms is sitting there, and the mechanism this entire
+project is built around is off by default.
+
+That is a lifecycle problem, not a performance one, and it is worth more than
+anything in findings 179-188 put together.
+
+### What the tail is still for
+
+The large link remains the case where the developer waits, and it is still a
+loss: 350 ms warm against 311 ms cold. But it is one link of sixteen, and the
+work needed to win it is structural (187) where the work needed to win the
+build is plumbing.
