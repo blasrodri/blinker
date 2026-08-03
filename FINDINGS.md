@@ -8728,3 +8728,57 @@ of them — from a counter that had been printing the whole time. A stage timer
 says how long something took; it cannot say that the work was avoidable. The
 reuse rate could, and it was sitting at 26% next to an address-change rate of
 0.04% for as long as both had been printed.
+
+## 180. The scan that finding 179 unlocked, and a regression that was not there
+
+Finding 179 took the reuse plan from 2,264 objects to 5,587, and inherited the
+work it had been skipping. `is_reusable` rejects on the input key *before* the
+dependency scan, so 3,370 objects had been costing one comparison each; now
+every one of them scans its whole dependency list. `cache_plan` went 4.8 ->
+10.4 ms, which for a while was larger than the `apply` it had just made cheap.
+
+The scan is 3.9 million `NameHash`es — 30 MB — probed against a set of 197.
+Nothing in it writes anything shared. It is finding 176's shape exactly, one
+stage further along: the proof that replaced the work became the work. Probing
+the input keys first (341 distinct files, once each) leaves a decision that
+touches only its arguments, so it runs on every core and the answers merge in
+chunk order.
+
+```
+cache_plan  10.5 ms -> 2.4 ms      relocate  77 ms -> 66 ms
+```
+
+The same pass also stopped building two half-million-entry `LinkCache`es per
+link. `changed_addresses` was a method, both callers had the address table and
+no cache to call it on, so both wrapped the table in a throwaway cache —
+copying 506,405 entries to reach a function that only reads them.
+
+### The regression that was noise
+
+Six iterations of the small workload put the change 1 ms behind:
+
+```
+[1 head]  12.2 ms    [1 final]  13.3 ms
+[2 head]  13.0 ms    [2 final]  13.4 ms
+```
+
+which is a coherent story — 238 objects and 88,000 dependencies is less work
+than spawning fifteen threads — and the fix for it was already drafted: a
+work-size threshold below which the pass stays serial. Twelve iterations
+instead of six:
+
+```
+[1 head]  12.3    [1 final]  12.2
+[2 head]  12.1    [2 final]  12.0
+[3 head]  13.1    [3 final]  12.4
+[4 head]  12.0    [4 final]  12.0
+```
+
+There was nothing to fix. The threshold would have been a constant tuned to a
+number that did not exist, and it would have looked justified forever after,
+because a serial path on a small link is not obviously wrong.
+
+This is the same trap as `scripts/ab.py`'s noise floor (whose two-copies-of-one-
+binary spread ran from +6.6 to -21.5 ms) with one difference: the wrong reading
+here came with a *mechanism*. A plausible explanation for a measurement is not
+evidence for it, and it is most dangerous when it arrives first.
