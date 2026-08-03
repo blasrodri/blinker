@@ -8939,3 +8939,60 @@ It measured 2 ms, not the 15 the removed pass appeared to be worth. Almost all
 of what the first pass cost was warming 9,722 contributions into cache for the
 second, which then ran that much faster. Removing redundant work is still right;
 predicting how much it was worth from how long it took was not.
+
+## 184. The counter that cost more than the stage it was next to
+
+`accounting` had been sitting at 9-13 ms in every profile in this file, and it
+is not part of a link. It counts how many contributions kept their address —
+a diagnostic, gated behind `count_placement`, which only the relink harness
+turns on.
+
+So the 9 ms was never a cost to a user. It was a cost to every *measurement*:
+`scripts/relink.py` sets the flag, so every stage table this file quotes was
+taken from a link doing 9 ms of work that a real one does not, and the
+percentages beside every other stage were computed against that total.
+
+What it was doing is the third occurrence of the same thing in two days:
+
+```rust
+.filter(|(path, key)| blinker_cache::InputKey::probe(path).as_ref() == Some(key))
+```
+
+341 inputs probed, which for rustc's objects is a read and a BLAKE3 — the same
+22 MB hashed at the top of the link (182), hashed again by the reuse plan
+before that was fixed, and hashed a third time here. The session proved every
+one of them and `key_for` hands the answer back. **9.2 ms -> 1.1 ms.**
+
+The comment directly above it reads:
+
+> a counter that costs a millisecond to compute is a measurement changing the
+> thing it measures.
+
+It cost nine.
+
+### Two more of the same kind
+
+**The previous image was copied to be read.** `previous_signature` cloned the
+last link's finished binary — 194 MB — out of a cache that is rebuilt from
+*this* link's image before being stored again. Nothing reads the old bytes
+afterwards, so it can be taken. `layout` 31.0 -> 28.4 ms.
+
+**The FDE map was grown from empty.** Finding where 265,308 FDEs landed runs on
+every core and takes 6.2 ms; merging the per-core results into one map took
+4.6, because the map started empty and eighteen doublings reinsert everything
+already in it at each one. Finding 135, in the serial tail of a parallel pass.
+`unwind` 20.0 -> 16.6 ms.
+
+### The shape of the last three days
+
+Eleven changes, and the profiler pointed at the right stage every time and at
+the right *line* none of them. Every one was found by reading the function
+underneath the number: a sort for a search nobody performs, a scan where a
+lookup was meant, a file hashed three times, a map grown from empty, a layout
+computed to count its own sections, a probe the comment above it said had
+already happened.
+
+None of them is a hard problem. What made them invisible is that each one lives
+inside something that had already been optimised — parallelised, memoised,
+given a fast hasher — and a stage that has been worked on reads as a stage that
+has been dealt with.
