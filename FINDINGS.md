@@ -7690,3 +7690,81 @@ Findings 157, 158 and this one are one mistake made in three places: a question
 about a *name* answered once per *occurrence of that name*. Interning, hashing,
 allocating. In each case the fix was to move the answer to where the name is
 first seen and hand out a subscript. Worth looking for a fourth.
+
+## 160. The fourth one: the address lookup was keyed by the name's text
+
+`unwind` was 105 ms of an 880 ms link, and the code already said where it went:
+"`eh_frame_fde_offsets` was 1.00 ms of `fill_unwind_info`'s 1.25". Re-measured
+at scale, that ratio held — 95 ms of 110.
+
+### The first fix measured nothing
+
+Inside that function, per `__eh_frame` section, was
+
+```rust
+let mut relocations: Vec<&InputRelocation> = object.parsed.relocations
+    .iter().filter(|r| r.section == section.id).collect();
+```
+
+— a scan of the object's *entire* relocation list to read one section's, which
+is quadratic in an object's size, and `relocations_for` did the same. The
+parser walks sections in order and appends, so the list is already grouped by
+section and the scan can be a binary search. That is now what it is, with the
+invariant documented on the accessor and checked in debug builds against the
+scan it replaces, so a `ParsedObject` assembled some other way cannot quietly
+return a subset of a section's relocations.
+
+**It measured zero**: 102.7 ms before, 104.3 after. Kept anyway — it removes a
+quadratic for a `partition_point`, and 3.9 million relocations over 5,637
+objects is the wrong shape to leave — but recorded as measuring nothing so
+nobody reads a win into it. The lesson is the ordinary one: the hypothesis was
+plausible, the arithmetic (5,637 x 690 steps) said 4 ms, and I did not do the
+arithmetic first.
+
+### What it actually was
+
+Instrumented per call site:
+
+```
+  fde: 265,308 fdes   remap 6 ms   target_address 93 ms   insert 11 ms
+```
+
+`target_address` resolves a relocation's symbol through `AddressMap`, which was
+`HashMap<&str, u64>` for globals and the same per object for locals. Two hashes
+of a mangled Rust name and a `memcmp` per question — and the same lookup runs
+once per relocation in `apply`.
+
+`AddressMap` is now keyed by `SymbolNameId`. The asker always holds the symbol,
+so it always holds the id; `target_address` takes the object's id vector and
+subscripts. The few callers that genuinely start from a name — the GOT and
+thread-pointer tables, a few thousand entries — pay one string hash through the
+interning table, which is where that cost belongs.
+
+`address_table` got simpler on the way past: it had been carrying an
+`Address { name, value }` pair so it could find each entry's id, and the map
+now *is* id-keyed, so it iterates it directly.
+
+### Measured
+
+```
+                  before    after
+  unwind           104.3     67.5
+  apply             96.6     59.6
+  address_map       36.2     11.4
+  address_table     10.9     10.7
+  relocate         299.0    188.4
+  link             927.0    838.7
+```
+
+Output byte-identical on the 187 MB image. 62 suites, 648 tests green, and
+green under `BLINKER_VERIFY_LIVENESS=1`.
+
+### Four times now
+
+157 interned the names once. 158 hashed them once. 159 stopped copying them and
+deduplicated by id. This one stopped looking them up by text. Every one was the
+same sentence — *a question about a name, asked once per occurrence of the
+name* — and every one was invisible until the workload was large enough for the
+occurrences to outnumber the names by two orders of magnitude.
+
+Together, on the same edit and the same machine: **1,994.6 ms -> 838.7 ms**.

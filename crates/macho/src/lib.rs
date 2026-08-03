@@ -283,10 +283,39 @@ impl ParsedObject {
     }
 
     /// Relocations that patch bytes in `section`.
-    pub fn relocations_for(&self, section: SectionId) -> impl Iterator<Item = &InputRelocation> {
-        self.relocations
-            .iter()
-            .filter(move |r| r.section == section)
+    /// This section's relocations, as a slice of the object's list.
+    ///
+    /// # The invariant this rests on
+    ///
+    /// `relocations` is grouped by section, in ascending section order,
+    /// because [`crate::parse`] walks the sections in order and appends. That
+    /// is what makes this a binary search instead of a scan.
+    ///
+    /// The difference is not small. Every caller that asks per section was
+    /// walking *all* of the object's relocations to read one section's, which
+    /// is quadratic in an object's size and invisible on a small one: finding
+    /// where each function's FDE landed came to 95 ms of a 110 ms unwind stage
+    /// on a debug rust-analyzer link (finding 160).
+    ///
+    /// A `ParsedObject` assembled some other way could break the grouping, and
+    /// the failure would be silent — a subset of a section's relocations, so
+    /// bytes left unpatched. Debug builds check the answer against the scan
+    /// this replaces, which every test run exercises on real objects.
+    pub fn relocations_for(&self, section: SectionId) -> &[InputRelocation] {
+        let start = self
+            .relocations
+            .partition_point(|r| r.section.0 < section.0);
+        let len = self.relocations[start..].partition_point(|r| r.section.0 == section.0);
+        let found = &self.relocations[start..start + len];
+        debug_assert_eq!(
+            found.len(),
+            self.relocations
+                .iter()
+                .filter(|r| r.section == section)
+                .count(),
+            "relocations are not grouped by section, so this returned a subset of them"
+        );
+        found
     }
 
     /// Total size of all sections that occupy file bytes.

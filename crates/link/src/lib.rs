@@ -44,8 +44,7 @@ use std::sync::Arc;
 use blinker_layout::InputPlacement;
 use blinker_macho::{
     parse_object, Arm64RelocationKind, InputRelocation, InputSection, ObjectId, ParsedObject,
-    RelocationLength, RelocationTarget, SectionId, SectionKind, SymbolId, SymbolStrength,
-    SymbolVisibility,
+    RelocationLength, RelocationTarget, SectionId, SectionKind, SymbolStrength, SymbolVisibility,
 };
 use blinker_output::image::Dylib;
 use blinker_output::symtab::OutputSymbol;
@@ -878,9 +877,10 @@ fn contribution_offsets(output: &blinker_layout::OutputSection) -> HashMap<(u32,
 
 fn eh_frame_fde_offsets(
     objects: &[LoadedObject],
+    interned: &[Arc<Vec<SymbolNameId>>],
     image: &Image,
     placed: &Placed,
-    addresses: &AddressMap<'_>,
+    addresses: &AddressMap,
     strip: &Strip,
 ) -> HashMap<u64, u32> {
     let mut offsets = HashMap::default();
@@ -895,7 +895,8 @@ fn eh_frame_fde_offsets(
     };
     let offsets_of = contribution_offsets(output);
 
-    for object in objects {
+    for (slot, object) in objects.iter().enumerate() {
+        let ids = &interned[slot];
         for section in &object.parsed.sections {
             if section.name != "__eh_frame" {
                 continue;
@@ -920,12 +921,8 @@ fn eh_frame_fde_offsets(
             //
             // `eh_frame_fde_offsets` was 1.00 ms of `fill_unwind_info`'s 1.25;
             // encoding the actual table was 0.02.
-            let mut relocations: Vec<&blinker_macho::InputRelocation> = object
-                .parsed
-                .relocations
-                .iter()
-                .filter(|r| r.section == section.id)
-                .collect();
+            let mut relocations: Vec<&blinker_macho::InputRelocation> =
+                object.parsed.relocations_for(section.id).iter().collect();
             // Stable, and the *last* match wins below. Both matter: a `PC
             // begin` field is a SUBTRACTOR pair — two relocations at one offset,
             // the anchor then the function — and the map this replaced kept
@@ -981,7 +978,7 @@ fn eh_frame_fde_offsets(
                         strip.remap(object.parsed.id, section.id, position),
                     ) {
                         if let Ok(function) =
-                            target_address(object, placed, addresses, relocation.target)
+                            target_address(object, ids, placed, addresses, relocation.target)
                         {
                             offsets.insert(function, (chunk_offset + moved) as u32);
                         }
@@ -1100,11 +1097,15 @@ fn survey_relocations(
 /// optionally a personality routine and an LSDA. The pointers are *relocations*
 /// rather than values — the object is not laid out yet — so the targets come
 /// from the relocation list and the scalars from the section bytes.
+// Eight, all distinct: the objects, their names, the layout, where each
+// contribution went, the addresses, the strip, the GOT and the FDE offsets.
+#[allow(clippy::too_many_arguments)]
 fn compact_unwind_entries(
     objects: &[LoadedObject],
+    interned: &[Arc<Vec<SymbolNameId>>],
     image: &Image,
     placed: &Placed,
-    addresses: &AddressMap<'_>,
+    addresses: &AddressMap,
     strip: &Strip,
     got_slots: &HashMap<String, u64>,
     fde_offsets: &HashMap<u64, u32>,
@@ -1129,7 +1130,8 @@ fn compact_unwind_entries(
     let mut targets: HashMap<(u64, u64), u64> = HashMap::default();
     let mut personality_names: HashMap<u64, String> = HashMap::default();
 
-    for object in objects {
+    for (slot, object) in objects.iter().enumerate() {
+        let ids = &interned[slot];
         for section in &object.parsed.sections {
             if section.name != "__compact_unwind" {
                 continue;
@@ -1151,13 +1153,9 @@ fn compact_unwind_entries(
             // For a section target the inline value is an address in the
             // object's own coordinate space, so the offset within that section
             // has to be recovered before rebasing onto the output address.
-            for relocation in object
-                .parsed
-                .relocations
-                .iter()
-                .filter(|r| r.section == section.id)
-            {
-                let Ok(base) = target_address(object, placed, addresses, relocation.target) else {
+            for relocation in object.parsed.relocations_for(section.id) {
+                let Ok(base) = target_address(object, ids, placed, addresses, relocation.target)
+                else {
                     continue;
                 };
 
@@ -1948,10 +1946,10 @@ fn link_inner(
     // which walks each symbol's defining section — cannot see them. They are
     // definitions all the same, and every reference resolves here.
     for (name, value) in common_addresses(&commons, &probe) {
-        // Interned rather than looked up: a common's name reaches the address
-        // table like any other, and the table indexes digests by id.
+        // Interned rather than looked up: a common has no defining section, so
+        // `address_map` never saw it, and every consumer asks by id.
         let id = session.names_mut().intern(name);
-        addresses.global.insert(name, Address { name: id, value });
+        addresses.global.insert(id, value);
     }
     // Taken after the last name is interned, so it covers every id above.
     let name_digests = session.digests();
@@ -1976,9 +1974,23 @@ fn link_inner(
     timings.eh_frame_ms = elapsed_ms(part);
 
     let part = std::time::Instant::now();
-    fill_got(&mut contents, &probe, &got, &addresses, &imports)?;
+    fill_got(
+        &mut contents,
+        &probe,
+        &got,
+        &addresses,
+        session.names(),
+        &imports,
+    )?;
     fill_stubs(&mut contents, &probe, &stubs, &got_slots)?;
-    fill_pointer_table(&mut contents, &probe, &tlv, &addresses, "__thread_ptrs")?;
+    fill_pointer_table(
+        &mut contents,
+        &probe,
+        &tlv,
+        &addresses,
+        session.names(),
+        "__thread_ptrs",
+    )?;
     timings.tables_ms = elapsed_ms(part);
 
     let part = std::time::Instant::now();
@@ -1986,6 +1998,7 @@ fn link_inner(
         &mut contents,
         &probe,
         &objects,
+        &interned,
         &placed,
         &addresses,
         &strip,
@@ -2512,7 +2525,7 @@ fn object_ranges_index(image: &Image) -> HashMap<u32, Vec<blinker_cache::Range>>
 /// folding in the scope and the table — which is what turned 140 ms of BLAKE3
 /// over half a million unchanged names into a subscript (finding 158).
 fn address_table(
-    addresses: &AddressMap<'_>,
+    addresses: &AddressMap,
     digests: &[blinker_cache::NameHash],
     got_slots: &HashMap<String, u64>,
     stub_slots: &HashMap<String, u64>,
@@ -2523,19 +2536,11 @@ fn address_table(
     let _t = std::time::Instant::now();
     let mut table: Vec<_> = addresses
         .global
-        .values()
-        .map(|address| {
-            (
-                combine(digest(address.name), GLOBAL, Table::Symbol),
-                address.value,
-            )
-        })
+        .iter()
+        .map(|(name, address)| (combine(digest(*name), GLOBAL, Table::Symbol), *address))
         .chain(addresses.local.iter().flat_map(|(object, names)| {
-            names.values().map(move |address| {
-                (
-                    combine(digest(address.name), *object, Table::Symbol),
-                    address.value,
-                )
+            names.iter().map(move |(name, address)| {
+                (combine(digest(*name), *object, Table::Symbol), *address)
             })
         }))
         .chain(indirect_entries(got_slots, Table::Got))
@@ -2665,19 +2670,22 @@ fn live_unwind_records(object: &LoadedObject, section: &InputSection, strip: &St
     // dropped anyway, so counting relocations rather than records is the same
     // number — except when there are none at all, where the section is not
     // something this understands and the whole of it is reserved for.
-    if live == 0 && !object.parsed.relocations_for(section.id).any(|_| true) {
+    if live == 0 && object.parsed.relocations_for(section.id).is_empty() {
         return total;
     }
     live.min(total)
 }
 
 /// Build the unwind table and write it into its section.
+// Eight for the same reason as `compact_unwind_entries`, which it calls.
+#[allow(clippy::too_many_arguments)]
 fn fill_unwind_info(
     contents: &mut SectionContents,
     image: &Image,
     objects: &[LoadedObject],
+    interned: &[Arc<Vec<SymbolNameId>>],
     placed: &Placed,
-    addresses: &AddressMap<'_>,
+    addresses: &AddressMap,
     strip: &Strip,
     got_slots: &HashMap<String, u64>,
 ) -> Result<(), LinkError> {
@@ -2696,9 +2704,10 @@ fn fill_unwind_info(
     // cost is finding where each function's FDE landed, not building the table
     // — which is the opposite of what the name suggests, and is where any work
     // on this should go.
-    let fde_offsets = eh_frame_fde_offsets(objects, image, placed, addresses, strip);
+    let fde_offsets = eh_frame_fde_offsets(objects, interned, image, placed, addresses, strip);
     let entries = compact_unwind_entries(
         objects,
+        interned,
         image,
         placed,
         addresses,
@@ -2840,7 +2849,8 @@ fn fill_pointer_table(
     contents: &mut HashMap<usize, Vec<u8>>,
     image: &Image,
     names: &[TableEntry],
-    addresses: &AddressMap<'_>,
+    addresses: &AddressMap,
+    interner: &SymbolNames,
     section_name: &str,
 ) -> Result<(), LinkError> {
     if names.is_empty() {
@@ -2862,7 +2872,14 @@ fn fill_pointer_table(
     for (slot, entry) in names.iter().enumerate() {
         // Looked up against the object that *referenced* it, so a local
         // definition is visible.
-        let Some(address) = addresses.lookup(entry.object, &entry.name) else {
+        // By name, because a table entry is named rather than carried from a
+        // symbol — a few thousand of them against the half million that go
+        // through `target_address`, so the string hash here is not the one
+        // that mattered.
+        let Some(address) = interner
+            .get(&entry.name)
+            .and_then(|name| addresses.lookup(entry.object, name))
+        else {
             continue;
         };
         let start = slot * GOT_ENTRY_SIZE as usize;
@@ -2876,7 +2893,8 @@ fn fill_got(
     contents: &mut HashMap<usize, Vec<u8>>,
     image: &Image,
     got: &[TableEntry],
-    addresses: &AddressMap<'_>,
+    addresses: &AddressMap,
+    interner: &SymbolNames,
     imports: &[String],
 ) -> Result<(), LinkError> {
     if got.is_empty() {
@@ -2901,11 +2919,12 @@ fn fill_got(
             // dyld writes this slot at load time; it starts as zero.
             continue;
         }
-        let address = addresses.lookup(SYNTHETIC_OBJECT, name).ok_or_else(|| {
-            LinkError::UndefinedSymbols {
+        let address = interner
+            .get(name)
+            .and_then(|id| addresses.lookup(SYNTHETIC_OBJECT, id))
+            .ok_or_else(|| LinkError::UndefinedSymbols {
                 names: vec![name.clone()],
-            }
-        })?;
+            })?;
         let start = slot * GOT_ENTRY_SIZE as usize;
         buffer[start..start + 8].copy_from_slice(&address.to_le_bytes());
     }
@@ -4297,23 +4316,21 @@ fn dependency_hashes(
     object: &LoadedObject,
     ids: &[SymbolNameId],
     digests: &[blinker_cache::NameHash],
-    addresses: &AddressMap<'_>,
+    addresses: &AddressMap,
     referenced: &HashSet<(u32, u8)>,
 ) -> Vec<blinker_cache::NameHash> {
     let mut hashes: Vec<_> = referenced
         .iter()
         .filter_map(|(symbol, table)| {
-            let name = &object.parsed.symbol(SymbolId(*symbol))?.name;
+            let name = *ids.get(*symbol as usize)?;
             let table = match table {
                 1 => blinker_cache::Table::Got,
                 2 => blinker_cache::Table::Stub,
                 3 => blinker_cache::Table::ThreadLocal,
                 _ => blinker_cache::Table::Symbol,
             };
-            // The scope still needs the text — it is a membership test against
-            // the borrowed address map — but the digest does not.
             Some(blinker_cache::combine(
-                digests[ids.get(*symbol as usize)?.0 as usize],
+                digests[name.0 as usize],
                 addresses.scope_of(object.parsed.id, name),
                 table,
             ))
@@ -4374,7 +4391,7 @@ impl Placed {
 /// and `placed` says where a *section* went — and a relocation needs all three
 /// to place its field and find its target.
 struct Placement<'a> {
-    addresses: &'a AddressMap<'a>,
+    addresses: &'a AddressMap,
     strip: &'a Strip,
     placed: &'a Placed,
 }
@@ -4437,6 +4454,7 @@ fn apply_relocations(
     let mut reused = 0u64;
     let mut reused_relocations = 0u64;
     for (slot, object) in objects.iter().enumerate() {
+        let ids = &names.interned[slot];
         // Where this object's fixups start. Binds and rebases are produced as
         // a side effect of relocating, so an object whose bytes are later
         // reused from the cache must carry its own away with it — and the
@@ -4543,10 +4561,10 @@ fn apply_relocations(
                 if record {
                     note_reference(&mut referenced, pair);
                 }
-                let subtrahend = target_address(object, placed, addresses, relocation.target)?;
+                let subtrahend = target_address(object, ids, placed, addresses, relocation.target)?;
                 let minuend = match indirect_personality(object, pair) {
                     Some(slot) => slot,
-                    None => target_address(object, placed, addresses, pair.target)?,
+                    None => target_address(object, ids, placed, addresses, pair.target)?,
                 };
 
                 // Mach-O relocations carry their addend **in the bytes being
@@ -4692,9 +4710,9 @@ fn apply_relocations(
                 // is unused for these kinds, so a failed lookup here is
                 // expected rather than an error.
                 (None, Some(_)) => {
-                    target_address(object, placed, addresses, relocation.target).unwrap_or(0)
+                    target_address(object, ids, placed, addresses, relocation.target).unwrap_or(0)
                 }
-                (None, None) => target_address(object, placed, addresses, relocation.target)?,
+                (None, None) => target_address(object, ids, placed, addresses, relocation.target)?,
             };
 
             let Some(buffer) = contents.get_mut(&section_index) else {
@@ -4839,8 +4857,9 @@ fn inline_addend(object: &LoadedObject, relocation: &InputRelocation) -> i64 {
 /// The output address a relocation refers to.
 fn target_address(
     object: &LoadedObject,
+    ids: &[SymbolNameId],
     placed: &Placed,
-    addresses: &AddressMap<'_>,
+    addresses: &AddressMap,
     target: RelocationTarget,
 ) -> Result<u64, LinkError> {
     match target {
@@ -4857,15 +4876,31 @@ fn target_address(
                 .parsed
                 .symbol(symbol_id)
                 .ok_or(LinkError::MissingSymbol { symbol: symbol_id })?;
+            let name = *ids
+                .get(symbol_id.0 as usize)
+                .ok_or(LinkError::MissingSymbol { symbol: symbol_id })?;
             addresses
-                .lookup(object.parsed.id, &symbol.name)
+                .lookup(object.parsed.id, name)
                 .ok_or(LinkError::UndefinedSymbols {
+                    // The text only on the failing path, where the cost of
+                    // finding it is beside the point.
                     names: vec![symbol.name.clone()],
                 })
         }
     }
 }
 
+/// Where every name in the link resolved to, by interned id.
+///
+/// # Why the key is an id and not the name
+///
+/// This is the hottest lookup in the linker: once per relocation in `apply`,
+/// and once per `__eh_frame` FDE while finding where each function's unwind
+/// record landed. Keyed by text it was two hashes of a mangled Rust name and a
+/// `memcmp` per question — 93 ms for the 265,308 FDEs alone, which was most of
+/// the unwind stage (finding 160). The asker always holds the symbol, and so
+/// its id.
+///
 /// Where every defined symbol ended up in the output image.
 ///
 /// Built once, across *all* objects. The first version of this searched only
@@ -4883,14 +4918,14 @@ fn target_address(
 /// thrown away at the end of the same link — around two hundred thousand heap
 /// allocations, for strings that already existed a pointer away.
 #[derive(Default)]
-struct AddressMap<'a> {
-    global: HashMap<&'a str, Address>,
+struct AddressMap {
+    global: HashMap<SymbolNameId, u64>,
     /// Locals, by object and then by name.
     ///
-    /// Nested rather than keyed by `(u32, &str)`, because a tuple key cannot
-    /// be *borrowed*: looking one up meant building the tuple, on a path asked
-    /// once per relocation. Two lookups in two maps beat one lookup plus that.
-    local: HashMap<u32, HashMap<&'a str, Address>>,
+    /// Nested rather than keyed by `(u32, SymbolNameId)` because a local's
+    /// object is the same for every symbol of it, so the outer lookup is
+    /// hoisted out of the loops that build and read this.
+    local: HashMap<u32, HashMap<SymbolNameId, u64>>,
 }
 
 /// Every name in the link, as ids and as digests.
@@ -4905,27 +4940,16 @@ struct Names<'a> {
     digests: &'a [blinker_cache::NameHash],
 }
 
-/// An address, and the interned name it belongs to.
-///
-/// The id is carried rather than looked up because `address_table` walks this
-/// map to hash half a million names, and finding each one's id would be the
-/// string hash the id exists to avoid.
-#[derive(Debug, Clone, Copy)]
-struct Address {
-    name: SymbolNameId,
-    value: u64,
-}
-
-impl AddressMap<'_> {
+impl AddressMap {
     /// The scope in which `lookup` would find `name` from `object`.
     ///
     /// Paired with `lookup` so the cache hashes the address the linker would
     /// actually have read, rather than one that merely shares its name.
-    fn scope_of(&self, object: ObjectId, name: &str) -> u32 {
+    fn scope_of(&self, object: ObjectId, name: SymbolNameId) -> u32 {
         if self
             .local
             .get(&object.0)
-            .is_some_and(|names| names.contains_key(name))
+            .is_some_and(|names| names.contains_key(&name))
         {
             object.0
         } else {
@@ -4933,24 +4957,24 @@ impl AddressMap<'_> {
         }
     }
 
-    fn lookup(&self, object: ObjectId, name: &str) -> Option<u64> {
+    fn lookup(&self, object: ObjectId, name: SymbolNameId) -> Option<u64> {
         // A local definition in this object shadows a global of the same name,
         // which is what "local" means.
         self.local
             .get(&object.0)
-            .and_then(|names| names.get(name))
-            .or_else(|| self.global.get(name))
-            .map(|address| address.value)
+            .and_then(|names| names.get(&name))
+            .or_else(|| self.global.get(&name))
+            .copied()
     }
 }
 
 /// Compute the output address of every definition.
-fn address_map<'a>(
-    objects: &'a [LoadedObject],
+fn address_map(
+    objects: &[LoadedObject],
     interned: &[Arc<Vec<SymbolNameId>>],
     placed: &Placed,
     strip: &Strip,
-) -> AddressMap<'a> {
+) -> AddressMap {
     let mut map = AddressMap::default();
     // Sized once rather than grown into: the global map ends up holding every
     // non-local definition in the link, and growing there from empty rehashes
@@ -5001,14 +5025,10 @@ fn address_map<'a>(
             let Some(name) = ids.get(symbol.id.0 as usize).copied() else {
                 continue;
             };
-            let address = Address {
-                name,
-                value: address,
-            };
             if symbol.visibility == SymbolVisibility::Local {
-                locals.insert(symbol.name.as_str(), address);
+                locals.insert(name, address);
             } else {
-                global.insert(symbol.name.as_str(), address);
+                global.insert(name, address);
             }
         }
     }

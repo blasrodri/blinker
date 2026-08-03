@@ -72,7 +72,7 @@ fn main() -> std::process::ExitCode {
 
         println!("  sections: {}", object.sections.len());
         for section in &object.sections {
-            let relocations = object.relocations_for(section.id).count();
+            let relocations = object.relocations_for(section.id).len();
             println!(
                 "    {:<28} {:<14} size={:<8} align={:<4} relocs={}",
                 section.qualified_name(),
