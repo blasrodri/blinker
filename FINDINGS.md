@@ -8167,3 +8167,47 @@ Three measurements, two of them measuring my own mistakes rather than the
 design. That is the normal ratio, and the alternative — keeping it because the
 argument was good — is how a codebase fills up with machinery nobody can
 justify later.
+
+## 168. `read_and_parse` was not parsing
+
+The 340 ms `read_and_parse` of a cold rust-analyzer link had been carried for a
+while as "extraction rounds 241, of which member parse ~102". That number was
+never measured; it was inferred from the fact that the rounds are where members
+get parsed. Bracketing the loop says otherwise:
+
+```
+want    10.9 ms   resolve the wanted names, copy them out, sort by text
+pick    25.3 ms   `defining.get` per wanted name
+parse   23.9 ms   parse the round's members, on fifteen cores
+store   49.4 ms   `session.store_member`
+intern 116.7 ms   `session.interned`
+absorb   7.5 ms   `frontier.absorb`
+```
+
+Parsing is 24 ms — a tenth of the stage and within a few milliseconds of what a
+standalone benchmark of the same 5,504 members predicts. The stage named "read
+and parse" spends 93% of itself on everything except reading and parsing.
+
+This matters beyond the arithmetic. The whole of the previous session's plan for
+this stage — intern names at parse time, drop `InputSymbol.name: String`, reach
+for a faster parser — was aimed at the 102 ms. A throwaway A/B on the allocation
+half says what that plan was worth: removing the `String` per symbol takes the
+serial parse of 213k symbols from 16.5 ms to 11.8, and the *parallel* parse from
+2.30 ms to 1.39. Scaled to the real link, about 4 ms of wall clock for a
+forty-call-site refactor, because the parse has been on fifteen cores for a long
+time and 976,000 allocations spread over fifteen cores are not 976,000
+allocations. A number that sounds appalling and costs nothing.
+
+### What was actually there
+
+`store` was 49 ms, of which 46 was `interface_digest` — a walk of every global
+symbol of every member, hashing its name. It is a pure function of the parse,
+computed one member at a time, on the thread that had *just finished parsing all
+of them in parallel*. Working the round's digests out together and reading them
+back out of the memo is 60 ms off the stage (367 → 307 on an interleaved A/B)
+and does not change a byte of the output.
+
+The seeding is not load-bearing: a parse whose digest is not held is digested
+where it is asked for, exactly as before. That is the property worth keeping —
+the fast path is an optimisation of the slow one, not a replacement that the
+slow one has to stay consistent with.

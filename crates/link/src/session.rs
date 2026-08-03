@@ -52,6 +52,8 @@ struct Memo {
     /// Each of this object's symbol names, interned against `Session::names`.
     /// Indexed by `SymbolId`, which is a position in `parsed.symbols`.
     interned: Option<Arc<Vec<SymbolNameId>>>,
+    /// This parse's [`interface_digest`]. See [`Session::interface_of`].
+    interface: Option<u64>,
 }
 
 impl Memo {
@@ -61,6 +63,7 @@ impl Memo {
             boundaries: FastMap::default(),
             atoms: None,
             interned: None,
+            interface: None,
         }
     }
 }
@@ -619,9 +622,9 @@ impl Session {
     /// map complete without `note_interface`'s "absent means changed" rule
     /// firing on a rename, which would invalidate every answer that a rename
     /// is supposed to leave alone.
-    fn note_interface_unchanged(&mut self, path: &Path, parsed: &ParsedObject) {
-        self.interfaces
-            .insert(path.to_path_buf(), interface_digest(parsed));
+    fn note_interface_unchanged(&mut self, path: &Path, parsed: &Arc<ParsedObject>) {
+        let digest = self.interface_of(parsed);
+        self.interfaces.insert(path.to_path_buf(), digest);
     }
 
     /// Whether a freshly parsed member's interface is the one held for it.
@@ -644,9 +647,60 @@ impl Session {
         self.interfaces_changed = true;
     }
 
+    /// This parse's interface digest, computed if it is not already held.
+    ///
+    /// Held per parse rather than per path because it is a function of the
+    /// parse and nothing else — the same bytes arriving under a second name
+    /// have the same interface, and a parse the session already holds has
+    /// already answered this.
+    fn interface_of(&mut self, parse: &Arc<ParsedObject>) -> u64 {
+        let key = Arc::as_ptr(parse) as usize;
+        let entry = self.memo.entry(key).or_insert_with(|| Memo::new(parse));
+        *entry
+            .interface
+            .get_or_insert_with(|| interface_digest(parse))
+    }
+
+    /// Work out a batch of parses' interface digests on every core.
+    ///
+    /// Storing an input notes its interface, and a digest walks every global
+    /// symbol the object has — so a cold link's 5,504 archive members were
+    /// 46 ms of name hashing done one member at a time, on the thread that had
+    /// just finished parsing all of them in parallel. The digests do not depend
+    /// on each other and none of them is wanted until the next round, so they
+    /// are worked out together and read back out of the memo.
+    ///
+    /// Seeding is not required for correctness: a parse that misses is digested
+    /// where it is asked for, exactly as before.
+    pub(crate) fn seed_interfaces(&mut self, parses: &[Arc<ParsedObject>]) {
+        let missing: Vec<&Arc<ParsedObject>> = parses
+            .iter()
+            .filter(|parse| {
+                !self
+                    .memo
+                    .get(&(Arc::as_ptr(parse) as usize))
+                    .is_some_and(|held| held.interface.is_some())
+            })
+            .collect();
+        if missing.len() < 2 {
+            return;
+        }
+        let digested = crate::parallel::map_chunks(&missing, |_, chunk| {
+            chunk
+                .iter()
+                .map(|parse| interface_digest(parse))
+                .collect::<Vec<_>>()
+        });
+        for (parse, digest) in missing.iter().zip(digested.into_iter().flatten()) {
+            let key = Arc::as_ptr(*parse) as usize;
+            let entry = self.memo.entry(key).or_insert_with(|| Memo::new(parse));
+            entry.interface = Some(digest);
+        }
+    }
+
     /// Note an input's symbol interface, and whether it moved.
-    fn note_interface(&mut self, path: &Path, parsed: &ParsedObject) {
-        let digest = interface_digest(parsed);
+    fn note_interface(&mut self, path: &Path, parsed: &Arc<ParsedObject>) {
+        let digest = self.interface_of(parsed);
         match self.interfaces.insert(path.to_path_buf(), digest) {
             Some(previous) if previous == digest => {}
             // Absent as well as different: an input this process has not seen

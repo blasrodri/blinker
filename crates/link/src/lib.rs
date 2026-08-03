@@ -3323,6 +3323,18 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
         }
     }
 
+    // Their interface digests first, for the same reason as the members below.
+    let digestible: Vec<Arc<ParsedObject>> = todo
+        .iter()
+        .filter_map(
+            |at| match loaded[*at].as_ref().and_then(|r| r.as_ref().ok()) {
+                Some(Loaded::Object(object)) => Some(Arc::clone(&object.parsed)),
+                _ => None,
+            },
+        )
+        .collect();
+    session.seed_interfaces(&digestible);
+
     // Everything freshly read goes into the session for the next link.
     for &at in &todo {
         match loaded[at].as_ref().and_then(|r| r.as_ref().ok()) {
@@ -3558,6 +3570,15 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
                 .map(|slot| slot.expect("every member was visited"))
                 .collect()
         };
+
+        // Every member's interface digest at once, while there are still
+        // fifteen cores to do it on — `store_member` below wants one each.
+        let digestible: Vec<Arc<ParsedObject>> = todo
+            .iter()
+            .filter_map(|at| parsed[*at].as_ref().ok())
+            .map(|loaded| Arc::clone(&loaded.parsed))
+            .collect();
+        session.seed_interfaces(&digestible);
 
         // Freshly parsed members go into the session; held ones are already in
         // it, and re-storing them would be a map write per member per link.
