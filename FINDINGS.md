@@ -8647,3 +8647,84 @@ array subscript.
 where each function's FDE landed, 6.7 encoding, 2.9 collecting — and `apply` is
 already on every core (166). Nothing here has the shape the other three had, and
 guessing at it would be inventing work rather than removing it.
+
+## 179. `relocate` was not the problem; the reuse plan was refusing to fire
+
+Finding 178 bracketed `relocate` and said so: `unwind` and `apply` had no
+obvious shape, and guessing would be inventing work. The way back in was not a
+profiler. It was one line of the relink report:
+
+```
+addresses: 197/506405 changed (0.04%)
+reused 2264/5637 objects, 1002916/3887921 relocations (26%)
+```
+
+Nothing about a program whose addressing is 99.96% unchanged explains reusing
+26% of its relocations. `apply` was 24 ms because three quarters of the work it
+was doing had already been done by the previous link.
+
+Counting the *reasons* the plan turned objects down, rather than the rate:
+
+```
+plan_reuse: 2264 of 5637 kept
+  turned down  no-entry 3  key 3370  ranges 0  deps 0
+```
+
+`deps 0` is the load-bearing number. Not one object was rejected for reading an
+address that moved — which is the condition the cache exists to check, and the
+only one whose failure means the bytes are actually stale. Every rejection came
+from the identity test in front of it.
+
+### A member has no file of its own
+
+The identity test is an `InputKey`: a content hash, or for a content-addressed
+path a `(path, mtime, size)`. It answers "is this the input the cached entry was
+built from", and it answers it *about a file*. An archive member is not a file.
+The key it gets is its archive's, and an rlib is rewritten whenever anything in
+the crate is recompiled — so a crate downstream of an edit gets a new archive
+key and every member inside it looks changed.
+
+The fifteen rlibs that failed hold 3,370 of the link's 5,637 objects. All 3,370
+were relocated again to produce, byte for byte, what the cache was already
+holding.
+
+This is finding 174's phenomenon at the next stage down. There, a re-read
+archive threw away parses whose bytes had not changed; here, the same archive
+throws away *relocations* whose inputs had not changed. Both had the same cause
+— reasoning about the archive when the question was about the member — and 174
+had already built the answer to it: `Session::member` serves a held parse only
+after proving the new archive holds the same bytes at that index. That proof is
+strictly stronger than the key it stands in for. A `LoadedObject` now carries
+whether it was served that way, and the plan asks the flag instead of the key.
+
+```
+apply       24.5 ms -> 3.3 ms      relocations reused  26% -> 98%
+relocate    92.6 ms -> 77.7 ms     link  ~426 ms -> ~406 ms
+```
+
+`cache_plan` grew 4.8 -> 10.4 ms, which is the honest cost of the change: it now
+inserts 5,587 entries where it inserted 2,264.
+
+### The test passed before it should have
+
+The first version asserted `reused_objects > 0`, and it passed against a
+deliberate sabotage of the flag. The fixture links three objects — `main.o` and
+two archive members — and `main.o` is a file, so its key is a content hash and
+it reuses correctly no matter what the members do. An assertion that only counts
+reuse is satisfied by the one object that was never in question. `assert_eq!(3)`
+fails at 1, which is the number the bug produces.
+
+Then it passed against the sabotage *again*, and that one was not the test's
+fault: restoring `lib.rs` from a `sed -i.bak` backup restores its old mtime, so
+cargo saw nothing newer than the build and re-ran the sabotaged binary. A
+verification that silently tests the previous build is worse than no
+verification, and it looks identical to a passing one. `touch` the file after
+any restore-by-move.
+
+### What this says about where to look
+
+Three stages had been profiled down in a row, and this was worth more than any
+of them — from a counter that had been printing the whole time. A stage timer
+says how long something took; it cannot say that the work was avoidable. The
+reuse rate could, and it was sitting at 26% next to an address-change rate of
+0.04% for as long as both had been printed.
