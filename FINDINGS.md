@@ -8782,3 +8782,80 @@ This is the same trap as `scripts/ab.py`'s noise floor (whose two-copies-of-one-
 binary spread ran from +6.6 to -21.5 ms) with one difference: the wrong reading
 here came with a *mechanism*. A plausible explanation for a measurement is not
 evidence for it, and it is most dangerous when it arrives first.
+
+## 181. Three stages named, and only two of them moved
+
+The instruction was `read_and_parse`, `emit` and `dead_strip`. Two moved and
+one did not, and the one that did not is the more useful entry.
+
+### `read_and_parse` 99 -> 77 ms
+
+**A sort for a search nobody performs.** `index_archive` sorted each archive's
+symbol table by name so `member_defining` could binary-search it. Nothing calls
+`member_defining` any more: finding 78 replaced the per-archive search with one
+index built across every archive at once, and that index reads the table by
+scanning it. The sort stayed.
+
+```
+index  200601904 bytes   73095 symbols   258 members   parse 12.5   sort 12.9
+```
+
+Half the cost of indexing rust-analyzer's largest rlib, ordering a table for a
+lookup that stopped happening. And it is on the critical path in the worst
+possible way: fifteen archives are re-read on an edit, one per core, so the
+stage's wall clock is whatever the largest one costs alone.
+
+The ordering that resolution actually depends on survives without it. The
+extraction round takes the *first* entry for a name, and an archive's symbol
+table already lists members in archive order, so the first occurrence names the
+same member the stable sort put first. Every output hash was unchanged, which
+is what says the two orders agree rather than that they happen to.
+
+**Hashing the names to build a name index.** The replacement index inherited
+what the binary search had cost: two million entries of sixty-odd bytes is
+120 MB of mangled name hashed, on one thread, to answer sixty-two thousand
+questions. Hashing touches nothing shared; filing the answer must be serial. So
+the same split the interner makes (175): hash on every core, key the table by
+the `u64`, keep the text and compare it rather than trusting the hash.
+
+```
+read_and_parse   85 ms -> 74 ms
+```
+
+The collision branch is the interesting part of that. Two distinct names
+hashing to one `u64` is a 10^-7 event that extracts the wrong archive member,
+and no test can reach it by choosing symbol names — that is what a 64-bit hash
+is for. So the insert and the lookup both take the hash as a parameter, and the
+test supplies a colliding pair directly. It fails when the branch is disabled,
+which is the only evidence that it works.
+
+### `dead_strip` 35 -> 31 ms
+
+`Atoms::resolved` was a `Vec<Vec<Option<usize>>>`: the traversal reads it once
+per edge — 1.2 million times — and a nested vector makes that two dependent
+loads, the inner vector's pointer and then the entry. It also spent sixteen
+bytes per entry to carry a value that fits in four, so the array being streamed
+was four times larger than the answers in it. One flat `Vec<u32>` with a base
+per block, and the probes that fill it run on every core.
+
+```
+atoms  6.0 -> 4.1 ms      traverse  21.0 -> 18.6 ms
+```
+
+### `emit` did not move
+
+The symbol table computed its string-table size and its highest interning key
+in two separate reductions over the same 1.7 million entries — 81 MB read twice
+to answer two questions about it. Fusing them is strictly less work and the
+change is kept, but the stage did not move:
+
+```
+emit   head 61.9 / 65.5 / 68.6 ms      after 61.4 / 67.5 / 68.2 ms
+```
+
+That is recorded as *unmeasured*, not as a win. A change that must be faster
+and measures flat is a change whose saving was smaller than the thing it was
+measured inside, and writing it down as 3 ms because the arithmetic says so is
+how a stage table stops describing the linker. `emit` is 82 MB of string table
+and 27 MB of entries built into a 194 MB image that is then hashed and written;
+one pass over 81 MB is not where it lives.
