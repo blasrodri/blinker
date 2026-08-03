@@ -8338,3 +8338,60 @@ owned `String`s in the symbol pipeline. Findings 168 and 169 had already
 measured that half at about 4 ms. The review's *structural* claim was right and
 its mechanism was wrong, and the stale README is why. Numbers left lying around
 are read as current.
+
+## 172. Two suggestions from the same paragraph: one already true, one a wash
+
+An outside review proposed replacing `OutputSymbol.name: String` with
+
+```rust
+enum NameRef<'a> { Empty, Borrowed(&'a str), Owned(Box<str>) }
+```
+
+and, in the next breath, replacing the stable sort that puts the symbol table
+into `LC_DYSYMTAB` group order with three vectors concatenated. Both were
+answered by measurement rather than argument, and they came out differently.
+
+### The borrowed name was already there, and the enum is the same size
+
+Finding 159 moved that field to `Cow<'a, str>` for exactly the stated reason.
+What was left of the suggestion was the shape: `Box<str>` in the owned arm
+instead of `String`, saving eight bytes in a struct built 1.7 million times.
+
+```text
+Cow<str>   24        String    24
+NameRef    24        Box<str>  16
+```
+
+`OutputSymbol` is 48 bytes either way. `Cow`'s niche optimisation already packs
+it into the space `String` alone occupies, so the proposed enum is byte-for-byte
+the same. A representation argument that is obviously right can still be worth
+nothing, and `size_of` settles it in less time than reasoning about it does.
+
+### The sort was real, and removing it bought its own cost back
+
+`sort_by_key(|s| s.group)` over 1,689,759 entries of 48 bytes — 81 MB
+rearranged to order a three-valued key — measured **10.8 to 17.1 ms of every
+link**. Walking the symbols once per group visits them in precisely the order
+the stable sort produced, so the entries and the string-table offsets come out
+identical, and the group counts fall out of the same walk.
+
+```text
+build()   with sort   min 31.1 ms   median 43.2 ms
+          no sort     min 32.0 ms   median 32.8 ms   (n=12 each)
+```
+
+**The minimum did not move.** The sort's 11-17 ms came back as two extra
+streaming passes over the same 81 MB. What did change is the median, by 10.4 ms,
+and the transient allocation: a stable sort of 1.7 million elements asks for a
+merge buffer, and that is what makes the bad runs bad.
+
+Kept, but not as a 10 ms win — as one less large allocation and one less 81 MB
+move, at equal best-case cost. Claiming the median here would be claiming the
+machine's load as a result.
+
+### The rule
+
+Two suggestions, one paragraph, one reviewer, equal confidence in both. One was
+already implemented and the remaining delta was zero by construction; the other
+named a real 17 ms and delivered none of it. Neither outcome was predictable
+from the argument, and both took under an hour to settle by measuring.
