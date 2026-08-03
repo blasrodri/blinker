@@ -38,7 +38,7 @@ use std::sync::Arc;
 use blinker_macho::ParsedObject;
 use blinker_symbols::{SymbolNameId, SymbolNames};
 
-use crate::hashing::{FastMap, FastSet};
+use crate::hashing::FastMap;
 use crate::mapping::Backing;
 
 /// What has been worked out about one held parse.
@@ -54,6 +54,11 @@ struct Memo {
     interned: Option<Arc<Vec<SymbolNameId>>>,
     /// This parse's [`interface_digest`]. See [`Session::interface_of`].
     interface: Option<u64>,
+    /// The last link that used this parse, for the same window `used_at`
+    /// applies to inputs. Holding the parse and dropping what was derived from
+    /// it leaves the second-largest half of the work in place: the atoms and
+    /// the interned name vectors are what `dead_strip` and `resolve` read.
+    used_at: u64,
 }
 
 impl Memo {
@@ -63,6 +68,7 @@ impl Memo {
             boundaries: FastMap::default(),
             atoms: None,
             interned: None,
+            used_at: 0,
             interface: None,
         }
     }
@@ -129,6 +135,68 @@ type ExtractionOrder = (Vec<PathBuf>, Vec<(usize, u32)>);
 /// The SDK stub files an exports set was read from, and the set itself.
 type HeldStubs = (Vec<(PathBuf, blinker_cache::InputKey)>, Arc<StubExports>);
 
+/// How many links an input survives without being mentioned.
+///
+/// Not one, which is what it was: a daemon serving a workspace alternates
+/// between its targets, and a window of one means each switch empties what the
+/// other just filled. Not unbounded either — a session that never forgets holds
+/// every program the daemon has ever linked, and these are mapped input files.
+///
+/// Four covers the shape the number exists for — a test binary, a build script,
+/// an executable, an example — and still drops a target that a build has moved
+/// on from within a few links.
+const RETAINED_LINKS: u64 = 4;
+
+/// A few answers from recent links, keyed by which link asked.
+///
+/// Every one of these was a single slot, which is correct for a linker that
+/// serves one program and silently wrong for a daemon that serves several: the
+/// slot holds whichever target linked last, so an alternating pair misses it
+/// every time. Two of them were *only* a miss; `imports` was worse, because its
+/// guard asks whether any interface moved and nothing there knows the target
+/// changed at all. What kept that safe was the eviction this finding removed —
+/// a different target emptied the session, so nothing was held to serve
+/// wrongly (finding 188).
+///
+/// Small and linear because it is: three entries, compared by a `u64`.
+#[derive(Default)]
+struct Recent<V> {
+    held: Vec<(u64, V)>,
+}
+
+impl<V> Recent<V> {
+    fn get(&self, key: u64) -> Option<&V> {
+        self.held
+            .iter()
+            .find(|(held, _)| *held == key)
+            .map(|(_, value)| value)
+    }
+
+    fn put(&mut self, key: u64, value: V) {
+        self.held.retain(|(held, _)| *held != key);
+        self.held.push((key, value));
+        if self.held.len() > RECENT_TARGETS {
+            self.held.remove(0);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.held.clear();
+    }
+}
+
+/// How many targets keep their per-link answers.
+const RECENT_TARGETS: usize = 3;
+
+/// How many finished images a session holds at once.
+///
+/// Much smaller than [`RETAINED_LINKS`] because the unit is different: an input
+/// is a mapped file the page cache owns anyway, and one of these is a 178 MB
+/// binary on the heap. Two is what an alternating pair needs; three leaves room
+/// for the third target of a workspace without holding half a gigabyte for the
+/// fourth.
+const RETAINED_CACHES: usize = 3;
+
 /// Parsed inputs held across links.
 ///
 /// Created once by a resident linker and passed to every link it performs. A
@@ -136,16 +204,32 @@ type HeldStubs = (Vec<(PathBuf, blinker_cache::InputKey)>, Arc<StubExports>);
 /// behaviour: every probe misses, and nothing is retained past the call.
 #[derive(Default)]
 pub struct Session {
-    /// The argument vector these entries were parsed for. See the module docs
-    /// on why a change to it empties everything.
-    inputs: Vec<PathBuf>,
+    /// Which link each held input was last part of.
+    ///
+    /// This was the previous link's argument vector, and anything not in the
+    /// *current* one was dropped. That is right for a linker serving one
+    /// program and wrong for a daemon, which is what it became: a workspace
+    /// alternates between a test binary, a build script and the executable,
+    /// and two targets with disjoint inputs empty each other's parses on every
+    /// switch. Measured, that took a rust-analyzer relink from 271 ms to 560 —
+    /// held 340 inputs to held 0 — and no benchmark here linked more than one
+    /// program, so nothing said so (finding 188).
+    ///
+    /// Keeping a stamp per path instead lets an input survive the links that
+    /// do not mention it, and [`RETAINED_LINKS`] decides how many.
+    used_at: FastMap<PathBuf, u64>,
+    /// How many links this session has served.
+    generation: u64,
+    /// Which target this link is for: a digest of its input list. What makes
+    /// an answer from a previous link belong to this one.
+    target: u64,
     entries: FastMap<PathBuf, (blinker_cache::InputKey, Entry)>,
     /// The SDK's exported symbols, and the stub files they came from.
     ///
     /// Kept whole rather than per file: it is one answer to one question —
     /// "which names does the system provide?" — and the files behind it are
     /// part of the SDK, so they change when Xcode changes and not otherwise.
-    stubs: Option<HeldStubs>,
+    stubs: Recent<HeldStubs>,
     /// Members already pulled out of archives and parsed. A Rust link extracts
     /// several hundred of them and parses every one on every link; holding the
     /// archive's bytes without holding what was parsed out of them leaves the
@@ -179,7 +263,7 @@ pub struct Session {
     /// a different set of archives. Storing them together is what lets the
     /// order survive an input list that changed *elsewhere* — which is every
     /// debug rebuild, because rustc renames the loose objects (finding 144).
-    extraction: Option<ExtractionOrder>,
+    extraction: Recent<ExtractionOrder>,
     /// A digest of each input's *symbol interface* — what it defines and what
     /// it leaves undefined — from when it was last parsed.
     ///
@@ -216,7 +300,7 @@ pub struct Session {
     /// path was ever written again. The no-op fast path reads the file, so
     /// every subsequent program lost it permanently — a resident linker that
     /// got slower the longer it ran.
-    cache_written: Option<PathBuf>,
+    cache_written: crate::hashing::FastSet<PathBuf>,
     /// Whether this session outlives the link that is using it.
     ///
     /// Set by the daemon, and by nothing else. It is not "am I warm yet" — it
@@ -256,7 +340,7 @@ pub struct Session {
     /// use instead — the same rule as `forget_unused_memos`, and for the same
     /// reason: without it a resident linker's memory grows with every build
     /// rather than with the program.
-    used_content: crate::hashing::FastSet<[u8; 32]>,
+    used_content: FastMap<[u8; 32], u64>,
     /// The last link's dead-strip answer, and the per-object projection
     /// digests it was computed from.
     ///
@@ -264,7 +348,7 @@ pub struct Session {
     /// contributes the atoms, edges and roots it contributed last time, then
     /// the owners map, the opaque set, the live set and the compaction are all
     /// the same, and so is this.
-    strip: Option<(Vec<u64>, std::sync::Arc<crate::reachability::Strip>)>,
+    strip: Recent<(Vec<u64>, std::sync::Arc<crate::reachability::Strip>)>,
     memo: FastMap<usize, Memo>,
     /// Every symbol name this session has ever seen, interned once.
     ///
@@ -294,7 +378,7 @@ pub struct Session {
     ///
     /// Keyed by object id, which is positional and stable for as long as the
     /// input list is — the same precondition the whole session runs under.
-    reach: FastMap<u32, u64>,
+    reach: Recent<FastMap<u32, u64>>,
     /// How many digests moved on this link, and how many were compared.
     reach_moved: u64,
     reach_total: u64,
@@ -310,7 +394,16 @@ pub struct Session {
     /// file, because a daemon that never wrote one would make every restart
     /// cold; every link after that keeps it in memory and leaves the disk
     /// alone.
-    cache: Option<(PathBuf, blinker_cache::LinkCache)>,
+    ///
+    /// One *per output*, and it was one slot. Two targets alternating missed
+    /// it every time, so every link decoded the file back off disk (29 ms) and
+    /// wrote it out again (76-91 ms) — the same single-slot mistake
+    /// `cache_written` below describes having already made once, made again in
+    /// the field beside it (finding 188).
+    ///
+    /// Bounded separately from everything else here, and tightly: each of
+    /// these holds a finished binary, 178 MB on a debug rust-analyzer link.
+    caches: FastMap<PathBuf, (u64, blinker_cache::LinkCache)>,
     /// How many inputs' interfaces moved, and the first one that did.
     ///
     /// A boolean says the replay was refused; this says by whom. Three of this
@@ -325,7 +418,7 @@ pub struct Session {
     /// strengths. That is precisely what [`interface_digest`] covers, so the
     /// answer stands whenever no interface moved *and* the SDK's exports are
     /// the ones it was computed against.
-    imports: Option<Vec<String>>,
+    imports: Recent<Vec<String>>,
     stubs_reparsed: bool,
     hits: usize,
     misses: usize,
@@ -360,30 +453,48 @@ impl Session {
     /// What cannot be kept is anything derived from the list *as a whole* —
     /// the extraction order and the import set, both of which are answers
     /// about every input at once.
-    pub fn begin(&mut self, inputs: &[PathBuf]) {
-        if self.inputs != inputs {
-            let surviving: FastSet<&Path> = inputs.iter().map(PathBuf::as_path).collect();
-            self.entries
-                .retain(|path, _| surviving.contains(path.as_path()));
-            self.members
-                .retain(|(archive, _), _| surviving.contains(archive.as_path()));
-            self.interfaces.retain(|path, _| {
-                // A member's interface is filed under a synthetic path inside
-                // its archive, so it survives with the archive rather than on
-                // its own.
-                surviving.contains(path.as_path())
-                    || path
-                        .parent()
-                        .is_some_and(|parent| surviving.contains(parent))
-            });
-            self.indexes
-                .retain(|path, _| surviving.contains(path.as_path()));
-            self.inputs = inputs.to_vec();
+    /// `target` identifies the program, not the input list. It comes from
+    /// `request_hash`, which covers the output's identifier, the entry symbol,
+    /// the options and the dylibs — and deliberately not the objects, because
+    /// rustc renames those on every debug build and a key that moved with them
+    /// would discard the extraction order on exactly the link it exists for
+    /// (finding 144). Keying these by the input list was tried first and broke
+    /// that test, which is what the test is for.
+    pub fn begin(&mut self, inputs: &[PathBuf], target: u64) {
+        self.generation += 1;
+        let now = self.generation;
+        self.target = target;
+        for path in inputs {
+            match self.used_at.get_mut(path) {
+                Some(stamp) => *stamp = now,
+                None => {
+                    self.used_at.insert(path.clone(), now);
+                }
+            }
         }
-        // Contents the previous link never looked at are dropped now, so a
-        // parse survives exactly as long as something keeps linking it.
-        let used = std::mem::take(&mut self.used_content);
-        self.by_content.retain(|hash, _| used.contains(hash));
+        // An input survives the links that do not mention it, for a while. The
+        // window is what makes alternating targets work; the bound is what
+        // stops a long-lived daemon holding every program it has ever linked.
+        let keep = now.saturating_sub(RETAINED_LINKS);
+        self.used_at.retain(|_, stamp| *stamp > keep);
+        let held = &self.used_at;
+        let surviving = |path: &Path| held.contains_key(path);
+        self.entries.retain(|path, _| surviving(path));
+        self.members.retain(|(archive, _), _| surviving(archive));
+        self.interfaces.retain(|path, _| {
+            // A member's interface is filed under a synthetic path inside
+            // its archive, so it survives with the archive rather than on
+            // its own.
+            surviving(path) || path.parent().is_some_and(surviving)
+        });
+        self.indexes.retain(|path, _| surviving(path));
+        // Contents no recent link looked at are dropped now, so a parse
+        // survives exactly as long as something keeps linking it — over the
+        // same window, because the whole point of this index is to serve an
+        // input whose path changed, and a path stamp cannot speak for it.
+        self.used_content.retain(|_, stamp| *stamp > keep);
+        let recent = &self.used_content;
+        self.by_content.retain(|hash, _| recent.contains_key(hash));
         self.hits = 0;
         self.misses = 0;
         self.content_hits = 0;
@@ -436,7 +547,7 @@ impl Session {
     ) -> Option<(Arc<ParsedObject>, Arc<Backing>)> {
         if let Some((blinker_cache::InputKey::Content(hash), _)) = self.entries.get(path) {
             let hash = *hash;
-            self.used_content.insert(hash);
+            self.used_content.insert(hash, self.generation);
         }
         if let Some(entry) = self.current(path, key) {
             return match entry {
@@ -454,7 +565,7 @@ impl Session {
         };
         let (parsed, backing) = self.by_content.get(&hash)?;
         let (parsed, backing) = (Arc::clone(parsed), Arc::clone(backing));
-        self.used_content.insert(hash);
+        self.used_content.insert(hash, self.generation);
         self.note_interface_unchanged(path, &parsed);
         // Filed under its new name too, so the next link finds it by path and
         // the entry is dropped with the input list when it stops being linked.
@@ -502,7 +613,7 @@ impl Session {
         };
         self.note_interface(path, parsed);
         if let blinker_cache::InputKey::Content(hash) = &key {
-            self.used_content.insert(*hash);
+            self.used_content.insert(*hash, self.generation);
             self.by_content
                 .insert(*hash, (Arc::clone(parsed), Arc::clone(data)));
         }
@@ -602,7 +713,7 @@ impl Session {
 
     /// The SDK's exports, if the stub files behind them are unchanged.
     pub fn stub_exports(&self, stubs: &[PathBuf]) -> Option<Arc<StubExports>> {
-        let (recorded, exports) = self.stubs.as_ref()?;
+        let (recorded, exports) = self.stubs.get(self.target)?;
         if recorded.len() != stubs.len() {
             return None;
         }
@@ -616,16 +727,22 @@ impl Session {
 
     /// The imports the last link resolved, if they must still be the same.
     pub fn imports(&mut self) -> Option<&[String]> {
-        if self.interfaces_changed || self.stubs_reparsed || self.imports.is_none() {
+        // The target key is not an optimisation. The two conditions before it
+        // ask whether anything *moved*, and neither can tell that this is a
+        // different program: a link whose inputs are all held reports nothing
+        // changed, and would be handed the other target's imports.
+        if self.interfaces_changed || self.stubs_reparsed {
             return None;
         }
+        let target = self.target;
+        self.imports.get(target)?;
         self.held_resolution = true;
-        self.imports.as_deref()
+        self.imports.get(target).map(Vec::as_slice)
     }
 
     /// Remember what resolution decided.
     pub fn store_imports(&mut self, imports: &[String]) {
-        self.imports = Some(imports.to_vec());
+        self.imports.put(self.target, imports.to_vec());
     }
 
     /// Remember the SDK's exports.
@@ -640,7 +757,7 @@ impl Session {
             };
             recorded.push((path.clone(), key));
         }
-        self.stubs = Some((recorded, exports));
+        self.stubs.put(self.target, (recorded, exports));
     }
 
     /// The extraction order the last link settled on, if it must still hold.
@@ -653,7 +770,7 @@ impl Session {
         if self.interfaces_changed {
             return None;
         }
-        let (recorded, order) = self.extraction.as_ref()?;
+        let (recorded, order) = self.extraction.get(self.target)?;
         if recorded != archives {
             return None;
         }
@@ -689,7 +806,7 @@ impl Session {
     /// Discard a replay that turned out not to hold, so this link recomputes
     /// and the next one is not offered the same wrong answer.
     pub fn abandon_extraction(&mut self) {
-        self.extraction = None;
+        self.extraction.clear();
         self.replayed_extraction = false;
         self.interfaces_changed = true;
     }
@@ -764,7 +881,7 @@ impl Session {
 
     /// Remember which members were extracted, and in what order.
     pub fn store_extraction(&mut self, archives: Vec<PathBuf>, order: Vec<(usize, u32)>) {
-        self.extraction = Some((archives, order));
+        self.extraction.put(self.target, (archives, order));
     }
 
     /// Inputs served from memory, and inputs that had to be read.
@@ -995,7 +1112,14 @@ impl Session {
     /// their `Arc`s alive with it — a resident linker's memory would grow with
     /// every rebuild rather than with the program being linked.
     pub fn forget_unused_memos(&mut self, used: &FastMap<usize, ()>) {
-        self.memo.retain(|key, _| used.contains_key(key));
+        let now = self.generation;
+        for key in used.keys() {
+            if let Some(memo) = self.memo.get_mut(key) {
+                memo.used_at = now;
+            }
+        }
+        let keep = now.saturating_sub(RETAINED_LINKS);
+        self.memo.retain(|_, memo| memo.used_at > keep);
     }
 
     /// The previous link's strip, if every object's projection is unchanged.
@@ -1003,7 +1127,7 @@ impl Session {
         &self,
         digests: &[u64],
     ) -> Option<std::sync::Arc<crate::reachability::Strip>> {
-        let (recorded, strip) = self.strip.as_ref()?;
+        let (recorded, strip) = self.strip.get(self.target)?;
         (recorded == digests).then(|| std::sync::Arc::clone(strip))
     }
 
@@ -1013,7 +1137,7 @@ impl Session {
         digests: Vec<u64>,
         strip: std::sync::Arc<crate::reachability::Strip>,
     ) {
-        self.strip = Some((digests, strip));
+        self.strip.put(self.target, (digests, strip));
     }
 
     /// Record this link's reachability digests and report how many moved.
@@ -1022,14 +1146,21 @@ impl Session {
     /// changed; if none moved, the live set cannot have changed and the whole
     /// strip is reusable.
     pub fn note_reachability(&mut self, digests: &[(u32, u64)]) -> (u64, u64) {
+        // Per target, because an object id is a position in *this* link's input
+        // list and means a different object in another's. Comparing across two
+        // targets would not be a wrong binary — nothing reads this but the
+        // report — but it would be a wrong number, which is its own kind of
+        // damage in a file like FINDINGS.
         let mut moved = 0;
-        let comparable = !self.reach.is_empty();
+        let held = self.reach.get(self.target);
+        let comparable = held.is_some_and(|held| !held.is_empty());
         for (object, digest) in digests {
-            if comparable && self.reach.get(object) != Some(digest) {
+            if comparable && held.and_then(|held| held.get(object)) != Some(digest) {
                 moved += 1;
             }
         }
-        self.reach = digests.iter().copied().collect();
+        self.reach
+            .put(self.target, digests.iter().copied().collect());
         self.reach_moved = if comparable {
             moved
         } else {
@@ -1050,15 +1181,12 @@ impl Session {
     /// produces the next, and handing out a reference would mean cloning a
     /// structure that contains the whole output image.
     pub fn take_cache(&mut self, path: &Path) -> Option<blinker_cache::LinkCache> {
-        match &self.cache {
-            Some((held, _)) if held == path => self.cache.take().map(|(_, cache)| cache),
-            _ => None,
-        }
+        self.caches.remove(path).map(|(_, cache)| cache)
     }
 
     /// The cache held for `path`, for writing it out.
-    pub fn cache_for(&self, path: &Path) -> Option<&(PathBuf, blinker_cache::LinkCache)> {
-        self.cache.as_ref().filter(|(held, _)| held == path)
+    pub fn cache_for(&self, path: &Path) -> Option<&blinker_cache::LinkCache> {
+        self.caches.get(path).map(|(_, cache)| cache)
     }
 
     /// Hold the cache this link produced, and say whether it must also be
@@ -1070,9 +1198,23 @@ impl Session {
     /// one link old, which costs one colder link and never a wrong one, because
     /// every cache is validated against its inputs before it is believed.
     pub fn store_cache(&mut self, path: &Path, cache: blinker_cache::LinkCache) -> bool {
-        let first = self.cache_written.as_deref() != Some(path);
-        self.cache_written = Some(path.to_path_buf());
-        self.cache = Some((path.to_path_buf(), cache));
+        let first = self.cache_written.insert(path.to_path_buf());
+        self.caches
+            .insert(path.to_path_buf(), (self.generation, cache));
+        // Least recently stored first, and only ever one over: each of these is
+        // a finished binary, so the bound is about memory and not about hit
+        // rate.
+        while self.caches.len() > RETAINED_CACHES {
+            let Some(oldest) = self
+                .caches
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(path, _)| path.clone())
+            else {
+                break;
+            };
+            self.caches.remove(&oldest);
+        }
         first
     }
 
@@ -1170,6 +1312,9 @@ fn interface_digest(parsed: &ParsedObject) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    /// One program, for the tests that are not about telling two apart.
+    const TARGET: u64 = 0xa11ce;
+
     use super::*;
     use blinker_test_support::Scratch;
 
@@ -1248,7 +1393,7 @@ mod tests {
         std::fs::write(&path, vec![0u8; 128]).expect("written");
 
         let mut session = Session::default();
-        session.begin(std::slice::from_ref(&path));
+        session.begin(std::slice::from_ref(&path), TARGET);
         let backing = Arc::new(Backing::Heap(vec![0u8; 128]));
         let parsed = Arc::new(ParsedObject {
             id: blinker_macho::ObjectId(0),
@@ -1279,7 +1424,7 @@ mod tests {
         // (finding 144). What protects the positional ids is the check in
         // `load_objects`, which serves a held parse only under the id this
         // link would assign it.
-        session.begin(&[path.clone(), scratch.join("b.o")]);
+        session.begin(&[path.clone(), scratch.join("b.o")], TARGET);
         assert!(
             session
                 .object(&path, blinker_cache::InputKey::probe(&path).as_ref())
@@ -1287,19 +1432,32 @@ mod tests {
             "an input that is still in the list was discarded with the list"
         );
 
-        // What does not survive is the input that stops being linked. It
-        // takes two links to go: the content index is pruned by *use*, not by
-        // the input list, because surviving a link whose paths all changed is
-        // the whole reason it exists (finding 145). So one link that does not
-        // touch it marks it, and the next drops it.
-        session.begin(&[scratch.join("b.o")]);
-        session.begin(&[scratch.join("b.o")]);
+        // And it survives the links that do not mention it at all, which is
+        // what a daemon alternating between two targets does on every switch.
+        // The window is `RETAINED_LINKS`; one link inside it must not drop it.
+        session.begin(&[scratch.join("b.o")], TARGET);
+        assert!(
+            session
+                .object(&path, blinker_cache::InputKey::probe(&path).as_ref())
+                .is_some(),
+            "an input skipped by one link was dropped — a workspace that \
+             alternates targets goes cold on every switch (finding 188)"
+        );
+
+        // What does not survive is the input that stops being linked. The
+        // bound is what keeps a resident linker's memory proportional to the
+        // programs it is *currently* building rather than to every program it
+        // has ever built.
+        for _ in 0..=RETAINED_LINKS {
+            session.begin(&[scratch.join("b.o")], TARGET);
+        }
         assert!(
             session
                 .object(&path, blinker_cache::InputKey::probe(&path).as_ref())
                 .is_none(),
-            "an input nothing has linked for two links was still held — the \
-             content index grows with every build rather than with the program"
+            "an input nothing has linked for {RETAINED_LINKS} links was still \
+             held — the session grows with every build rather than with the \
+             programs being built"
         );
     }
 
@@ -1317,7 +1475,7 @@ mod tests {
         std::fs::write(&second, vec![7u8; 128]).expect("same bytes, new name");
 
         let mut session = Session::default();
-        session.begin(std::slice::from_ref(&first));
+        session.begin(std::slice::from_ref(&first), TARGET);
         let backing = Arc::new(Backing::Heap(vec![7u8; 128]));
         let parsed = Arc::new(ParsedObject {
             id: blinker_macho::ObjectId(0),
@@ -1336,7 +1494,7 @@ mod tests {
         });
         session.store_object(&first, &parsed, &backing);
 
-        session.begin(std::slice::from_ref(&second));
+        session.begin(std::slice::from_ref(&second), TARGET);
         let held = session.object(&second, blinker_cache::InputKey::probe(&second).as_ref());
         assert!(
             held.is_some(),
@@ -1359,7 +1517,7 @@ mod tests {
         std::fs::write(&archive, vec![0u8; 128]).expect("written");
 
         let mut session = Session::default();
-        session.begin(&[object.clone(), archive.clone()]);
+        session.begin(&[object.clone(), archive.clone()], TARGET);
         session.store_extraction(vec![archive.clone()], vec![(0, 0)]);
         assert!(
             session.extraction(std::slice::from_ref(&archive)).is_some(),
@@ -1369,7 +1527,7 @@ mod tests {
         // The loose object is renamed, which is what a debug rebuild does. The
         // archives are untouched, so the order still means what it meant.
         let renamed = scratch.join("a.0bbbbbb.rcgu.o");
-        session.begin(&[renamed, archive.clone()]);
+        session.begin(&[renamed, archive.clone()], TARGET);
         assert!(
             session.extraction(std::slice::from_ref(&archive)).is_some(),
             "a rename of something that is not an archive discarded the \
@@ -1394,7 +1552,7 @@ mod tests {
         std::fs::write(&path, vec![1u8; 128]).expect("written");
 
         let mut session = Session::default();
-        session.begin(std::slice::from_ref(&path));
+        session.begin(std::slice::from_ref(&path), TARGET);
         let backing = Arc::new(Backing::Heap(vec![1u8; 128]));
         let parsed = Arc::new(ParsedObject {
             id: blinker_macho::ObjectId(0),

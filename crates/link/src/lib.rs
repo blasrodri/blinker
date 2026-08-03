@@ -1772,7 +1772,8 @@ fn link_inner(
     // cache, and therefore no new state whose staleness could change an
     // output.
     let step = std::time::Instant::now();
-    session.begin(&request.objects);
+    let request_key = request_hash(request);
+    session.begin(&request.objects, target_of(&request_key));
     let held_stubs = session.stub_exports(&request.stub_libraries);
     let (objects, exported, stubs_were_parsed, stub_ms) = std::thread::scope(|scope| {
         let held = held_stubs.clone();
@@ -2134,7 +2135,7 @@ fn link_inner(
         });
     let previous_layout = previous_cache
         .as_ref()
-        .filter(|cache| cache.request == request_hash(request))
+        .filter(|cache| cache.request == request_key)
         .filter(|cache| !cache.layout.slots.is_empty())
         .map(|cache| (cache.layout.clone(), contribution_keys.as_map()));
 
@@ -2471,7 +2472,7 @@ fn link_inner(
         // process starts cold.
         let write = session.store_cache(path, std::mem::take(cache));
         if write {
-            if let Some((_, held)) = session.cache_for(path) {
+            if let Some(held) = session.cache_for(path) {
                 let _ = blinker_cache::store(path, held);
             }
             timings.cache_bytes_written = std::fs::metadata(path).map_or(0, |meta| meta.len());
@@ -6197,6 +6198,16 @@ pub fn link_to_file_in(
 ///
 /// Identical objects linked with a different entry point are a different
 /// binary, and the input keys alone would not say so.
+/// The session's key for a program: the first eight bytes of its request hash.
+///
+/// Folded to a `u64` because the session compares it linearly against three
+/// held answers and nothing about it needs 256 bits — it separates the targets
+/// of one workspace, and both halves of a collision would have to be programs
+/// the same daemon links.
+fn target_of(request: &[u8; 32]) -> u64 {
+    u64::from_le_bytes(request[..8].try_into().expect("8 bytes"))
+}
+
 fn request_hash(request: &LinkRequest) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(request.entry_symbol.as_bytes());
@@ -6258,7 +6269,7 @@ fn reuse_finished_image(
     // that had none (D5). Replaying the file would hand back an image two links
     // old and then the next link would produce the current one again — an
     // output that alternates between two valid binaries.
-    let held = session.cache_for(path).map(|(_, cache)| cache);
+    let held = session.cache_for(path);
     let loaded;
     let cache = match held {
         Some(cache) => cache,

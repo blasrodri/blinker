@@ -636,3 +636,89 @@ fn a_member_whose_bytes_are_unchanged_reuses_its_relocations() {
     );
     assert_eq!(run(&second), "125\n");
 }
+
+/// Two programs alternating through one session stay warm, and stay correct.
+///
+/// A daemon serves a workspace, not a program: a test binary, a build script,
+/// an executable. The session held everything by the *last* link's input list,
+/// so two targets with different inputs emptied each other on every switch — a
+/// rust-analyzer relink went from 271 ms to 560, holding 340 inputs to holding
+/// none, and no benchmark here linked more than one program so nothing said so.
+///
+/// Correctness is the half that needed the test. `Session::imports` is guarded
+/// by "did any interface move", and a link whose inputs are all held reports
+/// that nothing did — so once inputs survived a target switch, the second
+/// program could be handed the first's resolved imports. What had been keeping
+/// that safe was the eviction, which is to say nothing was keeping it safe.
+///
+/// So this alternates two genuinely different programs and compares each
+/// against a cold link of itself. The reuse counter is asserted too, because
+/// "identical" is also what a session that reused nothing would produce.
+#[test]
+fn two_programs_alternating_through_one_session_each_link_correctly() {
+    let scratch = Scratch::dir("session-two-targets").expect("scratch");
+    let first = inputs(&scratch);
+
+    // A second program with its own objects, its own archive and its own
+    // answer, sharing nothing with the first.
+    let other_main = scratch.join("other-main.c");
+    std::fs::write(
+        &other_main,
+        "#include <stdio.h>\nint twice(int n);\nint main(void) { printf(\"%d\\n\", twice(21)); return 0; }\n",
+    )
+    .expect("source written");
+    let other_helper = scratch.join("twice.c");
+    std::fs::write(&other_helper, "int twice(int n) { return n * 2; }\n").expect("source written");
+    let compile_named = |source: &Path| {
+        let object = source.with_extension("o");
+        let status = Command::new("cc")
+            .args(["-c", "-o"])
+            .arg(&object)
+            .arg(source)
+            .status()
+            .expect("cc runs");
+        assert!(status.success(), "compiling {} failed", source.display());
+        object
+    };
+    let other_objects = vec![compile_named(&other_main), compile_named(&other_helper)];
+
+    let cold_first = scratch.join("cold-first");
+    let cold_other = scratch.join("cold-other");
+    link_to_file(&LinkRequest::new(first.clone()), &cold_first).expect("cold first");
+    link_to_file(&LinkRequest::new(other_objects.clone()), &cold_other).expect("cold other");
+
+    let mut session = Session::default();
+    session.set_resident(true);
+    let mut held = (0, 0);
+    for round in 0..3 {
+        for (name, objects, cold, expected) in [
+            ("first", &first, &cold_first, "125\n"),
+            ("other", &other_objects, &cold_other, "42\n"),
+        ] {
+            let warm = scratch.join(format!("{name}-{round}"));
+            let timings = link_to_file_in(&LinkRequest::new(objects.clone()), &warm, &mut session)
+                .expect("the link succeeds");
+            assert_eq!(
+                std::fs::read(&warm).expect("warm"),
+                std::fs::read(cold).expect("cold"),
+                "{name} differs from a cold link of the same inputs on round {round}"
+            );
+            assert_eq!(run(&warm), expected, "{name} produced a broken program");
+            if round > 0 {
+                held = (held.0 + timings.inputs_held, held.1 + timings.inputs_read);
+            }
+        }
+    }
+
+    // The point of the change: after the first round of each, a switch to the
+    // other target must not have emptied what this one had.
+    assert_eq!(
+        held.1, 0,
+        "an input was re-read after a target switch — {} held, {} read",
+        held.0, held.1
+    );
+    assert!(
+        held.0 > 0,
+        "nothing was held at all, so this proves nothing"
+    );
+}
