@@ -559,3 +559,80 @@ fn an_archive_whose_members_were_renamed_reuses_their_parses() {
     );
     assert_eq!(run(&second), "125\n");
 }
+
+/// A member whose bytes did not change reuses its relocations, even though the
+/// archive around it did.
+///
+/// The reuse plan asks whether an object's *input* is the one the cached entry
+/// was built from, and for a file that question has one answer: its
+/// `InputKey`. A member has no file of its own — the key it gets is its
+/// archive's — and an rlib is rewritten whenever anything in the crate is
+/// recompiled. So a crate downstream of an edit produced an archive with a new
+/// key and 256 members that had not changed a byte, and every one of them was
+/// relocated again to reproduce the bytes the cache already held. On a debug
+/// rust-analyzer relink that was 3,370 of 5,637 objects and 74% of the
+/// program's relocations (finding 179).
+///
+/// The rename is what makes the archive move while the members do not — the
+/// same shape as finding 144, and the reason the flag has to come from the
+/// byte comparison rather than from any name or key.
+///
+/// Two assertions, because either alone is passable by a wrong linker: the
+/// reuse must actually happen, and the binary must still be the one a cold
+/// link produces.
+#[test]
+fn a_member_whose_bytes_are_unchanged_reuses_its_relocations() {
+    let scratch = Scratch::dir("session-member-reuse").expect("scratch");
+    let main = compile(&scratch, "main.c", MAIN);
+    let helper = compile(&scratch, "helper.c", HELPER);
+    let other = compile(&scratch, "other.c", OTHER);
+
+    let stage = |names: [&str; 2]| {
+        let members: Vec<PathBuf> = names
+            .iter()
+            .zip([&helper, &other])
+            .map(|(name, from)| {
+                let renamed = scratch.join(name);
+                std::fs::copy(from, &renamed).expect("copy");
+                renamed
+            })
+            .collect();
+        std::fs::remove_file(scratch.join("libhelpers.a")).ok();
+        archive(&scratch, &members)
+    };
+
+    let cache = scratch.join("cache");
+    let library = stage(["h-1aaa.o", "o-1aaa.o"]);
+    let request = LinkRequest::new(vec![main.clone(), library.clone()]).cached_at(cache);
+
+    let mut session = Session::default();
+    session.set_resident(true);
+    let first = scratch.join("first");
+    link_to_file_in(&request, &first, &mut session).expect("the first link succeeds");
+
+    // The rebuild: same member bytes, new names, so the archive's key moves.
+    assert_eq!(
+        stage(["h-2bbb.o", "o-2bbb.o"]),
+        library,
+        "the archive keeps its path, as an rlib does"
+    );
+
+    let second = scratch.join("second");
+    let timings = link_to_file_in(&request, &second, &mut session).expect("the second link");
+    // Three, and not "more than none": `main.o` is a file of its own, so its
+    // key is a content hash and it reuses whatever the members do. An
+    // assertion that only counts reuse passes on the bug it is written for.
+    assert_eq!(
+        timings.reused_objects, 3,
+        "the two members did not reuse their relocations — the archive's key rejected them"
+    );
+
+    let cold = scratch.join("cold");
+    link_to_file(&request, &cold).expect("the cold link succeeds");
+    assert_eq!(
+        std::fs::read(&second).expect("second"),
+        std::fs::read(&cold).expect("cold"),
+        "reusing an unchanged member's relocations changed the binary"
+    );
+    assert_eq!(run(&second), "125\n");
+}

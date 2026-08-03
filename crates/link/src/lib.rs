@@ -688,6 +688,22 @@ struct LoadedObject {
     /// names. The parse held for those bytes carries whatever name they had the
     /// first time; the `OSO` stab has to name the member that exists *now*.
     member: Option<std::sync::Arc<str>>,
+    /// Whether the session proved these exact bytes unchanged since the link
+    /// that last parsed them.
+    ///
+    /// Set only where [`Session::member`] answered, and that answer is a
+    /// `memcmp` against the bytes the held parse was made from — so it means
+    /// the object's content is what the *previous* link relocated, not merely
+    /// that a parse was reused.
+    ///
+    /// It exists because the reuse plan's other way of asking is wrong for a
+    /// member. `InputKey` describes a *file*, and a member's file is its
+    /// archive: recompiling a crate downstream of an edit rewrites the rlib,
+    /// so the archive key moves and every member inside it looks changed. On a
+    /// rust-analyzer relink that rejected 3,370 of 5,637 objects — 3,370 whose
+    /// bytes this flag had already proven identical, and which were relocated
+    /// again to produce the bytes the cache was holding.
+    unchanged: bool,
 }
 
 /// Sections that exist for the linker's benefit and must not reach the output.
@@ -2478,6 +2494,39 @@ impl ReusePlan<'_> {
     }
 }
 
+/// Why [`plan_reuse`] turned an object down, under `BLINKER_REUSE_PARTS`.
+#[derive(Default)]
+struct Rejections {
+    /// Contributed nothing to the layout, so there is nothing to reuse.
+    unplaced: u64,
+    /// Nothing in the previous link began where this object's bytes begin.
+    no_entry: u64,
+    /// The file could not be examined at all.
+    unprobed: u64,
+    /// The input it came from is not the one the entry was built from.
+    key: u64,
+    /// It landed somewhere else, or at a different size.
+    ranges: u64,
+    /// It reads an address that moved.
+    deps: u64,
+}
+
+impl Rejections {
+    fn report(&self, kept: usize, total: usize, changed: usize) {
+        if std::env::var_os("BLINKER_REUSE_PARTS").is_none() {
+            return;
+        }
+        #[allow(clippy::print_stderr)]
+        {
+            eprintln!(
+                "plan_reuse: {kept} of {total} kept; turned down unplaced {} no-entry {} \
+                 unprobed {} key {} ranges {} deps {}  ({changed} addresses changed)",
+                self.unplaced, self.no_entry, self.unprobed, self.key, self.ranges, self.deps,
+            );
+        }
+    }
+}
+
 /// Decide, for every object, whether its bytes survive from the previous link.
 ///
 /// Entries are matched to objects by **where their bytes went**, not by
@@ -2511,34 +2560,64 @@ fn plan_reuse<'a>(
     // once per member pulled out of it.
     let mut keys: HashMap<&Path, Option<blinker_cache::InputKey>> = HashMap::default();
     let mut entries = HashMap::default();
+    // Why each object was turned down, for `BLINKER_REUSE_PARTS`. The
+    // reuse rate is the number this stage exists to move, and a bare
+    // percentage says nothing about which condition is spending it: the
+    // reading that found finding 179 was `key 3370, deps 0` — every rejection
+    // coming from the identity test and none from the dependency scan, which
+    // is a different bug from the one a low rate suggests.
+    let mut lost = Rejections::default();
     for object in objects {
         let Some(ranges) = ranges_of.get(&object.parsed.id.0) else {
+            lost.unplaced += 1;
             continue;
         };
         let Some(first) = ranges.first() else {
+            lost.unplaced += 1;
             continue;
         };
         let Some(entry) = by_placement.get(&(first.section, first.start)) else {
+            lost.no_entry += 1;
             continue;
         };
-        let path = object.path.as_ref();
-        // From the session when it has one: it proved this input a moment ago,
-        // and re-proving a rustc object means reading and hashing it again.
-        let Some(key) = keys
-            .entry(path)
-            .or_insert_with(|| {
-                session
-                    .key_for(path)
-                    .or_else(|| blinker_cache::InputKey::probe(path))
-            })
-            .clone()
-        else {
-            continue;
+        // A member the session proved byte-identical needs no key: the
+        // comparison that proved it is stronger than the one a key stands in
+        // for, and asking the key instead rejects every member of a recompiled
+        // crate's rlib for the enclosing archive's sake.
+        let reusable = if object.unchanged {
+            entry.is_content_reusable(ranges, &changed)
+        } else {
+            let path = object.path.as_ref();
+            // From the session when it has one: it proved this input a moment
+            // ago, and re-proving a rustc object means reading and hashing it
+            // again.
+            let Some(key) = keys
+                .entry(path)
+                .or_insert_with(|| {
+                    session
+                        .key_for(path)
+                        .or_else(|| blinker_cache::InputKey::probe(path))
+                })
+                .clone()
+            else {
+                lost.unprobed += 1;
+                continue;
+            };
+            if entry.key != key {
+                lost.key += 1;
+                continue;
+            }
+            entry.is_content_reusable(ranges, &changed)
         };
-        if entry.is_reusable(&key, ranges, &changed) {
+        if reusable {
             entries.insert(object.parsed.id.0, *entry);
+        } else if &entry.ranges != ranges {
+            lost.ranges += 1;
+        } else {
+            lost.deps += 1;
         }
     }
+    lost.report(entries.len(), objects.len(), changed.len());
 
     ReusePlan {
         entries,
@@ -3232,6 +3311,7 @@ fn load_one(path: &Path, id: Option<ObjectId>) -> Result<Loaded, LinkError> {
                 data: SourceBytes::whole(data),
                 path: Arc::from(path),
                 member: None,
+                unchanged: false,
             }))
         }
     }
@@ -3287,6 +3367,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
                         data: SourceBytes::whole_shared(&data),
                         path: Arc::from(path.as_path()),
                         member: None,
+                        unchanged: false,
                     })
                 })
             }),
@@ -3414,6 +3495,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
                     data: SourceBytes::window(data, window),
                     path: Arc::from(path.as_path()),
                     member: entry.map(|entry| Arc::from(entry.name.as_str())),
+                    unchanged: true,
                 },
                 // A member the session lost — it can only have been dropped
                 // with its archive, and its archive cannot have changed, so
@@ -3579,6 +3661,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
                         data: SourceBytes::window(data, begin..begin + fresh.len()),
                         path: Arc::from(path.as_path()),
                         member: Some(Arc::from(entry.name.as_str())),
+                        unchanged: true,
                     })
                 })
                 .collect::<Vec<_>>()
@@ -3832,6 +3915,7 @@ fn parse_member(
         data: SourceBytes::window(data, start..start + bytes.len()),
         path: Arc::from(path),
         member: Some(Arc::from(member.name.as_str())),
+        unchanged: false,
     })
 }
 

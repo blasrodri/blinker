@@ -400,7 +400,24 @@ impl Entry {
         ranges: &[Range],
         changed: &std::collections::HashSet<NameHash>,
     ) -> bool {
-        if &self.key != key || self.ranges != ranges {
+        &self.key == key && self.is_content_reusable(ranges, changed)
+    }
+
+    /// The same two conditions, for a caller that has already established the
+    /// content by other means.
+    ///
+    /// The key is a stand-in for "these are the bytes the entry was built
+    /// from", and it is the only one available for a file read off disk. An
+    /// archive member has a better one — the linker holds the bytes the
+    /// previous link parsed and can compare them — and for a member the key is
+    /// actively wrong, because it describes the enclosing archive and moves
+    /// whenever any member does.
+    pub fn is_content_reusable(
+        &self,
+        ranges: &[Range],
+        changed: &std::collections::HashSet<NameHash>,
+    ) -> bool {
+        if self.ranges != ranges {
             return false;
         }
         // `changed` is small after an ordinary edit and `deps` is large, so the
