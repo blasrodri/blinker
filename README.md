@@ -19,7 +19,7 @@ programs.
 | Cold link, small (238 objects) | **1.10×** `ld-prime` — inside the spread |
 | Cold link, large (5,637 objects) | **1.94×** `ld-prime` |
 | Edit relink, small, resident | **12.1 ms** against `ld-prime`'s 31.6 ms cold |
-| Edit relink, large, resident | **381 ms** against `ld-prime`'s 323 ms cold |
+| Edit relink, large, resident | **363 ms** against `ld-prime`'s 323 ms cold |
 
 The last two rows are the metric the product exists for, and they are where the
 two scales disagree: on a small link the resident linker is comfortably faster
@@ -31,7 +31,7 @@ to link internally.
 
 See [PRODUCT_SPEC.md](PRODUCT_SPEC.md) for the product definition,
 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for the milestone sequence,
-and **[FINDINGS.md](FINDINGS.md)** for the 186 places reality contradicted the
+and **[FINDINGS.md](FINDINGS.md)** for the 188 places reality contradicted the
 plan — several of them contradicting earlier entries in the same file.
 
 ## What is not done

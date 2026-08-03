@@ -8859,3 +8859,83 @@ measured inside, and writing it down as 3 ms because the arithmetic says so is
 how a stage table stops describing the linker. `emit` is 82 MB of string table
 and 27 MB of entries built into a 194 MB image that is then hashed and written;
 one pass over 81 MB is not where it lives.
+
+## 182. Two of the three probes were free, and one of them was the same probe twice
+
+`load_objects` opens with a serial pass asking the session whether it already
+holds each input. Serial because the session is not shareable across the reader
+threads that follow, which is true — and it is the *map* that is not shareable,
+not the probing.
+
+A probe is a `stat` for a content-addressed path and a read plus a BLAKE3 for
+one of rustc's. A debug rust-analyzer link has 133 loose objects and 22 MB of
+them, hashed on one thread before any reader starts: **7.9 ms**.
+
+Hashing a file touches nothing shared. Probing every input first, on every
+core, and handing the answers to the serial pass leaves it with only the map
+work.
+
+It also found the second probe. `Session::object` has always carried this
+comment:
+
+> `current` has just probed this file, and for a path that is not evidence that
+> probe is a hash of its bytes, so asking the content index costs nothing more
+> than the lookup.
+
+and then called `InputKey::probe(path)` again, reading and hashing the same
+bytes a second time. The comment describes the design; the code did not
+implement it. It only fires when the by-path lookup missed — and rustc renames
+every object of a recompiled crate, so missing by path is the ordinary case,
+not the rare one. That is the second time in this file a doc comment has
+described a saving the code below it did not take (177 was the first).
+
+```
+read_and_parse   73 ms -> 66 ms
+```
+
+## 183. `parse_symbol_map`, and laying the image out to count its sections
+
+Two more of the same species, found by reading the two functions the profile
+pointed at rather than by profiling further.
+
+### 18.9 million comparisons to answer 73,095 questions
+
+`parse_symbol_map` resolves each archive symbol to the member defining it. The
+archive symbol table addresses members by header offset and the index addresses
+them by position, so the two are reconciled through the member's data range:
+
+```rust
+if let Some(found) = members.iter().find(|m| m.offset == offset) {
+```
+
+Once per symbol. rust-analyzer's largest rlib lists 73,095 symbols across 258
+members, which is 18.9 million comparisons — finding 77's shape again, inside a
+function that reads like a lookup, and on the single thread that archive is
+being indexed on. A sorted index answers it in eight comparisons, and a
+one-entry cache answers it in none: the symbol table lists a member's symbols
+together, so the previous answer is right 257 times out of 258.
+
+### The layout computed twice to size its own header
+
+`Image::build` laid the whole image out, used the result only to count segments
+and sections, chose a header reservation from that count, and laid it out again
+for real.
+
+The reservation is a genuine input to the second pass — `__TEXT` starts after
+the commands, so every address depends on it. The *section set* is not. It comes
+from `output_segment_for` and `output_section_name`, which read an input's own
+segment, name and kind and nothing else. Sections cannot appear or disappear
+when addresses move.
+
+So the shape is derivable directly from the inputs, and `blinker_layout::output_shape`
+does it. Two tests pin the claim rather than restating it: that the predicted
+shape equals a real layout's, and that a layout's shape does not move when the
+reservation changes by a factor of 64. And the failure mode was already safe —
+the emitter compares the commands it actually wrote against the reservation and
+returns `CommandsOverflowedReservation` — so a shape that disagreed would fail
+the link rather than write load commands over the first section.
+
+It measured 2 ms, not the 15 the removed pass appeared to be worth. Almost all
+of what the first pass cost was warming 9,722 contributions into cache for the
+second, which then ran that much faster. Removing redundant work is still right;
+predicting how much it was worth from how long it took was not.
