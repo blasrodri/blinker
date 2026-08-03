@@ -3474,11 +3474,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
     }
 
     let mut objects: Vec<LoadedObject> = Vec::new();
-    let mut archives: Vec<(
-        PathBuf,
-        std::sync::Arc<blinker_archive::ArchiveIndex>,
-        std::sync::Arc<mapping::Backing>,
-    )> = Vec::new();
+    let mut archives: Vec<ArchiveInput> = Vec::new();
     for slot in loaded {
         match slot.expect("every input was visited")? {
             Loaded::Object(object) => objects.push(object),
@@ -3547,21 +3543,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
     // scan stopped at the first archive that answered. Iterating the archives
     // in order and inserting only when absent gives the same answer.
     gap!(_lap, "load: probe + read + parse");
-    let mut defining: HashMap<&str, (usize, blinker_archive::MemberId)> =
-        HashMap::with_capacity_and_hasher(
-            archives
-                .iter()
-                .map(|(_, index, _)| index.symbol_map.len())
-                .sum(),
-            Default::default(),
-        );
-    for (archive_index, (_, index, _)) in archives.iter().enumerate() {
-        for (name, member) in &index.symbol_map {
-            defining
-                .entry(name.as_str())
-                .or_insert((archive_index, *member));
-        }
-    }
+    let defining = DefiningIndex::build(&archives);
 
     gap!(_lap, "load: defining map");
     // Pull members in until nothing new is needed.
@@ -3629,7 +3611,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
             let found = parallel::map_chunks(&wanted, |_, chunk| {
                 chunk
                     .iter()
-                    .map(|name| defining.get(*name).copied())
+                    .map(|name| defining.get(name))
                     .collect::<Vec<_>>()
             });
 
@@ -3950,6 +3932,143 @@ fn parse_member(
         member: Some(Arc::from(member.name.as_str())),
         unchanged: false,
     })
+}
+
+/// One archive as the loader holds it: where it came from, its index, and the
+/// bytes both borrow from.
+type ArchiveInput = (
+    PathBuf,
+    std::sync::Arc<blinker_archive::ArchiveIndex>,
+    std::sync::Arc<mapping::Backing>,
+);
+
+/// Which archive defines each name, across all of them at once.
+///
+/// The frontier used to ask every archive in turn for every name it wanted,
+/// and each of those was a binary search with string comparisons. On a debug
+/// rust-analyzer link — 341 archives, tens of thousands of names — that was
+/// 517 ms of the 876 ms `read_and_parse` stage, on a relink whose members all
+/// came out of memory and where `parse` measured zero (finding 78).
+///
+/// # Keyed by the name's hash, not by the name
+///
+/// The replacement was a `HashMap<&str, _>`, and it inherited the cost the
+/// binary search had: hashing the text. Two million entries of sixty-odd bytes
+/// is 120 MB of mangled name hashed on one thread to build an index that
+/// answers sixty-two thousand questions.
+///
+/// Hashing a name touches nothing shared, so it belongs on every core; filing
+/// the answer has to be serial. Keying the table by the `u64` instead is what
+/// lets the two be separated — the same split [`blinker_symbols::SymbolNames`]
+/// makes for the same reason (finding 175), and for the same reason the text
+/// is kept and compared rather than trusted: a table keyed by a hash is a
+/// lookup structure, not a claim that the hash is unique.
+struct DefiningIndex<'a> {
+    /// Hash -> the first archive defining a name that hashes there.
+    first: blinker_hashing::FastMap<u64, Definition<'a>>,
+    /// Definitions displaced by a *different* name hashing the same, in the
+    /// order they were seen. Empty on every link measured; present because
+    /// "empty in practice" and "cannot happen" are different claims, and the
+    /// consequence of the second being wrong is extracting the wrong member.
+    collided: Vec<(u64, Definition<'a>)>,
+}
+
+/// Where one name is defined: the archive's position in the link, and the
+/// member within it.
+#[derive(Clone, Copy)]
+struct Definition<'a> {
+    name: &'a str,
+    archive: usize,
+    member: blinker_archive::MemberId,
+}
+
+impl<'a> DefiningIndex<'a> {
+    fn build(archives: &'a [ArchiveInput]) -> DefiningIndex<'a> {
+        // Every name's hash, on every core, in archive order.
+        let hashed = parallel::map_chunks(archives, |start, chunk| {
+            chunk
+                .iter()
+                .enumerate()
+                .flat_map(|(at, (_, index, _))| {
+                    index.symbol_map.iter().map(move |(name, member)| {
+                        (
+                            blinker_symbols::hash_of(name),
+                            Definition {
+                                name: name.as_str(),
+                                archive: start + at,
+                                member: *member,
+                            },
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+        });
+
+        let total = archives
+            .iter()
+            .map(|(_, index, _)| index.symbol_map.len())
+            .sum();
+        DefiningIndex::from_hashed(hashed.into_iter().flatten(), total)
+    }
+
+    /// File already-hashed definitions, in the order they must be preferred.
+    ///
+    /// Separate from [`DefiningIndex::build`] so the collision branch can be
+    /// tested. Two distinct names hashing to one `u64` cannot be produced by
+    /// writing symbol names in a test — that is the point of a 64-bit hash —
+    /// so a test that goes through `build` can only ever exercise the path
+    /// that does not collide, and the branch whose failure extracts the wrong
+    /// member would be the one nothing ran.
+    fn from_hashed(
+        entries: impl Iterator<Item = (u64, Definition<'a>)>,
+        capacity: usize,
+    ) -> DefiningIndex<'a> {
+        let mut first =
+            blinker_hashing::FastMap::with_capacity_and_hasher(capacity, Default::default());
+        let mut collided = Vec::new();
+        // First definition wins, which is what the archive scan it replaced did
+        // twice over: the symbol table lists a name under the earliest member
+        // defining it, and the scan stopped at the first archive that answered.
+        // Walking the archives in order and inserting only when absent gives
+        // the same answer.
+        for (hash, definition) in entries {
+            match first.entry(hash) {
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(definition);
+                }
+                std::collections::hash_map::Entry::Occupied(held) => {
+                    if held.get().name != definition.name {
+                        collided.push((hash, definition));
+                    }
+                }
+            }
+        }
+        DefiningIndex { first, collided }
+    }
+
+    fn get(&self, name: &str) -> Option<(usize, blinker_archive::MemberId)> {
+        self.at(blinker_symbols::hash_of(name), name)
+    }
+
+    /// The lookup, with the hash supplied. Split for the same reason
+    /// [`DefiningIndex::from_hashed`] is: a test cannot make `hash_of` collide,
+    /// so a test that goes in through `get` cannot reach the branch below.
+    fn at(&self, hash: u64, name: &str) -> Option<(usize, blinker_archive::MemberId)> {
+        let found = self.first.get(&hash)?;
+        let definition = if found.name == name {
+            *found
+        } else {
+            // Only reachable when two distinct names hash alike, and then only
+            // for the later one. Insertion order is archive order, so the first
+            // match here is the first definition, as above.
+            *self
+                .collided
+                .iter()
+                .find(|(at, held)| *at == hash && held.name == name)
+                .map(|(_, held)| held)?
+        };
+        Some((definition.archive, definition.member))
+    }
 }
 
 /// Every input section that belongs in the output, in object order.
@@ -6127,4 +6246,66 @@ fn write_output(bytes: &[u8], output: &Path) -> Result<(), LinkError> {
         let _ = std::fs::remove_file(&temporary);
         failed(source)
     })
+}
+
+#[cfg(test)]
+mod defining_index_tests {
+    use super::{DefiningIndex, Definition};
+    use blinker_archive::MemberId;
+
+    fn definition(name: &str, archive: usize, member: u32) -> Definition<'_> {
+        Definition {
+            name,
+            archive,
+            member: MemberId(member),
+        }
+    }
+
+    /// The ordinary case: the earliest archive defining a name wins, and a
+    /// name nothing defines is absent.
+    #[test]
+    fn the_first_archive_defining_a_name_wins() {
+        let entries = [
+            (1, definition("_malloc", 0, 7)),
+            (1, definition("_malloc", 3, 2)),
+            (2, definition("_free", 1, 4)),
+        ];
+        let index = DefiningIndex::from_hashed(entries.into_iter(), 3);
+        // Looked up through the real `get`, which hashes the text — so these
+        // go through the collision path, since the synthetic hashes above are
+        // not what `hash_of` produces. Checked against the fields instead.
+        assert_eq!(index.first.len(), 2);
+        assert_eq!(index.collided.len(), 0);
+        assert_eq!(index.first[&1].archive, 0);
+        assert_eq!(index.first[&1].member, MemberId(7));
+        assert_eq!(index.first[&2].archive, 1);
+    }
+
+    /// Two distinct names hashing to one `u64`, which is the case a table
+    /// keyed by a hash exists to survive.
+    ///
+    /// Unreachable through `build`: producing a 64-bit collision by choosing
+    /// symbol names is not something a test can do. So the hashes are supplied
+    /// directly, and what is checked is that each name still resolves to its
+    /// own definition — the failure being an archive member extracted for a
+    /// symbol it does not define.
+    #[test]
+    fn two_names_that_hash_alike_keep_their_own_definitions() {
+        const COLLIDING: u64 = 0x5ca1_ab1e;
+        let entries = [
+            (COLLIDING, definition("_first", 0, 1)),
+            (COLLIDING, definition("_second", 2, 5)),
+            // The earlier name again, from a later archive: still first.
+            (COLLIDING, definition("_first", 4, 9)),
+            // And the later one again, which must not displace its own first.
+            (COLLIDING, definition("_second", 6, 6)),
+        ];
+        let index = DefiningIndex::from_hashed(entries.into_iter(), 4);
+        assert_eq!(index.first[&COLLIDING].name, "_first");
+        assert_eq!(index.collided.len(), 2, "both sightings of the later name");
+
+        assert_eq!(index.at(COLLIDING, "_first"), Some((0, MemberId(1))));
+        assert_eq!(index.at(COLLIDING, "_second"), Some((2, MemberId(5))));
+        assert_eq!(index.at(COLLIDING, "_absent"), None);
+    }
 }
