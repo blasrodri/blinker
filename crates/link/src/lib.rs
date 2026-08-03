@@ -3187,7 +3187,7 @@ enum Loaded {
     Object(LoadedObject),
     Archive(
         PathBuf,
-        blinker_archive::ArchiveIndex,
+        std::sync::Arc<blinker_archive::ArchiveIndex>,
         std::sync::Arc<mapping::Backing>,
     ),
 }
@@ -3205,7 +3205,7 @@ fn load_one(path: &Path, id: Option<ObjectId>) -> Result<Loaded, LinkError> {
                 .map_err(|source| LinkError::Archive(Box::new(source)))?;
             Ok(Loaded::Archive(
                 path.to_path_buf(),
-                index,
+                std::sync::Arc::new(index),
                 std::sync::Arc::new(data),
             ))
         }
@@ -3349,7 +3349,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
     let mut objects: Vec<LoadedObject> = Vec::new();
     let mut archives: Vec<(
         PathBuf,
-        blinker_archive::ArchiveIndex,
+        std::sync::Arc<blinker_archive::ArchiveIndex>,
         std::sync::Arc<mapping::Backing>,
     )> = Vec::new();
     for slot in loaded {

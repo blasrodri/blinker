@@ -103,7 +103,7 @@ fn catch_up(digests: &mut Arc<Vec<blinker_cache::NameHash>>, names: &SymbolNames
 /// One input, as this process last saw it.
 enum Entry {
     Object(Arc<ParsedObject>, Arc<Backing>),
-    Archive(blinker_archive::ArchiveIndex, Arc<Backing>),
+    Archive(Arc<blinker_archive::ArchiveIndex>, Arc<Backing>),
 }
 
 /// A parsed archive member, by the archive it came from and its position in it.
@@ -445,9 +445,9 @@ impl Session {
     pub fn archive(
         &mut self,
         path: &Path,
-    ) -> Option<(blinker_archive::ArchiveIndex, Arc<Backing>)> {
+    ) -> Option<(Arc<blinker_archive::ArchiveIndex>, Arc<Backing>)> {
         match self.current(path)? {
-            Entry::Archive(index, backing) => Some((index.clone(), Arc::clone(backing))),
+            Entry::Archive(index, backing) => Some((Arc::clone(index), Arc::clone(backing))),
             Entry::Object(..) => None,
         }
     }
@@ -519,7 +519,7 @@ impl Session {
     pub fn store_archive(
         &mut self,
         path: &Path,
-        index: &blinker_archive::ArchiveIndex,
+        index: &Arc<blinker_archive::ArchiveIndex>,
         data: &Arc<Backing>,
     ) {
         let Some(key) = blinker_cache::InputKey::probe(path) else {
@@ -549,7 +549,7 @@ impl Session {
         self.indexes.insert(path.to_path_buf(), symbol_map);
         self.entries.insert(
             path.to_path_buf(),
-            (key, Entry::Archive(index.clone(), Arc::clone(data))),
+            (key, Entry::Archive(Arc::clone(index), Arc::clone(data))),
         );
     }
 

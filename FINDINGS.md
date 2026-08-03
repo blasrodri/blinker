@@ -8292,3 +8292,49 @@ A cold link is the *bad* case for this split: half of what the cores answer is
 "no", and the serial phase does that half again. A warm link's names are almost
 all in the table already, so the serial phase is nearly empty and the whole
 probe is parallel. The usual shape of an optimisation is the opposite.
+
+## 171. The warm link is proportional to the program, not to the edit
+
+A resident relink of debug rust-analyzer after a one-line edit: 341 inputs, 326
+of them held, **one** of 5,637 objects' reachability projections moved, 9,719 of
+9,722 contributions kept their address. Everything the incremental machinery
+claims is true. The link still takes 600 ms against `ld-prime`'s 332 ms cold.
+
+Bracketing it says where:
+
+```
+load: archive indexes    65 ms    the parallel input load, all 341 of them
+load: defining map       22 ms    name -> defining member, rebuilt from held indexes
+extraction preamble +    74 ms    of which the rounds themselves are ~50 us:
+  rounds                          the cost is `frontier.absorb` over 5,637 objects
+dead_strip               66 ms    1 of 5,637 projections moved
+relocate                104 ms
+emit                     88 ms
+probe layout + cache     41 ms
+symbols                  27 ms
+```
+
+The extraction *rounds* — the thing the session's extraction replay exists to
+skip — cost fifty microseconds. Everything expensive is a pass over the whole
+program that happens to be re-derived from held data rather than re-read from
+disk. Holding the inputs removed the I/O and the parsing; it did not remove the
+work that is proportional to what was parsed.
+
+`dead_strip` is the clearest case, because the machinery is all there and does
+not fire. `Session::strip` returns the previous link's answer only when *every*
+projection digest is unchanged — so it holds on a no-op relink and never on a
+real one, since an edit changes at least one object by definition. One object in
+5,637 rebuilds the atom index, the owners map, the resolved-name table, the full
+graph traversal and the compacted strip map. The incremental answer needs a live
+set with incoming counts that can be updated for the objects that moved; the
+all-or-nothing check is a placeholder that measures as one on the only workload
+that matters.
+
+### What this corrects
+
+An outside review of the project read the README — which still said 2.92x, "no
+debug map", and "the daemon is not implemented" — and concluded the gap was
+owned `String`s in the symbol pipeline. Findings 168 and 169 had already
+measured that half at about 4 ms. The review's *structural* claim was right and
+its mechanism was wrong, and the stale README is why. Numbers left lying around
+are read as current.
