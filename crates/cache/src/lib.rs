@@ -355,37 +355,45 @@ impl LinkCache {
     /// so this is a linear merge — the cost is proportional to the symbol
     /// table, once, rather than to the relocations, per object.
     pub fn changed_addresses(&self, previous: &LinkCache) -> Vec<NameHash> {
-        let (mut a, mut b) = (0, 0);
-        let (old, new) = (&previous.addresses, &self.addresses);
-        let mut changed = Vec::new();
-        while a < old.len() && b < new.len() {
-            let (on, oa) = old[a];
-            let (nn, na) = new[b];
-            match on.cmp(&nn) {
-                std::cmp::Ordering::Less => {
-                    // Defined before, gone now: anything referencing it is stale.
+        changed_addresses(&previous.addresses, &self.addresses)
+    }
+}
+
+/// The same merge, against the table itself rather than a cache holding it.
+///
+/// Both callers of the method above had the new table in hand and no cache to
+/// put it in, so both built one — copying half a million entries, twice a
+/// link, to call a method on the copy.
+pub fn changed_addresses(old: &[(NameHash, u64)], new: &[(NameHash, u64)]) -> Vec<NameHash> {
+    let (mut a, mut b) = (0, 0);
+    let mut changed = Vec::new();
+    while a < old.len() && b < new.len() {
+        let (on, oa) = old[a];
+        let (nn, na) = new[b];
+        match on.cmp(&nn) {
+            std::cmp::Ordering::Less => {
+                // Defined before, gone now: anything referencing it is stale.
+                changed.push(on);
+                a += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                changed.push(nn);
+                b += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                if oa != na {
                     changed.push(on);
-                    a += 1;
                 }
-                std::cmp::Ordering::Greater => {
-                    changed.push(nn);
-                    b += 1;
-                }
-                std::cmp::Ordering::Equal => {
-                    if oa != na {
-                        changed.push(on);
-                    }
-                    a += 1;
-                    b += 1;
-                }
+                a += 1;
+                b += 1;
             }
         }
-        changed.extend(old[a..].iter().map(|(n, _)| *n));
-        changed.extend(new[b..].iter().map(|(n, _)| *n));
-        changed.sort_unstable();
-        changed.dedup();
-        changed
     }
+    changed.extend(old[a..].iter().map(|(n, _)| *n));
+    changed.extend(new[b..].iter().map(|(n, _)| *n));
+    changed.sort_unstable();
+    changed.dedup();
+    changed
 }
 
 impl Entry {

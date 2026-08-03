@@ -2232,11 +2232,7 @@ fn link_inner(
     let diff_step = std::time::Instant::now();
     if let (Some(previous), Some(current)) = (previous_cache.as_ref(), current_addresses.as_ref()) {
         if !previous.addresses.is_empty() {
-            let changed = blinker_cache::LinkCache {
-                addresses: current.clone(),
-                ..blinker_cache::LinkCache::default()
-            }
-            .changed_addresses(previous);
+            let changed = blinker_cache::changed_addresses(&previous.addresses, current);
             timings.changed_addresses = changed.len() as u64;
             timings.total_addresses = current.len() as u64;
         }
@@ -2512,6 +2508,15 @@ struct Rejections {
 }
 
 impl Rejections {
+    fn add(&mut self, other: &Rejections) {
+        self.unplaced += other.unplaced;
+        self.no_entry += other.no_entry;
+        self.unprobed += other.unprobed;
+        self.key += other.key;
+        self.ranges += other.ranges;
+        self.deps += other.deps;
+    }
+
     fn report(&self, kept: usize, total: usize, changed: usize) {
         if std::env::var_os("BLINKER_REUSE_PARTS").is_none() {
             return;
@@ -2542,13 +2547,10 @@ fn plan_reuse<'a>(
     session: &Session,
     ranges_of: &HashMap<u32, Vec<blinker_cache::Range>>,
 ) -> ReusePlan<'a> {
-    let changed: std::collections::HashSet<blinker_cache::NameHash> = blinker_cache::LinkCache {
-        addresses: current_addresses.to_vec(),
-        ..blinker_cache::LinkCache::default()
-    }
-    .changed_addresses(previous)
-    .into_iter()
-    .collect();
+    let changed: std::collections::HashSet<blinker_cache::NameHash> =
+        blinker_cache::changed_addresses(&previous.addresses, current_addresses)
+            .into_iter()
+            .collect();
 
     let by_placement: HashMap<(u32, u64), &blinker_cache::Entry> = previous
         .entries
@@ -2556,66 +2558,89 @@ fn plan_reuse<'a>(
         .filter_map(|entry| entry.ranges.first().map(|r| ((r.section, r.start), entry)))
         .collect();
 
-    // One probe per distinct file: an archive is proven unchanged once, not
-    // once per member pulled out of it.
+    // One probe per distinct file, ahead of the decision below: an archive is
+    // proven unchanged once, not once per member pulled out of it, and the
+    // decision itself has to touch nothing shared.
     let mut keys: HashMap<&Path, Option<blinker_cache::InputKey>> = HashMap::default();
-    let mut entries = HashMap::default();
-    // Why each object was turned down, for `BLINKER_REUSE_PARTS`. The
-    // reuse rate is the number this stage exists to move, and a bare
-    // percentage says nothing about which condition is spending it: the
-    // reading that found finding 179 was `key 3370, deps 0` — every rejection
-    // coming from the identity test and none from the dependency scan, which
-    // is a different bug from the one a low rate suggests.
-    let mut lost = Rejections::default();
-    for object in objects {
-        let Some(ranges) = ranges_of.get(&object.parsed.id.0) else {
-            lost.unplaced += 1;
-            continue;
-        };
-        let Some(first) = ranges.first() else {
-            lost.unplaced += 1;
-            continue;
-        };
-        let Some(entry) = by_placement.get(&(first.section, first.start)) else {
-            lost.no_entry += 1;
-            continue;
-        };
-        // A member the session proved byte-identical needs no key: the
-        // comparison that proved it is stronger than the one a key stands in
-        // for, and asking the key instead rejects every member of a recompiled
-        // crate's rlib for the enclosing archive's sake.
-        let reusable = if object.unchanged {
-            entry.is_content_reusable(ranges, &changed)
-        } else {
-            let path = object.path.as_ref();
+    for object in objects.iter().filter(|object| !object.unchanged) {
+        let path = object.path.as_ref();
+        keys.entry(path).or_insert_with(|| {
             // From the session when it has one: it proved this input a moment
             // ago, and re-proving a rustc object means reading and hashing it
             // again.
-            let Some(key) = keys
-                .entry(path)
-                .or_insert_with(|| {
-                    session
-                        .key_for(path)
-                        .or_else(|| blinker_cache::InputKey::probe(path))
-                })
-                .clone()
-            else {
-                lost.unprobed += 1;
-                continue;
-            };
-            if entry.key != key {
-                lost.key += 1;
-                continue;
-            }
-            entry.is_content_reusable(ranges, &changed)
-        };
-        if reusable {
-            entries.insert(object.parsed.id.0, *entry);
-        } else if &entry.ranges != ranges {
-            lost.ranges += 1;
-        } else {
-            lost.deps += 1;
-        }
+            session
+                .key_for(path)
+                .or_else(|| blinker_cache::InputKey::probe(path))
+        });
+    }
+
+    // On every core, because the dependency scan reads every address every
+    // object read — 3.9 million of them, 30 MB of hashes — and finding 179
+    // made that the whole of this function rather than the tail of it. Nothing
+    // here writes anything shared; the answers are collected in order and the
+    // map is filled from them.
+    //
+    // The counters are per chunk and summed afterwards for the same reason.
+    let keys = &keys;
+    let changed = &changed;
+    let by_placement = &by_placement;
+    let judged = crate::parallel::map_chunks(objects, |_, chunk| {
+        let mut lost = Rejections::default();
+        let verdicts: Vec<Option<(u32, &blinker_cache::Entry)>> = chunk
+            .iter()
+            .map(|object| {
+                let ranges = ranges_of.get(&object.parsed.id.0)?;
+                let first = ranges.first()?;
+                let Some(entry) = by_placement.get(&(first.section, first.start)) else {
+                    lost.no_entry += 1;
+                    return None;
+                };
+                // A member the session proved byte-identical needs no key: the
+                // comparison that proved it is stronger than the one a key
+                // stands in for, and asking the key instead rejects every
+                // member of a recompiled crate's rlib for the enclosing
+                // archive's sake.
+                if !object.unchanged {
+                    let Some(Some(key)) = keys.get(object.path.as_ref()) else {
+                        lost.unprobed += 1;
+                        return None;
+                    };
+                    if &entry.key != key {
+                        lost.key += 1;
+                        return None;
+                    }
+                }
+                if entry.is_content_reusable(ranges, changed) {
+                    return Some((object.parsed.id.0, *entry));
+                }
+                if &entry.ranges != ranges {
+                    lost.ranges += 1;
+                } else {
+                    lost.deps += 1;
+                }
+                None
+            })
+            .collect();
+        // `unplaced` is what the two `?`s above swallow, and counting it inside
+        // the closure would need a third branch on each.
+        lost.unplaced = verdicts
+            .iter()
+            .zip(chunk)
+            .filter(|(verdict, object)| {
+                verdict.is_none()
+                    && ranges_of
+                        .get(&object.parsed.id.0)
+                        .is_none_or(|r| r.is_empty())
+            })
+            .count() as u64;
+        (verdicts, lost)
+    });
+
+    let mut entries = HashMap::default();
+    let mut lost = Rejections::default();
+    for (verdicts, chunk) in judged {
+        entries.extend(verdicts.into_iter().flatten());
+        lost.add(&chunk);
     }
     lost.report(entries.len(), objects.len(), changed.len());
 
@@ -3380,6 +3405,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
             None => todo.push(at),
         }
     }
+    gap!(_lap, "load: session probe");
 
     let threads = threads.min(todo.len().max(1));
     if threads > 1 {
@@ -3421,6 +3447,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
         }
     }
 
+    gap!(_lap, "load: read the rest");
     // Their interface digests first, for the same reason as the members below.
     let digestible: Vec<Arc<ParsedObject>> = todo
         .iter()
