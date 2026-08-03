@@ -8023,3 +8023,32 @@ called it. It only became a name of its own once both had been taken apart, and
 the instrumentation that found it took two minutes to write. The lesson is not
 "profile more" — it is that a cost hides inside whichever stage is currently
 the biggest, and it keeps hiding until that stage stops being the biggest.
+
+## 165. The projections were memoised but never built in parallel
+
+`ObjectAtoms` is a pure function of one object — that is the whole reason it can
+be held across links (finding 133). A cold link holds none of them and builds
+all 5,637, one after another, on one core.
+
+`Session::atoms(parse, compute)` made that hard to see: the memo lookup and the
+work were the same call, and the session cannot cross a thread boundary. Split
+into `held_atoms` (ask) and `store_atoms` (file), the work in between is a
+`map_chunks` over the objects that missed.
+
+```
+  cold   1115 ms -> 987 ms
+```
+
+On a warm link it changes nothing measurable, correctly — one projection of
+5,637 misses, and starting fifteen threads to build it would be the cost.
+
+### On the numbers in findings 163 and 164
+
+Those cold figures — 2786 ms before the interner work, 1916 after — were taken
+on a machine carrying a load average of 14 to 26 from unrelated processes. The
+same binaries measure 1115 and about 1000 on a quiet one. The *ratio* held up
+(−31% then, and the A/B here was back to back), but the absolutes were inflated
+by about 70%, and this file should not be read as if they were not.
+
+Quoting a number without the machine's state is how a measurement stops being
+one.

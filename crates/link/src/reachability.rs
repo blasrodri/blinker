@@ -714,6 +714,29 @@ impl<'a> Atoms<'a> {
         // length of this function: everything the traversal needs is resolved
         // to a flat atom index before it returns.
         let mut interned: Vec<Arc<Vec<SymbolNameId>>> = Vec::with_capacity(objects.len());
+
+        // Which projections are already held, asked before any is computed.
+        // A projection is a pure function of one object, so the ones that are
+        // missing can all be built at once — which on a cold link is every one
+        // of them, and on an edit is the handful that moved.
+        let held: Vec<Option<Arc<ObjectAtoms>>> = objects
+            .iter()
+            .map(|object| session.held_atoms(&object.parsed))
+            .collect();
+        if held.iter().any(Option::is_none) {
+            let computed = crate::parallel::map_chunks(objects, |base, chunk| {
+                chunk
+                    .iter()
+                    .enumerate()
+                    .filter(|(at, _)| held[base + at].is_none())
+                    .map(|(at, object)| (base + at, Arc::new(project(object))))
+                    .collect::<Vec<_>>()
+            });
+            for (at, projection) in computed.into_iter().flatten() {
+                session.store_atoms(&objects[at].parsed, projection);
+            }
+        }
+
         for object in objects {
             let block = session.atoms(&object.parsed, || project(object));
             interned.push(session.interned(&object.parsed));

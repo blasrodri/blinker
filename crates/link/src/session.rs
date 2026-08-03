@@ -742,6 +742,31 @@ impl Session {
         Arc::clone(memo.atoms.get_or_insert_with(|| Arc::new(compute())))
     }
 
+    /// This object's projection if one is already held, without computing it.
+    ///
+    /// Split from `atoms` so the ones that are *not* held can be computed on
+    /// every core: a cold link projects all 5,637 objects, and a projection
+    /// reads one object and nothing else. The session cannot be shared across
+    /// threads, so the question and the work are asked separately.
+    pub(crate) fn held_atoms(
+        &self,
+        parse: &Arc<ParsedObject>,
+    ) -> Option<Arc<crate::reachability::ObjectAtoms>> {
+        let key = Arc::as_ptr(parse) as usize;
+        self.memo.get(&key)?.atoms.clone()
+    }
+
+    /// File a projection computed elsewhere.
+    pub(crate) fn store_atoms(
+        &mut self,
+        parse: &Arc<ParsedObject>,
+        atoms: Arc<crate::reachability::ObjectAtoms>,
+    ) {
+        let key = Arc::as_ptr(parse) as usize;
+        let memo = self.memo.entry(key).or_insert_with(|| Memo::new(parse));
+        memo.atoms = Some(atoms);
+    }
+
     /// This object's symbol names as ids, interning each one once ever.
     ///
     /// The vector is indexed by `SymbolId`, so a caller holding a symbol can
