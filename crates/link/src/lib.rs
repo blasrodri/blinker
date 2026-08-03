@@ -3543,33 +3543,44 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
         // matches whenever the extraction order does, and when it does not the
         // member is simply parsed again rather than served under a name that
         // now means something else.
-        let mut held: Vec<Option<LoadedObject>> = (0..round.len()).map(|_| None).collect();
-        for (at, (archive_index, member_id)) in round.iter().enumerate() {
-            let (path, index, data) = &archives[*archive_index];
-            let Some(entry) = index.member(*member_id) else {
-                continue;
-            };
-            let Ok(fresh) = blinker_archive::member_data(data, entry, path) else {
-                continue;
-            };
-            let Some((parsed, _)) = session.member(path, member_id.0, fresh) else {
-                continue;
-            };
-            if parsed.id != ObjectId(base + at as u32) {
-                continue;
-            }
-            let start = entry.offset as usize;
-            held[at] = Some(LoadedObject {
-                parsed,
-                data: SourceBytes::window(data, start..start + fresh.len()),
-                path: Arc::from(path.as_path()),
-                member: Some(Arc::from(entry.name.as_str())),
-            });
-        }
+        //
+        // On every core, because proving a member unchanged is a `memcmp` and
+        // a round of them is the whole archive: 5,504 members against 800 MB.
+        // Sequentially that was 80 ms — more than the re-parsing it replaced
+        // (174). Nothing here mutates the session, so the only thing the
+        // chunking has to preserve is the position each answer belongs at, and
+        // `map_chunks` returns them in order.
+        let archives_ref = &archives;
+        let held_session = &*session;
+        let held: Vec<Option<LoadedObject>> = parallel::map_chunks(&round, |start, chunk| {
+            chunk
+                .iter()
+                .enumerate()
+                .map(|(offset, (archive_index, member_id))| {
+                    let at = start + offset;
+                    let (path, index, data) = &archives_ref[*archive_index];
+                    let entry = index.member(*member_id)?;
+                    let fresh = blinker_archive::member_data(data, entry, path).ok()?;
+                    let (parsed, _) = held_session.member(path, member_id.0, fresh)?;
+                    if parsed.id != ObjectId(base + at as u32) {
+                        return None;
+                    }
+                    let begin = entry.offset as usize;
+                    Some(LoadedObject {
+                        parsed,
+                        data: SourceBytes::window(data, begin..begin + fresh.len()),
+                        path: Arc::from(path.as_path()),
+                        member: Some(Arc::from(entry.name.as_str())),
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .into_iter()
+        .flatten()
+        .collect();
         let todo: Vec<usize> = (0..round.len()).filter(|at| held[*at].is_none()).collect();
 
         let round = &round;
-        let archives_ref = &archives;
         let todo_ref = &todo;
         let parsed: Vec<Result<LoadedObject, LinkError>> = {
             let cursor = std::sync::atomic::AtomicUsize::new(0);

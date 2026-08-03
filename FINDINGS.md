@@ -8534,3 +8534,37 @@ That is a different justification and it is worth stating as one rather than
 letting a speed number that does not exist stand in for it. A resident linker
 that holds forty megabytes it does not need is a real cost; it is just not a
 cost the stopwatch was measuring.
+
+## 176. The proof that replaced the work became the work
+
+Finding 174 stopped re-parsing 3,373 unchanged archive members by proving each
+one unchanged instead — a `memcmp` of the member against the bytes it was parsed
+from. The re-parsing collapsed exactly as intended:
+
+```
+members re-parsed per warm link   3,373  ->  1
+parse                              13.5 ms -> 0.6 ms
+store                              24.9 ms -> 0.2 ms
+```
+
+And the round got *slower* somewhere else, because a round is 5,504 members and
+proving all of them is comparing the whole archive set: 800 MB, on one thread,
+about 80 ms. Cheaper than parsing them, which is why the change was still worth
+80 ms overall — and it had quietly become the largest single item in the stage.
+
+Nothing about it is sequential. `Session::member` takes `&self`; a member's
+answer does not depend on any other member's; the only thing the chunking has
+to preserve is the position each answer belongs at. On every core:
+
+```
+extraction rounds   60 ms -> 37 ms
+```
+
+### What to take from it
+
+An optimisation that replaces work with a *proof* that the work is unnecessary
+has to be costed like work, because that is what it is. The proof was 800 MB of
+comparison standing in for 3,373 parses, and both of those numbers are
+proportional to the whole program rather than to the edit — the second one was
+just smaller. It showed up because the instrumentation from finding 171 was
+still in the tree and got re-run after the change rather than before it.
