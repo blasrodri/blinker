@@ -8607,3 +8607,43 @@ it does not say is who computes them, and the answer turned out to be "both
 callers, separately". A comment that describes an optimisation is not evidence
 the optimisation is still in force, and this one was load-bearing enough to read
 as one.
+
+## 178. Four passes over the same three stages
+
+The instruction was to make `read_and_parse`, `emit` and `relocate` smaller.
+Each yielded to a different fix, and none of them was the one the stage's name
+suggests.
+
+**`read_and_parse`, the extraction rounds.** Finding 176's parallel `memcmp`
+took the rounds from 60 ms to 37. What was left was `want` at 13-23 ms: sixty-two
+thousand `String`s allocated per link so that the interning table's borrow could
+end before the session was needed mutably again. Scoping the borrow to the block
+that reads it removes the copies and sorts `&str` instead.
+
+```
+read_and_parse   127 ms -> 99 ms
+```
+
+**`emit`, the two hashes.** Finding 177: the image was hashed twice, and the
+second pass was the entire signature. 11.65 ms -> 0.06 ms.
+
+**`emit`, the keyed dedup.** The string table deduplicates names by the caller's
+interning id, through a `FastMap<u32, u32>` sized for 1.7 million symbols — 13 MB
+of table, probed 759,597 times, a cache miss each. An interning id is a *dense
+integer from zero*, so the index wants to be a vector: four bytes per distinct
+name, 2 MB, resident in L2, and the probe is a bounds check and a load.
+
+```
+emit_linkedit    38 ms -> 32 ms
+```
+
+The map was chosen deliberately and its comment argues, correctly, that hashing
+four bytes beats hashing a hundred. That was the right comparison against the
+*text* index next to it and the wrong one against not hashing at all — the
+question a map answers is "is this key present", and for a dense key that is an
+array subscript.
+
+**`relocate`.** Bracketed and left alone. `unwind` is 20 ms of it — 11 finding
+where each function's FDE landed, 6.7 encoding, 2.9 collecting — and `apply` is
+already on every core (166). Nothing here has the shape the other three had, and
+guessing at it would be inventing work rather than removing it.

@@ -318,14 +318,26 @@ impl<'a> SymbolTableBuilder<'a> {
                 self.symbols.len(),
                 Default::default(),
             );
-        // The same map, for names whose identity the caller already knows.
-        // Separate rather than one map over an enum key: the whole point is
-        // that this one hashes four bytes instead of a hundred.
-        let mut by_key: blinker_hashing::FastMap<u32, u32> =
-            blinker_hashing::FastMap::with_capacity_and_hasher(
-                self.symbols.len(),
-                Default::default(),
-            );
+        // The same index, for names whose identity the caller already knows —
+        // and a plain vector rather than a map, because those identities are
+        // interning ids and an interning id is a dense integer from zero.
+        //
+        // It was a `FastMap<u32, u32>` sized for 1.7 million symbols: 13 MB of
+        // table, probed 759,597 times, one cache miss each. Indexed directly it
+        // is four bytes per *distinct* name — 2 MB, which stays in L2 — and the
+        // probe is a bounds check and a load. `UNSET` rather than `Option`
+        // because the niche would double it.
+        const UNSET: u32 = u32::MAX;
+        let mut by_key: Vec<u32> = match self
+            .symbols
+            .iter()
+            .filter(|s| s.key != OutputSymbol::UNKEYED)
+            .map(|s| s.key)
+            .max()
+        {
+            Some(highest) => vec![UNSET; highest as usize + 1],
+            None => Vec::new(),
+        };
 
         // The three groups, in the order the table requires them, without
         // moving anything to get there.
@@ -348,15 +360,15 @@ impl<'a> SymbolTableBuilder<'a> {
                 let name_offset = if symbol.name.is_empty() {
                     0
                 } else if symbol.key != OutputSymbol::UNKEYED {
-                    match by_key.entry(symbol.key) {
-                        std::collections::hash_map::Entry::Occupied(held) => *held.get(),
-                        std::collections::hash_map::Entry::Vacant(slot) => {
-                            let offset = strings.len() as u32;
-                            strings.extend_from_slice(symbol.name.as_bytes());
-                            strings.push(0);
-                            slot.insert(offset);
-                            offset
-                        }
+                    let slot = &mut by_key[symbol.key as usize];
+                    if *slot != UNSET {
+                        *slot
+                    } else {
+                        let offset = strings.len() as u32;
+                        strings.extend_from_slice(symbol.name.as_bytes());
+                        strings.push(0);
+                        *slot = offset;
+                        offset
                     }
                 } else if let Some(offset) = interned.get(symbol.name.as_ref()) {
                     *offset
