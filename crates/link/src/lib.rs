@@ -2063,7 +2063,7 @@ fn link_inner(
         .as_deref()
         .and_then(|path| session.take_cache(path));
     timings.cache_held = held_cache.is_some();
-    let previous_cache = match held_cache {
+    let mut previous_cache = match held_cache {
         Some(cache) => Some(cache),
         None => request.cache_path.as_deref().and_then(blinker_cache::load),
     };
@@ -2092,10 +2092,18 @@ fn link_inner(
         .unwrap_or_default();
     let reservations = request.cache_path.as_ref().map(|_| full_sizes(&objects));
     // Only the final pass signs, so only it needs these.
-    let previous_signature = previous_cache
-        .as_ref()
-        .filter(|cache| !cache.image.is_empty() && !cache.page_hashes.is_empty())
-        .map(|cache| (cache.image.clone(), cache.page_hashes.clone()));
+    // Taken, not copied. This is the previous link's finished binary — 194 MB
+    // on a debug rust-analyzer link — and the cache it comes out of is rebuilt
+    // from this link's image before it is stored again, so nothing later reads
+    // the old bytes.
+    let previous_signature = previous_cache.as_mut().and_then(|cache| {
+        (!cache.image.is_empty() && !cache.page_hashes.is_empty()).then(|| {
+            (
+                std::mem::take(&mut cache.image),
+                std::mem::take(&mut cache.page_hashes),
+            )
+        })
+    });
     let previous_layout = previous_cache
         .as_ref()
         .filter(|cache| cache.request == request_hash(request))
@@ -2316,10 +2324,13 @@ fn link_inner(
     // the relocations were computed against still hold.
     let sub = std::time::Instant::now();
     let placed_symbols = placed_symbols(&objects, &interned, &placed, &strip);
+    gap!(_gap, "sym: placed");
     let mut symbols = output_symbols(&placed_symbols);
+    gap!(_gap, "sym: output");
     // After the ordinary locals, which is where `ld` puts them and where a
     // consumer walking the local range expects the debug map to begin.
     symbols.extend(debug_map(&objects, &placed_symbols));
+    gap!(_gap, "sym: debug map");
 
     // Each GOT slot holds an absolute address, and the image is position
     // independent, so dyld must relocate every one of them at load time.
@@ -2372,9 +2383,21 @@ fn link_inner(
         // shares its archive's key, so an rlib that changed marks all of its
         // members changed — coarse, and the reason member-level identity is
         // the next thing this needs.
+        // Keys from the session, which proved every one of these inputs at the
+        // top of the link. Probing again means a `stat` per path and a read and
+        // a BLAKE3 for each of rustc's objects — 22 MB of them on a debug
+        // rust-analyzer link, hashed here for a third time, to compute a
+        // counter. The comment above says exactly this and the code did it
+        // anyway (finding 184).
         let unchanged: HashSet<&Path> = previous_cache_inputs
             .iter()
-            .filter(|(path, key)| blinker_cache::InputKey::probe(path).as_ref() == Some(key))
+            .filter(|(path, key)| {
+                session
+                    .key_for(path)
+                    .or_else(|| blinker_cache::InputKey::probe(path))
+                    .as_ref()
+                    == Some(key)
+            })
             .map(|(path, _)| path.as_path())
             .collect();
         let source_of: HashMap<u32, &Path> = objects
@@ -2405,6 +2428,7 @@ fn link_inner(
     }
 
     timings.accounting_ms = elapsed_ms(accounting);
+    gap!(_gap, "acct: total");
     gap!(_gap, "after accounting");
 
     if let (Some(path), Some(cache), Ok(image)) = (&request.cache_path, &mut cache, &image) {
