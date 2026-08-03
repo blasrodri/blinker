@@ -107,12 +107,15 @@ pub struct ArchiveIndex {
     pub path: PathBuf,
     pub members: Vec<ArchiveMember>,
     /// Symbol name → the member defining it, from the archive symbol table,
-    /// **sorted by name**.
+    /// **in the archive's own order**.
     ///
-    /// Sorted so that `member_defining` can binary-search it. The archive's own
-    /// order carries no meaning here — it is a lookup table, and the ordering
-    /// that matters for resolution is the order of `members`, which is
-    /// untouched.
+    /// Not sorted. It was, for a binary search this crate no longer performs;
+    /// the linker builds one index across every archive instead. A consumer
+    /// wanting a lookup should build its own, which is cheaper once and
+    /// correct for the question it is actually asking.
+    ///
+    /// The order carries one guarantee, which is the one resolution needs: the
+    /// first entry for a name is the earliest member defining it.
     ///
     /// Empty when the archive has no symbol table, which is not an error: the
     /// resolver then falls back to examining linkable members directly.
@@ -143,19 +146,18 @@ impl ArchiveIndex {
     /// the second-largest cost in it, inside a function that reads like a
     /// lookup (finding 78).
     ///
-    /// A sorted `Vec` rather than a `HashMap` because the table is built once
-    /// and read many times, it stays serialisable, and it costs no second copy
-    /// of every symbol name.
+    /// A scan, and not the binary search this used to be. The table is no
+    /// longer sorted — see `index_archive` — because the linker stopped asking
+    /// one archive at a time and the sort was costing more than every lookup
+    /// it served. A caller with many names to resolve should build an index
+    /// across the archives it has, as `load_objects` does, rather than call
+    /// this in a loop; that is the mistake finding 78 was about.
     pub fn member_defining(&self, symbol: &str) -> Option<MemberId> {
-        // `partition_point` rather than `binary_search`: an archive may list a
-        // name more than once, and the first definition has to win exactly as
-        // it did when this was a forward scan.
-        let at = self
-            .symbol_map
-            .partition_point(|(name, _)| name.as_str() < symbol);
+        // The first entry wins, exactly as a forward scan of the archive's own
+        // order would have: a name may be listed more than once.
         self.symbol_map
-            .get(at)
-            .filter(|(name, _)| name == symbol)
+            .iter()
+            .find(|(name, _)| name == symbol)
             .map(|(_, id)| *id)
     }
 
@@ -208,11 +210,19 @@ pub fn index_archive(data: &[u8], path: &Path) -> Result<ArchiveIndex, ArchiveEr
         });
     }
 
-    let mut symbol_map = parse_symbol_map(&archive, &members);
-    // Sorted for lookup. Stable, so that a name listed twice keeps the earlier
-    // member first and `member_defining` still resolves it the way a forward
-    // scan of the archive's own order would have.
-    symbol_map.sort_by(|(a, _), (b, _)| a.cmp(b));
+    // Left in the archive's own order. It was sorted here, for a binary search
+    // that no longer happens: the linker builds one map across every archive
+    // and reads this table by scanning it once (see `load_objects`). Sorting
+    // 73,095 `(String, MemberId)` pairs by text — every comparison two pointer
+    // chases — cost 9-14 ms on rust-analyzer's largest rlib, on the one thread
+    // that archive was being indexed on, to order a table nothing binary
+    // searched (finding 181).
+    //
+    // The order the linker does depend on is unchanged. It takes the *first*
+    // entry for a name, and the archive symbol table already lists members in
+    // archive order, so the first occurrence names the same member the stable
+    // sort put first.
+    let symbol_map = parse_symbol_map(&archive, &members);
 
     Ok(ArchiveIndex {
         path: path.to_path_buf(),

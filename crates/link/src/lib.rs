@@ -3580,6 +3580,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
     // Names already offered to every archive. One that no archive defines will
     // still be wanted next round, and asking again cannot produce a different
     // answer — the archives do not change.
+    gap!(_lap, "load: seed + absorb");
     let mut probed: HashSet<SymbolNameId> = HashSet::default();
     loop {
         let unprobed: Vec<SymbolNameId> = frontier
@@ -3641,8 +3642,9 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
             }
             round
         };
+        gap!(_lap, "round: pick");
         if round.is_empty() {
-            gap!(_lap, "load: extraction rounds");
+            gap!(_lap, "load: extraction rounds tail");
             session.store_extraction(archive_paths, order);
             return Ok(objects);
         }
@@ -3696,6 +3698,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
         .into_iter()
         .flatten()
         .collect();
+        gap!(_lap, "round: prove held");
         let todo: Vec<usize> = (0..round.len()).filter(|at| held[*at].is_none()).collect();
 
         let round = &round;
@@ -3764,6 +3767,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
             .filter_map(|loaded| loaded.as_ref().ok())
             .map(|loaded| Arc::clone(&loaded.parsed))
             .collect();
+        gap!(_lap, "round: parse");
         session.seed_interned(&derivable);
         let digestible: Vec<Arc<ParsedObject>> = todo
             .iter()
@@ -3792,6 +3796,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
             }
         }
 
+        gap!(_lap, "round: seed + store");
         for loaded in parsed {
             let loaded = loaded?;
             let ids = session.interned(&loaded.parsed);
@@ -3799,6 +3804,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
             objects.push(loaded);
             added = true;
         }
+        gap!(_lap, "round: absorb");
 
         if !added {
             gap!(_lap, "load: extraction rounds");
