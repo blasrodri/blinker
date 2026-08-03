@@ -18,8 +18,8 @@ programs.
 | Output size | **0.85×** `ld-prime`'s on a large link, with dead-stripping |
 | Cold link, small (238 objects) | **1.09×** `ld-prime` — inside the spread |
 | Cold link, large (5,637 objects) | **1.75×** `ld-prime` |
-| Edit relink, small, resident | **11.2 ms** against `ld-prime`'s 29.7 ms cold |
-| Edit relink, large, resident | **346 ms** against `ld-prime`'s 311 ms cold |
+| Edit relink, small, resident | **11.4 ms** against `ld-prime`'s 29.7 ms cold |
+| Edit relink, large, resident | **357 ms** against `ld-prime`'s 311 ms cold |
 
 The last two rows are the metric the product exists for, and they are where the
 two scales disagree: on a small link the resident linker is comfortably faster
@@ -38,8 +38,8 @@ plan — several of them contradicting earlier entries in the same file.
 
 - **Speed at scale.** 1.75× the system linker on a large cold link, against
   1.09× on a small one, and the resident relink of a large program is still
-  slower than a cold `ld-prime` — by 11%, where it was 51% at the start of the
-  work recorded in findings 179-185. The reason is that the stages left are
+  slower than a cold `ld-prime` — by 15%, where it was 51% at the start of the
+  work recorded in findings 179-186. The reason is that the stages left are
   proportional to the whole program rather than to the edit: dead stripping
   rebuilds the reachability graph even when one object in 5,637 moved, and the
   image is assembled, hashed and written whole even when 98% of relocations
