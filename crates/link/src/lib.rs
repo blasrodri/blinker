@@ -3468,14 +3468,30 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
         };
         let mut added = false;
 
+        // Which archive defines each wanted name, asked on every core.
+        //
+        // `defining` is read-only here, and a name's answer does not depend on
+        // any other name's — so the question is the shape finding 170 found in
+        // the interner, and it was costing the same way. Sixty-two thousand
+        // lookups at 450 ns each on a warm link: hash sixty bytes of mangled
+        // name, miss into a half-million-entry table, chase a pointer to the
+        // `String` it holds to compare the text. One name in flight at a time.
+        //
+        // The answers come back in `wanted` order, which is the order the
+        // members are pulled in and therefore what id each one gets — so the
+        // chunking has to preserve it, and `map_chunks` is what does.
+        let found = parallel::map_chunks(&wanted, |_, chunk| {
+            chunk
+                .iter()
+                .map(|name| defining.get(name.as_str()).copied())
+                .collect::<Vec<_>>()
+        });
+
         // Which members this round wants, in the order it wants them. Chosen
         // before any of them is parsed, so the ids below are assigned by
         // position and no thread's timing can reach the output.
         let mut round: Vec<(usize, blinker_archive::MemberId)> = Vec::new();
-        for name in &wanted {
-            let Some(&(archive_index, member_id)) = defining.get(name.as_str()) else {
-                continue;
-            };
+        for (archive_index, member_id) in found.into_iter().flatten().flatten() {
             if !extracted.insert((archive_index, member_id.0)) {
                 continue; // already in the link
             }

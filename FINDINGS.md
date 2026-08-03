@@ -8395,3 +8395,47 @@ Two suggestions, one paragraph, one reviewer, equal confidence in both. One was
 already implemented and the remaining delta was zero by construction; the other
 named a real 17 ms and delivered none of it. Neither outcome was predictable
 from the argument, and both took under an hour to settle by measuring.
+
+## 173. The same shape again, in the archive frontier
+
+Finding 171 bracketed a warm relink and found the extraction rounds costing
+86 ms — on a link where every member but one archive's came out of the session.
+Broken down:
+
+```
+want   10.9 ms   resolve the wanted ids to text, copy them out, sort
+pick   26.8 ms   `defining.get` for each
+parse  13.5 ms   the members of the one rlib that changed
+store  24.9 ms
+absorb  9.1 ms
+```
+
+`pick` is sixty-two thousand lookups at 450 ns each. Not because there are many
+— because each one hashes sixty bytes of mangled name, misses into a
+half-million-entry table, and chases a pointer to the `String` the entry holds
+to compare the text. Three dependent loads, one name in flight at a time. It is
+finding 170's shape exactly, in a different table, found by looking for it.
+
+And the same fix works, more simply than it did in the interner: `defining` is
+**read-only** for the whole round, so there is no insert to serialise against
+and no second phase to file the misses. The round's names go to every core in
+one `map_chunks` and the answers come back in `wanted` order — which is the
+order members are pulled in, and therefore what id each one gets, so preserving
+it is the whole safety argument.
+
+```
+pick   before  26.5 27.0 27.7 31.9 26.3 24.6   median 26.8 ms
+       after    7.2  9.2 14.1  9.7  7.3  7.3   median  8.2 ms
+```
+
+Nineteen milliseconds a warm link, output byte-identical.
+
+### Worth noting about how it was found
+
+The measurement that produced finding 171's table was misread first: the
+counters are microseconds accumulated per link, and reading them as cumulative
+across links made the extraction rounds look like 50 microseconds of a 600 ms
+link — a stage already perfect and not worth touching. They were 86 ms. The
+numbers were right and the sentence about them was wrong, which is the failure
+mode instrumentation is *least* protected against: a wrong reading of a correct
+measurement looks exactly like a correct one.
