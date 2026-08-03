@@ -662,6 +662,13 @@ fn hash_edge(edge: Option<Edge>, hasher: &mut impl std::hash::Hasher) {
     }
 }
 
+/// A name nothing in the link defines, in `Atoms::resolved`.
+///
+/// A sentinel rather than an `Option`, because the array is streamed by the
+/// traversal and four bytes per entry is what makes that cheap. Atom indices
+/// are bounded by the atom count, which is six figures.
+const UNRESOLVED: u32 = u32::MAX;
+
 /// Every atom of a link, as the objects' own numbering plus a base each.
 pub(crate) struct Atoms<'a> {
     objects: &'a [LoadedObject],
@@ -673,8 +680,17 @@ pub(crate) struct Atoms<'a> {
     slot_of: Vec<u32>,
     /// Object id -> block index.
     slot: HashMap<u32, usize>,
-    /// Per block, where each of its distinct referenced names resolves to.
-    resolved: Vec<Vec<Option<usize>>>,
+    /// Where each block's distinct referenced names resolve to, end to end.
+    ///
+    /// One flat array and a base per block, not a `Vec` per block. The
+    /// traversal reads this once per edge — 1.2 million times — and a nested
+    /// `Vec` makes that two dependent loads: the inner vector's pointer, then
+    /// the entry. It also stored an `Option<usize>`, sixteen bytes to carry a
+    /// value that fits in four, so the array the traversal streams was four
+    /// times larger than the answers in it.
+    resolved: Vec<u32>,
+    /// Where each block's names start in `resolved`.
+    resolved_base: Vec<u32>,
     total: usize,
     /// Sections kept whole because a reference into their middle would not
     /// survive their atoms being moved.
@@ -791,33 +807,50 @@ impl<'a> Atoms<'a> {
             opaque: HashSet::default(),
             owners,
             resolved: Vec::new(),
+            resolved_base: Vec::new(),
         };
-        result.resolved = result.resolve_names(&interned);
+        (result.resolved, result.resolved_base) = result.resolve_names(&interned);
         result.opaque = result.find_opaque(&interned);
         parts[2] = step.elapsed().as_secs_f64() * 1000.0;
         result
     }
 
-    /// Where each block's distinct referenced names resolve to.
+    /// Where each block's distinct referenced names resolve to, and where each
+    /// block's run starts.
     ///
     /// One owners probe per (object, name) rather than per edge — 390,606
     /// instead of 1,195,652 on a debug rust-analyzer link.
-    fn resolve_names(&self, interned: &[Arc<Vec<SymbolNameId>>]) -> Vec<Vec<Option<usize>>> {
-        self.blocks
-            .iter()
-            .enumerate()
-            .map(|(slot, block)| {
-                let ids = &interned[slot];
-                block
-                    .names
-                    .iter()
-                    .map(|symbol| {
-                        let name = ids.get(symbol.0 as usize)?;
-                        self.owners.get(name).map(|owners| owners.first)
-                    })
-                    .collect()
-            })
-            .collect()
+    ///
+    /// On every core: a probe reads the owners map and the block, and writes
+    /// nothing. The runs are concatenated in block order, so the bases are the
+    /// running lengths and neither depends on which thread finished first.
+    fn resolve_names(&self, interned: &[Arc<Vec<SymbolNameId>>]) -> (Vec<u32>, Vec<u32>) {
+        let (owners, blocks) = (&self.owners, &self.blocks);
+        let chunks = crate::parallel::map_chunks(blocks, |start, chunk| {
+            chunk
+                .iter()
+                .enumerate()
+                .map(|(at, block)| {
+                    let ids = &interned[start + at];
+                    block
+                        .names
+                        .iter()
+                        .map(|symbol| {
+                            ids.get(symbol.0 as usize)
+                                .and_then(|name| owners.get(name))
+                                .map_or(UNRESOLVED, |owners| owners.first as u32)
+                        })
+                        .collect::<Vec<u32>>()
+                })
+                .collect::<Vec<_>>()
+        });
+        let mut resolved = Vec::new();
+        let mut bases = Vec::with_capacity(blocks.len());
+        for names in chunks.into_iter().flatten() {
+            bases.push(resolved.len() as u32);
+            resolved.extend(names);
+        }
+        (resolved, bases)
     }
 
     /// Sections that must be kept whole.
@@ -866,7 +899,12 @@ impl<'a> Atoms<'a> {
             // Answered by subscript. Every distinct name was resolved once,
             // below; doing it here meant a string hash per edge walked, and
             // the traversal walks 1.2 million of them.
-            Edge::Name(at) => self.resolved[slot][at as usize],
+            Edge::Name(at) => {
+                match self.resolved[self.resolved_base[slot] as usize + at as usize] {
+                    UNRESOLVED => None,
+                    index => Some(index as usize),
+                }
+            }
         }
     }
 
