@@ -26,6 +26,14 @@ pub enum LinkError {
     UndefinedSymbols {
         names: Vec<String>,
     },
+    /// Names defined strongly by more than one input.
+    ///
+    /// Never a silent pick: the two definitions are different code, and
+    /// choosing one produces a program that runs the wrong one with nothing in
+    /// the build log to say so.
+    DuplicateSymbols {
+        names: Vec<String>,
+    },
     /// No object contributed anything placeable.
     NothingToLink,
     /// The entry symbol was not found in any object.
@@ -82,6 +90,13 @@ impl std::fmt::Display for LinkError {
             LinkError::Archive(source) => write!(f, "{source}"),
             LinkError::UndefinedSymbols { names } => {
                 write!(f, "undefined symbols:")?;
+                for name in names {
+                    write!(f, "\n  {name}")?;
+                }
+                Ok(())
+            }
+            LinkError::DuplicateSymbols { names } => {
+                write!(f, "duplicate symbol definitions:")?;
                 for name in names {
                     write!(f, "\n  {name}")?;
                 }

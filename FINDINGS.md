@@ -7833,3 +7833,70 @@ tests green.
 One incidental fix on the way past: `survey_relocations` built a
 `std::collections::HashSet<SectionId>` — SipHash, not the fast hasher — once
 per object, 5,637 times, to hold at most one element. It is a `Vec` now.
+
+## 162. The link built a symbol table to find errors, then dropped the errors
+
+`resolve_symbols` walked every symbol of every object into a full
+`SymbolTable` — `resolved`, `candidates`, `rules` and `undefined`, four maps
+over half a million names — and then:
+
+```rust
+let undefined = table.undefined_symbols();
+let outcome = if undefined.is_empty() { Ok(()) } else { Err(...) };
+*names = table.into_names();
+outcome                     // the table is dropped here
+```
+
+Instrumented on a debug rust-analyzer link: **93.3 ms**, against 12.8 ms for
+the `resolve_imports` call beside it.
+
+### Two things were wrong, and the second is not a performance problem
+
+**The undefined check was already done.** `resolve_imports` computes the
+undefined set and errors on anything the stub libraries do not provide, before
+this runs. It is the stricter of the two — it counts a weak-undefined
+reference as undefined where the table would allow it — so it always fires
+first. The 93 ms re-derived an answer that had already been given.
+
+**The duplicate check was never done at all.** `SymbolTable` collects
+`SymbolError::Duplicate` for a name defined strongly twice — the rule the
+symbols module's own documentation calls the dangerous one, tested since the
+crate was written — and nothing in the linker has ever called `errors()`.
+`grep` finds no caller outside that crate's tests. So a program with two strong
+definitions of one name linked, ran, and called whichever definition arrived
+first, with nothing in the build log to say so.
+
+That is the failure mode the whole module was designed around, and it was
+unreachable because the link never asked the question.
+
+### What replaced it
+
+`duplicate_definitions` — one pass, counting strong non-local definitions into
+a `Vec<u8>` indexed by name id. No hashing at all: the ids are dense from zero,
+so the count is a subscript. Anything above one is a duplicate.
+
+`explain_duplicates` builds the full table, but only for the names that already
+failed, and only on the path that is about to return an error. A diagnostic
+that names every competing definition is worth 93 ms when there *is* an error;
+it is worth nothing on the 100% of links where there is not.
+
+`two_strong_definitions_of_one_name_are_refused` compiles three objects, two of
+which define `_shared`, and requires the link to fail and to name both files.
+It fails against the previous code, which linked them happily.
+
+### Measured
+
+```
+  resolve stage    71.2 ms -> ~10 ms
+```
+
+rust-analyzer has no duplicate strong definitions, so the new check fires on
+nothing and the 187 MB output is byte-identical. 62 suites, 649 tests green.
+
+### The shape
+
+Finding 135 is "a container whose final size is a known function of the input,
+built by repeated insertion from empty". This is its sibling: **a container
+built to be searched once, for something that is almost never there.** The fix
+is the same shape as an exception path — do the cheap test always, pay for the
+explanation only when you owe one.

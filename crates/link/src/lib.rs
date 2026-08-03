@@ -1851,7 +1851,22 @@ fn link_inner(
             // Resolution runs for its diagnostics: it is what turns a
             // genuinely missing definition into a named error rather than a
             // relocation against zero.
-            resolve_symbols(&objects, &interned, &imports, session.names_mut())?;
+            // Two strong definitions of one name is an error, and this is
+            // where the link asks. It used to build the whole resolution
+            // table to find out — 93 ms of maps that were then dropped
+            // without anything reading the errors in them (162).
+            let duplicated = duplicate_definitions(&objects, &interned, session.names());
+            if !duplicated.is_empty() {
+                return Err(LinkError::DuplicateSymbols {
+                    names: explain_duplicates(
+                        &objects,
+                        &interned,
+                        &imports,
+                        session.names_mut(),
+                        &duplicated,
+                    ),
+                });
+            }
             session.store_imports(&imports);
             imports
         }
@@ -3544,24 +3559,67 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
 /// out and dropped on an error: the id vectors in `interned` are only
 /// meaningful against this table, and a link that failed is followed by a link
 /// that reuses every one of them.
-fn resolve_symbols(
+fn duplicate_definitions(
+    objects: &[LoadedObject],
+    interned: &[Arc<Vec<SymbolNameId>>],
+    names: &SymbolNames,
+) -> Vec<SymbolNameId> {
+    // Saturating counts, indexed by name id — no hashing at all. A `Vec` and
+    // not a map because the ids are dense from zero by construction, and the
+    // whole question is asked once per symbol in the link.
+    let mut strong: Vec<u8> = vec![0; names.len()];
+    for (slot, object) in objects.iter().enumerate() {
+        let ids = &interned[slot];
+        for symbol in &object.parsed.symbols {
+            // A local definition is invisible outside its object, and two
+            // objects may legitimately define the same local name.
+            if symbol.strength != SymbolStrength::Strong
+                || symbol.visibility == SymbolVisibility::Local
+            {
+                continue;
+            }
+            let Some(name) = ids.get(symbol.id.0 as usize) else {
+                continue;
+            };
+            let count = &mut strong[name.0 as usize];
+            *count = count.saturating_add(1);
+        }
+    }
+    strong
+        .into_iter()
+        .enumerate()
+        .filter(|(_, count)| *count > 1)
+        .map(|(index, _)| SymbolNameId(index as u32))
+        .collect()
+}
+
+/// Explain a set of duplicate definitions, naming every competitor.
+///
+/// The slow path, and only the slow path: it builds the full resolution table,
+/// which is what carries the candidates. That build is 93 ms on a debug
+/// rust-analyzer link, and paying it on every successful link to describe
+/// errors that were not there is what finding 162 is about.
+fn explain_duplicates(
     objects: &[LoadedObject],
     interned: &[Arc<Vec<SymbolNameId>>],
     imports: &[String],
     names: &mut SymbolNames,
-) -> Result<(), LinkError> {
+    duplicated: &[SymbolNameId],
+) -> Vec<String> {
+    let wanted: crate::hashing::FastSet<SymbolNameId> = duplicated.iter().copied().collect();
     let mut table = SymbolTable::with_names(std::mem::take(names));
-
-    // Dylib exports are definitions as far as resolution is concerned; dyld
-    // supplies the address at load time.
     for name in imports {
         table.define_dynamic(name, 0);
     }
-
     for (slot, object) in objects.iter().enumerate() {
         let ids = &interned[slot];
         for symbol in &object.parsed.symbols {
-            let name_id = ids[symbol.id.0 as usize];
+            let Some(name_id) = ids.get(symbol.id.0 as usize).copied() else {
+                continue;
+            };
+            if !wanted.contains(&name_id) {
+                continue;
+            }
             if symbol.strength.is_definition() {
                 table.define_id(
                     name_id,
@@ -3577,20 +3635,34 @@ fn resolve_symbols(
             }
         }
     }
-
-    let undefined = table.undefined_symbols();
-    let outcome = if undefined.is_empty() {
-        Ok(())
-    } else {
-        Err(LinkError::UndefinedSymbols {
-            names: undefined
-                .into_iter()
-                .filter_map(|u| table.name_of(u.name).map(str::to_string))
-                .collect(),
+    let reported = table
+        .errors()
+        .iter()
+        .filter_map(|error| match error {
+            blinker_symbols::SymbolError::Duplicate(duplicate) => {
+                let name = table.name_of(duplicate.name).unwrap_or("<unknown>");
+                let objects: Vec<String> = duplicate
+                    .candidates
+                    .iter()
+                    .filter_map(|candidate| match candidate.provider {
+                        SymbolProvider::Object { object, .. }
+                        | SymbolProvider::ArchiveMember { object, .. } => Some(object),
+                        _ => None,
+                    })
+                    .map(|object| {
+                        objects
+                            .get(object.0 as usize)
+                            .map(|held| held.path.display().to_string())
+                            .unwrap_or_else(|| format!("object {}", object.0))
+                    })
+                    .collect();
+                Some(format!("{name} (defined in {})", objects.join(", ")))
+            }
+            blinker_symbols::SymbolError::Undefined(_) => None,
         })
-    };
+        .collect();
     *names = table.into_names();
-    outcome
+    reported
 }
 
 /// Read and parse one archive member.

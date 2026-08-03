@@ -381,3 +381,47 @@ fn the_linked_image_is_validly_signed() {
         String::from_utf8_lossy(&verify.stderr)
     );
 }
+
+/// Two strong definitions of one name is an error, not a silent pick.
+///
+/// The rule was implemented and tested in `blinker_symbols` from the start,
+/// and the linker never asked: `resolve_symbols` collected the errors into a
+/// table it then dropped, so a program with two `_shared` functions linked,
+/// ran, and called whichever definition happened to arrive first — the exact
+/// silent wrong answer that module's own documentation calls the dangerous
+/// case (finding 162).
+///
+/// So this is the test for a check the link did not previously perform.
+#[test]
+fn two_strong_definitions_of_one_name_are_refused() {
+    let scratch = Scratch::dir("duplicate-symbols").expect("scratch");
+    let objects = compile(
+        &scratch,
+        &[
+            (
+                "main.c",
+                "int shared(void);\nint main(void) { return shared(); }\n",
+            ),
+            ("one.c", "int shared(void) { return 1; }\n"),
+            ("two.c", "int shared(void) { return 2; }\n"),
+        ],
+    );
+
+    let output = scratch.join("duplicate");
+    let error = link_to_file(&LinkRequest::new(objects), &output)
+        .expect_err("two definitions of `_shared` must not link");
+    let message = error.to_string();
+    assert!(
+        message.contains("duplicate symbol"),
+        "wrong error for a duplicate definition: {message}"
+    );
+    assert!(
+        message.contains("_shared"),
+        "the error did not name the symbol: {message}"
+    );
+    // And it names where they came from, which is the question a user has.
+    assert!(
+        message.contains("one.c.o") && message.contains("two.c.o"),
+        "the error did not name both definitions: {message}"
+    );
+}
