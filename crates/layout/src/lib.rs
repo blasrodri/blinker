@@ -29,7 +29,7 @@
 //!   rather than a shortcut — but the stabs are then required for debugging to
 //!   work at all, which is M3's problem.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use blinker_macho::{ObjectId, SectionId, SectionKind};
 
@@ -508,6 +508,38 @@ pub fn compute_layout_reusing(
         key_of,
         reserve_of,
     )
+}
+
+/// How many sections each output segment will hold, in no particular order.
+///
+/// Every consumer of a `Layout` so far has needed the addresses in it. One does
+/// not: sizing the Mach-O load commands needs the *shape* — how many segments,
+/// and how many sections in each — and nothing about where anything lands.
+///
+/// That distinction was costing a whole extra layout. The image is laid out
+/// twice, once to learn how much room the header and commands need and once for
+/// real, and the header reservation is an input to the second. But the section
+/// set is not: it comes from `output_segment_for` and `output_section_name`,
+/// which read an input's own segment, name and kind and nothing else. The
+/// second pass moves every address and cannot add or remove a section
+/// (finding 183).
+///
+/// `__PAGEZERO` and `__LINKEDIT` are here because [`compute`] always emits
+/// them, with no sections each.
+pub fn output_shape(inputs: &[InputPlacement]) -> Vec<usize> {
+    let mut per_segment: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
+    for input in inputs {
+        let Some(segment) = output_segment_for(&input.segment, &input.name, input.kind) else {
+            continue;
+        };
+        per_segment
+            .entry(segment)
+            .or_default()
+            .insert(output_section_name(&input.name, input.kind));
+    }
+    let mut shape = vec![0, 0];
+    shape.extend(per_segment.values().map(|sections| sections.len()));
+    shape
 }
 
 fn compute(
@@ -1320,5 +1352,84 @@ mod slop_tests {
         let layout = compute_layout_with_slop(&[text(0, 4000)], 0x1000, Slop::DEFAULT);
         let contribution = &layout.sections[0].contributions[0];
         assert_eq!(contribution.size, 4000);
+    }
+}
+
+#[cfg(test)]
+mod shape_tests {
+    use super::*;
+    use blinker_macho::{ObjectId, SectionId};
+
+    fn input(object: u32, segment: &str, name: &str, kind: SectionKind) -> InputPlacement {
+        InputPlacement {
+            object: ObjectId(object),
+            section: SectionId(0),
+            segment: segment.to_string(),
+            name: name.to_string(),
+            kind,
+            size: 64,
+            alignment: 4,
+        }
+    }
+
+    /// The property the extra layout pass was replaced by: the shape predicted
+    /// from the inputs alone is the shape the layout produces.
+    ///
+    /// It is checked against `compute_layout_with_slop` rather than restated,
+    /// because the two deriving it separately is exactly the arrangement that
+    /// drifts — and the consequence of drift is a header reservation too small
+    /// for the load commands.
+    #[test]
+    fn the_predicted_shape_is_the_shape_the_layout_has() {
+        let inputs = vec![
+            input(0, "__TEXT", "__text", SectionKind::Code),
+            // A second object contributing to a section that already exists.
+            input(1, "__TEXT", "__text", SectionKind::Code),
+            input(0, "__TEXT", "__const", SectionKind::Data),
+            input(0, "__DATA", "__data", SectionKind::Data),
+            input(0, "__DATA", "__bss", SectionKind::Bss),
+            input(0, "__TEXT", "__cstring", SectionKind::ReadOnlyData),
+            input(0, "__TEXT", "__eh_frame", SectionKind::Unwind),
+            input(0, "__DATA", "__thread_data", SectionKind::ThreadLocal),
+            // Debug sections do not reach the output at all.
+            input(0, "__DWARF", "__debug_info", SectionKind::Debug),
+        ];
+
+        let mut predicted = output_shape(&inputs);
+        let layout = compute_layout_with_slop(&inputs, PAGE_SIZE, Slop::NONE);
+        let mut actual: Vec<usize> = layout.segments.iter().map(|s| s.sections.len()).collect();
+
+        // Compared as multisets: the caller sums them, so the order the two
+        // list segments in is not part of the claim.
+        predicted.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(
+            predicted, actual,
+            "predicted {predicted:?} actual {actual:?}"
+        );
+        assert_eq!(predicted.len(), layout.segments.len());
+    }
+
+    /// And that it does not depend on the reservation, which is the whole
+    /// reason it can be computed before one is chosen.
+    #[test]
+    fn the_shape_does_not_move_with_the_header_reservation() {
+        let inputs = vec![
+            input(0, "__TEXT", "__text", SectionKind::Code),
+            input(0, "__DATA", "__data", SectionKind::Data),
+        ];
+        let small = compute_layout_with_slop(&inputs, PAGE_SIZE, Slop::NONE);
+        let large = compute_layout_with_slop(&inputs, PAGE_SIZE * 64, Slop::NONE);
+        // Sorted: `output_shape` documents no order, because its only caller
+        // sums it.
+        let shape = |l: &Layout| -> Vec<usize> {
+            let mut counts: Vec<usize> = l.segments.iter().map(|s| s.sections.len()).collect();
+            counts.sort_unstable();
+            counts
+        };
+        assert_eq!(shape(&small), shape(&large));
+        let mut predicted = output_shape(&inputs);
+        predicted.sort_unstable();
+        assert_eq!(predicted, shape(&small));
     }
 }

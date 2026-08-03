@@ -370,10 +370,18 @@ pub fn write_linkedit_data(writer: &mut Writer, command: u32, offset: u32, size:
 /// fields included — use [`command_size_with_path`] to compute each, so the
 /// prediction and the emission cannot disagree about the alignment rule.
 pub fn command_size_for(layout: &Layout, dylib_command_bytes: usize) -> usize {
-    let segment_bytes: usize = layout
-        .segments
+    let shape: Vec<usize> = layout.segments.iter().map(|s| s.sections.len()).collect();
+    command_size_for_shape(&shape, dylib_command_bytes)
+}
+
+/// The same size, from the shape alone.
+///
+/// `shape` is one entry per output segment, holding its section count — what
+/// [`blinker_layout::output_shape`] produces without laying anything out.
+pub fn command_size_for_shape(shape: &[usize], dylib_command_bytes: usize) -> usize {
+    let segment_bytes: usize = shape
         .iter()
-        .map(|s| sizes::SEGMENT_64 + s.sections.len() * sizes::SECTION_64)
+        .map(|sections| sizes::SEGMENT_64 + sections * sizes::SECTION_64)
         .sum();
 
     segment_bytes

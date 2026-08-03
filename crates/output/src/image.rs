@@ -360,7 +360,6 @@ impl<'a> ImageBuilder<'a> {
 
         let mut timings = EmitTimings::default();
         let started = std::time::Instant::now();
-        let probe = lay_out(PAGE_SIZE);
         let dylib_bytes: usize = self
             .dylibs
             .iter()
@@ -369,9 +368,23 @@ impl<'a> ImageBuilder<'a> {
         // Over-reserves by three `linkedit_data_command`s: LC_FUNCTION_STARTS,
         // LC_DATA_IN_CODE and LC_CODE_SIGNATURE are not emitted yet but will
         // be. Reserving space we do not use is harmless; running out is not.
-        let command_size = commands::command_size_for(&probe, dylib_bytes);
+        //
+        // From the shape rather than from a layout. This was a whole extra
+        // `lay_out` — the image laid out twice, once to count its sections and
+        // once for real — and counting them needs no addresses at all.
+        //
+        // Over-reserving stays harmless and under-reserving stays an error:
+        // the emitter compares the commands it actually wrote against this
+        // reservation and returns `CommandsOverflowedReservation`. So a shape
+        // that disagreed with the layout would fail the link rather than write
+        // load commands over the first section, which is the failure mode that
+        // has no symptom.
+        let command_size = commands::command_size_for_shape(
+            &blinker_layout::output_shape(&self.inputs),
+            dylib_bytes,
+        );
 
-        // Pass two: lay out for real, with room for the header and commands.
+        // Lay out for real, with room for the header and commands.
         let reservation = align_up((MachHeader::SIZE + command_size) as u64, 16);
         let layout = lay_out(reservation);
         timings.layout_ms = started.elapsed().as_secs_f64() * 1000.0;
