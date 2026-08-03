@@ -292,11 +292,18 @@ impl<'a> SymbolTableBuilder<'a> {
         // that copy about 160 MB on the way (135). The bound is the total
         // length of every name; interning brings the real size below it, and
         // the difference is transient.
-        let bytes: usize = self
-            .symbols
-            .iter()
-            .map(|symbol| symbol.name.len() + 1)
-            .sum();
+        // Both bounds in one pass. They are two reductions over the same 1.7
+        // million entries — 81 MB — and reading that twice to answer two
+        // questions about it is the pass, not the arithmetic.
+        let (bytes, highest_key) = self.symbols.iter().fold((0usize, None), |(bytes, key), s| {
+            (
+                bytes + s.name.len() + 1,
+                match s.key {
+                    OutputSymbol::UNKEYED => key,
+                    k => Some(key.map_or(k, |held: u32| held.max(k))),
+                },
+            )
+        });
         let mut strings = Vec::with_capacity(bytes + 1);
         strings.push(0u8);
         let mut entries = Vec::with_capacity(self.symbols.len());
@@ -328,13 +335,7 @@ impl<'a> SymbolTableBuilder<'a> {
         // probe is a bounds check and a load. `UNSET` rather than `Option`
         // because the niche would double it.
         const UNSET: u32 = u32::MAX;
-        let mut by_key: Vec<u32> = match self
-            .symbols
-            .iter()
-            .filter(|s| s.key != OutputSymbol::UNKEYED)
-            .map(|s| s.key)
-            .max()
-        {
+        let mut by_key: Vec<u32> = match highest_key {
             Some(highest) => vec![UNSET; highest as usize + 1],
             None => Vec::new(),
         };
