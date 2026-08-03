@@ -2115,14 +2115,23 @@ fn link_inner(
     // on a debug rust-analyzer link — and the cache it comes out of is rebuilt
     // from this link's image before it is stored again, so nothing later reads
     // the old bytes.
-    let previous_signature = previous_cache.as_mut().and_then(|cache| {
-        (!cache.image.is_empty() && !cache.page_hashes.is_empty()).then(|| {
-            (
-                std::mem::take(&mut cache.image),
-                std::mem::take(&mut cache.page_hashes),
-            )
-        })
-    });
+    // `BLINKER_NO_PAGE_REUSE` withholds it, so the mechanism can be measured
+    // rather than argued about. It is worth 18 ms — `emit_uuid` is 12.0 ms with
+    // the previous image to compare against and 29.8 ms hashing all 43,600
+    // pages without it — which is the opposite result to the patching writer
+    // finding 186 removed, and for a reason: hashing a page costs far more than
+    // comparing it, where *writing* a page does not.
+    let previous_signature = previous_cache
+        .as_mut()
+        .filter(|_| std::env::var_os("BLINKER_NO_PAGE_REUSE").is_none())
+        .and_then(|cache| {
+            (!cache.image.is_empty() && !cache.page_hashes.is_empty()).then(|| {
+                (
+                    std::mem::take(&mut cache.image),
+                    std::mem::take(&mut cache.page_hashes),
+                )
+            })
+        });
     let previous_layout = previous_cache
         .as_ref()
         .filter(|cache| cache.request == request_hash(request))

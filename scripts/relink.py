@@ -393,10 +393,14 @@ def main():
     # the stage containing it double-counts, and the first version of this made
     # `unmeasured` negative — which is at least a number that announces itself.
     overlapped = {"stub_parse", "digest", "atoms", "liveness", "group", "traverse", "strip_build",
-                  # Both run inside the relocate timer. Counting them again
-                  # made `unmeasured` negative, which is the one way a profile
-                  # can announce that it does not add up.
-                  "address_table", "cache_plan",
+                  # All four run inside the relocate timer, and `cache_load`
+                  # inside the layout one. Counting them again made
+                  # `unmeasured` negative once, which is the one way a profile
+                  # can announce that it does not add up — and then `write`
+                  # arrived (186), `unmeasured` went positive, and three of
+                  # them stayed double-counted while looking fine.
+                  "address_table", "cache_plan", "cache_build", "address_diff",
+                  "cache_load",
                   "placements", "personality", "unwind_size", "commons",
                   "eh_frame", "tables", "unwind",
                   "emit_layout", "emit_contents", "emit_linkedit",
@@ -429,8 +433,10 @@ def main():
             marker = "  (inside dead_strip)"
         elif name in ("eh_frame", "tables", "unwind"):
             marker = "  (inside synthetic)"
-        elif name in ("address_table", "cache_plan"):
+        elif name in ("address_table", "cache_plan", "cache_build", "address_diff"):
             marker = "  (inside relocate)"
+        elif name == "cache_load":
+            marker = "  (inside layout)"
         print(f"    {name:<16}{value:6.2f} ms  {value / total * 100:5.1f}%{marker}")
     print(f"    {'unmeasured':<16}{total - accounted:6.2f} ms  "
           f"{(total - accounted) / total * 100:5.1f}%")
