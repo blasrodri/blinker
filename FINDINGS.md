@@ -9483,3 +9483,48 @@ it stops the daemon being the thing present at the *next* one.
 Both of these are the same lesson from opposite ends. A mechanism that is
 opt-in is a mechanism that is not tested by use, and the bugs in it are not
 absent — they are queued.
+
+## 193. The graph costs more to build than the traversal costs to run
+
+Incremental liveness needs the reachability relation written down: an edge set
+to add to and remove from. [`liveness`] does not have one. It computes the
+answer as a sequence of phases — roots, propagate, a metadata pass, propagate
+again, then a revival loop over atoms whose edges were deliberately not
+followed — each reading the objects' projections directly. There is nothing to
+update.
+
+`Graph` is the same relation as a compressed-row edge set: every atom's
+out-edges resolved to flat indices, plus the roots. Metadata's edges run the
+other way in it — a function keeps its FDE alive rather than the FDE keeping
+its function alive — which is what makes the phased version's suppression
+unnecessary.
+
+The two are written to agree and are not obviously the same thing, so it is
+checked rather than argued: `agrees_with` compares the closure to the traversal's
+live set bit for bit, under `BLINKER_VERIFY_LIVENESS`. It agrees on all six
+captured workloads and across the whole test suite.
+
+### The number that changes the plan
+
+```
+Graph::build      30.2 ms      2,791,216 edges
+Graph::closure    15.0 ms
+liveness (phased) 17.2 ms      what the closure would replace
+```
+
+Building the graph costs nearly twice what traversing it saves. A delta pass
+that rebuilds the graph each link is a straight loss, and the obvious shape —
+"derive the edge set, then update it" — is the losing one.
+
+So retention is not an optimisation of this design, it is the design. The graph
+has to live in `ReachState` across links, with only the changed objects' rows
+rebuilt; and the closure has to *replace* the phased traversal rather than
+supplement it, or a cold link pays 30 ms for a structure it does not use. That
+makes the cold arithmetic roughly neutral — drop 17, add a build and a closure
+— and it is the warm path that the whole thing is for.
+
+It also puts a floor under what incremental liveness is worth. `dead_strip` is
+29 ms of a 342 ms relink and `traverse` is 17 of those, so the ceiling here is
+5%. It is first in the sequence because it is the smallest well-understood
+delta problem and the machinery transfers, not because it is where the time is
+— that is `emit` at 90 ms and `relocate` at 67.

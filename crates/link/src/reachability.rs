@@ -1008,6 +1008,188 @@ impl Owners {
     }
 }
 
+/// The reachability graph, as a graph.
+///
+/// [`liveness`] below computes the same answer as a sequence of phases — roots,
+/// propagate, metadata, propagate, a revival loop over atoms whose edges were
+/// deliberately not followed — and each phase reads the objects' projections
+/// directly. That is fine for computing an answer once and impossible to
+/// update, because there is no edge set to add to or remove from.
+///
+/// This is the same relation written down: every atom's out-edges resolved to
+/// flat indices, and the roots. The claim it rests on is that the live set is
+/// exactly the closure of the roots under these edges — see
+/// [`Graph::agrees_with`] for why that is a claim and not a definition, and
+/// where it is checked.
+pub(crate) struct Graph {
+    /// Targets of every atom's edges, concatenated in atom order.
+    targets: Vec<u32>,
+    /// Where each atom's targets begin. `atoms + 1` entries, so an atom's run
+    /// is `base[i]..base[i + 1]` with no special case for the last.
+    base: Vec<u32>,
+    /// Atoms that are live whatever points at them.
+    roots: Vec<u32>,
+}
+
+impl Graph {
+    fn build(atoms: &Atoms<'_>, entry: Option<SymbolNameId>) -> Graph {
+        let total = atoms.len();
+
+        // Counting sort into compressed rows: count the out-edges of every
+        // atom, prefix-sum, then fill. A `Vec<Vec<u32>>` would be one
+        // allocation per atom — 1.7 million of them on the large workload — to
+        // hold an average of two entries each.
+        let mut base = vec![0u32; total + 1];
+        let mut count = |source: usize| base[source + 1] += 1;
+        for (slot, block) in atoms.blocks.iter().enumerate() {
+            let at = atoms.base[slot];
+            for local in 0..block.atoms.len() {
+                let (start, end) = block.spans[local];
+                for edge in &block.edges[start as usize..end as usize] {
+                    if atoms.resolve(slot, *edge).is_some() {
+                        count(at + local);
+                    }
+                }
+            }
+            // Metadata's edges run the other way. An FDE does not keep its
+            // function alive; the function keeps the FDE alive, and the
+            // `__compact_unwind` record — which never reaches the output — is
+            // only the statement that a function owns an exception table.
+            for record in &block.eh_frame {
+                if metadata_edge(atoms, slot, record.function).is_some() {
+                    count(edge_source(atoms, slot, record.function));
+                }
+            }
+            for (function, lsda) in &block.unwind {
+                if metadata_edge(atoms, slot, *function).is_some()
+                    && atoms.resolve(slot, *lsda).is_some()
+                {
+                    count(edge_source(atoms, slot, *function));
+                }
+            }
+        }
+        for index in 1..base.len() {
+            base[index] += base[index - 1];
+        }
+
+        // A separate cursor rather than advancing `base` and shifting it back
+        // afterwards. The shift trick saves this allocation and costs a reader
+        // the argument for why the rows end up where they started; the
+        // allocation is four bytes an atom and lives for one function.
+        let mut targets = vec![0u32; base[total] as usize];
+        let mut cursor = base.clone();
+        let mut fill = |source: usize, target: usize| {
+            targets[cursor[source] as usize] = target as u32;
+            cursor[source] += 1;
+        };
+        for (slot, block) in atoms.blocks.iter().enumerate() {
+            let at = atoms.base[slot];
+            for local in 0..block.atoms.len() {
+                let (start, end) = block.spans[local];
+                for edge in &block.edges[start as usize..end as usize] {
+                    if let Some(target) = atoms.resolve(slot, *edge) {
+                        fill(at + local, target);
+                    }
+                }
+            }
+            for record in &block.eh_frame {
+                if let Some(function) = metadata_edge(atoms, slot, record.function) {
+                    fill(function, at + record.atom as usize);
+                }
+            }
+            for (function, lsda) in &block.unwind {
+                if let (Some(function), Some(table)) = (
+                    metadata_edge(atoms, slot, *function),
+                    atoms.resolve(slot, *lsda),
+                ) {
+                    fill(function, table);
+                }
+            }
+        }
+        Graph {
+            targets,
+            base,
+            roots: roots(atoms, entry),
+        }
+    }
+
+    /// Atoms reachable from the roots.
+    fn closure(&self) -> LiveSet {
+        let mut live = LiveSet::with_capacity(self.base.len() - 1);
+        let mut worklist: Vec<u32> = Vec::new();
+        for root in &self.roots {
+            if live.insert(*root as usize) {
+                worklist.push(*root);
+            }
+        }
+        while let Some(index) = worklist.pop() {
+            let (start, end) = (
+                self.base[index as usize] as usize,
+                self.base[index as usize + 1] as usize,
+            );
+            for target in &self.targets[start..end] {
+                if live.insert(*target as usize) {
+                    worklist.push(*target);
+                }
+            }
+        }
+        live
+    }
+
+    /// Whether the closure is the live set the phased traversal produced.
+    ///
+    /// The two are written to agree and are not obviously the same thing. The
+    /// phased version suppresses metadata's own edges during propagation and
+    /// then revives their targets in a later loop, and it runs the metadata
+    /// pass once rather than to a fixed point — so a function that only became
+    /// live during revival would keep its FDE in this closure and not there.
+    /// `revived` counts exactly the cases where that could differ, and it is
+    /// zero on every workload measured; this is what says so on the ones that
+    /// have not been.
+    fn agrees_with(&self, live: &LiveSet) -> bool {
+        self.closure().bits == live.bits
+    }
+}
+
+/// The atom an `__eh_frame` or `__compact_unwind` record hangs off, if any.
+fn metadata_edge(atoms: &Atoms<'_>, slot: usize, function: Option<Edge>) -> Option<usize> {
+    function.and_then(|edge| atoms.resolve(slot, edge))
+}
+
+/// The same, where the caller has already established there is one.
+fn edge_source(atoms: &Atoms<'_>, slot: usize, function: Option<Edge>) -> usize {
+    metadata_edge(atoms, slot, function).expect("the caller checked")
+}
+
+/// Atoms that are live before anything points at them.
+fn roots(atoms: &Atoms<'_>, entry: Option<SymbolNameId>) -> Vec<u32> {
+    let mut roots: Vec<u32> = atoms.defining(entry).map(|at| at as u32).collect();
+    for index in 0..atoms.len() {
+        if atoms.opaque.contains(&atoms.atom(index).key()) {
+            roots.push(index as u32);
+        }
+    }
+    for (slot, block) in atoms.blocks.iter().enumerate() {
+        let at = atoms.base[slot];
+        for local in &block.never_strip {
+            roots.push((at + *local as usize) as u32);
+        }
+        for edge in &block.unsplit {
+            if let Some(index) = atoms.resolve(slot, *edge) {
+                roots.push(index as u32);
+            }
+        }
+        // A CIE is live because an FDE that refers to it is, and the FDE's own
+        // edges are metadata — so nothing would ever reach it.
+        for record in &block.eh_frame {
+            if record.cie {
+                roots.push((at + record.atom as usize) as u32);
+            }
+        }
+    }
+    roots
+}
+
 /// Which atoms a program can reach from `entry`.
 fn liveness(
     atoms: &Atoms<'_>,
@@ -1481,6 +1663,17 @@ pub(crate) fn plan(
     timings.liveness_ms = step.elapsed().as_secs_f64() * 1000.0;
     timings.group_ms = live_parts[0];
     timings.traverse_ms = live_parts[1];
+
+    // The graph the delta pass will update, and the check that it describes
+    // the same program the phased traversal just walked. Under verification
+    // only, for now: building it costs a pass over 1.2 million edges, and it
+    // buys nothing until something updates it instead of rebuilding it.
+    if verify_liveness() {
+        assert!(
+            Graph::build(&atoms, entry).agrees_with(&live),
+            "the reachability graph and the traversal disagree about what is live"
+        );
+    }
 
     let step = std::time::Instant::now();
     let strip = Strip::build(objects, &atoms, &live);
