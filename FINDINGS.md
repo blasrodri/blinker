@@ -9701,3 +9701,98 @@ slots and string offsets need exactly the same treatment (187), and the
 relocation dirty set needs the same reverse indexing this graph provides.
 Liveness was the cheapest place to build all of it and the worst place to
 collect on it — 29 ms of a 342 ms link, against `emit`'s 90 and `relocate`'s 67.
+
+## 197. Half the output file is names, and rebuilding them costs four milliseconds
+
+Finding 196 ended by pointing at `emit`'s 90 ms and `relocate`'s 67. The first
+of those numbers was stale. Measured again on a warm relink of debug
+rust-analyzer through a resident daemon, minima over twelve iterations:
+
+```
+  link                361.6 ms
+    read_and_parse     71.0        emit               62.6
+    relocate           66.1          emit_linkedit    20.9
+    layout             33.6          emit_uuid        12.5
+    dead_strip         32.9          emit_assemble     5.4
+    symbols            26.5          emit_layout       4.9
+    write              14.1        unmeasured         30.2
+```
+
+Nothing dominates. That is itself the finding: every stage is whole-program
+work being redone when `197` of `506,405` addresses changed and one object's
+projection in `5,637` moved.
+
+The one coherent group is the symbol table. From the emitted image:
+
+```
+  nsyms  1,689,759          symbol table   27.0 MB
+  strsize   82,153,095      string table   82.2 MB
+  file size 194,694,628     __LINKEDIT    109.6 MB  (56%)
+```
+
+`symbols` builds the 1.7 million `OutputSymbol`s, `emit_linkedit` turns them
+into `nlist_64`s and a string blob, and `write` and `emit_uuid` carry the
+result. Over 70 ms of the link, and 56% of the bytes, for a table whose content
+barely moves.
+
+### Stable offsets, and what they cost
+
+An `nlist_64` names its symbol by byte offset into the string table, so an
+offset *is* a name's identity. Built fresh each link those offsets are a
+running total, and a running total means one added name shifts every name after
+it — the same defect finding 194 found in the atom numbering, in the same
+shape. A retained `NlistEntry` is meaningless unless its `n_strx` still is.
+
+So: a `StringTable` that outlives the link, appends and never rewrites, keyed
+by the interning id the linker already has. Rebuilt only when the padding left
+by names that have gone away outweighs what is live — `SPREAD = 2`, the atom
+numbering's constant, for the atom numbering's reason.
+
+It works, and on its own it is worth almost nothing:
+
+```
+  emit_linkedit    20.88 ms  ->  16.54 ms
+```
+
+4.3 ms of a 361 ms link.
+
+### The part that is not free
+
+A retained table is not byte-identical to a fresh one, and cannot be. Its
+offsets are first-reference order over the names of whichever link built it: a
+name that has gone away still holds its bytes, a name that has appeared sits at
+the end rather than where this link first mentions it, and every byte after
+them moves. Three session tests failed on exactly that, correctly.
+
+Those tests link a program warm and cold and compare the two files. It is the
+strongest oracle in the suite and it has caught nearly every session bug worth
+catching, including two this month. Trading it for 4.3 ms is not a trade.
+
+Trading it for what the offsets *enable* might be — a run of `NlistEntry`
+belonging to an object that did not change is reusable only once its names
+stop moving, and that is the 26.5 ms `symbols` stage plus most of what is left
+in `emit_linkedit`. So the ownership change lands and the retention does not:
+`BLINKER_RETAIN_STRINGS`, off, beside `BLINKER_DELTA_LIVENESS` and for the same
+reason. The default path is unchanged and still byte-identical — six warm links
+alternating two targets through one daemon, each equal to its cold link.
+
+The retained path is not left unverified. It runs under a test that compares
+what the offsets *mean* rather than where they point: every symbol resolved
+through the string table, with its type, section, description and value, read
+back out of the file by a parser that shares no code with the linker. That
+check is stricter than it sounds — the failure being guarded against is an
+offset pointing at some other symbol's name, which shows up as a mismatched
+name on an otherwise identical entry. The same test asserts the two images
+*differ*, so it cannot quietly degrade into testing the default.
+
+### The second time this has happened
+
+Finding 196: machinery correct, collection point wrong, two milliseconds.
+Finding 197: machinery correct, collection point wrong, four milliseconds.
+
+Both were built at the bottom of a dependency — liveness before relocation,
+string offsets before symbol slots — because that is where the prerequisite
+lives. Neither pays there. The lesson is not to stop building prerequisites; it
+is that a prerequisite's measurement is not evidence about the thing it
+enables, and reporting it as though it were is how finding 195 came to claim
+2.6x for a bug.

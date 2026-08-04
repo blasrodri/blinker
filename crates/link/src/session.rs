@@ -396,6 +396,12 @@ pub struct Session {
     /// See [`crate::reachability::ReachState`] for why the atom numbering it
     /// carries has to travel with it.
     reach: Recent<crate::reachability::ReachState>,
+    /// This target's `__LINKEDIT` string table, as the last link left it.
+    ///
+    /// Per target for the reason the reachability state is: the offsets in it
+    /// are only meaningful alongside the symbol table that refers to them, and
+    /// two targets do not share one.
+    strings: Recent<blinker_output::symtab::StringTable>,
     /// How many digests moved on this link, and how many were compared.
     reach_moved: u64,
     reach_total: u64,
@@ -1159,6 +1165,21 @@ impl Session {
         self.reach.put(self.target, state);
     }
 
+    /// This target's string table, or an empty one for a target never linked
+    /// here. Taken rather than borrowed for the reason `reach_state` is: it is
+    /// appended to and handed back, not copied.
+    pub(crate) fn take_strings(&mut self) -> blinker_output::symtab::StringTable {
+        let target = self.target;
+        self.strings.take(target).unwrap_or_default()
+    }
+
+    pub(crate) fn store_strings(&mut self, strings: blinker_output::symtab::StringTable) {
+        if !retain_strings() {
+            return;
+        }
+        self.strings.put(self.target, strings);
+    }
+
     /// Record how much of the reachability graph moved, for the report.
     ///
     /// A digest that moved means some atom boundary or some edge in that object
@@ -1307,6 +1328,39 @@ fn interface_digest(parsed: &ParsedObject) -> u64 {
         total = total.wrapping_add(hasher.finish());
     }
     total
+}
+
+/// Whether the `__LINKEDIT` string table survives from one link to the next.
+///
+/// # Why this is not yet the default
+///
+/// A retained table is *correct* — every offset it hands out points at the
+/// name it was given for — but it is not byte-identical to what a cold link
+/// produces, and it cannot be. Its offsets are first-reference order over the
+/// names of the link that built it: a name that has since gone away still holds
+/// its bytes, and a name that has appeared sits at the end rather than where
+/// this link first mentioned it. Every downstream byte in `__LINKEDIT` moves
+/// with them.
+///
+/// That matters because the strongest thing the test suite does is link the
+/// same program warm and cold and compare the two files byte for byte, which
+/// has caught nearly every session bug worth catching. Retention breaks that
+/// comparison for a measured 4.3 ms of a 361 ms link — `emit_linkedit` falls
+/// from 20.9 ms to 16.5 — which is not a trade worth making on its own.
+///
+/// It is worth making for what it *enables*. An `NlistEntry` refers to its name
+/// by offset, so a retained entry is meaningless unless the offset still is;
+/// stable offsets are what would let an object that did not change keep its
+/// whole run of entries instead of rebuilding them. That is the 28 ms
+/// `symbols` stage and most of the 16.5 ms left in `emit_linkedit`, and when it
+/// exists this turns on with it — together with an equivalence check to replace
+/// the byte comparison it costs.
+///
+/// The same shape as `BLINKER_DELTA_LIVENESS`, and for the same reason: the
+/// machinery is right and the place it was first built is not where it pays.
+fn retain_strings() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BLINKER_RETAIN_STRINGS").is_some())
 }
 
 #[cfg(test)]

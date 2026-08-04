@@ -254,6 +254,165 @@ impl<'a> OutputSymbol<'a> {
     }
 }
 
+/// The string table, kept across links so a name keeps its offset.
+///
+/// # Why this outlives one link
+///
+/// `nlist_64` refers to a name by its byte offset into this blob, so an offset
+/// is a name's identity as far as the symbol table is concerned. Built fresh
+/// each link the offsets are a running total, and a running total means one
+/// added name shifts every name after it — which makes every retained answer
+/// above it worthless, exactly as a dense atom numbering did for reachability
+/// (finding 194). It is the same problem and it takes the same shape of fix:
+/// give the thing a stable identity, and let what did not change stay put.
+///
+/// So this appends and never rewrites. A name interned by an earlier link
+/// keeps the offset that link gave it, for as long as the table lives, which
+/// is what makes a retained `NlistEntry` mean anything: its `name_offset`
+/// still points at its name.
+///
+/// # What it costs
+///
+/// Names of symbols that have gone away stay in the blob. They are unreachable
+/// — nothing indexes them — and a Mach-O string table containing bytes no
+/// symbol points at is well formed, but they are still bytes in the output
+/// file. So the table is discarded and rebuilt once the padding outweighs what
+/// is live, on the same argument and with the same constant as the atom
+/// numbering's `SPREAD`: a link that rebuilds pays what every link used to pay,
+/// and it buys the next several links their stability back.
+#[derive(Debug)]
+pub struct StringTable {
+    /// The blob itself, shared with the [`SymbolTable`] built from it so that
+    /// emitting the image does not copy 82 MB of names.
+    bytes: std::sync::Arc<Vec<u8>>,
+    /// Interning id to offset, or [`Self::UNSET`]. A plain vector because an
+    /// interning id is a dense integer from zero — see [`OutputSymbol::key`].
+    by_key: Vec<u32>,
+    /// The link that last referred to each id, against [`Self::generation`].
+    /// This is what makes `used` a count of what is *live* rather than of
+    /// everything the table has ever held.
+    seen: Vec<u32>,
+    /// Names with no caller-supplied identity: the debug map's synthesised
+    /// directory, file and object paths. Three per object, so this is
+    /// thousands of entries where `by_key` is millions.
+    by_text: blinker_hashing::FastMap<Box<str>, (u32, u32)>,
+    generation: u32,
+    /// Bytes belonging to names *this* link referred to.
+    used: usize,
+}
+
+impl Default for StringTable {
+    fn default() -> Self {
+        StringTable {
+            // Opens with a NUL so offset 0 is the empty string, which is what
+            // an unnamed symbol points at.
+            bytes: std::sync::Arc::new(vec![0]),
+            by_key: Vec::new(),
+            seen: Vec::new(),
+            by_text: blinker_hashing::FastMap::default(),
+            generation: 0,
+            used: 1,
+        }
+    }
+}
+
+impl StringTable {
+    /// No offset recorded for this id yet.
+    ///
+    /// A sentinel rather than `Option<u32>` because this vector has one entry
+    /// per interned name — millions on a debug link — and the niche would
+    /// double it.
+    const UNSET: u32 = u32::MAX;
+
+    /// Past this ratio of blob to live names, start again.
+    ///
+    /// The same bound and the same reasoning as the atom numbering's `SPREAD`:
+    /// stability is worth carrying padding for, and is not worth carrying
+    /// unboundedly.
+    const SPREAD: usize = 2;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ready this table for a link, discarding it if it has gone mostly stale.
+    ///
+    /// Returning rather than mutating in place would let a caller keep using
+    /// the old offsets alongside the new blob, which is the one way this can be
+    /// silently wrong: an offset that survives a rebuild points at whatever
+    /// moved into its place.
+    pub fn begin(&mut self) {
+        if self.bytes.len() > Self::SPREAD * self.used.max(1) {
+            *self = StringTable::new();
+            return;
+        }
+        self.generation += 1;
+        self.used = 1;
+    }
+
+    /// Whether this table was built by an earlier link.
+    ///
+    /// A fresh table gives out the same offsets a from-scratch build would, so
+    /// nothing retained against a previous one may be reused across it.
+    pub fn is_empty(&self) -> bool {
+        self.bytes.len() == 1
+    }
+
+    pub fn bytes(&self) -> &std::sync::Arc<Vec<u8>> {
+        &self.bytes
+    }
+
+    /// Where `name` sits, appending it if this is the first time it is asked
+    /// for. `key` is the caller's identity for the name, or
+    /// [`OutputSymbol::UNKEYED`].
+    fn offset(&mut self, key: u32, name: &str) -> u32 {
+        if name.is_empty() {
+            return 0;
+        }
+        if key == OutputSymbol::UNKEYED {
+            if let Some((offset, seen)) = self.by_text.get_mut(name) {
+                if *seen != self.generation {
+                    *seen = self.generation;
+                    self.used += name.len() + 1;
+                }
+                return *offset;
+            }
+            let offset = self.append(name);
+            self.by_text.insert(name.into(), (offset, self.generation));
+            return offset;
+        }
+        let at = key as usize;
+        if at >= self.by_key.len() {
+            self.by_key.resize(at + 1, Self::UNSET);
+            self.seen.resize(at + 1, 0);
+        }
+        if self.by_key[at] != Self::UNSET {
+            if self.seen[at] != self.generation {
+                self.seen[at] = self.generation;
+                self.used += name.len() + 1;
+            }
+            return self.by_key[at];
+        }
+        let offset = self.append(name);
+        self.by_key[at] = offset;
+        self.seen[at] = self.generation;
+        offset
+    }
+
+    fn append(&mut self, name: &str) -> u32 {
+        // Unique between links: the `SymbolTable` sharing it is dropped with
+        // the image that was built from it. A clone here would be correct and
+        // slow, which is the right way round for something that must not be
+        // able to hand out a stale offset.
+        let bytes = std::sync::Arc::make_mut(&mut self.bytes);
+        let offset = bytes.len() as u32;
+        bytes.extend_from_slice(name.as_bytes());
+        bytes.push(0);
+        self.used += name.len() + 1;
+        offset
+    }
+}
+
 /// Builds a correctly grouped symbol table and its string table.
 #[derive(Debug, Default)]
 pub struct SymbolTableBuilder<'a> {
@@ -278,67 +437,33 @@ impl<'a> SymbolTableBuilder<'a> {
         self.symbols.is_empty()
     }
 
-    /// Produce the symbol table, string table, and the group ranges.
+    /// Produce the symbol table and the group ranges, against a fresh string
+    /// table. For callers with nothing to retain.
+    pub fn build(self) -> SymbolTable {
+        let mut strings = StringTable::new();
+        strings.begin();
+        self.build_into(&mut strings)
+    }
+
+    /// Produce the symbol table, its group ranges, and the offsets `strings`
+    /// gives every name.
     ///
     /// Sorting happens here rather than being the caller's responsibility,
     /// because a caller that inserted out of order would produce a file that
     /// loads and then misbehaves.
-    pub fn build(self) -> SymbolTable {
-        // The string table opens with a NUL so index 0 is the empty string,
-        // which is what an unnamed symbol points at.
-        //
-        // Sized before it is filled. rust-analyzer's debug image comes to 82 MB
-        // of names, and growing there from one byte is twenty-seven doublings
-        // that copy about 160 MB on the way (135). The bound is the total
-        // length of every name; interning brings the real size below it, and
-        // the difference is transient.
-        // Both bounds in one pass. They are two reductions over the same 1.7
-        // million entries — 81 MB — and reading that twice to answer two
-        // questions about it is the pass, not the arithmetic.
-        let (bytes, highest_key) = self.symbols.iter().fold((0usize, None), |(bytes, key), s| {
-            (
-                bytes + s.name.len() + 1,
-                match s.key {
-                    OutputSymbol::UNKEYED => key,
-                    k => Some(key.map_or(k, |held: u32| held.max(k))),
-                },
-            )
-        });
-        let mut strings = Vec::with_capacity(bytes + 1);
-        strings.push(0u8);
+    ///
+    /// # Why the string table is the caller's
+    ///
+    /// It used to be built here, sized from a pass over every symbol and
+    /// filled as the groups were walked. That produces the right bytes and the
+    /// wrong offsets: correct for this link and meaningless against the last
+    /// one, so nothing built on top of them — an `NlistEntry`, a run of them
+    /// belonging to an object that did not change — could be carried forward.
+    /// Handed one that outlives the link, the offsets become stable and the
+    /// 82 MB of names a debug rust-analyzer link produces stop being rebuilt
+    /// (see [`StringTable`]).
+    pub fn build_into(self, strings: &mut StringTable) -> SymbolTable {
         let mut entries = Vec::with_capacity(self.symbols.len());
-        // Names repeat: the debug map names every function a second time, so
-        // half the string table would otherwise be a copy of the other half.
-        // First occurrence wins, and insertion order is already deterministic,
-        // so the offsets are too.
-        // Fast-hashed, not `std`'s SipHash. This map is probed once per symbol,
-        // and a debug build's symbol count is what makes `emit_linkedit` the
-        // worst-scaling stage in the link — 7.2x when the work grew 3.7x
-        // (finding 130). The reasoning is the one in `blinker_hashing`: every
-        // key here comes from an object file the linker was told to read.
-        // Sized too, for the same reason: it is probed once per symbol and ends
-        // up holding one entry per distinct name, and 1.7 million inserts into
-        // a table that starts empty rehash everything already in it once per
-        // doubling.
-        let mut interned: blinker_hashing::FastMap<&str, u32> =
-            blinker_hashing::FastMap::with_capacity_and_hasher(
-                self.symbols.len(),
-                Default::default(),
-            );
-        // The same index, for names whose identity the caller already knows —
-        // and a plain vector rather than a map, because those identities are
-        // interning ids and an interning id is a dense integer from zero.
-        //
-        // It was a `FastMap<u32, u32>` sized for 1.7 million symbols: 13 MB of
-        // table, probed 759,597 times, one cache miss each. Indexed directly it
-        // is four bytes per *distinct* name — 2 MB, which stays in L2 — and the
-        // probe is a bounds check and a load. `UNSET` rather than `Option`
-        // because the niche would double it.
-        const UNSET: u32 = u32::MAX;
-        let mut by_key: Vec<u32> = match highest_key {
-            Some(highest) => vec![UNSET; highest as usize + 1],
-            None => Vec::new(),
-        };
 
         // The three groups, in the order the table requires them, without
         // moving anything to get there.
@@ -358,28 +483,7 @@ impl<'a> SymbolTableBuilder<'a> {
         ] {
             for symbol in self.symbols.iter().filter(|s| s.group == group) {
                 counts[group as usize] += 1;
-                let name_offset = if symbol.name.is_empty() {
-                    0
-                } else if symbol.key != OutputSymbol::UNKEYED {
-                    let slot = &mut by_key[symbol.key as usize];
-                    if *slot != UNSET {
-                        *slot
-                    } else {
-                        let offset = strings.len() as u32;
-                        strings.extend_from_slice(symbol.name.as_bytes());
-                        strings.push(0);
-                        *slot = offset;
-                        offset
-                    }
-                } else if let Some(offset) = interned.get(symbol.name.as_ref()) {
-                    *offset
-                } else {
-                    let offset = strings.len() as u32;
-                    strings.extend_from_slice(symbol.name.as_bytes());
-                    strings.push(0);
-                    interned.insert(symbol.name.as_ref(), offset);
-                    offset
-                };
+                let name_offset = strings.offset(symbol.key, symbol.name.as_ref());
 
                 entries.push(NlistEntry {
                     name_offset,
@@ -394,7 +498,7 @@ impl<'a> SymbolTableBuilder<'a> {
 
         SymbolTable {
             entries,
-            strings,
+            strings: std::sync::Arc::clone(strings.bytes()),
             groups: SymbolGroups {
                 local_index: 0,
                 local_count: locals,
@@ -436,7 +540,10 @@ impl NlistEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolTable {
     pub entries: Vec<NlistEntry>,
-    pub strings: Vec<u8>,
+    /// Shared with the [`StringTable`] that produced it rather than copied out
+    /// of it: on a debug rust-analyzer link this blob is 82 MB, and it is
+    /// written to the image once and then dropped.
+    pub strings: std::sync::Arc<Vec<u8>>,
     pub groups: SymbolGroups,
 }
 
@@ -702,7 +809,7 @@ mod tests {
         assert_eq!(table.groups.local_count, 0);
         assert_eq!(table.groups.undefined_count, 0);
         // The leading NUL is still present.
-        assert_eq!(table.strings, vec![0]);
+        assert_eq!(*table.strings, vec![0]);
     }
 
     #[test]

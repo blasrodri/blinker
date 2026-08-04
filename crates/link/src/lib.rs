@@ -2148,6 +2148,7 @@ fn link_inner(
             dylibs: &dylibs,
             ..Assembly::default()
         },
+        blinker_output::symtab::StringTable::default(),
     )?;
 
     timings.layout_probe_ms = elapsed_ms(step);
@@ -2389,6 +2390,7 @@ fn link_inner(
             previous_signature: previous_signature.as_ref(),
             dylibs: &dylibs,
         },
+        session.take_strings(),
     );
     timings.emit_ms = elapsed_ms(step);
     gap!(_gap, "after emit");
@@ -2478,6 +2480,19 @@ fn link_inner(
             timings.cache_bytes_written = std::fs::metadata(path).map_or(0, |meta| meta.len());
         }
         timings.cache_store_ms = elapsed_ms(cache_step);
+    }
+
+    // Kept for the next link, which is the only reason it was threaded through
+    // the image at all. Moved out rather than cloned: it is 82 MB of names on a
+    // debug rust-analyzer link.
+    //
+    // A failed link stores nothing, so the next one starts from an empty table
+    // and gives every name a fresh offset. That is the safe direction — a table
+    // half-appended-to by a link that then failed would hand out offsets for
+    // names the output never contained.
+    let mut image = image;
+    if let Ok(image) = &mut image {
+        session.store_strings(std::mem::take(&mut image.strings));
     }
 
     gap!(_gap, "cache store tail");
@@ -4241,7 +4256,17 @@ fn full_sizes(objects: &[LoadedObject]) -> blinker_output::PlacementReservations
     sizes
 }
 
-fn assemble(request: &LinkRequest, assembly: &Assembly<'_>) -> Result<Image, LinkError> {
+/// Assemble the image.
+///
+/// `strings` is the `__LINKEDIT` string table to place the names in, and is
+/// handed back on the [`Image`] so the next link can reuse the offsets. The
+/// layout probe passes an empty one: it emits no symbols, so it has nothing to
+/// place and nothing to hand on.
+fn assemble(
+    request: &LinkRequest,
+    assembly: &Assembly<'_>,
+    strings: blinker_output::symtab::StringTable,
+) -> Result<Image, LinkError> {
     let Assembly {
         placements,
         symbols: output_symbols,
@@ -4256,6 +4281,7 @@ fn assemble(request: &LinkRequest, assembly: &Assembly<'_>) -> Result<Image, Lin
         dylibs: _,
     } = *assembly;
     let mut builder = ImageBuilder::new();
+    builder.reusing_strings(strings);
     if !assembly.final_pass {
         builder.unsigned();
     }

@@ -79,6 +79,10 @@ pub struct ImageBuilder<'a> {
     inputs: Vec<InputPlacement>,
     contents: Vec<SectionContent>,
     symbols: SymbolTableBuilder<'a>,
+    /// The string table the symbols' names are placed in. Supplied by a caller
+    /// that keeps one across links, so that a name keeps its offset; otherwise
+    /// empty, which produces the offsets a from-scratch build always did.
+    strings: crate::symtab::StringTable,
     dylibs: Vec<Dylib>,
     rebases: Vec<Rebase>,
     binds: Vec<Bind>,
@@ -172,7 +176,15 @@ impl std::error::Error for ImageError {}
 pub struct Image {
     pub bytes: Vec<u8>,
     pub layout: Layout,
-    pub symbols: SymbolTable,
+    /// The string table the names were placed in, handed back so the next link
+    /// can give the same names the same offsets. See [`crate::symtab::StringTable`].
+    ///
+    /// The built [`SymbolTable`] is *not* returned alongside it, and that is
+    /// deliberate rather than an omission: it holds a shared reference to this
+    /// blob, so an image that kept one would make the next link's first
+    /// appended name copy all 82 MB of it — the exact copy the retained table
+    /// exists to remove. Nothing outside `build` ever read it.
+    pub strings: crate::symtab::StringTable,
     /// The page hashes the signature was built from, for the next link to
     /// reuse. Empty when the image was not signed.
     pub page_hashes: Vec<crate::signature::PageHash>,
@@ -213,6 +225,7 @@ impl<'a> ImageBuilder<'a> {
             inputs: Vec::new(),
             contents: Vec::new(),
             symbols: SymbolTableBuilder::new(),
+            strings: crate::symtab::StringTable::new(),
             dylibs: Vec::new(),
             rebases: Vec::new(),
             binds: Vec::new(),
@@ -247,6 +260,18 @@ impl<'a> ImageBuilder<'a> {
 
     pub fn symbols(&mut self) -> &mut SymbolTableBuilder<'a> {
         &mut self.symbols
+    }
+
+    /// Place this image's names in a string table an earlier link built, so
+    /// the names it already holds keep the offsets they were given.
+    ///
+    /// Handed back on [`Image::strings`] — including when the table decided it
+    /// had gone stale and started again, which is a decision the next link has
+    /// to be told about rather than left to rediscover.
+    pub fn reusing_strings(&mut self, mut strings: crate::symtab::StringTable) -> &mut Self {
+        strings.begin();
+        self.strings = strings;
+        self
     }
 
     pub fn dylib(&mut self, dylib: Dylib) -> &mut Self {
@@ -407,7 +432,8 @@ impl<'a> ImageBuilder<'a> {
         timings.contents_ms = started.elapsed().as_secs_f64() * 1000.0 - timings.layout_ms;
 
         let started = std::time::Instant::now();
-        let symbols = std::mem::take(&mut self.symbols).build();
+        let mut strings = std::mem::take(&mut self.strings);
+        let symbols = std::mem::take(&mut self.symbols).build_into(&mut strings);
         let rebase_stream = encode_rebase(&self.rebases);
         let bind_stream = encode_bind(&self.binds);
 
@@ -549,7 +575,8 @@ impl<'a> ImageBuilder<'a> {
             page_hashes,
             bytes,
             layout,
-            symbols,
+            // deliberately not `symbols` — see `Image::strings`.
+            strings,
         })
     }
 
