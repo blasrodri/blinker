@@ -664,6 +664,14 @@ impl<'a> ImageBuilder<'a> {
         let end = start + groups.external_count as usize;
         let mut exports = Vec::with_capacity(groups.external_count as usize);
         for entry in &symbols.entries[start..end] {
+            // A private extern is external so that the *link* can resolve it
+            // and no further: `N_PEXT` is what hidden visibility compiles to,
+            // and rustc gives almost every symbol it emits hidden visibility.
+            // Exporting them is how a proc-macro dylib comes to offer fifty
+            // definitions instead of the two rustc asked for.
+            if entry.type_byte & crate::symtab::n_type::N_PEXT != 0 {
+                continue;
+            }
             let Some(name) = symbols.name_at(entry.name_offset) else {
                 return Err(ImageError::UnreadableSymbolName {
                     offset: entry.name_offset,

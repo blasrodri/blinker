@@ -1,15 +1,15 @@
 //! Output kinds blinker does not produce must delegate, not fail.
 //!
-//! blinker emits a `MH_EXECUTE` image with an `LC_MAIN` entry point and
-//! nothing else. `rustc` hands the same linker every crate in a workspace, and
-//! a proc-macro crate is built as a `-dynamiclib` — so a linker that refuses
-//! what it cannot do is unusable on any project that has one, which is most of
-//! them. It was unusable on *this* one: building blinker with blinker stopped
-//! at `serde_derive` with "entry symbol _main is not defined in any input".
+//! `rustc` hands the same linker every crate in a workspace, so a linker that
+//! refuses what it cannot do is unusable on any project containing one crate
+//! it does not cover. It was unusable on *this* one: building blinker with
+//! blinker stopped at `serde_derive` with "entry symbol _main is not defined
+//! in any input", because a proc-macro crate is a `-dynamiclib`.
 //!
-//! `--blinker-internal` therefore means "link internally where you can", and
-//! the fallback carries a structured reason so the delegation is visible
-//! rather than silent.
+//! blinker now produces dylibs, so that case is a control here rather than the
+//! subject. `--blinker-internal` still means "link internally where you can",
+//! and the fallback still carries a structured reason, so a delegation is
+//! visible rather than silent.
 
 use blinker_test_support::{blinker, Scratch};
 use std::path::PathBuf;
@@ -51,30 +51,72 @@ fn link(scratch: &Scratch, tag: &str, extra: &[&str], object: &PathBuf, out: &Pa
     std::fs::read_to_string(&record).expect("record written")
 }
 
-/// A dynamic library is what every proc-macro crate is, and blinker cannot
-/// make one. It must produce the library anyway, by handing the job on.
+/// A dynamic library is what every proc-macro crate is, and blinker now makes
+/// one itself. The deliverable is not "a file appeared": it is a library dyld
+/// loads and calls into, which is the only definition of a working dylib.
 #[test]
-fn a_dynamic_library_is_delegated_and_still_produced() {
-    let scratch = Scratch::dir("delegate-dylib").expect("scratch");
-    let object = compile(&scratch, "lib.c", "int answer(void) { return 42; }\n");
+fn a_dynamic_library_is_linked_internally_and_loads() {
+    let scratch = Scratch::dir("internal-dylib").expect("scratch");
+    let object = compile(
+        &scratch,
+        "lib.c",
+        "int helper(int x) { return x * 7; }\nint answer(void) { return helper(6); }\n",
+    );
     let out = scratch.join("libanswer.dylib");
-    let json = link(&scratch, "dylib", &["-dynamiclib"], &object, &out);
+    let json = link(
+        &scratch,
+        "dylib",
+        &["-dynamiclib", "-lSystem"],
+        &object,
+        &out,
+    );
 
     assert!(
-        json.contains("\"delegated\""),
-        "the record does not say it delegated:\n{json}"
+        !json.contains("\"delegated\""),
+        "the dylib was delegated:\n{json}"
     );
-    assert!(
-        json.contains("UnsupportedArgument") || json.contains("unsupported_argument"),
-        "the delegation carries no structured reason:\n{json}"
-    );
-    // And the actual deliverable: the library exists and is a dylib.
-    assert!(out.exists(), "no library was produced");
     let kind = Command::new("file").arg(&out).output().expect("file runs");
     let kind = String::from_utf8_lossy(&kind.stdout);
     assert!(
         kind.contains("dynamically linked shared library"),
         "not a dylib: {kind}"
+    );
+
+    // dlopen, then call. Everything else about a dylib can be right while it
+    // is unloadable, and nothing but the loader can say that it is not.
+    let host = scratch
+        .write(
+            "host.c",
+            r#"
+#include <dlfcn.h>
+#include <stdio.h>
+int main(int argc, char **argv) {
+  void *library = dlopen(argv[1], RTLD_NOW);
+  if (!library) { printf("dlopen: %s\n", dlerror()); return 1; }
+  int (*answer)(void) = dlsym(library, "answer");
+  if (!answer) { printf("dlsym: %s\n", dlerror()); return 2; }
+  return answer();
+}
+"#,
+        )
+        .expect("writable");
+    let host_binary = scratch.join("host");
+    let built = Command::new("cc")
+        .arg(&host)
+        .arg("-o")
+        .arg(&host_binary)
+        .status()
+        .expect("cc runs");
+    assert!(built.success(), "the host program did not compile");
+
+    let ran = Command::new(&host_binary)
+        .arg(&out)
+        .status()
+        .expect("the host runs");
+    assert_eq!(
+        ran.code(),
+        Some(42),
+        "dyld could not load the library, or the function it called was wrong"
     );
 }
 

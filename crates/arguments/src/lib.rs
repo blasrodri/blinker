@@ -59,6 +59,12 @@ pub enum LinkerArg {
     Library(String),
     /// `-framework <name>`
     Framework(String),
+    /// `-install_name <path>` — the name a dylib records for itself, which is
+    /// what anything linking against it will later look for.
+    InstallName(String),
+    /// `-exported_symbols_list <file>` — the only names the image exports.
+    /// Everything else defined in it becomes invisible from outside.
+    ExportedSymbolsList(PathBuf),
     /// A positional Mach-O object file (`.o`).
     ObjectFile(PathBuf),
     /// A positional static archive (`.a`).
@@ -93,6 +99,8 @@ impl LinkerArg {
             LinkerArg::FrameworkSearchPath(_) => "framework_search_path",
             LinkerArg::Library(_) => "library",
             LinkerArg::Framework(_) => "framework",
+            LinkerArg::InstallName(_) => "install_name",
+            LinkerArg::ExportedSymbolsList(_) => "exported_symbols_list",
             LinkerArg::ObjectFile(_) => "object_file",
             LinkerArg::Archive(_) => "archive",
             LinkerArg::Rlib(_) => "rlib",
@@ -149,6 +157,33 @@ impl ParsedInvocation {
         self.find_map(|a| match a {
             LinkerArg::Output(p) => Some(p.as_path()),
             _ => None,
+        })
+    }
+
+    /// The name a dylib will record for itself, if `-install_name` was given.
+    pub fn install_name(&self) -> Option<&str> {
+        self.find_map(|a| match a {
+            LinkerArg::InstallName(s) => Some(s.as_str()),
+            _ => None,
+        })
+    }
+
+    /// The file listing what the image may export, if one was named.
+    pub fn exported_symbols_list(&self) -> Option<&Path> {
+        self.find_map(|a| match a {
+            LinkerArg::ExportedSymbolsList(p) => Some(p.as_path()),
+            _ => None,
+        })
+    }
+
+    /// Whether the invocation asks for a dynamic library.
+    pub fn wants_dylib(&self) -> bool {
+        self.args.iter().any(|(_, a)| {
+            matches!(
+                a,
+                LinkerArg::KnownUnmodelled(flag) | LinkerArg::LinkerFlag(flag)
+                    if flag == "-dynamiclib"
+            )
         })
     }
 
@@ -218,6 +253,8 @@ fn classify_option(name: &str, values: &[String]) -> LinkerArg {
         ("-o", [v]) => LinkerArg::Output(PathBuf::from(v)),
         ("-arch", [v]) => LinkerArg::Arch(v.clone()),
         ("-framework", [v]) => LinkerArg::Framework(v.clone()),
+        ("-install_name", [v]) => LinkerArg::InstallName(v.clone()),
+        ("-exported_symbols_list", [v]) => LinkerArg::ExportedSymbolsList(PathBuf::from(v)),
         ("-L", [v]) => LinkerArg::LibrarySearchPath(PathBuf::from(v)),
         ("-F", [v]) => LinkerArg::FrameworkSearchPath(PathBuf::from(v)),
         (_, []) => LinkerArg::KnownUnmodelled(name.to_string()),
@@ -256,19 +293,33 @@ fn classify(argv: &[String]) -> Vec<(usize, LinkerArg)> {
 
         // `-Wl,a,b,c` — the driver's tunnel for ld64 options.
         //
-        // Arity applies *within* the payload: `-Wl,-exported_symbol,_main` is
+        // Arity applies *within* the sequence: `-Wl,-exported_symbol,_main` is
         // one option consuming one value, not two independent flags. Splitting
         // blindly on commas would classify `_main` as its own option.
-        if let Some(payload) = arg.strip_prefix("-Wl,") {
-            let elements: Vec<String> = payload
-                .split(',')
-                .filter(|e| !e.is_empty())
-                .map(str::to_string)
-                .collect();
-            for arg in classify_ld64_sequence(&elements) {
-                out.push((i, arg));
+        //
+        // And the sequence spans arguments. rustc writes an option and its
+        // value as *two* `-Wl,` arguments — `-Wl,-exported_symbols_list`
+        // followed by `-Wl,/path/to/list` — which is the only form it ever
+        // emits for that flag. Reading each argument on its own leaves the
+        // option with nothing and the path looking like an option, so a whole
+        // run of consecutive `-Wl,` arguments is flattened and read as one.
+        if arg.starts_with("-Wl,") {
+            let mut elements: Vec<String> = Vec::new();
+            // Which argv index each element came from, so a classified option
+            // still points at the argument that introduced it.
+            let mut origins: Vec<usize> = Vec::new();
+            let mut at = i;
+            while let Some(payload) = argv.get(at).and_then(|a| a.strip_prefix("-Wl,")) {
+                for element in payload.split(',').filter(|e| !e.is_empty()) {
+                    elements.push(element.to_string());
+                    origins.push(at);
+                }
+                at += 1;
             }
-            i += 1;
+            for (element, arg) in classify_ld64_sequence(&elements) {
+                out.push((origins[element], arg));
+            }
+            i = at;
             continue;
         }
 
@@ -335,22 +386,33 @@ fn classify(argv: &[String]) -> Vec<(usize, LinkerArg)> {
 ///
 /// Used for `-Wl,` payloads, where the elements form their own little argument
 /// vector with the same value-consuming rules as the top level.
-fn classify_ld64_sequence(elements: &[String]) -> Vec<LinkerArg> {
+/// Classify a flattened `-Wl,` sequence, pairing each result with the index of
+/// the element it started at.
+fn classify_ld64_sequence(elements: &[String]) -> Vec<(usize, LinkerArg)> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < elements.len() {
+        let start = i;
         let element = &elements[i];
         let arity = reference::arity_of(element).unwrap_or(0) as usize;
 
         if arity > 0 && i + arity < elements.len() {
             let values = &elements[i + 1..=i + arity];
-            out.push(LinkerArg::LinkerFlag(format!(
-                "{element} {}",
-                values.join(" ")
-            )));
+            // Modelled options are modelled wherever they arrive. An
+            // `-exported_symbols_list` tunnelled through `-Wl,` is the same
+            // instruction as one spelled out, and rustc only ever sends the
+            // tunnelled form — so classifying it as an opaque `LinkerFlag`
+            // here means the linker never sees the flag it does honour.
+            let classified = match classify_option(element, values) {
+                LinkerArg::KnownUnmodelled(_) => {
+                    LinkerArg::LinkerFlag(format!("{element} {}", values.join(" ")))
+                }
+                modelled => modelled,
+            };
+            out.push((start, classified));
             i += 1 + arity;
         } else {
-            out.push(LinkerArg::LinkerFlag(element.clone()));
+            out.push((start, LinkerArg::LinkerFlag(element.clone())));
             i += 1;
         }
     }

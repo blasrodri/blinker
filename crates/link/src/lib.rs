@@ -41,7 +41,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use blinker_layout::InputPlacement;
+use blinker_layout::{ImageKind, InputPlacement};
 use blinker_macho::{
     parse_object, Arm64RelocationKind, InputRelocation, InputSection, ObjectId, ParsedObject,
     RelocationLength, RelocationTarget, SectionId, SectionKind, SymbolStrength, SymbolVisibility,
@@ -52,6 +52,9 @@ use blinker_output::{Bind, Image, ImageBuilder, Rebase, UnwindEntry};
 use blinker_relocations::{apply, Context};
 use blinker_symbols::{SymbolNameId, SymbolNames, SymbolProvider, SymbolTable};
 use reachability::Strip;
+
+pub mod exports;
+pub use exports::ExportList;
 
 mod hashing;
 mod identity;
@@ -341,6 +344,16 @@ pub fn reachability_report(request: &LinkRequest) -> Result<reachability::Report
 #[derive(Debug, Clone)]
 pub struct LinkRequest {
     pub objects: Vec<PathBuf>,
+    /// Executable or dylib. See [`LinkRequest::as_dylib`].
+    pub kind: ImageKind,
+    /// What a dylib records as its own name. Ignored for an executable.
+    pub install_name: String,
+    /// The only names the image exports, when the command line named a list.
+    ///
+    /// `None` means "export every global definition", which is what a link
+    /// with no `-exported_symbols_list` does. An empty list is not the same
+    /// thing and is not treated as one: it means export nothing.
+    pub exported_symbols: Option<ExportList>,
     /// Symbol the image enters at.
     pub entry_symbol: String,
     /// Identifier embedded in the ad-hoc signature; conventionally the output
@@ -401,6 +414,9 @@ impl LinkRequest {
     pub fn new(objects: Vec<PathBuf>) -> Self {
         LinkRequest {
             objects,
+            kind: ImageKind::Executable,
+            install_name: String::new(),
+            exported_symbols: None,
             entry_symbol: "_main".to_string(),
             identifier: "a.out".to_string(),
             dylibs: vec![Dylib::lib_system()],
@@ -446,6 +462,23 @@ impl LinkRequest {
     /// [`LinkRequest::reuse_relocations`] for why this is not the default.
     pub fn reusing_relocations(mut self, on: bool) -> Self {
         self.reuse_relocations = on;
+        self
+    }
+
+    /// Produce a dylib recorded under `install_name`.
+    ///
+    /// A dylib has no entry point, so `entry_symbol` stops being consulted;
+    /// it is left in place rather than cleared so that a request can be
+    /// switched back without losing what it was.
+    pub fn as_dylib(mut self, install_name: &str) -> Self {
+        self.kind = ImageKind::Dylib;
+        self.install_name = install_name.to_string();
+        self
+    }
+
+    /// Export only what `list` names. See [`ExportList`].
+    pub fn exporting(mut self, list: ExportList) -> Self {
+        self.exported_symbols = Some(list);
         self
     }
 
@@ -1849,7 +1882,15 @@ fn link_inner(
     // Decided before anything is placed, because it changes how big every
     // contribution is. Everything downstream asks it where an input byte went.
     let step = std::time::Instant::now();
-    let (strip, report, strip_timings) = if request.dead_strip {
+    // A dylib is not stripped, and that is a stated limitation rather than an
+    // oversight. Reachability starts from one root — the entry point — and a
+    // dylib's roots are its whole export list, which this API cannot yet be
+    // given. Stripping from the wrong root set produces a library that links,
+    // loads, and has had a live function deleted from it, so until the root set
+    // is plural the honest answer is to keep everything: the output is larger
+    // than ld64's and it is the same output a link without `-dead_strip` gives.
+    let strip_this = request.dead_strip && request.kind == ImageKind::Executable;
+    let (strip, report, strip_timings) = if strip_this {
         reachability::plan(&objects, &request.entry_symbol, session)
     } else {
         (
@@ -2351,7 +2392,12 @@ fn link_inner(
         .map(|o| o.parsed.relocations.len() as u64)
         .sum();
     let contents = patched.contents;
-    let entry_offset = entry_offset(request, &objects, &probe, &strip)?;
+    // A dylib names no entry point, so there is nothing to find and no error
+    // if it is missing — `_main` is exactly the symbol a library does not have.
+    let entry_offset = match request.kind {
+        ImageKind::Executable => entry_offset(request, &objects, &probe, &strip)?,
+        ImageKind::Dylib => 0,
+    };
     timings.relocate_ms = elapsed_ms(step);
     gap!(_gap, "after relocate");
 
@@ -2377,6 +2423,7 @@ fn link_inner(
         &mut strings,
         held_symbols,
         timings,
+        request.exported_symbols.as_ref(),
     );
     let symbols = symbol_state.groups();
     gap!(_gap, "sym: plan");
@@ -4334,7 +4381,14 @@ fn assemble(
         builder.dylib(dylib.clone());
     }
     builder.identifier(&request.identifier);
-    builder.entry_offset(entry_offset);
+    match request.kind {
+        ImageKind::Executable => {
+            builder.entry_offset(entry_offset);
+        }
+        ImageKind::Dylib => {
+            builder.dylib_output(&request.install_name);
+        }
+    }
 
     // Sections with no supplied content are emitted as zeroes of the right
     // size, so the first pass produces a valid image to read the layout from.
@@ -4415,10 +4469,31 @@ fn is_temporary_label(name: &str) -> bool {
 /// in rather than rebuild.
 ///
 /// One chunk's placed definitions as symbol-table entries, unsorted.
-fn output_symbols_of<'a>(placed: &[PlacedSymbol<'a>]) -> Vec<OutputSymbol<'a>> {
+/// A definition's visibility, after the export list has had its say.
+///
+/// A global the list does not name becomes **local**, which is what `ld64`
+/// does: the definition stays in the image and in its symbol table, and
+/// nothing outside can reach it. It cannot merely be left out of the export
+/// trie — the symbol table's external group is what `nm -g` reports and what a
+/// later link against this library would resolve through, so a name that is
+/// external there and absent from the trie is a promise the image does not
+/// keep.
+fn visibility_of(symbol: &PlacedSymbol<'_>, exports: Option<&ExportList>) -> SymbolVisibility {
+    match (symbol.visibility, exports) {
+        (SymbolVisibility::Global, Some(list)) if !list.allows(symbol.name) => {
+            SymbolVisibility::Local
+        }
+        (visibility, _) => visibility,
+    }
+}
+
+fn output_symbols_of<'a>(
+    placed: &[PlacedSymbol<'a>],
+    exports: Option<&ExportList>,
+) -> Vec<OutputSymbol<'a>> {
     placed
         .iter()
-        .map(|symbol| match symbol.visibility {
+        .map(|symbol| match visibility_of(symbol, exports) {
             SymbolVisibility::Local => {
                 OutputSymbol::local(symbol.name, symbol.section_number, symbol.address)
                     .keyed(symbol.key)
@@ -4870,6 +4945,10 @@ fn plan_symbols(
     strings: &mut blinker_output::symtab::StringTable,
     previous: Option<SymbolState>,
     timings: &mut LinkTimings,
+    // What the image may export, when the command line named a list. Held
+    // symbols are reused per object, so this is part of the request hash: two
+    // links of the same objects with different lists are different links.
+    exports: Option<&ExportList>,
 ) -> SymbolState {
     let runs = placed_runs(objects, placed);
     let digests: Vec<u64> = crate::parallel::map_chunks(objects, |base, chunk| {
@@ -4920,7 +4999,7 @@ fn plan_symbols(
                     let mine = &placed[start..end];
                     let mut defs_local = Vec::new();
                     let mut defs_external = Vec::new();
-                    for symbol in output_symbols_of(mine) {
+                    for symbol in output_symbols_of(mine, exports) {
                         match symbol.group {
                             SymbolGroup::Local => defs_local.push(symbol),
                             _ => defs_external.push(symbol),
@@ -6386,6 +6465,20 @@ fn request_hash(request: &LinkRequest) -> [u8; 32] {
     hasher.update(&[0]);
     hasher.update(request.identifier.as_bytes());
     hasher.update(&[request.dead_strip as u8, request.stable_layout as u8]);
+    // The output kind and everything that follows from it. Two links of the
+    // same objects that differ here produce different images, so they must not
+    // share a session: a held symbol table built with one export list would
+    // otherwise be spliced into a link that asked for another.
+    hasher.update(&[request.kind as u8]);
+    hasher.update(request.install_name.as_bytes());
+    hasher.update(&[0]);
+    match &request.exported_symbols {
+        Some(list) => list.hash_into(&mut hasher),
+        // Distinct from an empty list, which exports nothing.
+        None => {
+            hasher.update(b"no-export-list");
+        }
+    }
     // The linker itself is an input to its own output.
     //
     // Without this, changing blinker and relinking replays the binary the

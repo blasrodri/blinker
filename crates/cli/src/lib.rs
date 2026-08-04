@@ -339,12 +339,12 @@ pub fn run_in(
 /// whose every crate it cannot yet link. One that fails is not.
 fn unsupported_output_kind(parsed: &ParsedInvocation) -> Option<&'static str> {
     const KINDS: &[&str] = &[
-        // A dynamic library — what every proc-macro crate is built as.
-        "-dynamiclib",
-        "-shared",
-        // A loadable bundle, e.g. a plugin.
-        "-bundle",
-        // A relocatable partial link: object in, object out.
+        // `-dynamiclib` is *not* here: a dylib is an output kind blinker
+        // produces. `-shared` still is, because the driver spelling arrives on
+        // links blinker has never seen and the two are not synonyms here until
+        // one has been.
+        "-shared", // A loadable bundle, e.g. a plugin.
+        "-bundle", // A relocatable partial link: object in, object out.
         "-r",
         // A static executable, which has no dyld and therefore no LC_MAIN
         // bootstrap of the kind blinker emits.
@@ -491,6 +491,25 @@ fn internal_link(
         // with the cache — but it is applied to the cold link too, so that the
         // cached output is the one a cold link with the same options produces.
         .with_stable_layout(options.incremental_cache);
+    if parsed.wants_dylib() {
+        // `ld64` records the `-o` path when `-install_name` is absent, and
+        // records it exactly as spelled — a relative `-o` gives a dylib that
+        // can only be found from the directory it was linked in. rustc passes
+        // an absolute path, so matching ld64 here is matching what rustc gets.
+        let install_name = parsed
+            .install_name()
+            .map(str::to_string)
+            .unwrap_or_else(|| output.display().to_string());
+        request = request.as_dylib(&install_name);
+    }
+    if let Some(path) = parsed.exported_symbols_list() {
+        let text =
+            std::fs::read_to_string(path).map_err(|source| blinker_link::LinkError::Read {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        request = request.exporting(blinker_link::ExportList::parse(&text));
+    }
     // Opt-in for now: the reuse path is new, and a linker that silently
     // depends on state from a previous run is one whose output cannot be
     // reproduced from its inputs alone. `--blinker-cache` turns it on.
