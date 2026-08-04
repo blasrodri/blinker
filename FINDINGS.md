@@ -9796,3 +9796,55 @@ lives. Neither pays there. The lesson is not to stop building prerequisites; it
 is that a prerequisite's measurement is not evidence about the thing it
 enables, and reporting it as though it were is how finding 195 came to claim
 2.6x for a bug.
+
+## 198. The symbol table was sorted by name for no reason anybody wrote down
+
+Finding 197 pointed at the symbol table and said the next step was reusing an
+unchanged object's entries. That step is blocked by something nobody had
+questioned: `output_symbols` sorted all 380,000 definitions by name.
+
+The sort's *cost* is documented in detail — finding 152 parallelised it, found a
+k-way heap merge took 41 ms against the 4.9 ms of sorts feeding it, and replaced
+it with a merge tree whose ties compose to exactly a single sort's order. What
+the sort *bought* is nowhere. It was inherited and optimised.
+
+Nothing needs it:
+
+- `LC_DYSYMTAB` requires the three groups to be contiguous and in order. It
+  says nothing about the order within a group.
+- blinker emits no indirect symbol table, so no index points into this.
+- An executable's exported range is not searched. dyld reads a dylib's exports
+  from the trie, `dsymutil` reads the debug map, and a symbolicator sorts by
+  address itself.
+
+`ld` does sort its external group — `nm -np` on a `cc`-linked binary shows
+locals in emission order and externals in name order — so this is a real
+divergence rather than a no-op. Checked rather than argued: `dsymutil` builds a
+`.dSYM` from the unsorted output and `atos` resolves through it to the right
+function and the right source line, the backtrace suite still names the right
+frames, 63 suites pass, and warm output is still byte-identical to cold across
+alternating targets.
+
+Interleaved A/B on the cold rust-analyzer link, against a noise floor measured
+by running one binary as both arms:
+
+```
+                  link         floor
+  with sort     508.2 ms
+  without       498.7 ms     4.6 ms
+                 -9.5 ms
+```
+
+Twice the floor. Worth having and not worth changing the output for on its own.
+
+### The reason to care
+
+A global sort interleaves objects, and an interleaved table has no per-object
+runs in it. Object order is what makes an unchanged object's symbols a
+contiguous span — something a later link can splice rather than rebuild, which
+is what finding 197's retained string offsets were built to allow.
+
+The debug map is already per object and in object order, and it is most of the
+table: of 1,689,759 symbols, 1,398,995 are local and roughly 1.31 million of
+those are stabs. Four out of five entries in this file are debug-map records
+sitting in exactly the shape reuse wants.

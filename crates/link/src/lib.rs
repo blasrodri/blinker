@@ -4368,128 +4368,33 @@ fn is_temporary_label(name: &str) -> bool {
 /// of uncertainty. `crates/cli/tests/backtraces_name_the_right_function.rs`
 /// has the observed output: four frames inside a private recursive function
 /// reported as `core::fmt::rt::Argument::new_display`.
+/// # Why these are no longer sorted by name
+///
+/// They were, for as long as this function existed, and the sort was
+/// parallelised and merge-tree'd rather than questioned (finding 152). What it
+/// bought was never written down, and nothing needs it: `LC_DYSYMTAB` requires
+/// the three *groups* to be contiguous and says nothing about the order within
+/// one, blinker emits no indirect symbol table for an index into this to point
+/// at, and an executable's exported range is not searched by anything — dyld
+/// reads a dylib's exports from the trie, `dsymutil` reads the debug map, and
+/// a symbolicator sorts by address itself.
+///
+/// `ld` does sort its external group, and blinker no longer matches it there.
+/// That was checked rather than assumed: `dsymutil` builds a `.dSYM` from the
+/// result and `atos` resolves through it to the right function and source line,
+/// and the backtrace suite still names the right frames.
+///
+/// The reason to care is not the 9.5 ms it saves on a 508 ms cold link — twice
+/// the harness's noise floor, and worth having, but not worth a change to the
+/// output on its own. It is that a global sort interleaves objects, and an
+/// interleaved table has no per-object runs to keep. Object order is what makes
+/// an unchanged object's symbols a contiguous span that a later link can splice
+/// in rather than rebuild.
 fn output_symbols<'a>(placed: &[PlacedSymbol<'a>]) -> Vec<OutputSymbol<'a>> {
-    // Sorted per chunk on every core, then merged. A single sort of 380,000
-    // entries compares mangled names about 6.9 million times; sixty sorted
-    // runs merged by a heap is 2.2 million, and the sorts themselves overlap.
-    let sorted = crate::parallel::map_chunks(placed, |_, chunk| {
-        let mut chunk = output_symbols_of(chunk);
-        chunk.sort_unstable_by(compare_output_symbols);
-        chunk
-    });
-    merge_sorted(sorted)
-}
-
-/// Order two entries of the symbol table.
-///
-/// Locals may share a name across objects, so the name alone no longer orders
-/// the table — address and section break the tie.
-fn compare_output_symbols(a: &OutputSymbol<'_>, b: &OutputSymbol<'_>) -> std::cmp::Ordering {
-    a.name
-        .cmp(&b.name)
-        .then(a.value.cmp(&b.value))
-        .then(a.section.cmp(&b.section))
-}
-
-/// Merge sorted runs into one sorted vector, ties resolved by run order.
-///
-/// A tree of two-way merges rather than one k-way heap. Both do the same
-/// `n log k` comparisons, but a heap pays a sift per element on one core,
-/// while the tree is a single comparison per element and its early rounds —
-/// which are nearly all of the work — run on every core. The heap version of
-/// this merged 379,857 entries in 41 ms against 4.9 ms for the sorts feeding
-/// it, which is the whole reason the sorts were parallelised.
-///
-/// Ties take the earlier run, at every level, so the result is exactly the
-/// order a single sort of the concatenation would give — a fixed function of
-/// the chunk boundaries, which are fixed before any thread starts.
-fn merge_sorted<'a>(mut runs: Vec<Vec<OutputSymbol<'a>>>) -> Vec<OutputSymbol<'a>> {
-    /// One pending two-way merge: where it belongs in the next round, and the
-    /// two runs feeding it.
-    type Pending<'a> = (usize, Vec<OutputSymbol<'a>>, Vec<OutputSymbol<'a>>);
-
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
-    while runs.len() > 1 {
-        // Adjacent pairs, so "earlier run wins a tie" composes up the tree.
-        let mut pairs: Vec<Pending<'a>> = Vec::new();
-        let mut odd: Option<Vec<OutputSymbol<'a>>> = None;
-        let mut drained = runs.into_iter();
-        let mut at = 0usize;
-        while let Some(left) = drained.next() {
-            match drained.next() {
-                Some(right) => {
-                    pairs.push((at, left, right));
-                    at += 1;
-                }
-                // An odd run rides to the next round untouched, and stays last.
-                None => odd = Some(left),
-            }
-        }
-
-        let mut buckets: Vec<Vec<Pending<'a>>> = (0..threads.min(pairs.len().max(1)))
-            .map(|_| Vec::new())
-            .collect();
-        for (index, pair) in pairs.into_iter().enumerate() {
-            let bucket = index % buckets.len();
-            buckets[bucket].push(pair);
-        }
-
-        let done: Vec<Vec<(usize, Vec<OutputSymbol<'a>>)>> = std::thread::scope(|scope| {
-            let workers: Vec<_> = buckets
-                .into_iter()
-                .map(|bucket| {
-                    scope.spawn(move || {
-                        bucket
-                            .into_iter()
-                            .map(|(index, left, right)| (index, merge_two(left, right)))
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .collect();
-            workers
-                .into_iter()
-                .map(|worker| worker.join().expect("a merge worker panicked"))
-                .collect()
-        });
-
-        let count = done.iter().map(Vec::len).sum();
-        let mut ordered: Vec<Option<Vec<OutputSymbol<'a>>>> = (0..count).map(|_| None).collect();
-        for (index, merged) in done.into_iter().flatten() {
-            ordered[index] = Some(merged);
-        }
-        runs = ordered
-            .into_iter()
-            .map(|run| run.expect("every pair was merged exactly once"))
-            .chain(odd)
-            .collect();
-    }
-    runs.pop().unwrap_or_default()
-}
-
-/// Two sorted runs into one. A tie takes `left`, which is the earlier run.
-fn merge_two<'a>(
-    left: Vec<OutputSymbol<'a>>,
-    right: Vec<OutputSymbol<'a>>,
-) -> Vec<OutputSymbol<'a>> {
-    let mut out = Vec::with_capacity(left.len() + right.len());
-    let mut left = left.into_iter().peekable();
-    let mut right = right.into_iter().peekable();
-    loop {
-        let take_right = match (left.peek(), right.peek()) {
-            (Some(a), Some(b)) => compare_output_symbols(b, a) == std::cmp::Ordering::Less,
-            (Some(_), None) => false,
-            (None, Some(_)) => true,
-            (None, None) => break,
-        };
-        if take_right {
-            out.push(right.next().expect("peeked"));
-        } else {
-            out.push(left.next().expect("peeked"));
-        }
-    }
-    out
+    // In object order, which is `placed`'s order, which is the order the chunk
+    // boundaries were fixed in before any thread started.
+    let chunks = crate::parallel::map_chunks(placed, |_, chunk| output_symbols_of(chunk));
+    chunks.into_iter().flatten().collect()
 }
 
 /// One chunk's placed definitions as symbol-table entries, unsorted.
