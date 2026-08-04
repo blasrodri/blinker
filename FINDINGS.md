@@ -9647,3 +9647,57 @@ to see why: blinker --blinker-daemon-serve
 A fallback that cannot fail is a fallback that hides everything behind it. This
 is the third time this week the measurement was the thing that was broken, and
 the first time it was broken in the direction of good news.
+
+## 196. Correct incremental liveness is worth two milliseconds
+
+Finding 195 left the delta wrong by 246 atoms. It leaked in one direction only
+— live where a fresh closure said dead — and every leaked atom had a positive
+support count.
+
+They were supporting each other. A group of atoms that point at one another
+keeps its own counts up, so when the edge that reached the group from the roots
+goes away, every member still has a supporter and none of them ever looks
+suspicious. `support == 0` is not the condition for "might have died"; it is
+the condition for "obviously died". A call graph with a loop in it is most call
+graphs.
+
+The fix is the one the design called for and the implementation weakened:
+*every* atom that lost an edge from a live atom is a suspect, whatever its
+count says, and the region recompute decides. With that, the delta is exact —
+byte-identical output over alternating warm links, zero disagreements against a
+fresh closure on every link under verification.
+
+And it stops paying.
+
+```
+                      liveness stage (minimum of 8)
+  phased traversal        22.14 ms
+  delta, region ≤ 1/4     43.62 ms
+  delta, region ≤ 1/64    20.16 ms
+```
+
+The reason is the same fact from the other side. The objects a body edit
+touches are near the roots of the call graph, so the forward closure of "things
+that lost an edge" is most of what is live. The region bound is reached on the
+ordinary edit, not the rare one, and the work is then: discover a huge region,
+give up, recompute anyway. Shrinking the bound to a sixty-fourth makes the
+giving-up cheap, and what is left is not an update at all — it is a closure
+over a retained graph, 20.16 ms against the phased traversal's 22.14.
+
+Two milliseconds, for a graph held across links, an arena with holes, a
+numbering with slack, and a region recompute. It stays behind
+`BLINKER_DELTA_LIVENESS`.
+
+### What was actually bought
+
+The 7.16 ms figure in finding 195 was the *wrong* version — it was fast because
+it skipped the work correctness requires. That is worth stating plainly: the
+first measurement of a new fast path measured a bug, and it measured it as a
+2.6x improvement.
+
+What survives is not nothing. The numbering is stable now, which was the
+blocker 194 identified, and it costs nothing on its own. `__LINKEDIT`'s symbol
+slots and string offsets need exactly the same treatment (187), and the
+relocation dirty set needs the same reverse indexing this graph provides.
+Liveness was the cheapest place to build all of it and the worst place to
+collect on it — 29 ms of a 342 ms link, against `emit`'s 90 and `relocate`'s 67.

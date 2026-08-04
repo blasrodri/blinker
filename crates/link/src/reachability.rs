@@ -1501,6 +1501,14 @@ impl Graph {
         let (mut own, mut produced) = (Vec::new(), Vec::new());
         let mut rows: Vec<(usize, Vec<u32>)> = Vec::new();
         let mut metadata_moved = false;
+        // Every atom that lost an edge from a live atom. Support reaching zero
+        // is *not* enough to find these: a group of atoms that point at each
+        // other keeps its own counts up, so when the edge that reached the
+        // group from the roots goes away, every member still has a supporter
+        // and none of them ever looks suspicious. That is not a corner case —
+        // it is a call graph with a loop in it, which is most of them, and it
+        // is what made this leak 246 atoms while every count stayed positive.
+        let mut withdrawn: Vec<u32> = Vec::new();
         for slot in moved.iter().copied() {
             Graph::object_edges(atoms, slot, &mut own, &mut produced);
             let at = atoms.base[slot];
@@ -1512,6 +1520,7 @@ impl Graph {
                 if live.set.contains(index) {
                     for target in self.edges(index).0.to_vec() {
                         live.support[target as usize] -= 1;
+                        withdrawn.push(target);
                     }
                 }
                 rows.push((index, row.clone()));
@@ -1527,6 +1536,7 @@ impl Graph {
                 if live.set.contains(index) {
                     for target in self.edges(index).0.to_vec() {
                         live.support[target as usize] -= 1;
+                        withdrawn.push(target);
                     }
                     live.set.remove(index);
                 }
@@ -1536,6 +1546,7 @@ impl Graph {
                 for (source, target) in &self.produced[slot] {
                     if live.set.contains(*source as usize) {
                         live.support[*target as usize] -= 1;
+                        withdrawn.push(*target);
                     }
                 }
                 self.produced[slot] = std::mem::take(&mut produced);
@@ -1605,7 +1616,15 @@ impl Graph {
         // Propagation only adds support, so a suspect it rescued is no longer
         // one. Checked here rather than filtered above, because a suspect can
         // also be rescued by another suspect's rescue.
-        suspects.retain(|index| live.support[*index as usize] == 0);
+        // Anything that lost an edge is suspect, whatever its count says. The
+        // region recompute below is what decides; the count only decides which
+        // atoms are *obviously* gone.
+        suspects.extend(
+            withdrawn
+                .into_iter()
+                .filter(|index| live.set.contains(*index as usize)),
+        );
+        suspects.retain(|index| !self.root.contains(*index as usize));
         if suspects.is_empty() {
             return Some(());
         }
@@ -1620,12 +1639,26 @@ impl Graph {
                 frontier.push(suspect);
             }
         }
-        // Bounded, because past some size this is the whole traversal with
-        // none of its locality, and the caller has a better option.
-        let limit = total / 4;
+        // Bounded, because past some size the region is the program and
+        // walking it twice — once to find it, once to rebuild it — is worse
+        // than starting over. Starting over is cheap here in a way it was not
+        // before: the graph is already updated, so it is a closure and not a
+        // build, and a closure of the whole graph still beats the phased
+        // traversal it replaced.
+        //
+        // This bound is reached on an ordinary edit, not a rare one. The
+        // objects a body edit touches are usually near the roots of the call
+        // graph, and everything they reach is most of what is live.
+        // A sixty-fourth, and not a quarter as it was first written. The
+        // region is almost always the whole live set on this workload, so the
+        // bound's job is to notice that quickly rather than to permit a large
+        // recompute: walking a quarter of the program before giving up cost
+        // more than the closure it gave up in favour of.
+        let limit = total / 64;
         while let Some(index) = frontier.pop() {
             if members.len() > limit {
-                return None;
+                *live = self.closure();
+                return Some(());
             }
             let (own, meta) = self.edges(index as usize);
             for target in own.iter().chain(meta) {
@@ -2268,10 +2301,15 @@ pub(crate) fn plan(
     // reaches it is off. An experimental path that produces a *plausible*
     // binary is worse than one that stops, and this project has now been
     // caught twice by a wrong answer that looked like a right one.
-    if delta_liveness() && timings.delta_used {
+    // The delta's own check, and the one that matters: the updated live set
+    // must be the closure of the graph it was updated against. It is a
+    // different question from `agrees_with` below, which asks whether the graph
+    // describes the same program as the phased traversal — and it is the one
+    // that caught a 246-atom leak that every byte comparison had passed.
+    if verify_liveness() && timings.delta_used {
         assert!(
             Graph::build(&atoms, entry).closure().set.bits == live.set.bits,
-            "the updated live set is not the one the graph supports"
+            "the updated live set is not the closure of the graph it came from"
         );
     }
     if verify_liveness() && delta_liveness() {
