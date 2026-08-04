@@ -10285,3 +10285,131 @@ Recorded rather than built. The threading is an afternoon; the path resolution
 is the part that decides whether the result is correct, and starting the second
 without finishing the first is how a linker comes to read the wrong file under
 load only.
+
+## 206. Four processes, because a working directory belongs to a process
+
+Finding 205 stopped short of building the concurrent daemon and named the
+reason: the daemon enters the caller's directory with `chdir`, which is
+process-global, so two links running in one process would resolve each other's
+relative paths. It proposed narrowing that — a classifier proving a request's
+paths are all absolute, so most links need no directory at all.
+
+That was the wrong first move, and the right one is smaller. Run the workers as
+*separate processes* and `chdir` is correct again by construction, because a
+working directory is a property of a process. Nothing needs proving about
+arguments; the existing per-request `set_current_dir` keeps working exactly as
+it did. The classifier was written, measured against a real rustc argument
+vector, and then reverted: with per-process directories it buys one syscall,
+and carrying an unused predicate that claims to be a correctness boundary is
+worse than not having one.
+
+The pid turned out to be load-bearing in two more places that were already
+written and would have had to change for threads:
+
+```
+    crates/link/src/lib.rs:6522     .blinker-{pid}.tmp     the output, then renamed
+    crates/cache/src/lib.rs:507     .tmp{pid}              the cache, then renamed
+```
+
+Both are safe across processes and both are a collision across threads. So the
+process design is not merely equivalent to the thread design — three separate
+pieces of existing code are already written for it.
+
+### The shape
+
+Four workers, each `--blinker-daemon-serve=N`, each owning one session, each
+serving one link at a time. There is no coordinator: the *client* hashes the
+output path and connects to that worker's socket directly, which removes a
+relay hop and means the process that never calls `chdir` is the one that does
+not exist. Workers start on demand, so a build that links one crate still runs
+one daemon.
+
+Routing is by output path because that is what "target" means downstream: one
+binary is one session's retained state, and two links writing one binary must
+not run at once whatever else is true. Hashing gives both — affinity, so a
+target keeps finding its warm session, and serialisation of same-output links
+for free.
+
+`BLINKER_MEMORY_BUDGET` is divided by four when a worker is spawned. Finding
+201 gave the session a byte budget so retained state would be bounded; four
+workers each honouring the whole number would have quietly quadrupled it.
+
+### What it is worth
+
+Three interleaved rounds of a clean `cargo build --workspace` per arm, against
+resident daemons, minima taken:
+
+```
+                        one daemon      four workers
+    total client wait     705.8 ms         517.9 ms      -27%
+    median wait/link       44.6 ms          28.5 ms      -36%
+    wall with a link out  326.6 ms         319.6 ms       unchanged
+```
+
+The third row is the honest one. Time spent with at least one link outstanding
+barely moved, because this workspace's sixteen links are not all concurrent —
+they arrive in waves as crates finish compiling, and a wave of two does not
+care how many workers there are. What moved is what each waiting build process
+pays, which is the number on the critical path.
+
+### The routing is unbalanced, and that is the ceiling
+
+```
+    worker   0    1    2    3
+    links    4    4    8    0
+```
+
+Sixteen links over four buckets, and one worker took half of them while another
+took none — the same split every round, because the hash of a path is not
+random, it is fixed. Half the queue is still there.
+
+Balancing it means giving up affinity, and affinity is what makes a warm link
+fast, which is the entire product. So this stays: the imbalance is the price of
+the property being bought, it is bounded (more targets spread better), and it
+is worth writing down that the measured win above is what a 8/4/4/0 split
+yields rather than what four workers could yield.
+
+### Two instruments broke, both because links now really do overlap
+
+The client's wait trace used `writeln!`, which issues a write per fragment. Four
+clients appending fragments to one file interleaved them, and the third round
+produced a line with two timestamps spliced together and a span of 6.5e17 ms.
+`O_APPEND` makes a *single* write atomic, so the fix is to only make one.
+
+And the daemon's own integration test started one daemon. With routing, a
+client whose worker is not running links in process — silently, correctly, and
+passing every assertion in a test whose entire purpose is to prove the daemon
+was used. It now starts the whole set and asserts every one is answering.
+
+That is the fourth measurement this run that told a plausible story about work
+that did not happen, and the second where two runs agreeing exactly was the
+tell.
+
+### The test that justifies the design
+
+`overlapping_links_are_byte_identical` submits four links at once from four
+directories, each naming its inputs and its output *relatively*, and every
+directory uses the same names — `main.o`, `prog`. A link that resolved a
+relative path against another link's directory would read that link's object,
+write that link's binary, and sign it with that link's identifier: a complete,
+valid, running program that is the wrong one. One of the four goes through an
+`@response` file holding a relative name, because response files are expanded
+by the server, later, against the same directory. Every output is compared to
+an isolated cold link of the same program.
+
+(There is no third case. `INPUT`/`INCLUDE` in linker scripts are GNU `ld`;
+`ld64` has no linker scripts.)
+
+The test picks its four directories so that each routes to a different worker,
+rather than taking what a scratch path happens to hash to — four programs
+dropped anywhere land on one worker about one run in sixty, and that run would
+serialise and still pass.
+
+It also caught a real defect. Routing first canonicalized the output's
+directory, which made the answer depend on whether that directory existed
+*yet*: a target routed one way on the link that created it and another way
+afterwards, losing the session it had just filled. Routing is lexical now —
+absolutize, drop `.`, pop `..`, never touch the disk. The cost is that two
+spellings of one file through a symlink route apart, which is also how the test
+first failed: it asked about `/tmp/...` while the client, whose key comes from
+`current_dir`, asked about `/private/tmp/...`.
