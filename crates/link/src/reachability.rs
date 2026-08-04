@@ -956,7 +956,7 @@ fn within<'g, 'a>(grouped: &'g ByOffset<'a>, atom: &Atom) -> &'g [&'a InputReloc
 ///
 /// The API is deliberately the same three operations the `HashSet` offered, so
 /// the traversal below reads unchanged.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct LiveSet {
     bits: Vec<u64>,
 }
@@ -975,6 +975,12 @@ impl LiveSet {
         let new = *slot & bit == 0;
         *slot |= bit;
         new
+    }
+
+    /// Mark `index` dead. Only the region recompute does this: the phased
+    /// traversal only ever adds, which is why the type had no need of it.
+    fn remove(&mut self, index: usize) {
+        self.bits[index / 64] &= !(1u64 << (index % 64));
     }
 
     pub(crate) fn contains(&self, index: usize) -> bool {
@@ -1011,129 +1017,276 @@ impl Owners {
 /// The reachability graph, as a graph.
 ///
 /// [`liveness`] below computes the same answer as a sequence of phases — roots,
-/// propagate, metadata, propagate, a revival loop over atoms whose edges were
-/// deliberately not followed — and each phase reads the objects' projections
-/// directly. That is fine for computing an answer once and impossible to
-/// update, because there is no edge set to add to or remove from.
+/// propagate, a metadata pass, propagate again, then a revival loop over atoms
+/// whose edges were deliberately not followed — and each phase reads the
+/// objects' projections directly. That is fine for computing an answer once and
+/// impossible to update, because there is no edge set to add to or remove from.
 ///
-/// This is the same relation written down: every atom's out-edges resolved to
-/// flat indices, and the roots. The claim it rests on is that the live set is
-/// exactly the closure of the roots under these edges — see
-/// [`Graph::agrees_with`] for why that is a claim and not a definition, and
-/// where it is checked.
+/// This is the same relation written down. The claim it rests on is that the
+/// live set is exactly the closure of the roots under these edges — see
+/// [`Graph::agrees_with`] for why that is a claim and not a definition.
+///
+/// # Why it is retained rather than derived
+///
+/// Building it costs 30.2 ms against the 17.2 ms traversal it replaces
+/// (finding 193). Deriving the edge set each link and updating it would be a
+/// straight loss, so the graph lives in [`ReachState`] across links and only
+/// the changed objects' rows are rebuilt.
+///
+/// # Two edge sets, not one
+///
+/// An atom's own edges come from its object's relocations, so an object owns
+/// every row it can change and its rows can be patched in isolation.
+///
+/// Metadata edges cannot: they run *backwards* — a function keeps its FDE
+/// alive rather than the FDE keeping its function alive, which is what makes
+/// the phased version's suppression unnecessary — and the function an object's
+/// FDE describes may live in another object. Rebuilding one object's rows
+/// would drop metadata edges another object put there. They are 11% of the
+/// edges (303,918 of 2,791,216), so they are kept per producing object and
+/// re-indexed whole, which costs a pass over a ninth of the graph rather than
+/// an index that would have to be patched from both ends.
+#[derive(Default)]
 pub(crate) struct Graph {
-    /// Targets of every atom's edges, concatenated in atom order.
-    targets: Vec<u32>,
-    /// Where each atom's targets begin. `atoms + 1` entries, so an atom's run
-    /// is `base[i]..base[i + 1]` with no special case for the last.
-    base: Vec<u32>,
-    /// Atoms that are live whatever points at them.
+    /// Own edges, as rows in an arena: `arena[start[a] .. start[a] + len[a]]`.
+    ///
+    /// An arena and not a prefix-sum table, because a row that grows has to go
+    /// somewhere. A patched row is appended and the old space left as a hole.
+    start: Vec<u32>,
+    len: Vec<u32>,
+    arena: Vec<u32>,
+    /// Entries of `arena` that some row still points at. The rest are holes.
+    used: usize,
+
+    /// Metadata edges as `(source, target)`, grouped by the object that
+    /// produced them, so a changed object's contribution can be replaced.
+    produced: Vec<Vec<(u32, u32)>>,
+    /// The same edges indexed by source: `meta[base[a] .. base[a + 1]]`.
+    meta: Vec<u32>,
+    meta_base: Vec<u32>,
+
+    /// Roots as a set, for the delta, and as a list, for a full closure.
+    root: LiveSet,
     roots: Vec<u32>,
 }
 
+/// A live set and the support that justifies each bit.
+///
+/// `support[a]` counts a's live predecessors. Settled, `live[a]` holds exactly
+/// when `a` is a root or `support[a] > 0` — the forward direction because a
+/// live predecessor propagates, the backward one because an atom only became
+/// live as a root or through one.
+///
+/// The counts are what make removal possible. They are not sufficient on their
+/// own: a cycle no root reaches supports itself, and would keep itself alive
+/// forever under pure reference counting. [`Graph::update`] handles that by
+/// recomputing a bounded region rather than by trusting the count.
+#[derive(Clone, Default)]
+pub(crate) struct Live {
+    set: LiveSet,
+    support: Vec<u32>,
+}
+
+impl From<LiveSet> for Live {
+    /// A live set with no support behind it, for the path that computed one
+    /// without a graph. Nothing may update it — `Graph::update` needs counts —
+    /// and nothing does: the same condition that produced it stops the delta.
+    fn from(set: LiveSet) -> Live {
+        Live {
+            set,
+            support: Vec::new(),
+        }
+    }
+}
+
 impl Graph {
-    fn build(atoms: &Atoms<'_>, entry: Option<SymbolNameId>) -> Graph {
-        let total = atoms.len();
-
-        // Counting sort into compressed rows: count the out-edges of every
-        // atom, prefix-sum, then fill. A `Vec<Vec<u32>>` would be one
-        // allocation per atom — 1.7 million of them on the large workload — to
-        // hold an average of two entries each.
-        let mut base = vec![0u32; total + 1];
-        let mut count = |source: usize| base[source + 1] += 1;
-        for (slot, block) in atoms.blocks.iter().enumerate() {
-            let at = atoms.base[slot];
-            for local in 0..block.atoms.len() {
-                let (start, end) = block.spans[local];
-                for edge in &block.edges[start as usize..end as usize] {
-                    if atoms.resolve(slot, *edge).is_some() {
-                        count(at + local);
-                    }
-                }
-            }
-            // Metadata's edges run the other way. An FDE does not keep its
-            // function alive; the function keeps the FDE alive, and the
-            // `__compact_unwind` record — which never reaches the output — is
-            // only the statement that a function owns an exception table.
-            for record in &block.eh_frame {
-                if metadata_edge(atoms, slot, record.function).is_some() {
-                    count(edge_source(atoms, slot, record.function));
-                }
-            }
-            for (function, lsda) in &block.unwind {
-                if metadata_edge(atoms, slot, *function).is_some()
-                    && atoms.resolve(slot, *lsda).is_some()
-                {
-                    count(edge_source(atoms, slot, *function));
+    /// The edges every atom of one object contributes, as `(source, target)`.
+    ///
+    /// Own edges and metadata edges are collected together because both are
+    /// read off the same projection, and separated by the caller: `source` is
+    /// inside the object for the first kind and anywhere for the second.
+    fn object_edges(
+        atoms: &Atoms<'_>,
+        slot: usize,
+        own: &mut Vec<Vec<u32>>,
+        produced: &mut Vec<(u32, u32)>,
+    ) {
+        let block = &atoms.blocks[slot];
+        let at = atoms.base[slot];
+        own.clear();
+        own.resize(block.atoms.len(), Vec::new());
+        for (local, row) in own.iter_mut().enumerate() {
+            let (start, end) = block.spans[local];
+            row.clear();
+            for edge in &block.edges[start as usize..end as usize] {
+                if let Some(target) = atoms.resolve(slot, *edge) {
+                    row.push(target as u32);
                 }
             }
         }
-        for index in 1..base.len() {
-            base[index] += base[index - 1];
-        }
-
-        // A separate cursor rather than advancing `base` and shifting it back
-        // afterwards. The shift trick saves this allocation and costs a reader
-        // the argument for why the rows end up where they started; the
-        // allocation is four bytes an atom and lives for one function.
-        let mut targets = vec![0u32; base[total] as usize];
-        let mut cursor = base.clone();
-        let mut fill = |source: usize, target: usize| {
-            targets[cursor[source] as usize] = target as u32;
-            cursor[source] += 1;
-        };
-        for (slot, block) in atoms.blocks.iter().enumerate() {
-            let at = atoms.base[slot];
-            for local in 0..block.atoms.len() {
-                let (start, end) = block.spans[local];
-                for edge in &block.edges[start as usize..end as usize] {
-                    if let Some(target) = atoms.resolve(slot, *edge) {
-                        fill(at + local, target);
-                    }
-                }
-            }
-            for record in &block.eh_frame {
-                if let Some(function) = metadata_edge(atoms, slot, record.function) {
-                    fill(function, at + record.atom as usize);
-                }
-            }
-            for (function, lsda) in &block.unwind {
-                if let (Some(function), Some(table)) = (
-                    metadata_edge(atoms, slot, *function),
-                    atoms.resolve(slot, *lsda),
-                ) {
-                    fill(function, table);
-                }
+        produced.clear();
+        for record in &block.eh_frame {
+            if let Some(function) = record.function.and_then(|edge| atoms.resolve(slot, edge)) {
+                produced.push((function as u32, (at + record.atom as usize) as u32));
             }
         }
-        Graph {
-            targets,
-            base,
-            roots: roots(atoms, entry),
+        for (function, lsda) in &block.unwind {
+            if let (Some(function), Some(table)) = (
+                function.and_then(|edge| atoms.resolve(slot, edge)),
+                atoms.resolve(slot, *lsda),
+            ) {
+                produced.push((function as u32, table as u32));
+            }
         }
     }
 
-    /// Atoms reachable from the roots.
-    fn closure(&self) -> LiveSet {
-        let mut live = LiveSet::with_capacity(self.base.len() - 1);
+    fn build(atoms: &Atoms<'_>, entry: Option<SymbolNameId>) -> Graph {
+        let total = atoms.len();
+        let mut graph = Graph {
+            start: vec![0; total],
+            len: vec![0; total],
+            arena: Vec::new(),
+            used: 0,
+            produced: vec![Vec::new(); atoms.blocks.len()],
+            meta: Vec::new(),
+            meta_base: vec![0; total + 1],
+            root: LiveSet::with_capacity(total),
+            roots: Vec::new(),
+        };
+
+        // On every core, and correct to do so: an object's own edges are a
+        // function of its own projection and the resolution table, both read
+        // only. The rows concatenate in object order, so the arena is the
+        // chunks end to end and neither it nor the lengths depend on which
+        // thread finished first.
+        let built = crate::parallel::map_chunks(&atoms.blocks, |base, chunk| {
+            let (mut own, mut produced) = (Vec::new(), Vec::new());
+            let mut flat: Vec<u32> = Vec::new();
+            let mut lengths: Vec<u32> = Vec::new();
+            let mut metadata: Vec<Vec<(u32, u32)>> = Vec::with_capacity(chunk.len());
+            for slot in base..base + chunk.len() {
+                Graph::object_edges(atoms, slot, &mut own, &mut produced);
+                for row in &own {
+                    lengths.push(row.len() as u32);
+                    flat.extend_from_slice(row);
+                }
+                metadata.push(std::mem::take(&mut produced));
+            }
+            (flat, lengths, metadata)
+        });
+        let (mut atom, mut slot) = (0usize, 0usize);
+        for (flat, lengths, metadata) in built {
+            let chunk = graph.arena.len() as u32;
+            let mut within = 0u32;
+            for length in lengths {
+                graph.start[atom] = chunk + within;
+                graph.len[atom] = length;
+                within += length;
+                atom += 1;
+            }
+            graph.arena.extend_from_slice(&flat);
+            for edges in metadata {
+                graph.produced[slot] = edges;
+                slot += 1;
+            }
+        }
+        graph.used = graph.arena.len();
+        graph.index_metadata();
+        graph.set_roots(roots(atoms, entry));
+        graph
+    }
+
+    /// Rebuild the by-source index over every object's metadata edges.
+    fn index_metadata(&mut self) {
+        let total = self.start.len();
+        self.meta_base.clear();
+        self.meta_base.resize(total + 1, 0);
+        for edges in &self.produced {
+            for (source, _) in edges {
+                self.meta_base[*source as usize + 1] += 1;
+            }
+        }
+        for index in 1..self.meta_base.len() {
+            self.meta_base[index] += self.meta_base[index - 1];
+        }
+        self.meta = vec![0; self.meta_base[total] as usize];
+        let mut cursor = self.meta_base.clone();
+        for edges in &self.produced {
+            for (source, target) in edges {
+                self.meta[cursor[*source as usize] as usize] = *target;
+                cursor[*source as usize] += 1;
+            }
+        }
+    }
+
+    fn set_roots(&mut self, roots: Vec<u32>) {
+        self.root = LiveSet::with_capacity(self.start.len());
+        for root in &roots {
+            self.root.insert(*root as usize);
+        }
+        self.roots = roots;
+    }
+
+    /// Where atom `a`'s edges are, as its own row and its metadata row.
+    fn edges(&self, a: usize) -> (&[u32], &[u32]) {
+        let own = self.start[a] as usize..self.start[a] as usize + self.len[a] as usize;
+        let meta = self.meta_base[a] as usize..self.meta_base[a + 1] as usize;
+        (&self.arena[own], &self.meta[meta])
+    }
+
+    /// Replace atom `a`'s own row, leaving the old space as a hole.
+    fn set_row(&mut self, a: usize, row: &[u32]) {
+        self.used -= self.len[a] as usize;
+        self.start[a] = self.arena.len() as u32;
+        self.len[a] = row.len() as u32;
+        self.arena.extend_from_slice(row);
+        self.used += row.len();
+    }
+
+    /// Move every row back into a dense arena.
+    ///
+    /// Patching leaves holes, and a session that relinks a target a hundred
+    /// times would otherwise grow the arena without bound. Called when the
+    /// holes outnumber the rows.
+    fn compact(&mut self) {
+        let mut arena = Vec::with_capacity(self.used);
+        for a in 0..self.start.len() {
+            let row = self.start[a] as usize..self.start[a] as usize + self.len[a] as usize;
+            self.start[a] = arena.len() as u32;
+            arena.extend_from_slice(&self.arena[row]);
+        }
+        self.arena = arena;
+        self.used = self.arena.len();
+    }
+
+    /// Everything reachable from the roots, and the support behind it.
+    fn closure(&self) -> Live {
+        let total = self.start.len();
+        let mut live = Live {
+            set: LiveSet::with_capacity(total),
+            support: vec![0; total],
+        };
         let mut worklist: Vec<u32> = Vec::new();
         for root in &self.roots {
-            if live.insert(*root as usize) {
+            if live.set.insert(*root as usize) {
                 worklist.push(*root);
             }
         }
+        self.propagate(&mut live, &mut worklist);
+        live
+    }
+
+    /// Mark everything the worklist reaches, counting support as it goes.
+    fn propagate(&self, live: &mut Live, worklist: &mut Vec<u32>) {
         while let Some(index) = worklist.pop() {
-            let (start, end) = (
-                self.base[index as usize] as usize,
-                self.base[index as usize + 1] as usize,
-            );
-            for target in &self.targets[start..end] {
-                if live.insert(*target as usize) {
+            let (own, meta) = self.edges(index as usize);
+            for target in own.iter().chain(meta) {
+                live.support[*target as usize] += 1;
+                if live.set.insert(*target as usize) {
                     worklist.push(*target);
                 }
             }
         }
-        live
     }
 
     /// Whether the closure is the live set the phased traversal produced.
@@ -1147,18 +1300,197 @@ impl Graph {
     /// zero on every workload measured; this is what says so on the ones that
     /// have not been.
     fn agrees_with(&self, live: &LiveSet) -> bool {
-        self.closure().bits == live.bits
+        self.closure().set.bits == live.bits
     }
-}
 
-/// The atom an `__eh_frame` or `__compact_unwind` record hangs off, if any.
-fn metadata_edge(atoms: &Atoms<'_>, slot: usize, function: Option<Edge>) -> Option<usize> {
-    function.and_then(|edge| atoms.resolve(slot, edge))
-}
+    /// Fold one link's changes into this graph and its live set.
+    ///
+    /// `moved` lists the objects whose edges may differ. Returns `None` when
+    /// the region that has to be recomputed grows past a bound, so the caller
+    /// falls back to a full closure rather than doing its work badly.
+    ///
+    /// # Why support counts are not enough
+    ///
+    /// Adding an edge is the easy direction: it can only make atoms live, and
+    /// propagating forward from the new edge is exactly right.
+    ///
+    /// Removing one is not. `support[a]` counts a's live predecessors, and
+    /// reaching zero is necessary for a to die but not sufficient the other
+    /// way round — a cycle no root reaches supports itself, and pure reference
+    /// counting would keep that dead loop alive for the life of the session.
+    ///
+    /// So the counts are used only to find *suspects*: live atoms that are not
+    /// roots and have no live predecessor left. That set cannot be wrong in the
+    /// direction that matters — an atom that should die always ends up in it —
+    /// and the answer for the suspects is recomputed rather than deduced.
+    ///
+    /// The region recomputed is everything forward-reachable from the
+    /// suspects. It is closed under successors by construction: if `a` is in it
+    /// and `a -> t` then `t` is reachable from a suspect too. That is what
+    /// makes the recompute local — no edge leaves the region, so cutting it out
+    /// cannot disturb the support of anything outside. Clear it, and every atom
+    /// in it that is a root or still has support from outside seeds a
+    /// propagation that stays inside.
+    fn update(
+        &mut self,
+        atoms: &Atoms<'_>,
+        moved: &[usize],
+        live: &mut Live,
+        entry: Option<SymbolNameId>,
+    ) -> Option<()> {
+        let total = self.start.len();
 
-/// The same, where the caller has already established there is one.
-fn edge_source(atoms: &Atoms<'_>, slot: usize, function: Option<Edge>) -> usize {
-    metadata_edge(atoms, slot, function).expect("the caller checked")
+        // Phase one: withdraw the edges of every object that moved, from the
+        // support of everything they were holding up.
+        let (mut own, mut produced) = (Vec::new(), Vec::new());
+        let mut rows: Vec<(usize, Vec<u32>)> = Vec::new();
+        let mut metadata_moved = false;
+        for slot in moved.iter().copied() {
+            Graph::object_edges(atoms, slot, &mut own, &mut produced);
+            let at = atoms.base[slot];
+            for (local, row) in own.iter().enumerate() {
+                let index = at + local;
+                if self.edges(index).0 == row.as_slice() {
+                    continue;
+                }
+                if live.set.contains(index) {
+                    for target in self.edges(index).0.to_vec() {
+                        live.support[target as usize] -= 1;
+                    }
+                }
+                rows.push((index, row.clone()));
+            }
+            if self.produced[slot] != produced {
+                for (source, target) in &self.produced[slot] {
+                    if live.set.contains(*source as usize) {
+                        live.support[*target as usize] -= 1;
+                    }
+                }
+                self.produced[slot] = std::mem::take(&mut produced);
+                metadata_moved = true;
+            }
+        }
+
+        // Phase two: install them, and count what the new ones hold up.
+        for (index, row) in &rows {
+            self.set_row(*index, row);
+        }
+        if metadata_moved {
+            self.index_metadata();
+        }
+        // Roots are recomputed rather than tracked: a root can appear from an
+        // opacity decision made in another object, so there is no object whose
+        // change would announce it. This is the scan the phased traversal did
+        // anyway.
+        self.set_roots(roots(atoms, entry));
+
+        let mut seeds: Vec<u32> = Vec::new();
+        for (index, _) in &rows {
+            if live.set.contains(*index) {
+                for target in self.edges(*index).0.to_vec() {
+                    live.support[target as usize] += 1;
+                    if !live.set.contains(target as usize) {
+                        seeds.push(target);
+                    }
+                }
+            }
+        }
+        if metadata_moved {
+            for slot in moved.iter().copied() {
+                for (source, target) in self.produced[slot].clone() {
+                    if live.set.contains(source as usize) {
+                        live.support[target as usize] += 1;
+                        if !live.set.contains(target as usize) {
+                            seeds.push(target);
+                        }
+                    }
+                }
+            }
+        }
+
+        // One pass says both what a new root owes its life to and what has run
+        // out of support. Targeted versions of these were tried first and were
+        // wrong in both directions: a root can be gained by an atom no changed
+        // object mentions, and an atom can lose its last supporter through a
+        // metadata edge that came from somewhere else entirely.
+        let mut suspects: Vec<u32> = Vec::new();
+        for index in 0..total {
+            let (alive, root) = (live.set.contains(index), self.root.contains(index));
+            if root && !alive {
+                seeds.push(index as u32);
+            } else if alive && !root && live.support[index] == 0 {
+                suspects.push(index as u32);
+            }
+        }
+
+        let mut worklist: Vec<u32> = Vec::new();
+        for seed in seeds {
+            if live.set.insert(seed as usize) {
+                worklist.push(seed);
+            }
+        }
+        self.propagate(live, &mut worklist);
+        // Propagation only adds support, so a suspect it rescued is no longer
+        // one. Checked here rather than filtered above, because a suspect can
+        // also be rescued by another suspect's rescue.
+        suspects.retain(|index| live.support[*index as usize] == 0);
+        if suspects.is_empty() {
+            return Some(());
+        }
+
+        // Phase three: the region that might have died, recomputed exactly.
+        let mut region = LiveSet::with_capacity(total);
+        let mut members: Vec<u32> = Vec::new();
+        let mut frontier: Vec<u32> = Vec::new();
+        for suspect in suspects {
+            if live.set.contains(suspect as usize) && region.insert(suspect as usize) {
+                members.push(suspect);
+                frontier.push(suspect);
+            }
+        }
+        // Bounded, because past some size this is the whole traversal with
+        // none of its locality, and the caller has a better option.
+        let limit = total / 4;
+        while let Some(index) = frontier.pop() {
+            if members.len() > limit {
+                return None;
+            }
+            let (own, meta) = self.edges(index as usize);
+            for target in own.iter().chain(meta) {
+                if live.set.contains(*target as usize) && region.insert(*target as usize) {
+                    members.push(*target);
+                    frontier.push(*target);
+                }
+            }
+        }
+
+        // Cut it out. Every edge out of the region lands inside it, so this
+        // cannot disturb the support of anything that stays.
+        for index in members.iter().copied() {
+            live.set.remove(index as usize);
+        }
+        for index in members.iter().copied() {
+            let (own, meta) = self.edges(index as usize);
+            for target in own.iter().chain(meta) {
+                live.support[*target as usize] -= 1;
+            }
+        }
+        // Then put back whatever the rest of the program still holds up.
+        for index in members.iter().copied() {
+            if (self.root.contains(index as usize) || live.support[index as usize] > 0)
+                && live.set.insert(index as usize)
+            {
+                worklist.push(index);
+            }
+        }
+        self.propagate(live, &mut worklist);
+        // Patched rows leave the old space behind, and a session that relinks
+        // one target two hundred times would otherwise grow an arena of holes.
+        if self.arena.len() > 2 * self.used {
+            self.compact();
+        }
+        Some(())
+    }
 }
 
 /// Atoms that are live before anything points at them.
@@ -1502,6 +1834,12 @@ pub(crate) struct StripTimings {
     pub reach_total: u64,
     /// Whether the previous link's answer was reused whole.
     pub reused_strip: bool,
+    /// Whether the live set was updated rather than recomputed, and over how
+    /// many objects' edges.
+    pub delta_used: bool,
+    pub delta_objects: u64,
+    /// Atoms the propagation left dead that a live atom then referred to.
+    pub revived: u64,
 }
 
 /// What one target's reachability was, last time this session linked it.
@@ -1544,8 +1882,21 @@ pub(crate) struct ReachState {
     bases: Vec<u32>,
     /// Atoms in that numbering.
     total: u32,
-    /// The live set the traversal produced, in the numbering above.
-    live: LiveSet,
+    /// Where each object's distinct referenced names resolved to, so a link
+    /// can tell an object whose *targets* moved from one whose bytes did.
+    ///
+    /// A digest cannot answer that. It hashes the object's own structure —
+    /// atoms, local edges, the symbol *indices* it refers to — and not what
+    /// those indices resolve to, which is decided by every other object in the
+    /// link. rustc renames every codegen unit of a recompiled crate, and a
+    /// rename that is consistent between a definition and its references
+    /// leaves both the digests and these values untouched, which is exactly
+    /// why the pair is worth keeping and the digest alone is not.
+    resolved: Vec<u32>,
+    resolved_base: Vec<u32>,
+    /// The graph, and the live set with the support behind it.
+    graph: Graph,
+    live: Live,
     /// What that live set was compacted into.
     strip: Arc<Strip>,
 }
@@ -1586,10 +1937,24 @@ impl ReachState {
             .count() as u64
     }
 
-    /// The live set, in the numbering [`ReachState::aligned_with`] describes.
-    #[allow(dead_code, reason = "the delta pass this was retained for")]
-    pub(crate) fn live(&self) -> &LiveSet {
-        &self.live
+    /// Which objects' edges may differ from the ones in this state.
+    ///
+    /// Two questions, because an object's edges move for two reasons. Its own
+    /// projection moving is the obvious one. The other is that its targets
+    /// moved without it: an edge is stored as "the name at index 7", and where
+    /// index 7 lands is a fact about the whole link.
+    fn moved(&self, digests: &[u64], resolved: &[u32], base: &[u32]) -> Vec<usize> {
+        (0..digests.len())
+            .filter(|slot| {
+                let slot = *slot;
+                if self.projections[slot] != digests[slot] {
+                    return true;
+                }
+                let now = base[slot] as usize..base[slot + 1] as usize;
+                let held = self.resolved_base[slot] as usize..self.resolved_base[slot + 1] as usize;
+                held.len() != now.len() || self.resolved[held] != resolved[now]
+            })
+            .collect()
     }
 }
 
@@ -1618,10 +1983,15 @@ pub(crate) fn plan(
     let digest_step = std::time::Instant::now();
     let projections: Vec<u64> = atoms.blocks.iter().map(|block| block.digest).collect();
     let identities: Vec<u32> = objects.iter().map(|object| object.parsed.id.0).collect();
-    let bases: Vec<u32> = atoms.base.iter().map(|at| *at as u32).collect();
+    // Both tables carry a terminator, so an object's run is `[i]..[i + 1]` with
+    // no special case for the last one.
+    let mut bases: Vec<u32> = atoms.base.iter().map(|at| *at as u32).collect();
+    bases.push(atoms.len() as u32);
+    let mut resolved_base = atoms.resolved_base.clone();
+    resolved_base.push(atoms.resolved.len() as u32);
 
     let previous = session.reach_state();
-    let moved = match previous.as_deref() {
+    let moved = match previous.as_ref() {
         Some(state) => state.moved_against(&identities, &projections),
         // No previous state for this target is not "nothing moved". It is the
         // cold case, and reporting zero would make a first link indistinguishable
@@ -1639,67 +2009,132 @@ pub(crate) fn plan(
     // recomputes and compares: stripping an atom that is still reachable
     // produces a binary that links, runs, and crashes somewhere else later, so
     // this is not a place to trust an argument.
-    let held = previous
-        .filter(|state| state.matches(&identities, &projections))
-        .map(|state| Arc::clone(&state.strip));
+    let reusable = previous
+        .as_ref()
+        .is_some_and(|state| state.matches(&identities, &projections));
     // "The held answer was valid", not "the shortcut was taken". Under
     // verification the work is done anyway and the two answers compared, and a
     // flag that flipped with the verification mode would mean every test of it
     // measured the mode rather than the linker — which is how this was found.
-    timings.reused_strip = held.is_some();
-    if let Some(strip) = held.as_ref() {
-        if !verify_liveness() {
-            return (
-                Strip::clone(strip),
-                report_from(objects, &atoms, strip),
-                timings,
-            );
-        }
+    timings.reused_strip = reusable;
+    if reusable && !verify_liveness() {
+        let state = previous.expect("reusable implies there is one");
+        let report = report_from(objects, &atoms, &state.strip);
+        let strip = Strip::clone(&state.strip);
+        // Stored again, unchanged. Reading it is not what keeps it — see
+        // `Recent::take` — and a target whose answer is always right would
+        // otherwise be the one eviction drops.
+        session.store_reach(state);
+        return (strip, report, timings);
     }
 
+    // The delta. Everything above is bookkeeping; this is the thing the state
+    // exists for. `update` returns `None` when the region it would have to
+    // recompute is large enough that a full closure is the better answer, so a
+    // fallback here is a decision rather than a failure.
     let step = std::time::Instant::now();
     let mut live_parts = [0.0f64; 2];
-    let (live, revived) = liveness(&atoms, entry, &mut live_parts);
+    let updated = previous.filter(|_| delta_liveness()).and_then(|mut state| {
+        if !state.aligned_with(&identities, &bases, atoms.len() as u32) {
+            return None;
+        }
+        let moved = state.moved(&projections, &atoms.resolved, &resolved_base);
+        // Moved out rather than borrowed: `update` rewrites both in place, and
+        // the state they came from is on its way to being replaced.
+        let mut graph = std::mem::take(&mut state.graph);
+        let mut live = std::mem::take(&mut state.live);
+        graph
+            .update(&atoms, &moved, &mut live, entry)
+            .map(|()| (graph, live, moved.len() as u64))
+    });
+    timings.delta_used = updated.is_some();
+    timings.delta_objects = updated.as_ref().map_or(0, |(_, _, moved)| *moved);
+
+    // The full path is still the phased traversal, and the graph is only built
+    // where something will update it. Finding 194 is why: a retained graph that
+    // cannot be updated is 7 ms a link of pure cost, and today it cannot be —
+    // an edit that changes one object's atom count shifts every atom index
+    // after it, and `aligned_with` refuses. Under `BLINKER_DELTA_LIVENESS` the
+    // whole apparatus runs, so it stays exercised and measurable while the
+    // numbering it needs is built.
+    let (graph, live) = match updated {
+        Some((graph, live, _)) => (graph, live),
+        None if delta_liveness() => {
+            let graph = Graph::build(&atoms, entry);
+            let live = graph.closure();
+            (graph, live)
+        }
+        None => {
+            let (set, revived) = liveness(&atoms, entry, &mut live_parts);
+            timings.revived = revived as u64;
+            (Graph::default(), Live::from(set))
+        }
+    };
     timings.liveness_ms = step.elapsed().as_secs_f64() * 1000.0;
     timings.group_ms = live_parts[0];
     timings.traverse_ms = live_parts[1];
 
-    // The graph the delta pass will update, and the check that it describes
-    // the same program the phased traversal just walked. Under verification
-    // only, for now: building it costs a pass over 1.2 million edges, and it
-    // buys nothing until something updates it instead of rebuilding it.
-    if verify_liveness() {
+    // The phased traversal, kept as the thing the graph is checked against.
+    // It reads the projections directly and shares no code with the closure,
+    // which is what makes the comparison worth anything.
+    if verify_liveness() && delta_liveness() {
+        let (expected, revived) = liveness(&atoms, entry, &mut live_parts);
+        timings.revived = revived as u64;
         assert!(
-            Graph::build(&atoms, entry).agrees_with(&live),
+            Graph::build(&atoms, entry).agrees_with(&expected),
             "the reachability graph and the traversal disagree about what is live"
         );
-    }
-
-    let step = std::time::Instant::now();
-    let strip = Strip::build(objects, &atoms, &live);
-    timings.build_ms = step.elapsed().as_secs_f64() * 1000.0;
-
-    if let Some(held) = held {
-        assert_eq!(
-            *held, strip,
-            "the held strip differs from a freshly computed one: reachability \
-             reused an answer that the graph no longer supports"
+        assert!(
+            live.set.bits == expected.bits,
+            "the delta and a full traversal disagree about what is live"
         );
     }
-    let report = report(objects, &atoms, &live, revived);
-    // The live set is stored, which is the whole of what this commit adds. It
-    // is 1.7 million bits — 210 KB on the largest workload — against the
-    // `Strip` beside it, and nothing reads it yet.
+    let revived = timings.revived as usize;
+
+    let step = std::time::Instant::now();
+    let strip = Strip::build(objects, &atoms, &live.set);
+    timings.build_ms = step.elapsed().as_secs_f64() * 1000.0;
+
+    let report = report(objects, &atoms, &live.set, revived);
     session.store_reach(ReachState {
         objects: identities,
         projections,
         bases,
         total: atoms.len() as u32,
+        // Only where something will read them. With the delta off these are
+        // 1.5 MB of copying a link to answer a question nobody asks.
+        resolved: if delta_liveness() {
+            atoms.resolved.clone()
+        } else {
+            Vec::new()
+        },
+        resolved_base: if delta_liveness() {
+            resolved_base
+        } else {
+            Vec::new()
+        },
+        graph,
         live,
         strip: Arc::new(strip.clone()),
     });
 
     (strip, report, timings)
+}
+
+/// Whether to retain the reachability graph and update it across links.
+///
+/// Off by default, and finding 194 says why: the delta is implemented, agrees
+/// with a full traversal bit for bit, and cannot fire on a real edit. Atom
+/// indices are a dense running total over the link's objects, so one object
+/// gaining one atom shifts every index after it and the retained live set
+/// stops meaning anything. Rebasing a dense numbering costs more than the
+/// traversal it would save.
+///
+/// `BLINKER_DELTA_LIVENESS=1` turns it on, so the machinery stays exercised
+/// and measurable while stable atom identity is built underneath it.
+fn delta_liveness() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("BLINKER_DELTA_LIVENESS").is_some())
 }
 
 /// Whether to recompute liveness and compare it against the held answer.

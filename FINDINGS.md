@@ -9528,3 +9528,62 @@ It also puts a floor under what incremental liveness is worth. `dead_strip` is
 5%. It is first in the sequence because it is the smallest well-understood
 delta problem and the machinery transfers, not because it is where the time is
 — that is `emit` at 90 ms and `relocate` at 67.
+
+## 194. The delta works, and cannot fire
+
+`Graph::update` is incremental liveness as finding 193 set it up. It withdraws
+the edges of every object that moved from the support counts of what they held
+up, installs the new ones, propagates forward from anything newly supported,
+and then — for atoms that lost their last live predecessor — recomputes a
+bounded region rather than trusting the count, because a cycle no root reaches
+supports itself and reference counting alone would keep a dead loop alive for
+the life of the session. The region is everything forward-reachable from the
+suspects, which is closed under successors, so cutting it out cannot disturb
+anything outside it.
+
+It is correct. Under `BLINKER_VERIFY_LIVENESS` every link recomputes the live
+set with the phased traversal and asserts the delta's bitset is equal, and that
+holds across the whole test suite and every captured workload, warm and cold.
+
+It never runs.
+
+```
+delta: used false  objects None  atoms 864302
+delta: used false  objects None  atoms 864301
+delta: used false  objects None  atoms 864302
+```
+
+### One atom, and the numbering moves
+
+Atom indices are a dense running total over the link's objects. The live set,
+the support counts and every edge in the graph are expressed in them. So an
+object that gains a single atom shifts every index after it, and the retained
+state stops describing the program.
+
+That is not an unusual edit. It is the ordinary one: the two versions of the
+relink workload differ by one atom, and `aligned_with` correctly refuses on
+every link.
+
+Rebasing does not save it. Translating the retained graph into the new
+numbering is a pass over 2.79 million edges, and support has to be recomputed
+from the live set afterwards because atoms may have been dropped — together
+more than the 17 ms traversal the whole exercise was to avoid. A dense global
+numbering makes every local change global, which is the same sentence as
+finding 187 about `__LINKEDIT` string offsets, arrived at from the other end.
+
+### What it costs to have found this out the long way
+
+Retaining a graph that cannot be updated is 7 ms a link of pure loss, so the
+default path is unchanged: the phased traversal, no graph, no retention.
+`BLINKER_DELTA_LIVENESS=1` runs the whole apparatus, which keeps it exercised
+and measurable rather than rotting. Interleaved warm minima with the flag off
+are 334/331 and 329/333 ms against 326/323 and 332/328 — neutral, which is what
+"unchanged default path" has to mean before it is worth saying.
+
+The order was wrong, and it was wrong for a reason worth writing down. The plan
+put incremental liveness first because it is the smallest well-understood delta
+problem. It is — and it turns out to depend on the piece that was scheduled
+fifth, because *stable identity is not a property of the output stage, it is a
+property of the linker*. Atom numbers, symbol slots, string offsets and
+addresses are all the same problem, and none of the deltas above them are worth
+building until the thing underneath stops moving.

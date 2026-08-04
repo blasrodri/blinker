@@ -179,19 +179,16 @@ impl<V> Recent<V> {
             .map(|(_, value)| value)
     }
 
-    /// Read an entry and mark it as the most recent.
+    /// Remove an entry and hand it over.
     ///
-    /// Eviction drops the *oldest inserted*, so an entry that is read on every
-    /// link and rewritten on none of them ages out while it is still in use.
-    /// That is exactly what a target whose answer keeps being reused does, and
-    /// it is how a held answer becomes a cold link: three targets alternating,
-    /// two of them recomputing, and the one that never had to is the one thrown
-    /// away.
-    fn touch(&mut self, key: u64) -> Option<&V> {
+    /// The reachability state is updated in place and put back, which is worth
+    /// twenty megabytes of copying a link — and it is also what keeps it. This
+    /// map evicts the oldest *insertion*, so a target whose answer stays valid
+    /// and is only ever read would be the one thrown away; taking and putting
+    /// back makes every use an insertion.
+    fn take(&mut self, key: u64) -> Option<V> {
         let at = self.held.iter().position(|(held, _)| *held == key)?;
-        let entry = self.held.remove(at);
-        self.held.push(entry);
-        self.held.last().map(|(_, value)| value)
+        Some(self.held.remove(at).1)
     }
 
     fn put(&mut self, key: u64, value: V) {
@@ -398,7 +395,7 @@ pub struct Session {
     ///
     /// See [`crate::reachability::ReachState`] for why the atom numbering it
     /// carries has to travel with it.
-    reach: Recent<Arc<crate::reachability::ReachState>>,
+    reach: Recent<crate::reachability::ReachState>,
     /// How many digests moved on this link, and how many were compared.
     reach_moved: u64,
     reach_total: u64,
@@ -1149,17 +1146,17 @@ impl Session {
     /// numbering a live set is expressed in is a running total over one link's
     /// objects. Sharing either across targets would not merely be a wrong
     /// number; it would be a live set read against the wrong graph.
-    /// `&mut` because reading it is what keeps it: see [`Recent::touch`]. A
-    /// link that reuses this answer stores nothing, so the read is the only
-    /// evidence the target is still being built.
-    pub(crate) fn reach_state(&mut self) -> Option<Arc<crate::reachability::ReachState>> {
+    /// Taken, not borrowed: a link updates the graph in place and puts it
+    /// back, which is worth twenty megabytes of copying. A link that reuses the
+    /// answer whole still has to store it again — see `store_reach`.
+    pub(crate) fn reach_state(&mut self) -> Option<crate::reachability::ReachState> {
         let target = self.target;
-        self.reach.touch(target).map(Arc::clone)
+        self.reach.take(target)
     }
 
     /// Replace it with what this link computed.
     pub(crate) fn store_reach(&mut self, state: crate::reachability::ReachState) {
-        self.reach.put(self.target, Arc::new(state));
+        self.reach.put(self.target, state);
     }
 
     /// Record how much of the reachability graph moved, for the report.
@@ -1580,30 +1577,5 @@ mod tests {
                 .is_none(),
             "a rewritten object was served from memory"
         );
-    }
-
-    /// An entry that is read on every link and rewritten on none of them must
-    /// not age out while it is being used.
-    ///
-    /// Eviction drops the oldest *insertion*, and a target whose answer keeps
-    /// being reused never inserts. Three targets alternating is enough: the
-    /// one that never has to recompute is the one thrown away, and the next
-    /// link for it is cold. `Recent::touch` is what makes reading count.
-    #[test]
-    fn reading_a_recent_entry_keeps_it() {
-        let mut recent: Recent<&str> = Recent::default();
-        for (key, value) in [(1, "a"), (2, "b"), (3, "c")] {
-            recent.put(key, value);
-        }
-        assert_eq!(recent.held.len(), RECENT_TARGETS);
-
-        // Target 1 is the oldest insertion and the one about to be dropped —
-        // unless reading it counts.
-        assert_eq!(recent.touch(1), Some(&"a"));
-        recent.put(4, "d");
-
-        assert_eq!(recent.get(1), Some(&"a"), "the entry in use was evicted");
-        assert_eq!(recent.get(2), None, "the unread entry survived instead");
-        assert_eq!(recent.get(4), Some(&"d"));
     }
 }
