@@ -268,8 +268,7 @@ impl<'a> ImageBuilder<'a> {
     /// Handed back on [`Image::strings`] — including when the table decided it
     /// had gone stale and started again, which is a decision the next link has
     /// to be told about rather than left to rediscover.
-    pub fn reusing_strings(&mut self, mut strings: crate::symtab::StringTable) -> &mut Self {
-        strings.begin();
+    pub fn reusing_strings(&mut self, strings: crate::symtab::StringTable) -> &mut Self {
         self.strings = strings;
         self
     }

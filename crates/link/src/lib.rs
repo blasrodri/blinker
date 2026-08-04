@@ -47,7 +47,7 @@ use blinker_macho::{
     RelocationLength, RelocationTarget, SectionId, SectionKind, SymbolStrength, SymbolVisibility,
 };
 use blinker_output::image::Dylib;
-use blinker_output::symtab::OutputSymbol;
+use blinker_output::symtab::{NlistEntry, OutputSymbol, SymbolGroup};
 use blinker_output::{Bind, Image, ImageBuilder, Rebase, UnwindEntry};
 use blinker_relocations::{apply, Context};
 use blinker_symbols::{SymbolNameId, SymbolNames, SymbolProvider, SymbolTable};
@@ -125,6 +125,10 @@ pub struct LinkTimings {
     pub digest_ms: f64,
     pub reach_moved: u64,
     pub reach_total: u64,
+    /// Objects whose symbol-table entries were kept from the previous link,
+    /// of how many there were.
+    pub symbols_reused: u64,
+    pub symbols_total: u64,
     /// Work between the named stages that no stage owned: building placements,
     /// scanning `__eh_frame` for personality fields, sizing the unwind table,
     /// and collecting commons. It was 1.9 ms of "unmeasured" and the only
@@ -2148,7 +2152,7 @@ fn link_inner(
             dylibs: &dylibs,
             ..Assembly::default()
         },
-        Vec::new(),
+        [Vec::new(), Vec::new(), Vec::new()],
         blinker_output::symtab::StringTable::default(),
     )?;
 
@@ -2356,12 +2360,23 @@ fn link_inner(
     let sub = std::time::Instant::now();
     let placed_symbols = placed_symbols(&objects, &interned, &placed, &strip);
     gap!(_gap, "sym: placed");
-    let mut symbols = output_symbols(&placed_symbols);
-    gap!(_gap, "sym: output");
-    // After the ordinary locals, which is where `ld` puts them and where a
-    // consumer walking the local range expects the debug map to begin.
-    symbols.extend(debug_map(&objects, &placed_symbols));
-    gap!(_gap, "sym: debug map");
+    // The string table is taken before the symbols are built rather than at
+    // `assemble`, because building them *is* placing their names in it.
+    let mut strings = session.take_strings();
+    let held_symbols = session.take_symbols();
+    // Whether the table has room left for another link's worth of names,
+    // decided from what the runs still held speak for. Before anything is
+    // resolved: a rebuild moves every offset, so it must not happen partway.
+    strings.rebuild_unless_live(held_symbols.as_ref().map_or(0, SymbolState::live_bytes));
+    let symbol_state = plan_symbols(
+        &objects,
+        &placed_symbols,
+        &mut strings,
+        held_symbols,
+        timings,
+    );
+    let symbols = symbol_state.groups();
+    gap!(_gap, "sym: plan");
 
     // Each GOT slot holds an absolute address, and the image is position
     // independent, so dyld must relocate every one of them at load time.
@@ -2391,7 +2406,7 @@ fn link_inner(
             dylibs: &dylibs,
         },
         symbols,
-        session.take_strings(),
+        strings,
     );
     timings.emit_ms = elapsed_ms(step);
     gap!(_gap, "after emit");
@@ -2493,6 +2508,7 @@ fn link_inner(
     // names the output never contained.
     let mut image = image;
     if let Ok(image) = &mut image {
+        session.store_symbols(symbol_state);
         session.store_strings(std::mem::take(&mut image.strings));
     }
 
@@ -4271,7 +4287,7 @@ fn full_sizes(objects: &[LoadedObject]) -> blinker_output::PlacementReservations
 fn assemble(
     request: &LinkRequest,
     assembly: &Assembly<'_>,
-    output_symbols: Vec<OutputSymbol<'_>>,
+    symbols: [Vec<NlistEntry>; 3],
     strings: blinker_output::symtab::StringTable,
 ) -> Result<Image, LinkError> {
     let Assembly {
@@ -4327,7 +4343,7 @@ fn assemble(
         }
     }
 
-    builder.symbols().absorb(output_symbols);
+    builder.symbols().take_groups(symbols);
     for rebase in rebases {
         builder.rebase(*rebase);
     }
@@ -4394,13 +4410,7 @@ fn is_temporary_label(name: &str) -> bool {
 /// interleaved table has no per-object runs to keep. Object order is what makes
 /// an unchanged object's symbols a contiguous span that a later link can splice
 /// in rather than rebuild.
-fn output_symbols<'a>(placed: &[PlacedSymbol<'a>]) -> Vec<OutputSymbol<'a>> {
-    // In object order, which is `placed`'s order, which is the order the chunk
-    // boundaries were fixed in before any thread started.
-    let chunks = crate::parallel::map_chunks(placed, |_, chunk| output_symbols_of(chunk));
-    chunks.into_iter().flatten().collect()
-}
-
+///
 /// One chunk's placed definitions as symbol-table entries, unsorted.
 fn output_symbols_of<'a>(placed: &[PlacedSymbol<'a>]) -> Vec<OutputSymbol<'a>> {
     placed
@@ -4588,48 +4598,9 @@ fn placed_symbols_of<'a>(
 /// this is a place where a silent wrong answer is easy. Objects with no debug
 /// sections are skipped entirely rather than given an entry that points at
 /// nothing.
-fn debug_map<'a>(
-    objects: &'a [LoadedObject],
-    placed: &[PlacedSymbol<'a>],
-) -> Vec<OutputSymbol<'a>> {
-    // The map is per compilation unit, and sorted by address within one so a
-    // definition's size is the distance to the next.
-    //
-    // `placed` is built by walking the objects in order, so each object's
-    // symbols are already a contiguous run of it. Grouping them into a map
-    // re-derived that — one hash and one push per symbol, and a `Vec`
-    // allocation per object — from a fact the ordering already carried. Found
-    // by looking for containers built from empty (135); this one was not too
-    // small, it was unnecessary.
-    let mut runs: Vec<(usize, usize)> = vec![(0, 0); objects.len()];
-    let mut at = 0usize;
-    while at < placed.len() {
-        let object = placed[at].object;
-        let start = at;
-        while at < placed.len() && placed[at].object == object {
-            at += 1;
-        }
-        if let Some(run) = runs.get_mut(object) {
-            *run = (start, at);
-        }
-    }
-
-    // Per chunk on every core, concatenated in object order. Each object's
-    // stabs depend on that object and its own run of `placed` and on nothing
-    // else, so the only thing the chunking has to preserve is the order the
-    // compilation units appear in.
-    let chunks = crate::parallel::map_chunks(objects, |base, chunk| {
-        debug_map_of(chunk, base, placed, &runs)
-    });
-    let mut out = Vec::with_capacity(chunks.iter().map(Vec::len).sum());
-    for chunk in chunks {
-        out.extend(chunk);
-    }
-    out
-}
-
-/// One chunk's compilation units. `base` is where the chunk starts in
-/// `objects`, which is what indexes `runs`.
+///
+/// `base` is where this chunk starts in `objects`, which is what indexes
+/// `runs`.
 fn debug_map_of<'a>(
     objects: &'a [LoadedObject],
     base: usize,
@@ -4740,6 +4711,255 @@ fn object_mtime(path: &std::path::Path) -> u64 {
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|since| since.as_secs())
         .unwrap_or(0)
+}
+
+/// The output symbol table as each object contributed to it, kept so the next
+/// link can splice rather than rebuild.
+///
+/// # Why per object, and why three buckets
+///
+/// `LC_DYSYMTAB` needs the three groups contiguous and in order, so the table
+/// cannot simply be objects end to end. But within a group it can be: the
+/// definitions are emitted in object order (finding 198 removed the sort that
+/// interleaved them), and the debug map already was. So an object owns a run
+/// inside each bucket, and the table is the buckets laid end to end — locals
+/// first, and within the locals the ordinary definitions before the stabs,
+/// which is where `ld` puts them.
+///
+/// # What makes a run reusable
+///
+/// Everything an object's entries are computed from, digested: the placed
+/// definitions it contributed — their names as interned ids, visibility,
+/// section, address and chunk end — and what the debug map additionally reads,
+/// which is the path this link found the object under, its member name and its
+/// modification time.
+///
+/// Not the object's *bytes*. An object nobody edited still moves if the layout
+/// moved it, and its entries carry addresses; an object that was re-read from a
+/// renamed file has identical entries unless the name reached the `OSO`. The
+/// digest is over the inputs, so both come out right without a special case.
+///
+/// And not the names themselves — an entry names its symbol by offset into the
+/// string table, so a run means nothing against a table that has started again.
+/// [`StringTable::offsets_id`] is stored beside the digests and checked first.
+pub(crate) struct SymbolState {
+    /// The string table these offsets were resolved against.
+    offsets_id: u32,
+    /// Per object, a digest of everything its entries were computed from.
+    digests: Vec<u64>,
+    /// Local definitions, exported definitions, debug-map stabs.
+    buckets: [Vec<NlistEntry>; 3],
+    /// Per bucket, per object, where that object's run sits in it.
+    bounds: [Vec<(u32, u32)>; 3],
+    /// Per object, the string-table bytes resolving it appended.
+    ///
+    /// Summed over the runs still held, this is what tells the string table how
+    /// much of itself is still spoken for — see `rebuild_unless_live`.
+    appended: Vec<u32>,
+}
+
+/// Ordinary local definitions.
+const DEFS_LOCAL: usize = 0;
+/// Exported definitions.
+const DEFS_EXTERNAL: usize = 1;
+/// Debug-map stabs, which are locals but must follow the ordinary ones.
+const STABS: usize = 2;
+
+impl SymbolState {
+    /// The three groups `LC_DYSYMTAB` describes, laid out as it requires.
+    ///
+    /// Copied out rather than moved: the state is kept for the next link, and
+    /// this is 27 MB against the 25 ms of resolution it exists to avoid.
+    fn groups(&self) -> [Vec<NlistEntry>; 3] {
+        let mut locals =
+            Vec::with_capacity(self.buckets[DEFS_LOCAL].len() + self.buckets[STABS].len());
+        locals.extend_from_slice(&self.buckets[DEFS_LOCAL]);
+        locals.extend_from_slice(&self.buckets[STABS]);
+        // Nothing in this linker emits an undefined symbol: every reference is
+        // either resolved to a definition or bound through the dyld opcodes,
+        // and `nundefsym` on a linked image is zero. The group exists because
+        // the load command has a range for it.
+        [locals, self.buckets[DEFS_EXTERNAL].clone(), Vec::new()]
+    }
+
+    /// How much of the string table the runs held here are still speaking for.
+    fn live_bytes(&self) -> usize {
+        self.appended.iter().map(|bytes| *bytes as usize).sum()
+    }
+}
+
+/// Where each object's definitions sit in `placed`.
+///
+/// `placed` is built by walking the objects in order, so each object's symbols
+/// are already a contiguous run of it — this reads that off rather than
+/// grouping into a map, which was one hash and one push per symbol for a fact
+/// the ordering already carried (finding 135).
+fn placed_runs(objects: &[LoadedObject], placed: &[PlacedSymbol<'_>]) -> Vec<(usize, usize)> {
+    let mut runs: Vec<(usize, usize)> = vec![(0, 0); objects.len()];
+    let mut at = 0usize;
+    while at < placed.len() {
+        let object = placed[at].object;
+        let start = at;
+        while at < placed.len() && placed[at].object == object {
+            at += 1;
+        }
+        if let Some(run) = runs.get_mut(object) {
+            *run = (start, at);
+        }
+    }
+    runs
+}
+
+/// A digest of everything one object's symbol-table entries are computed from.
+///
+/// Deliberately over-inclusive. The alternative is a list of the conditions
+/// under which a run stays valid, checked one at a time, and the cost of that
+/// list being one item short is a symbol table pointing at addresses that
+/// moved — a binary that links, runs, and is wrong somewhere else entirely.
+fn symbol_digest(object: &LoadedObject, run: &[PlacedSymbol<'_>]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = crate::hashing::FastHasher::default();
+    run.len().hash(&mut hasher);
+    for symbol in run {
+        symbol.key.hash(&mut hasher);
+        (symbol.visibility as u8).hash(&mut hasher);
+        symbol.section.0.hash(&mut hasher);
+        symbol.section_number.hash(&mut hasher);
+        symbol.address.hash(&mut hasher);
+        symbol.chunk_end.hash(&mut hasher);
+        symbol.is_code.hash(&mut hasher);
+    }
+    // What the debug map reads and the definitions do not. `has_debug_info`
+    // decides whether an object contributes stabs at all, and the other three
+    // are written into them: an `OSO` names a file a debugger will open.
+    object.parsed.metadata.has_debug_info.hash(&mut hasher);
+    object.path.hash(&mut hasher);
+    object.member.hash(&mut hasher);
+    if object.parsed.metadata.has_debug_info {
+        // A syscall per object, and only where the answer is emitted. It is
+        // already paid by `debug_map_of`, which reads it for the same objects.
+        object_mtime(&object.path).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// Build this link's symbol table, keeping every object's entries that the
+/// previous link's still describe.
+///
+/// Resolution is sequential because the string table is one growing blob and an
+/// offset depends on what came before it. Constructing the `OutputSymbol`s is
+/// not, and is done on every core first — for the changed objects only, which
+/// on an ordinary relink is a few dozen of several thousand.
+fn plan_symbols(
+    objects: &[LoadedObject],
+    placed: &[PlacedSymbol<'_>],
+    strings: &mut blinker_output::symtab::StringTable,
+    previous: Option<SymbolState>,
+    timings: &mut LinkTimings,
+) -> SymbolState {
+    let runs = placed_runs(objects, placed);
+    let digests: Vec<u64> = crate::parallel::map_chunks(objects, |base, chunk| {
+        chunk
+            .iter()
+            .enumerate()
+            .map(|(at, object)| {
+                let (start, end) = runs[base + at];
+                symbol_digest(object, &placed[start..end])
+            })
+            .collect::<Vec<u64>>()
+    })
+    .into_iter()
+    .flatten()
+    .collect();
+
+    // Only against the same objects in the same positions, and only while the
+    // offsets the entries carry still mean what they meant. Either failing is
+    // the cold case rather than an error.
+    let held = previous.filter(|state| {
+        state.offsets_id == strings.offsets_id() && state.digests.len() == objects.len()
+    });
+    // A plain vector rather than a closure over `digests`, which would borrow
+    // it for as long as it is consulted and it has to be moved into the state.
+    let reusable: Vec<bool> = match held.as_ref() {
+        Some(state) => digests
+            .iter()
+            .zip(&state.digests)
+            .map(|(now, before)| now == before)
+            .collect(),
+        None => vec![false; objects.len()],
+    };
+
+    let changed: Vec<usize> = (0..objects.len()).filter(|at| !reusable[*at]).collect();
+    timings.symbols_reused = (objects.len() - changed.len()) as u64;
+    timings.symbols_total = objects.len() as u64;
+
+    // Every changed object's symbols, in output form, on every core. Indexed by
+    // position in `changed` rather than by object, because most of the vector
+    // would otherwise be empty on the relink this exists for.
+    let built: Vec<[Vec<OutputSymbol<'_>>; 3]> =
+        crate::parallel::map_chunks(&changed, |_, chunk| {
+            chunk
+                .iter()
+                .map(|at| {
+                    let (start, end) = runs[*at];
+                    let object = &objects[*at];
+                    let mine = &placed[start..end];
+                    let mut defs_local = Vec::new();
+                    let mut defs_external = Vec::new();
+                    for symbol in output_symbols_of(mine) {
+                        match symbol.group {
+                            SymbolGroup::Local => defs_local.push(symbol),
+                            _ => defs_external.push(symbol),
+                        }
+                    }
+                    [
+                        defs_local,
+                        defs_external,
+                        debug_map_of(std::slice::from_ref(object), *at, placed, &runs),
+                    ]
+                })
+                .collect::<Vec<_>>()
+        })
+        .into_iter()
+        .flatten()
+        .collect();
+
+    let mut state = SymbolState {
+        offsets_id: strings.offsets_id(),
+        digests,
+        buckets: [Vec::new(), Vec::new(), Vec::new()],
+        bounds: [
+            Vec::with_capacity(objects.len()),
+            Vec::with_capacity(objects.len()),
+            Vec::with_capacity(objects.len()),
+        ],
+        appended: Vec::with_capacity(objects.len()),
+    };
+    let mut next_changed = 0usize;
+    for (at, reusable) in reusable.iter().copied().enumerate() {
+        if reusable {
+            let previous = held.as_ref().expect("reusable implies one is held");
+            for bucket in [DEFS_LOCAL, DEFS_EXTERNAL, STABS] {
+                let (start, end) = previous.bounds[bucket][at];
+                let from = start as usize..end as usize;
+                let at_now = state.buckets[bucket].len() as u32;
+                state.buckets[bucket].extend_from_slice(&previous.buckets[bucket][from]);
+                state.bounds[bucket].push((at_now, state.buckets[bucket].len() as u32));
+            }
+            state.appended.push(previous.appended[at]);
+            continue;
+        }
+        let mine = &built[next_changed];
+        next_changed += 1;
+        let before = strings.len();
+        for bucket in [DEFS_LOCAL, DEFS_EXTERNAL, STABS] {
+            let start = state.buckets[bucket].len() as u32;
+            state.buckets[bucket].extend(mine[bucket].iter().map(|symbol| symbol.entry(strings)));
+            state.bounds[bucket].push((start, state.buckets[bucket].len() as u32));
+        }
+        state.appended.push((strings.len() - before) as u32);
+    }
+    state
 }
 
 /// Objects by id, so finding one is an index rather than a search.

@@ -402,6 +402,8 @@ pub struct Session {
     /// are only meaningful alongside the symbol table that refers to them, and
     /// two targets do not share one.
     strings: Recent<blinker_output::symtab::StringTable>,
+    /// This target's symbol table, per object, resolved against `strings`.
+    symbols: Recent<crate::SymbolState>,
     /// How many digests moved on this link, and how many were compared.
     reach_moved: u64,
     reach_total: u64,
@@ -1178,6 +1180,23 @@ impl Session {
             return;
         }
         self.strings.put(self.target, strings);
+    }
+
+    /// This target's symbol table as the last link built it, per object.
+    ///
+    /// Only alongside a retained string table: the entries name their symbols
+    /// by offset into it, so without one they point into a blob that no longer
+    /// exists. The two are stored and dropped together.
+    pub(crate) fn take_symbols(&mut self) -> Option<crate::SymbolState> {
+        let target = self.target;
+        self.symbols.take(target)
+    }
+
+    pub(crate) fn store_symbols(&mut self, symbols: crate::SymbolState) {
+        if !retain_strings() {
+            return;
+        }
+        self.symbols.put(self.target, symbols);
     }
 
     /// Record how much of the reachability graph moved, for the report.

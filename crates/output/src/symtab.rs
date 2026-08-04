@@ -218,6 +218,23 @@ impl<'a> OutputSymbol<'a> {
         self
     }
 
+    /// This symbol as a table entry, with its name placed in `strings`.
+    ///
+    /// The single symbol's worth of work, exposed so a caller can do it a run
+    /// at a time. [`SymbolTableBuilder`] does the whole table in one pass and
+    /// is the right thing for a link with nothing to reuse; a caller that
+    /// knows which objects did not change resolves only theirs and keeps the
+    /// rest, which it can only do if the entries come out grouped by object.
+    pub fn entry(&self, strings: &mut StringTable) -> NlistEntry {
+        NlistEntry {
+            name_offset: strings.offset(self.key, self.name.as_ref()),
+            type_byte: self.type_byte(),
+            section: self.section.unwrap_or(NO_SECT),
+            desc: self.desc(),
+            value: self.value,
+        }
+    }
+
     /// The `n_type` byte for this symbol.
     fn type_byte(&self) -> u8 {
         // A stab's type is the stab kind itself, not a composition of the
@@ -288,17 +305,17 @@ pub struct StringTable {
     /// Interning id to offset, or [`Self::UNSET`]. A plain vector because an
     /// interning id is a dense integer from zero — see [`OutputSymbol::key`].
     by_key: Vec<u32>,
-    /// The link that last referred to each id, against [`Self::generation`].
-    /// This is what makes `used` a count of what is *live* rather than of
-    /// everything the table has ever held.
-    seen: Vec<u32>,
     /// Names with no caller-supplied identity: the debug map's synthesised
     /// directory, file and object paths. Three per object, so this is
     /// thousands of entries where `by_key` is millions.
-    by_text: blinker_hashing::FastMap<Box<str>, (u32, u32)>,
-    generation: u32,
-    /// Bytes belonging to names *this* link referred to.
-    used: usize,
+    by_text: blinker_hashing::FastMap<Box<str>, u32>,
+    /// How many times this table has been thrown away and started again.
+    ///
+    /// Anything retained against the offsets it used to hand out — a run of
+    /// `NlistEntry` belonging to an object that has not changed — is valid only
+    /// while this stands still. It survives a rebuild so that the rebuild is
+    /// *visible*: a counter reset to zero would say "same table as before".
+    rebuilds: u32,
 }
 
 impl Default for StringTable {
@@ -308,10 +325,8 @@ impl Default for StringTable {
             // an unnamed symbol points at.
             bytes: std::sync::Arc::new(vec![0]),
             by_key: Vec::new(),
-            seen: Vec::new(),
             by_text: blinker_hashing::FastMap::default(),
-            generation: 0,
-            used: 1,
+            rebuilds: 0,
         }
     }
 }
@@ -335,19 +350,49 @@ impl StringTable {
         Self::default()
     }
 
-    /// Ready this table for a link, discarding it if it has gone mostly stale.
+    /// Discard this table if `live` bytes are no longer most of it.
     ///
-    /// Returning rather than mutating in place would let a caller keep using
-    /// the old offsets alongside the new blob, which is the one way this can be
-    /// silently wrong: an offset that survives a rebuild points at whatever
-    /// moved into its place.
-    pub fn begin(&mut self) {
-        if self.bytes.len() > Self::SPREAD * self.used.max(1) {
-            *self = StringTable::new();
+    /// # Why the caller says what is live
+    ///
+    /// This used to count it here, marking each name as the link asked for it.
+    /// That works only while every name *is* asked for — and the point of a
+    /// stable table is that a caller reusing an unchanged object's entries
+    /// never asks. Names reached only through reused entries went uncounted,
+    /// the table looked almost entirely stale on every link, and it would have
+    /// rebuilt itself every time: the accounting would have destroyed the
+    /// property it was there to protect.
+    ///
+    /// So the caller measures instead, and it measures the one thing it can
+    /// know exactly — how many bytes each object's run *appended*, which is
+    /// `len()` before and after resolving it. Summed over the runs still held,
+    /// that is a lower bound on what is live, because a run that has since been
+    /// replaced may have appended names another run still refers to. A lower
+    /// bound errs towards rebuilding, which is the safe direction: a rebuild
+    /// costs one link its reuse, and carrying garbage costs every link after
+    /// it a larger file.
+    pub fn rebuild_unless_live(&mut self, live: usize) {
+        if self.bytes.len() <= Self::SPREAD * live.max(1) {
             return;
         }
-        self.generation += 1;
-        self.used = 1;
+        let rebuilds = self.rebuilds;
+        *self = StringTable::new();
+        self.rebuilds = rebuilds + 1;
+    }
+
+    /// An identity for the run of offsets this table is currently handing out.
+    ///
+    /// Changes exactly when the table starts again, so a caller holding entries
+    /// resolved against it can tell in one comparison whether they still mean
+    /// anything. Not a hash of the contents: appending leaves every offset
+    /// already given out exactly where it was, which is the whole point.
+    pub fn offsets_id(&self) -> u32 {
+        self.rebuilds
+    }
+
+    /// Bytes handed out so far. Differenced across a run to learn what that
+    /// run appended; see [`Self::rebuild_unless_live`].
+    pub fn len(&self) -> usize {
+        self.bytes.len()
     }
 
     /// Whether this table was built by an earlier link.
@@ -365,37 +410,27 @@ impl StringTable {
     /// Where `name` sits, appending it if this is the first time it is asked
     /// for. `key` is the caller's identity for the name, or
     /// [`OutputSymbol::UNKEYED`].
-    fn offset(&mut self, key: u32, name: &str) -> u32 {
+    pub fn offset(&mut self, key: u32, name: &str) -> u32 {
         if name.is_empty() {
             return 0;
         }
         if key == OutputSymbol::UNKEYED {
-            if let Some((offset, seen)) = self.by_text.get_mut(name) {
-                if *seen != self.generation {
-                    *seen = self.generation;
-                    self.used += name.len() + 1;
-                }
+            if let Some(offset) = self.by_text.get(name) {
                 return *offset;
             }
             let offset = self.append(name);
-            self.by_text.insert(name.into(), (offset, self.generation));
+            self.by_text.insert(name.into(), offset);
             return offset;
         }
         let at = key as usize;
         if at >= self.by_key.len() {
             self.by_key.resize(at + 1, Self::UNSET);
-            self.seen.resize(at + 1, 0);
         }
         if self.by_key[at] != Self::UNSET {
-            if self.seen[at] != self.generation {
-                self.seen[at] = self.generation;
-                self.used += name.len() + 1;
-            }
             return self.by_key[at];
         }
         let offset = self.append(name);
         self.by_key[at] = offset;
-        self.seen[at] = self.generation;
         offset
     }
 
@@ -408,7 +443,6 @@ impl StringTable {
         let offset = bytes.len() as u32;
         bytes.extend_from_slice(name.as_bytes());
         bytes.push(0);
-        self.used += name.len() + 1;
         offset
     }
 }
@@ -417,6 +451,10 @@ impl StringTable {
 #[derive(Debug, Default)]
 pub struct SymbolTableBuilder<'a> {
     symbols: Vec<OutputSymbol<'a>>,
+    /// Entries whose names a caller already placed, one vector per group in
+    /// [`SymbolGroup`] order. Set by [`Self::take_groups`], and then `symbols`
+    /// is not consulted at all.
+    groups: Option<[Vec<NlistEntry>; 3]>,
 }
 
 impl<'a> SymbolTableBuilder<'a> {
@@ -435,6 +473,19 @@ impl<'a> SymbolTableBuilder<'a> {
     /// A caller with 1.7 million symbols has them in a vector already, and
     /// moving that vector in is the difference between naming the batch and
     /// copying 81 MB of it.
+    /// Supply the table already grouped, with every name already placed.
+    ///
+    /// The three vectors are the three groups in [`SymbolGroup`] order, and
+    /// their contents go into the table exactly as given — the contiguity
+    /// `LC_DYSYMTAB` requires comes from the grouping, and the order within a
+    /// group is the caller's to decide. Only for a caller that resolved names
+    /// against the very [`StringTable`] this table will be built with; entries
+    /// carrying offsets from any other one name the wrong symbols.
+    pub fn take_groups(&mut self, groups: [Vec<NlistEntry>; 3]) -> &mut Self {
+        self.groups = Some(groups);
+        self
+    }
+
     pub fn absorb(&mut self, symbols: Vec<OutputSymbol<'a>>) -> &mut Self {
         if self.symbols.is_empty() {
             self.symbols = symbols;
@@ -456,7 +507,6 @@ impl<'a> SymbolTableBuilder<'a> {
     /// table. For callers with nothing to retain.
     pub fn build(self) -> SymbolTable {
         let mut strings = StringTable::new();
-        strings.begin();
         self.build_into(&mut strings)
     }
 
@@ -478,6 +528,9 @@ impl<'a> SymbolTableBuilder<'a> {
     /// 82 MB of names a debug rust-analyzer link produces stop being rebuilt
     /// (see [`StringTable`]).
     pub fn build_into(self, strings: &mut StringTable) -> SymbolTable {
+        if let Some(groups) = self.groups {
+            return SymbolTable::grouped(groups, strings);
+        }
         let mut entries = Vec::with_capacity(self.symbols.len());
 
         // The three groups, in the order the table requires them, without
@@ -510,21 +563,7 @@ impl<'a> SymbolTableBuilder<'a> {
             }
         }
         let [locals, externals, undefined] = counts;
-
-        SymbolTable {
-            entries,
-            strings: std::sync::Arc::clone(strings.bytes()),
-            groups: SymbolGroups {
-                local_index: 0,
-                local_count: locals,
-                external_index: locals,
-                external_count: externals,
-                undefined_index: locals + externals,
-                undefined_count: undefined,
-                indirect_offset: 0,
-                indirect_count: 0,
-            },
-        }
+        SymbolTable::of(entries, [locals, externals, undefined], strings)
     }
 }
 
@@ -563,6 +602,48 @@ pub struct SymbolTable {
 }
 
 impl SymbolTable {
+    /// One table from the three groups laid end to end, in the order
+    /// `LC_DYSYMTAB` requires them.
+    fn grouped(groups: [Vec<NlistEntry>; 3], strings: &StringTable) -> SymbolTable {
+        let counts = [
+            groups[0].len() as u32,
+            groups[1].len() as u32,
+            groups[2].len() as u32,
+        ];
+        let [locals, externals, undefined] = groups;
+        let mut entries = locals;
+        entries.extend(externals);
+        entries.extend(undefined);
+        SymbolTable::of(entries, counts, strings)
+    }
+
+    /// The table and the ranges that describe it. `counts` is per group, in
+    /// [`SymbolGroup`] order, and must sum to `entries.len()` — the ranges are
+    /// what dyld and the debugger index by, so a count that disagrees with the
+    /// entries is a file that is read wrongly rather than rejected.
+    fn of(entries: Vec<NlistEntry>, counts: [u32; 3], strings: &StringTable) -> SymbolTable {
+        let [locals, externals, undefined] = counts;
+        debug_assert_eq!(
+            (locals + externals + undefined) as usize,
+            entries.len(),
+            "the group counts do not cover the symbol table"
+        );
+        SymbolTable {
+            entries,
+            strings: std::sync::Arc::clone(strings.bytes()),
+            groups: SymbolGroups {
+                local_index: 0,
+                local_count: locals,
+                external_index: locals,
+                external_count: externals,
+                undefined_index: locals + externals,
+                undefined_count: undefined,
+                indirect_offset: 0,
+                indirect_count: 0,
+            },
+        }
+    }
+
     /// Serialize the `nlist_64` array.
     pub fn write_entries(&self, writer: &mut Writer) {
         for entry in &self.entries {

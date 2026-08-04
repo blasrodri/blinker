@@ -9894,3 +9894,85 @@ The lesson is not "profile more". `EmitTimings` exists *because* finding 101
 chose wrongly against a single number, and it still left a hole big enough to
 hide the largest item in the stage. A breakdown answers questions about the
 parts it names, and says nothing at all about the space between them.
+
+## 200. An object's symbols, kept — and forty per cent is the honest number
+
+Findings 197 and 198 cleared the way: offsets that hold still, and a table in
+object order rather than name order. This is what they were for. The symbol
+table is now built per object — ordinary local definitions, exported
+definitions, debug-map stabs, three buckets with each object owning a run
+inside each — and an object whose run the previous link still describes has its
+`NlistEntry`s copied rather than recomputed.
+
+What decides that is one digest per object, over everything the entries are
+computed from: each placed definition's interned name id, visibility, section,
+section number, address and chunk end, plus what only the debug map reads —
+`has_debug_info`, the path this link found the object under, its member name,
+its mtime. Deliberately over-inclusive. The alternative is a list of conditions
+checked one at a time, and the cost of that list being one item short is a
+symbol table pointing at addresses that moved: a binary that links, runs, and is
+wrong somewhere else.
+
+### Where the work went
+
+```
+                        symbols   emit_linkedit    total    link (min)
+  before this change      12.21          25.71     37.9
+  per object, no reuse    35.16           3.20     38.4       341.0 ms
+  per object, reusing     21.17           2.84     24.0       307.6 ms
+```
+
+The middle row is the point of the first two columns: resolution moved out of
+`emit_linkedit` and into `symbols`, and the default path costs what it always
+did. The third row is the payoff — 14 ms — and it arrives with the string table
+retained, which is the only condition under which a kept entry's `n_strx` still
+names its symbol.
+
+### Forty per cent, and why it is not ninety-nine
+
+The relocation cache reuses 5,587 objects of 5,637 on this workload. The symbol
+runs reuse 2,264. The gap is not a defect in the digest: `relink.py` alternates
+two whole builds, and rustc renames every codegen unit of a recompiled crate, so
+an rlib whose members are byte-for-byte identical still lists them under new
+names. A member name is written into its `OSO` stab, which a debugger opens. The
+entries genuinely differ, and rebuilding them is the right answer.
+
+So 40% is what a harness that flips the entire delta on every iteration
+produces. A developer's session moves forward instead of alternating, and would
+keep far more — but that is an argument, and the 14 ms is a measurement, so 14
+is the number.
+
+### What says it is right
+
+Four rounds of alternating real edits at one output path through one resident
+daemon, each warm image compared against a cold link of the same inputs — not by
+bytes, which a retained string table changes by design, but by what the offsets
+mean. Every symbol resolved through the string table, with its type, section,
+description and value, in order:
+
+```
+  round 0  bytes equal    IDENTICAL symbol tables
+  round 1  bytes differ   IDENTICAL symbol tables
+  round 2  bytes equal    IDENTICAL symbol tables
+  round 3  bytes differ   IDENTICAL symbol tables
+```
+
+The rounds where the bytes differ are the ones where the retained table carries
+names from the other version — the feature, visible. The linked rust-analyzer
+runs and `codesign --verify` passes on it.
+
+### Still off by default, and this time it is the memory
+
+`BLINKER_RETAIN_STRINGS` now gates the runs as well as the offsets; they are
+stored and dropped together, because entries resolved against a table that no
+longer exists name nothing.
+
+The reason it stays off is no longer that the payoff is too small — 14 ms of 341
+is 4%, and it puts the large debug link level with `ld` for the first time. It
+is that a retained table and its runs are about 110 MB per target, held for
+three targets, on a daemon already at 3.6 GB. There is no byte budget yet, and
+adding a tenth of a gigabyte to an unbounded thing is not a default.
+
+Turning it on also means converting five byte-identity tests to equivalence
+tests, which weakens the oracle for every future change and not just this one.
+Both of those belong with the byte-budgeted store, not ahead of it.

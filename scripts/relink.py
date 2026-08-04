@@ -468,6 +468,12 @@ def main():
             first = counters.get("first_interface_change") or ""
             print(f"           {changes} interface(s) moved, first: {_os.path.basename(first)}")
 
+    reused = counters.get("symbols_reused")
+    if reused is not None:
+        total = counters.get("symbols_total") or 1
+        print(f"  symbols: {reused}/{total} objects kept their entries"
+              f" ({100 * reused / total:.0f}%)")
+
     moved = counters.get("reach_moved")
     if moved is not None:
         print(f"  reachability: {moved}/{counters.get('reach_total')} objects' "
