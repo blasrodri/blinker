@@ -9423,3 +9423,63 @@ was the one keeping the pair alive.
 `Recent::touch` promotes on read. Merging the two halves is what made the
 discrepancy visible: one structure cannot disagree with itself about whether it
 is in use.
+
+## 192. Two things the daemon being off had been hiding
+
+Turning the resident linker on by default (190) made two long-standing bugs
+reachable within an hour. Neither was caused by the change. Both had been
+sitting behind "nobody starts one of these".
+
+### `SO_RCVTIMEO` does not apply to `accept`, and says it does
+
+`serve` waited for clients with a blocking `accept` on a listener carrying a
+one-second receive timeout, and checked the idle timeout in the branch where
+`accept` returns `WouldBlock`. The comment above it explained, correctly, why a
+non-blocking accept in a sleep loop was wrong — the first version cost a
+measured 10.6 ms per link.
+
+`setsockopt` returns 0. `accept` then blocks forever. On macOS the receive
+timeout applies to `recv` on a connected socket and not to `accept` on a
+listening one, so that branch was unreachable and **the idle timeout had never
+once fired**. Every daemon ever started was still running.
+
+The give-away was there all day and read as something else: stray
+`--blinker-daemon-serve` processes after every test run, which looked like
+tests leaking daemons — and one test was, so the explanation fit and the
+symptom stayed.
+
+`poll` is what the old comment described: it blocks in the kernel, returns the
+instant a client arrives, and gives up on schedule. The idle timeout is now a
+parameter rather than a constant, which is what let a test assert it at 300 ms
+instead of twenty minutes. `an_idle_daemon_goes_away` is an assertion that
+previously had no way to fail.
+
+A syscall that succeeds and does nothing is worse than one that fails.
+
+### Overwriting a running executable poisons its inode
+
+`scripts/workload.py` copies blinker to a fixed path and builds through it.
+With a resident linker, the previous capture leaves a process running from that
+path, and `shutil.copy2` writes the next one over it in place. Every subsequent
+`exec` of that path then dies with `SIGKILL` — reported by rustc as
+
+```
+error: linking with `…/.linker` failed: signal: 9 (SIGKILL)
+```
+
+with nothing else. What makes it hard to read is that every check passes: the
+file's bytes are identical to a working binary, `codesign --verify` says valid
+on disk, and copying those same bytes to another path produces something that
+runs. macOS invalidates the code signature of an executable modified while a
+process is executing it, and the invalidation attaches to the *inode*. A
+`rename` gives a new one; a write in place does not.
+
+The harness now installs by rename. blinker also retires a daemon whose
+executable has been replaced — it is unreachable already, since the socket name
+carries the executable's content, and it was holding the file open for nothing.
+That does not prevent the poisoning, which happens at the moment of the write;
+it stops the daemon being the thing present at the *next* one.
+
+Both of these are the same lesson from opposite ends. A mechanism that is
+opt-in is a mechanism that is not tested by use, and the bugs in it are not
+absent — they are queued.

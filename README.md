@@ -15,16 +15,18 @@ programs.
 | `cargo test` binaries | work |
 | Debug information | `SO`/`OSO`/`FUN` debug map emitted; `dsymutil` reads it back |
 | Dylibs, bundles, partial links | delegated to the system linker, with a recorded reason |
-| A whole `cargo build`'s links | **2.7×** the system toolchain resident, **1.6×** without a daemon |
+| A whole `cargo build`'s links | **2.7×** the system toolchain, out of the box |
 | Output size | **0.85×** `ld-prime`'s on a large link, with dead-stripping |
 | Cold link, small (238 objects) | **1.09×** `ld-prime` — inside the spread |
 | Cold link, large (5,637 objects) | **1.75×** `ld-prime` |
-| Edit relink, small, resident | **11.4 ms** against `ld-prime`'s 29.7 ms cold |
-| Edit relink, large, resident | **347 ms** against `ld-prime`'s 311 ms cold |
+| Edit relink, small, resident | **11.8 ms** against `ld-prime`'s 29.7 ms cold |
+| Edit relink, large, resident | **342 ms** against `ld-prime`'s 311 ms cold |
 
 The per-link rows are where the two scales disagree: on a small link the
 resident linker is comfortably faster than a cold `ld-prime`, and on a large one
-it is still slower.
+it is still slower. Per-link figures are minima over ten alternating relinks
+(`scripts/relink.py <workload> --daemon`), which is the statistic that survives
+a loaded machine; medians run 5–15% higher.
 
 The first row is the one a developer feels, and it took until finding 189 to
 measure. `cargo build` on this workspace performs sixteen links with a median of
@@ -47,6 +49,20 @@ Both of those were opt-in until finding 190, which means the documented setup
 used to install a program that delegated every link to Apple's linker and never
 started the daemon it was built around.
 
+What the large relink spends its 342 ms on, when one object in 5,637 changed:
+
+```
+  emit             90 ms      __LINKEDIT is 59% of the image (187)
+  relocate         67 ms      98% of relocations reused; the rest is global
+  read_and_parse   46 ms
+  dead_strip       29 ms      of which 17 ms traversing a graph that did not move
+  layout           27 ms
+  write            17 ms
+```
+
+Every one of those is proportional to the whole program rather than to the
+edit. That is the work of findings 191 onward.
+
 Output kinds blinker cannot produce — `-dynamiclib`, so every proc-macro crate
 — are still delegated automatically, with the reason recorded.
 `--blinker-delegate` delegates everything, and `--blinker-no-daemon` or
@@ -55,14 +71,14 @@ resident linker.
 
 See [PRODUCT_SPEC.md](PRODUCT_SPEC.md) for the product definition,
 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for the milestone sequence,
-and **[FINDINGS.md](FINDINGS.md)** for the 194 places reality contradicted the
+and **[FINDINGS.md](FINDINGS.md)** for the 196 places reality contradicted the
 plan — several of them contradicting earlier entries in the same file.
 
 ## What is not done
 
 - **Speed at scale.** 1.75× the system linker on a large cold link, against
   1.09× on a small one, and the resident relink of a large program is still
-  slower than a cold `ld-prime` — by 15%, where it was 51% at the start of the
+  slower than a cold `ld-prime` — by 10%, where it was 51% at the start of the
   work recorded in findings 179-186. The reason is that the stages left are
   proportional to the whole program rather than to the edit: dead stripping
   rebuilds the reachability graph even when one object in 5,637 moved, and the
@@ -93,7 +109,7 @@ plan — several of them contradicting earlier entries in the same file.
   Worth less than it sounds, and measured rather than assumed: 59% of the
   output is `__LINKEDIT` and 46% of it is symbol-name text, and one symbol
   added near the front shifts every string offset after it. The ceiling on
-  never touching an unchanged byte is about 9 ms of a 347 ms link — see
+  never touching an unchanged byte is about 9 ms of a 342 ms link — see
   finding 187, and finding 186 for the version of it that measured slower than
   writing the file whole.
 - **`x86_64`, universal binaries, LTO.**

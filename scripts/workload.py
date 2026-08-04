@@ -116,6 +116,27 @@ def force_final_link(project):
         fail(f"no binary crate found under {project} to force a link")
 
 
+def install(source, destination):
+    """Put `source` at `destination`, replacing what is there — by rename.
+
+    Never by writing over the file in place. macOS invalidates the code
+    signature of an executable that is modified while a process is executing
+    it, and the invalidation attaches to the *inode*: every later `exec` of
+    that path is killed with SIGKILL before any of its code runs. The bytes are
+    fine, the signature verifies on disk, and a copy of the same file at
+    another path runs — which is what makes it so hard to read. `rustc` reports
+    it as `linking with ... failed: signal: 9 (SIGKILL)`.
+
+    This mattered the moment blinker started a resident linker by default,
+    because a capture now leaves a process running from this exact path and the
+    next capture used to overwrite it. Renaming gives a new inode, so the
+    running daemon keeps its own file and the new one is untouched.
+    """
+    staged = destination.with_suffix(destination.suffix + ".incoming")
+    shutil.copy2(source, staged)
+    os.replace(staged, destination)
+
+
 def capture(project, records, linker, target_dir, profile):
     """Build `project` with blinker recording every link it is asked to do."""
     force_final_link(project)
@@ -402,7 +423,7 @@ def main():
     # is shared — cargo fingerprints the linker it was told to use.
     linker = Path(options.out) / ".linker"
     linker.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(BLINKER, linker)
+    install(BLINKER, linker)
 
     # One path for every capture, then moved: see the header. The linker copy
     # is per-workload and does not travel in rustflags, so it may stay put.

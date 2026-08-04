@@ -87,6 +87,13 @@ const MAX_FRAME: u32 = 1 << 20;
 /// starting another.
 const STARTUP_WINDOW: Duration = Duration::from_secs(10);
 
+/// How often a waiting daemon looks up from the socket.
+///
+/// It is not a poll interval in the sleep-loop sense: `poll` blocks in the
+/// kernel and returns the instant a client arrives, so this costs one wakeup a
+/// second and nothing on the latency of a link.
+const TICK: Duration = Duration::from_secs(1);
+
 /// Where this linker's daemon listens.
 ///
 /// Per user and per executable: see the module docs on why the executable's
@@ -272,9 +279,15 @@ pub fn is_alive(socket: &Path) -> bool {
 /// `handle` performs one link and returns its exit code and captured stderr.
 /// It is passed in rather than called directly so this file holds no opinion
 /// about what a link is, and so a test can serve something it can check.
-pub fn serve<F>(socket: &Path, mut handle: F) -> std::io::Result<()>
+pub fn serve<F, S>(
+    socket: &Path,
+    mut handle: F,
+    superseded: S,
+    idle_timeout: Duration,
+) -> std::io::Result<()>
 where
     F: FnMut(&Path, &[String]) -> (i32, Vec<u8>),
+    S: Fn() -> bool,
 {
     // A socket file left by a dead daemon would make `bind` fail with
     // `EADDRINUSE` forever. Connecting first distinguishes the two cases: if
@@ -294,16 +307,18 @@ where
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))?;
     }
-    // A *blocking* accept with a timeout, not a non-blocking one in a sleep
-    // loop. The first version polled every 20 ms, which is invisible in a test
-    // and adds an average of 10 ms of latency to every link — measured at
-    // +10.6 ms, which made the daemon slower than not having one and wiped out
-    // everything residency had bought. A linker's whole job here is measured in
-    // tens of milliseconds; a sleep is not a small thing to put in front of it.
-    accept_timeout(&listener, Duration::from_secs(1))?;
+    // Non-blocking, with `poll` doing the waiting: see `wait_for_client`.
+    listener.set_nonblocking(true)?;
 
     let mut idle_since = Instant::now();
     loop {
+        if !wait_for_client(&listener, TICK)? {
+            if superseded() || idle_since.elapsed() >= idle_timeout {
+                let _ = std::fs::remove_file(socket);
+                return Ok(());
+            }
+            continue;
+        }
         match listener.accept() {
             Ok((mut stream, _)) => {
                 idle_since = Instant::now();
@@ -322,18 +337,10 @@ where
                     }
                 }
             }
-            // The timeout expiring, which is how idleness is noticed.
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                if idle_since.elapsed() >= IDLE_TIMEOUT {
-                    let _ = std::fs::remove_file(socket);
-                    return Ok(());
-                }
-            }
+            // `poll` said readable and `accept` disagreed — a client that gave
+            // up in between, or a spurious wakeup. Neither is this daemon's
+            // problem, and the next iteration is another tick.
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => {
                 let _ = std::fs::remove_file(socket);
                 return Err(error);
@@ -342,34 +349,47 @@ where
     }
 }
 
-/// Make `accept` block, but not forever.
+/// Wait until a client is there, or `timeout` passes. `true` means a client.
 ///
-/// `std` has no accept timeout, and the alternatives are both worse: a
-/// non-blocking accept in a sleep loop trades latency for idleness, and a
-/// blocking one never notices it should exit. `SO_RCVTIMEO` on the listening
-/// socket gives an `accept` that returns as soon as a client arrives and gives
-/// up after `timeout`.
-fn accept_timeout(listener: &UnixListener, timeout: Duration) -> std::io::Result<()> {
+/// `std` has no accept timeout, and the obvious alternatives are both bad: a
+/// non-blocking accept in a sleep loop trades latency for idleness — the first
+/// version of this polled every 20 ms and added a measured 10.6 ms to every
+/// link, which made the daemon slower than not having one — and a blocking
+/// accept never notices it should exit.
+///
+/// This was `SO_RCVTIMEO` on the listening socket, which reads like the right
+/// answer, is accepted by `setsockopt` with a return of 0, and does nothing:
+/// on macOS the receive timeout does not apply to `accept`, which goes on
+/// blocking forever. So the idle timeout above had never once fired. Every
+/// daemon ever started was still running, and the only reason that was not
+/// obvious is that starting one used to be a deliberate act.
+///
+/// `poll` is the thing that actually blocks in the kernel until a client
+/// arrives and gives up on schedule, which is what the old comment claimed.
+fn wait_for_client(listener: &UnixListener, timeout: Duration) -> std::io::Result<bool> {
     use std::os::unix::io::AsRawFd;
-    let value = libc::timeval {
-        tv_sec: timeout.as_secs() as libc::time_t,
-        tv_usec: timeout.subsec_micros() as libc::suseconds_t,
+    let mut fds = libc::pollfd {
+        fd: listener.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
     };
-    // SAFETY: `fd` is the listener's, open for the call; `value` is a
-    // correctly-sized `timeval` and its length is passed as such.
-    let result = unsafe {
-        libc::setsockopt(
-            listener.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_RCVTIMEO,
-            std::ptr::addr_of!(value).cast(),
-            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-        )
-    };
-    if result != 0 {
-        return Err(std::io::Error::last_os_error());
+    // SAFETY: one correctly-initialised `pollfd`, and a count that says so.
+    // The listener owns the descriptor and outlives the call.
+    let ready = unsafe { libc::poll(&mut fds, 1, timeout.as_millis() as libc::c_int) };
+    match ready {
+        // Interrupted is not an error to the caller: it is a tick that found
+        // nothing, which is what the idle check wants anyway.
+        -1 => {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                Ok(false)
+            } else {
+                Err(error)
+            }
+        }
+        0 => Ok(false),
+        _ => Ok(true),
     }
-    Ok(())
 }
 
 /// Whether the daemon should keep listening after answering a request.
@@ -464,30 +484,43 @@ pub fn serve_links() -> std::io::Result<()> {
     // another one. See `Session::resident`.
     session.set_resident(true);
 
-    serve(&socket, move |cwd, argv| {
-        // Relative input and output paths are resolved against the caller's
-        // directory, not the daemon's. Safe because requests are served one at
-        // a time; a concurrent daemon would have to resolve paths itself
-        // rather than move the process.
-        if std::env::set_current_dir(cwd).is_err() {
-            return (
-                1,
-                format!("blinker: cannot enter {}\n", cwd.display()).into_bytes(),
-            );
-        }
-        // The daemon's own `--blinker-daemon` is stripped: the link is being
-        // performed here, and passing it on would ask this process to look for
-        // a daemon to hand it to.
-        let argv: Vec<String> = argv
-            .iter()
-            .filter(|arg| *arg != "--blinker-daemon")
-            .cloned()
-            .collect();
-        match crate::run_in(&argv, &mut session) {
-            Ok(outcome) => (outcome.exit_code, Vec::new()),
-            Err(error) => (1, format!("blinker: {error}\n").into_bytes()),
-        }
-    })
+    // "The file I was started from is no longer the file I am." Computed the
+    // same way a client computes the path it looks for, so the daemon retires
+    // exactly when it stops being findable.
+    let identity = socket.clone();
+    let superseded = move || {
+        std::env::current_exe().is_ok_and(|executable| socket_path(&executable) != identity)
+    };
+
+    serve(
+        &socket,
+        move |cwd, argv| {
+            // Relative input and output paths are resolved against the caller's
+            // directory, not the daemon's. Safe because requests are served one at
+            // a time; a concurrent daemon would have to resolve paths itself
+            // rather than move the process.
+            if std::env::set_current_dir(cwd).is_err() {
+                return (
+                    1,
+                    format!("blinker: cannot enter {}\n", cwd.display()).into_bytes(),
+                );
+            }
+            // The daemon's own `--blinker-daemon` is stripped: the link is being
+            // performed here, and passing it on would ask this process to look for
+            // a daemon to hand it to.
+            let argv: Vec<String> = argv
+                .iter()
+                .filter(|arg| *arg != "--blinker-daemon")
+                .cloned()
+                .collect();
+            match crate::run_in(&argv, &mut session) {
+                Ok(outcome) => (outcome.exit_code, Vec::new()),
+                Err(error) => (1, format!("blinker: {error}\n").into_bytes()),
+            }
+        },
+        superseded,
+        IDLE_TIMEOUT,
+    )
 }
 
 /// Ask a resident linker to perform this link.
@@ -709,7 +742,12 @@ mod tests {
         let served = {
             let socket = socket.clone();
             std::thread::spawn(move || {
-                serve(&socket, |_, argv| (argv.len() as i32, b"served".to_vec()))
+                serve(
+                    &socket,
+                    |_, argv| (argv.len() as i32, b"served".to_vec()),
+                    || false,
+                    IDLE_TIMEOUT,
+                )
             })
         };
         let mut answer = None;
@@ -738,7 +776,9 @@ mod tests {
 
         let served = {
             let socket = socket.clone();
-            std::thread::spawn(move || serve(&socket, |_, _| (0, Vec::new())))
+            std::thread::spawn(move || {
+                serve(&socket, |_, _| (0, Vec::new()), || false, IDLE_TIMEOUT)
+            })
         };
         // Bound, not merely spawned: `stop` on a path nothing is listening to
         // removes the file and returns, which would pass this test without a
@@ -754,6 +794,78 @@ mod tests {
         assert!(alive, "the daemon never came up");
 
         stop(&socket);
+        served
+            .join()
+            .expect("the daemon thread finished")
+            .expect("it stopped cleanly");
+        assert!(!socket.exists(), "it left its socket behind");
+    }
+
+    /// A daemon whose executable was replaced stops on its own.
+    ///
+    /// It is already unreachable — the socket name carries the executable's
+    /// content, so no client will compute this path again — and it holds a
+    /// session and an open file for nothing. The file matters: on macOS an
+    /// executable overwritten in place while a process runs it has its inode
+    /// invalidated, and every later `exec` of that path dies with SIGKILL
+    /// before any of its code runs.
+    #[test]
+    fn a_superseded_daemon_retires_itself() {
+        let scratch = Scratch::dir("daemon-superseded").expect("scratch");
+        let socket = scratch.join("old.sock");
+
+        let replaced = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let served = {
+            let (socket, replaced) = (socket.clone(), std::sync::Arc::clone(&replaced));
+            std::thread::spawn(move || {
+                serve(
+                    &socket,
+                    |_, _| (0, Vec::new()),
+                    move || replaced.load(std::sync::atomic::Ordering::Relaxed),
+                    IDLE_TIMEOUT,
+                )
+            })
+        };
+        let mut alive = false;
+        for _ in 0..400 {
+            if is_alive(&socket) {
+                alive = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(alive, "the daemon never came up");
+
+        replaced.store(true, std::sync::atomic::Ordering::Relaxed);
+        served
+            .join()
+            .expect("the daemon thread finished")
+            .expect("it stopped cleanly");
+        assert!(!socket.exists(), "it left its socket behind");
+    }
+
+    /// And a daemon nobody uses goes away on its own.
+    ///
+    /// This is the assertion that had no way to fail before: the idle check sat
+    /// in a branch of `accept` that `SO_RCVTIMEO` promised to reach and never
+    /// did, so every daemon ever started outlived the build it was for, and the
+    /// only reason nobody noticed is that starting one used to be deliberate.
+    #[test]
+    fn an_idle_daemon_goes_away() {
+        let scratch = Scratch::dir("daemon-idle").expect("scratch");
+        let socket = scratch.join("idle.sock");
+
+        let served = {
+            let socket = socket.clone();
+            std::thread::spawn(move || {
+                serve(
+                    &socket,
+                    |_, _| (0, Vec::new()),
+                    || false,
+                    Duration::from_millis(300),
+                )
+            })
+        };
         served
             .join()
             .expect("the daemon thread finished")
