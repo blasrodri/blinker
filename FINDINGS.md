@@ -10413,3 +10413,67 @@ absolutize, drop `.`, pop `..`, never touch the disk. The cost is that two
 spellings of one file through a symlink route apart, which is also how the test
 first failed: it asked about `/tmp/...` while the client, whose key comes from
 `current_dir`, asked about `/private/tmp/...`.
+
+## 207. A dylib is a different image, not an executable with a flag flipped
+
+blinker delegated every `-dynamiclib` link to `ld` for its whole life, which
+meant the README's claim to link a build was false in the one crate kind almost
+every workspace has: a proc-macro. It now links them, and rustc `dlopen`s the
+result and expands macros through it.
+
+Four things separate the two images, and each is a way to produce a file that
+`otool` walks perfectly and dyld refuses:
+
+- **`MH_DYLIB`, and flags `0x00100085`** — `MH_NO_REEXPORTED_DYLIBS` where an
+  executable has `MH_PIE`. The missing `MH_PIE` looks like an omission; it is
+  not. The bit asks the kernel to load a *main program* at a random base, and a
+  dylib is mapped at a slide dyld picks. `ld64` leaves it clear.
+- **No `__PAGEZERO`, and a base address of 0.** The guard segment is a claim on
+  the low 4 GiB of the loading process, which is not a library's to make.
+- **`LC_ID_DYLIB` instead of `LC_MAIN`.** `LC_MAIN` in a library is not merely
+  unused: it says "this file is a program".
+- **No `LC_LOAD_DYLINKER`.** By the time a dylib is mapped, dyld is the thing
+  doing the mapping.
+
+### The export trie is the whole interface
+
+An executable's symbol table is read by debuggers; a dylib's exports are read
+by `dlsym`, by dyld's two-level bindings, and by every later link against it —
+all of which walk the trie and none of which consult `LC_SYMTAB`. blinker had
+no trie at all: `export_offset` and `export_size` had been zero since the field
+existed. So a dylib was impossible rather than unimplemented.
+
+`dyld_info -exports` is not the oracle for whether one was written. Given an
+image with no trie it prints the symbol table instead — the executable blinker
+had never given a trie reported `_main` at `0x4000`, which is what a working
+trie would also have shown. The test that means something reads
+`LC_DYLD_INFO_ONLY`, finds the bytes, and decodes them.
+
+### Two filters, and the second was invisible
+
+rustc passes `-exported_symbols_list` naming **two** symbols for a proc-macro
+crate that defines tens of thousands. Honouring it took two fixes:
+
+1. rustc writes the option and its value as *two* `-Wl,` arguments —
+   `-Wl,-exported_symbols_list` then `-Wl,/path/to/list`. Read one argument at
+   a time, the option has no value and the path looks like an option, so the
+   flag was silently doing nothing. Arity spans arguments; a run of consecutive
+   `-Wl,` arguments has to be flattened and read as one sequence.
+2. With that fixed the count went from thousands to fifty, not two. The
+   remainder were **private externs**: `N_PEXT` is what hidden visibility
+   compiles to, and rustc gives nearly every symbol it emits hidden visibility.
+   They are external so the link can resolve them and no further, and a trie
+   built from the symbol table's external group exports every one.
+
+Exporting the rest is not a size problem. It offers a definition for every Rust
+symbol in the library, and two such libraries in one process are two answers to
+the same name.
+
+### What is not done
+
+A dylib is not dead-stripped. Reachability starts from a single root — the
+entry point — and a dylib's roots are its whole export list, which that API
+cannot yet be given. Stripping from the wrong root set produces a library that
+links, loads, and has had a live function deleted from it, so until the root set
+is plural the answer is to keep everything: the output is larger than `ld64`'s
+and is exactly what a link without `-dead_strip` produces.
