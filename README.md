@@ -17,14 +17,21 @@ programs.
 | Dylibs, bundles, partial links | delegated to the system linker, with a recorded reason |
 | A whole `cargo build`'s links | **2.7×** the system toolchain, out of the box |
 | Output size | **0.85×** `ld-prime`'s on a large link, with dead-stripping |
-| Cold link, small (238 objects) | **1.09×** `ld-prime` — inside the spread |
-| Cold link, large (5,637 objects) | **1.75×** `ld-prime` |
-| Edit relink, small, resident | **11.8 ms** against `ld-prime`'s 29.7 ms cold |
-| Edit relink, large, resident | **342 ms** against `ld-prime`'s 311 ms cold |
+| Cold link, small (238 objects) | **1.03×** `ld-prime` — inside the spread |
+| Cold link, large (5,637 objects) | **1.70×** `ld-prime` |
+| Edit relink, small, resident | **20.6 ms** wall against `ld-prime`'s 34.3 ms cold |
+| Edit relink, large, resident | **~390 ms** wall against `ld-prime`'s 367 ms cold |
+| A body edit, debug self (1,099 objects) | **41.9 ms** wall, **31.9 ms** linking |
 
-The per-link rows are where the two scales disagree: on a small link the
-resident linker is comfortably faster than a cold `ld-prime`, and on a large one
-it is still slower. Per-link figures are minima over ten alternating relinks
+The per-link rows are where the two scales disagree, and the disagreement is
+the honest summary of where this is: on a small link the resident linker is
+comfortably ahead of a cold `ld-prime`, and on a large one it is level with it.
+Cold, it is still 1.7× slower on the large link — a resident linker's first
+link pays for the state every link after it reuses.
+
+Wall clock is what a build feels, so the per-link rows quote it; the internal
+link is 14.3 ms and ~360 ms respectively, and the gap is process startup and
+dyld. Per-link figures are minima over eight alternating relinks
 (`scripts/relink.py <workload> --daemon`), which is the statistic that survives
 a loaded machine; medians run 5–15% higher.
 
@@ -49,19 +56,29 @@ Both of those were opt-in until finding 190, which means the documented setup
 used to install a program that delegated every link to Apple's linker and never
 started the daemon it was built around.
 
-What the large relink spends its 342 ms on, when one object in 5,637 changed:
+What the large relink spends its time on, when 1 object in 5,637 has a
+reachability projection that moved and 197 of 506,405 addresses changed:
 
 ```
-  emit             90 ms      __LINKEDIT is 59% of the image (187)
-  relocate         67 ms      98% of relocations reused; the rest is global
-  read_and_parse   46 ms
-  dead_strip       29 ms      of which 17 ms traversing a graph that did not move
-  layout           27 ms
-  write            17 ms
+  read_and_parse   71 ms      of which ~29 ms is the extraction frontier
+  relocate         66 ms      98% of relocations reused; the rest is global
+  symbols          35 ms      1.7M entries; 21 ms with retained runs (200)
+  emit             40 ms      was 62 before findings 198-200
+  layout           33 ms
+  dead_strip       32 ms      of which 21 ms traversing a graph that did not move
+  write            14 ms
 ```
 
 Every one of those is proportional to the whole program rather than to the
-edit. That is the work of findings 191 onward.
+edit. That is the work of findings 191 onward, and the largest single item so
+far was not a stage at all but a 1.7-million-element clone sitting in the gap
+*between* two measured stages (199).
+
+Three of that work's results are built, verified and switched off, each behind
+a flag and each for a reason recorded in the findings rather than a plan to get
+to it: `BLINKER_DELTA_LIVENESS` (2 ms), `BLINKER_RETAIN_STRINGS` (14 ms, and it
+costs the warm-equals-cold byte comparison the test suite leans on).
+`BLINKER_MEMORY_BUDGET` bounds the per-target state in megabytes, default 1024.
 
 Output kinds blinker cannot produce — `-dynamiclib`, so every proc-macro crate
 — are still delegated automatically, with the reason recorded.
@@ -71,7 +88,7 @@ resident linker.
 
 See [PRODUCT_SPEC.md](PRODUCT_SPEC.md) for the product definition,
 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for the milestone sequence,
-and **[FINDINGS.md](FINDINGS.md)** for the 207 places reality contradicted the
+and **[FINDINGS.md](FINDINGS.md)** for the 208 places reality contradicted the
 plan — several of them contradicting earlier entries in the same file.
 
 ## What is not done

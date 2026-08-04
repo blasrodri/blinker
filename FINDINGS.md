@@ -10053,3 +10053,55 @@ budget can see it now, and 400 of 1024 has room. It is that turning it on
 converts five byte-identity tests into equivalence tests, and that oracle is
 worth more than 14 ms until the thing it guards has stopped changing every
 other commit.
+
+## 202. The resolution reuse the plan asked for already existed, for the edit it was about
+
+Item two of the plan this run has been following was "exact reuse of all
+resolution state when interfaces are unchanged", and finding 197 sized it: the
+extraction frontier is about 29 ms of `read_and_parse`'s 71, and the session
+discards it whole when 2 interfaces of 5,637 move.
+
+Before building a delta for it, the guard was worth reading again. It refuses
+the replay when *any* object's symbol interface moved — and an interface digest
+is exactly the multiset of `(name, is_definition)`, which is exactly the
+frontier's input. So the guard is not conservative. When it fires, the frontier's
+input genuinely changed and the order genuinely could differ.
+
+And on the edit the product is about, it does not fire. A body-only edit to the
+debug self-link:
+
+```
+  blast radius: 2 of 79 inputs changed
+  session: 77 inputs held, 2 read; extraction replayed, resolution held
+  read_and_parse    3.93 ms
+  resolve           0.00 ms
+  link             31.9 ms      wall 41.9 ms
+```
+
+The 29 ms is the *exported*-edit case, where a public signature changed and
+every archive may want different members. That case is a real cost and a real
+piece of work, and it is not the case the plan's justification described.
+
+### Where this leaves the product claims
+
+Measured against `ld-prime` on the same machine, cold arms from `bench.py` and
+warm from `relink.py`:
+
+```
+                        blinker      ld-prime
+  cold, 238 objects      35.3 ms      34.3 ms     1.03x
+  cold, 5,637 objects   625.1 ms     367.4 ms     1.70x
+  relink, small          20.6 ms      34.3 ms     0.60x
+  relink, large         ~390   ms    367.4 ms     1.06x
+```
+
+The small link is comfortably ahead. The large link is level, which is an
+improvement on the README's previous 342-against-311 — findings 198 and 199
+moved it — and it is not the 2-3x the product promises. Cold is still 1.7x
+slower on the large link, which is a resident linker's first link paying for the
+state every link after it reuses.
+
+Stating that plainly matters more than the individual millisecond counts,
+because five of this run's seven commits were worth between 2 and 14 ms each and
+it would be easy to read them as adding up to something they do not. What they
+add up to on the large link is parity.
