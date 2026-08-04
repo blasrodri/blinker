@@ -21,6 +21,14 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // Setup, which is the one thing a user does before ever using blinker as a
+    // linker — and the only reason to run it by hand other than stopping the
+    // daemon. Handled here, ahead of everything, because none of it is a link
+    // and none of it should need a valid link configuration.
+    if let Some(code) = setup_mode(&argv) {
+        return code;
+    }
+
     // Serving is a mode, not a link: the process becomes the resident linker
     // and does not return until it has been idle long enough to be pointless.
     if let Some(worker) = blinker_cli::daemon::serving(&argv) {
@@ -73,5 +81,73 @@ fn exit_code(code: i32) -> ExitCode {
     match u8::try_from(code) {
         Ok(c) => ExitCode::from(c),
         Err(_) => ExitCode::from(1),
+    }
+}
+
+/// `--blinker-install`, `--blinker-uninstall` and `--blinker-try`.
+///
+/// `None` when the argument vector asks for none of them, which is every
+/// invocation rustc ever makes.
+fn setup_mode(argv: &[String]) -> Option<ExitCode> {
+    use blinker_cli::setup::{self, Change};
+
+    let project = match std::env::current_dir() {
+        Ok(directory) => directory,
+        Err(error) => {
+            eprintln!("blinker: cannot find the current directory: {error}");
+            return Some(ExitCode::from(1));
+        }
+    };
+
+    let report = |result: Result<Change, setup::SetupError>, verb: &str| match result {
+        Ok(Change::Wrote(path)) => {
+            eprintln!("blinker: {verb} {}", path.display());
+            ExitCode::SUCCESS
+        }
+        Ok(Change::Removed(path)) => {
+            eprintln!("blinker: removed {}", path.display());
+            ExitCode::SUCCESS
+        }
+        Ok(Change::AlreadyDone(path)) => {
+            eprintln!("blinker: {} already says so", path.display());
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("blinker: {error}");
+            ExitCode::from(1)
+        }
+    };
+
+    if argv.iter().any(|a| a == "--blinker-install") {
+        let linker = match setup::self_path() {
+            Ok(path) => path,
+            Err(error) => {
+                eprintln!("blinker: {error}");
+                return Some(ExitCode::from(1));
+            }
+        };
+        return Some(report(setup::install(&project, &linker), "wrote"));
+    }
+    if argv.iter().any(|a| a == "--blinker-uninstall") {
+        return Some(report(setup::uninstall(&project), "updated"));
+    }
+
+    // Everything after the flag is cargo's, so `--blinker-try test --release`
+    // means what it looks like. Blinker's own options are not mixed in: this
+    // process runs no link, it runs cargo.
+    let at = argv.iter().position(|a| a == "--blinker-try")?;
+    let linker = match setup::self_path() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("blinker: {error}");
+            return Some(ExitCode::from(1));
+        }
+    };
+    match setup::try_build(&project, &linker, &argv[at + 1..]) {
+        Ok(code) => Some(exit_code(code)),
+        Err(error) => {
+            eprintln!("blinker: {error}");
+            Some(ExitCode::from(1))
+        }
     }
 }

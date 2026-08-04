@@ -27,6 +27,7 @@ pub mod archive;
 pub mod daemon;
 pub mod fallback;
 pub mod options;
+pub mod setup;
 
 pub use options::{split_args, ProjectOptions, Verbosity, HELP};
 

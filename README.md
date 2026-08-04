@@ -205,11 +205,33 @@ The binary lands at `target/release/blinker`.
 
 ## Use it as your linker
 
+Try it first, from the project you want to build. This writes no configuration
+and builds into `target/blinker-try`, so nothing about the project changes and
+the next ordinary `cargo build` is not made to rebuild anything:
+
+```bash
+/absolute/path/to/blinker --blinker-try build
+```
+
+Then, from the same directory:
+
+```bash
+/absolute/path/to/blinker --blinker-install
+```
+
+which writes what you would have written by hand, with the running binary's own
+absolute path:
+
 ```toml
 # .cargo/config.toml
 [target.aarch64-apple-darwin]
 linker = "/absolute/path/to/blinker"
 ```
+
+An existing `.cargo/config.toml` is edited rather than replaced — comments,
+ordering and every other setting survive — and a `linker` already pointing at
+something that is not blinker is reported rather than overwritten. Running it
+twice does nothing the second time.
 
 Then build as normal:
 
@@ -221,10 +243,11 @@ cargo test
 That is the whole of the setup. Blinker links internally, and the first link
 starts a resident linker that the rest of the build reaches.
 
-**To restore the default linker**, delete that `[target.aarch64-apple-darwin]`
-section (or just the `linker` key), then run `blinker --blinker-daemon-stop` —
-the daemon is the one piece of state a build leaves behind, and it would go on
-its own twenty minutes later regardless.
+**To restore the default linker**, run `blinker --blinker-uninstall` from the
+project — it removes the key it added, and the file and `.cargo` directory too
+if they held nothing else — then `blinker --blinker-daemon-stop`. The daemon is
+the one piece of state a build leaves behind, and it would go on its own twenty
+minutes later regardless.
 
 ## Corpus tooling
 

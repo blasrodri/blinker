@@ -254,17 +254,26 @@ OPTIONS:
     --blinker-no-daemon                Link in this process, and start no daemon
     --blinker-daemon-serve[=N]         Become resident linker N (default 0, of 4)
     --blinker-daemon-stop              Stop the resident linker, if any
+    --blinker-install                  Set this binary as the linker for the
+                                       project in the current directory
+    --blinker-uninstall                Undo that, leaving the project as found
+    --blinker-try [CARGO ARGS...]      Build through blinker with no
+                                       configuration, into target/blinker-try
     --blinker-print-stats              Print the human-readable summary
     --blinker-strict-fingerprints      Hash every input (slower, exact identity)
     --blinker-version                  Print version
     --blinker-help                     Print this help
 
 SETUP:
+    blinker --blinker-try build         # once, changing nothing
+    blinker --blinker-install           # from then on
+    blinker --blinker-uninstall         # and back again
+
+    --blinker-install writes the same two lines you would by hand:
+
     # .cargo/config.toml
     [target.aarch64-apple-darwin]
     linker = \"/absolute/path/to/blinker\"
-
-    Remove that section to restore the default linker.
 ";
 
 #[cfg(test)]
