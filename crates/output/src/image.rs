@@ -140,6 +140,16 @@ pub enum ImageError {
         signature_start: u64,
         content_end: u64,
     },
+    /// The exports could not be encoded as a trie. See
+    /// [`crate::exports::ExportError`] — every case is a set of exports that
+    /// cannot mean one thing, so none of them is guessable.
+    Export(crate::exports::ExportError),
+    /// A symbol's name is not in the string table it was written into.
+    ///
+    /// Unreachable through the builder, which puts every name there itself.
+    /// Checked because the alternative is exporting a symbol under whatever
+    /// bytes happen to be at that offset.
+    UnreadableSymbolName { offset: u32 },
     /// The emitted load commands did not fit the reservation layout made.
     ///
     /// Only reachable if the size prediction and the emitter disagree, which
@@ -167,6 +177,11 @@ impl std::fmt::Display for ImageError {
             } => write!(
                 f,
                 "the signature would start at {signature_start:#x}, inside content ending at {content_end:#x}"
+            ),
+            ImageError::Export(error) => write!(f, "the export trie could not be built: {error}"),
+            ImageError::UnreadableSymbolName { offset } => write!(
+                f,
+                "an exported symbol names string table offset {offset}, which holds no name"
             ),
             ImageError::CommandsOverflowedReservation { reserved, emitted } => write!(
                 f,
@@ -466,6 +481,7 @@ impl<'a> ImageBuilder<'a> {
         let symbols = std::mem::take(&mut self.symbols).build_into(&mut strings);
         let rebase_stream = encode_rebase(&self.rebases);
         let bind_stream = encode_bind(&self.binds);
+        let export_stream = self.export_trie(&symbols)?;
 
         // __LINKEDIT sits above every mapped segment; its contents are laid
         // out here because they did not exist during layout.
@@ -504,6 +520,18 @@ impl<'a> ImageBuilder<'a> {
         link_edit.bind_offset = cursor as u32;
         link_edit.bind_size = bind_stream.len() as u32;
         cursor += bind_stream.len() as u64;
+
+        // The export trie, where ld64 puts it: after the bind streams and
+        // before the symbol table. Skipped entirely when there is nothing to
+        // export, so an executable's `__LINKEDIT` is laid out exactly as it was
+        // before any of this existed — `export_off` and `export_size` stay the
+        // zeroes that mean "no trie" rather than becoming an offset to nothing.
+        if !export_stream.is_empty() {
+            cursor = align_up(cursor, 8);
+            link_edit.export_offset = cursor as u32;
+            link_edit.export_size = export_stream.len() as u32;
+            cursor += export_stream.len() as u64;
+        }
 
         // The symbol table must be 8-byte aligned: each nlist_64 ends with a
         // u64 value field, and an unaligned table is read incorrectly.
@@ -544,6 +572,7 @@ impl<'a> ImageBuilder<'a> {
             &link_edit,
             &rebase_stream,
             &bind_stream,
+            &export_stream,
             link_edit_start,
             link_edit_end,
             reservation,
@@ -610,6 +639,57 @@ impl<'a> ImageBuilder<'a> {
         })
     }
 
+    /// What dyld will let anything else find in this image.
+    ///
+    /// Built from the symbol table's external group rather than from a list the
+    /// caller supplies separately: the two would then be able to disagree, and
+    /// a symbol that `nm` reports and `dlsym` cannot find is a bug with no
+    /// symptom until something looks for it.
+    ///
+    /// A trie entry's address is an **offset from the mach header**, not a
+    /// virtual address. For a dylib those are the same number, because
+    /// [`ImageKind::Dylib`] is laid out from zero — which is the reason the
+    /// executable path below returns early rather than being merely unfinished.
+    fn export_trie(&self, symbols: &SymbolTable) -> Result<Vec<u8>, ImageError> {
+        if self.kind != ImageKind::Dylib {
+            // ld64 writes a trie for an executable too, holding `_main` and
+            // `_mh_execute_header`. blinker never has, nothing loads an
+            // executable by symbol, and emitting one now would change every
+            // executable it produces — so this stays the dylib's business.
+            return Ok(Vec::new());
+        }
+
+        let groups = symbols.groups;
+        let start = groups.external_index as usize;
+        let end = start + groups.external_count as usize;
+        let mut exports = Vec::with_capacity(groups.external_count as usize);
+        for entry in &symbols.entries[start..end] {
+            let Some(name) = symbols.name_at(entry.name_offset) else {
+                return Err(ImageError::UnreadableSymbolName {
+                    offset: entry.name_offset,
+                });
+            };
+            let mut flags = if entry.type_byte & crate::symtab::n_type::N_TYPE
+                == crate::symtab::n_type::N_ABS
+            {
+                // An absolute symbol's value is not an address in the image, so
+                // dyld must not add the slide to it.
+                crate::exports::KIND_ABSOLUTE
+            } else {
+                crate::exports::KIND_REGULAR
+            };
+            if entry.desc & crate::symtab::N_WEAK_DEF != 0 {
+                flags |= crate::exports::WEAK_DEFINITION;
+            }
+            exports.push(crate::exports::Export {
+                name: name.to_string(),
+                address: entry.value,
+                flags,
+            });
+        }
+        crate::exports::encode(&exports).map_err(ImageError::Export)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn emit(
         &self,
@@ -618,6 +698,7 @@ impl<'a> ImageBuilder<'a> {
         link_edit: &LinkEditLayout,
         rebase_stream: &[u8],
         bind_stream: &[u8],
+        export_stream: &[u8],
         link_edit_start: u64,
         link_edit_end: u64,
         reservation: u64,
@@ -758,6 +839,10 @@ impl<'a> ImageBuilder<'a> {
         // happened to end.
         writer.pad_to(link_edit.bind_offset as usize);
         writer.bytes(bind_stream);
+        if !export_stream.is_empty() {
+            writer.pad_to(link_edit.export_offset as usize);
+            writer.bytes(export_stream);
+        }
         writer.pad_to(link_edit.symbol_offset as usize);
         symbols.write_entries(&mut writer);
         writer.bytes(&symbols.strings);

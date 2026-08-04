@@ -306,6 +306,32 @@ fn otool_sees_a_dylib_as_a_dylib() {
     );
 }
 
+/// `dyld_info` reads `__LINKEDIT` the way dyld does, and complains about
+/// content it cannot use — "mis-aligned LINKEDIT content" is how it reports a
+/// stream placed where dyld will silently ignore it.
+///
+/// It is *not* the oracle for what the trie contains: with no trie at all it
+/// falls back to the symbol table and prints the same names, so a passing
+/// `-exports` here would say nothing about whether a trie was written. That
+/// question belongs to `a_dylib_exports_what_it_defines.rs`, which decodes the
+/// bytes.
+#[test]
+fn dyld_info_reads_the_dylibs_linkedit() {
+    let image = sample_dylib("/usr/local/lib/libsample.dylib");
+    let artifact = artifact("libexports", &image.bytes);
+    let (ok, stdout, stderr) = run("dyld_info", &["-exports", &artifact.as_str()]);
+
+    assert!(ok, "dyld_info failed: {stderr}\n{stdout}");
+    assert!(
+        !stdout.contains("mis-aligned") && !stderr.contains("mis-aligned"),
+        "dyld_info cannot use the __LINKEDIT content:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("_answer"),
+        "the exported symbol is not there at all:\n{stdout}"
+    );
+}
+
 /// An empty image is a degenerate but legal case, and must still be walkable.
 #[test]
 fn even_an_empty_image_is_well_formed() {

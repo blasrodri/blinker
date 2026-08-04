@@ -45,6 +45,12 @@ pub mod n_type {
 /// `n_sect` value meaning "no section".
 pub const NO_SECT: u8 = 0;
 
+/// `n_desc` bit marking a definition the linker may replace with another of
+/// the same name — a C++ inline function, or anything else emitted into every
+/// translation unit that uses it. The export trie carries the same fact, and
+/// dyld needs it there to pick one definition across images.
+pub const N_WEAK_DEF: u16 = 0x0080;
+
 /// Which of the three groups a symbol belongs to.
 ///
 /// The order of these variants *is* the required table order.
