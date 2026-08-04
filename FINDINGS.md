@@ -10237,3 +10237,51 @@ That is the third time this run a measurement told a plausible story about work
 that did not occur: finding 199's clone hid between two timed stages, finding
 203's `fallback_exec_ms` reported a branch that never ran, and this reported
 links that never happened.
+
+## 205. The obstacle to a concurrent daemon is a `chdir`, not a thread
+
+Finding 204 established that a cold build submits eleven links at once and the
+daemon serves them one at a time, and the obvious next move is a thread per
+connection with a lock per target. The obstacle is one line, and the comment
+above it had been describing this exact problem since it was written:
+
+```rust
+// Relative input and output paths are resolved against the caller's
+// directory, not the daemon's. Safe because requests are served one at
+// a time; a concurrent daemon would have to resolve paths itself
+// rather than move the process.
+if std::env::set_current_dir(cwd).is_err() { … }
+```
+
+The daemon `chdir`s into the client's directory for each request. That is
+process-global state. Two links running at once would resolve each other's
+relative paths — a linker reading another link's object files, producing a
+binary that is wrong rather than one that fails.
+
+So the first task is not the threading. It is removing the process-global
+dependency: every relative path in a request — inputs, `-o`, `-L`, `-F`,
+`@response` files, the cache path — resolved against that request's `cwd`
+explicitly. Which arguments are paths is exactly the knowledge in `options.rs`,
+and getting it one flag wrong reads the wrong file silently.
+
+There is a shortcut worth taking first, because it is safe and covers the case
+that matters. Every path cargo passes is already absolute — the traces in
+finding 204 are all `/Users/…` — so a request whose non-flag arguments are all
+absolute needs no `chdir` at all and can run on any worker. Anything else takes
+an exclusive path that keeps today's behaviour. That splits a correctness
+problem into "the common case, provably safe" and "the rest, unchanged",
+instead of requiring the full path audit before any of the benefit arrives.
+
+### The shape the threading should then take
+
+Not a thread per connection with a session each: that multiplies the parse
+cache by the number of concurrent targets, and finding 201 has only just given
+the session a byte budget. A small fixed pool — four workers, each owning one
+session, a target routed to a worker by hash — bounds memory to four sessions,
+keeps a target's state on one worker so it stays warm, and serialises same-target
+links for free, which they require anyway.
+
+Recorded rather than built. The threading is an afternoon; the path resolution
+is the part that decides whether the result is correct, and starting the second
+without finishing the first is how a linker comes to read the wrong file under
+load only.
