@@ -1054,14 +1054,19 @@ impl<'a> Atoms<'a> {
         }
     }
 
-    /// Every atom defining `name`, for use as a root.
+    /// Every atom defining any of `names`, for use as roots.
     ///
-    /// `None` when nothing in the link ever mentioned the name, which is the
-    /// same case as a name no object defines: no roots, and the missing
-    /// definition is reported by resolution rather than here.
-    fn defining(&self, name: Option<SymbolNameId>) -> impl Iterator<Item = usize> + '_ {
-        name.and_then(|name| self.owners.get(&name))
-            .into_iter()
+    /// A name nothing in the link ever mentioned has no id and contributes
+    /// nothing, which is the same case as a name no object defines: no roots,
+    /// and the missing definition is reported by resolution rather than here.
+    ///
+    /// Plural because the root set is plural. An executable enters at one
+    /// symbol; a dylib is entered at every symbol it exports, and stripping a
+    /// dylib from a single root deletes live code from it.
+    fn defining<'n>(&'n self, names: &'n [SymbolNameId]) -> impl Iterator<Item = usize> + 'n {
+        names
+            .iter()
+            .filter_map(|name| self.owners.get(name))
             .flat_map(Owners::all)
     }
 }
@@ -1315,7 +1320,7 @@ impl Graph {
         }
     }
 
-    fn build(atoms: &Atoms<'_>, entry: Option<SymbolNameId>) -> Graph {
+    fn build(atoms: &Atoms<'_>, entry: &[SymbolNameId]) -> Graph {
         let total = atoms.len();
         let mut graph = Graph {
             start: vec![0; total],
@@ -1525,7 +1530,7 @@ impl Graph {
         atoms: &Atoms<'_>,
         moved: &[usize],
         live: &mut Live,
-        entry: Option<SymbolNameId>,
+        entry: &[SymbolNameId],
     ) -> Option<()> {
         let total = self.start.len();
 
@@ -1732,7 +1737,7 @@ impl Graph {
 }
 
 /// Atoms that are live before anything points at them.
-fn roots(atoms: &Atoms<'_>, entry: Option<SymbolNameId>) -> Vec<u32> {
+fn roots(atoms: &Atoms<'_>, entry: &[SymbolNameId]) -> Vec<u32> {
     let mut roots: Vec<u32> = atoms.defining(entry).map(|at| at as u32).collect();
     for index in atoms.indices() {
         if atoms.opaque.contains(&atoms.atom(index).key()) {
@@ -1760,12 +1765,8 @@ fn roots(atoms: &Atoms<'_>, entry: Option<SymbolNameId>) -> Vec<u32> {
     roots
 }
 
-/// Which atoms a program can reach from `entry`.
-fn liveness(
-    atoms: &Atoms<'_>,
-    entry: Option<SymbolNameId>,
-    parts: &mut [f64; 2],
-) -> (LiveSet, usize) {
+/// Which atoms a program can reach from its roots.
+fn liveness(atoms: &Atoms<'_>, entry: &[SymbolNameId], parts: &mut [f64; 2]) -> (LiveSet, usize) {
     let step = std::time::Instant::now();
     let mut live = LiveSet::with_capacity(atoms.len());
     let mut worklist: Vec<usize> = Vec::new();
@@ -2232,7 +2233,7 @@ impl ReachState {
 /// Decide what a link keeps.
 pub(crate) fn plan(
     objects: &[LoadedObject],
-    entry: &str,
+    entry: &[String],
     session: &mut crate::session::Session,
 ) -> (Strip, Report, StripTimings) {
     let mut timings = StripTimings::default();
@@ -2251,8 +2252,11 @@ pub(crate) fn plan(
         previous.as_ref().map(|state| &state.numbering),
     );
     // Interned after the build, which is what puts every input's names in the
-    // table. An entry symbol nothing mentions has no id, and no roots.
-    let entry = session.names().get(entry);
+    // table. A root symbol nothing mentions has no id, and no atoms.
+    let entry: Vec<SymbolNameId> = entry
+        .iter()
+        .filter_map(|name| session.names().get(name))
+        .collect();
     timings.atoms_ms = step.elapsed().as_secs_f64() * 1000.0;
 
     // How much of the graph moved, taken from the projections themselves.
@@ -2324,7 +2328,7 @@ pub(crate) fn plan(
         let mut graph = std::mem::take(&mut state.graph);
         let mut live = std::mem::take(&mut state.live);
         graph
-            .update(&atoms, &moved, &mut live, entry)
+            .update(&atoms, &moved, &mut live, &entry)
             .map(|()| (graph, live, moved.len() as u64))
     });
     timings.delta_used = updated.is_some();
@@ -2340,12 +2344,12 @@ pub(crate) fn plan(
     let (graph, live) = match updated {
         Some((graph, live, _)) => (graph, live),
         None if delta_liveness() => {
-            let graph = Graph::build(&atoms, entry);
+            let graph = Graph::build(&atoms, &entry);
             let live = graph.closure();
             (graph, live)
         }
         None => {
-            let (set, revived) = liveness(&atoms, entry, &mut live_parts);
+            let (set, revived) = liveness(&atoms, &entry, &mut live_parts);
             timings.revived = revived as u64;
             (Graph::default(), Live::from(set))
         }
@@ -2371,15 +2375,15 @@ pub(crate) fn plan(
     // that caught a 246-atom leak that every byte comparison had passed.
     if verify_liveness() && timings.delta_used {
         assert!(
-            Graph::build(&atoms, entry).closure().set.bits == live.set.bits,
+            Graph::build(&atoms, &entry).closure().set.bits == live.set.bits,
             "the updated live set is not the closure of the graph it came from"
         );
     }
     if verify_liveness() && delta_liveness() {
-        let (expected, revived) = liveness(&atoms, entry, &mut live_parts);
+        let (expected, revived) = liveness(&atoms, &entry, &mut live_parts);
         timings.revived = revived as u64;
         assert!(
-            Graph::build(&atoms, entry).agrees_with(&expected),
+            Graph::build(&atoms, &entry).agrees_with(&expected),
             "the reachability graph and the traversal disagree about what is live"
         );
         assert!(
@@ -2472,7 +2476,7 @@ fn report_from(objects: &[LoadedObject], atoms: &Atoms<'_>, strip: &Strip) -> Re
 }
 
 /// Report what analysis alone can say, without changing any output.
-pub(crate) fn analyse(objects: &[LoadedObject], entry: &str) -> Report {
+pub(crate) fn analyse(objects: &[LoadedObject], entry: &[String]) -> Report {
     plan(objects, entry, &mut crate::session::Session::default()).1
 }
 

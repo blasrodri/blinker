@@ -337,7 +337,52 @@ pub mod reachability;
 /// strips correctly before anything is rebuilt around it (finding 70).
 pub fn reachability_report(request: &LinkRequest) -> Result<reachability::Report, LinkError> {
     let objects = load_objects(&request.objects, &mut Session::default())?;
-    Ok(reachability::analyse(&objects, &request.entry_symbol))
+    Ok(reachability::analyse(
+        &objects,
+        &strip_roots(request, &objects),
+    ))
+}
+
+/// The symbols a dead strip must keep, along with everything they reach.
+///
+/// An executable enters at one symbol and everything live is reachable from
+/// it. A dylib is entered at **every symbol it exports**: dyld resolves a name
+/// in it by walking the export trie, so a definition nothing inside the
+/// library refers to is still reachable from outside it, and stripping from a
+/// single root deletes live code.
+///
+/// The export list's patterns are matched here rather than interned, because a
+/// pattern names no symbol — `_rust_metadata_*` is a question asked about every
+/// definition in the link, not a name to look up.
+fn strip_roots(request: &LinkRequest, objects: &[LoadedObject]) -> Vec<String> {
+    if request.kind == ImageKind::Executable {
+        return vec![request.entry_symbol.clone()];
+    }
+    let mut roots = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::default();
+    for object in objects {
+        for symbol in &object.parsed.symbols {
+            // Private externals are deliberately absent: `N_PEXT` means
+            // "resolvable during this link and not after it", so nothing
+            // outside can enter through one. It is also nearly every symbol
+            // rustc emits, which is why including them would make a dylib's
+            // root set its whole symbol table and the strip a no-op.
+            if !symbol.strength.is_definition()
+                || symbol.visibility != blinker_macho::SymbolVisibility::Global
+            {
+                continue;
+            }
+            if let Some(list) = &request.exported_symbols {
+                if !list.allows(&symbol.name) {
+                    continue;
+                }
+            }
+            if seen.insert(symbol.name.as_str()) {
+                roots.push(symbol.name.clone());
+            }
+        }
+    }
+    roots
 }
 
 /// What to link.
@@ -1882,16 +1927,8 @@ fn link_inner(
     // Decided before anything is placed, because it changes how big every
     // contribution is. Everything downstream asks it where an input byte went.
     let step = std::time::Instant::now();
-    // A dylib is not stripped, and that is a stated limitation rather than an
-    // oversight. Reachability starts from one root — the entry point — and a
-    // dylib's roots are its whole export list, which this API cannot yet be
-    // given. Stripping from the wrong root set produces a library that links,
-    // loads, and has had a live function deleted from it, so until the root set
-    // is plural the honest answer is to keep everything: the output is larger
-    // than ld64's and it is the same output a link without `-dead_strip` gives.
-    let strip_this = request.dead_strip && request.kind == ImageKind::Executable;
-    let (strip, report, strip_timings) = if strip_this {
-        reachability::plan(&objects, &request.entry_symbol, session)
+    let (strip, report, strip_timings) = if request.dead_strip {
+        reachability::plan(&objects, &strip_roots(request, &objects), session)
     } else {
         (
             Strip::none(),
