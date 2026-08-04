@@ -10469,11 +10469,26 @@ Exporting the rest is not a size problem. It offers a definition for every Rust
 symbol in the library, and two such libraries in one process are two answers to
 the same name.
 
-### What is not done
+### The root set is plural
 
-A dylib is not dead-stripped. Reachability starts from a single root — the
-entry point — and a dylib's roots are its whole export list, which that API
-cannot yet be given. Stripping from the wrong root set produces a library that
-links, loads, and has had a live function deleted from it, so until the root set
-is plural the answer is to keep everything: the output is larger than `ld64`'s
-and is exactly what a link without `-dead_strip` produces.
+Reachability took one root, because an executable has one: everything live is
+reachable from `_main`. A dylib is entered at **every symbol it exports** —
+dyld resolves a name by walking the export trie, so a function nothing inside
+the library calls is still reachable from outside it. Stripping a dylib from a
+single root produces a library that links, loads, and has had a live function
+deleted, which has no symptom until something calls the missing one.
+
+So `plan` takes a slice of names. For an executable it holds the entry symbol
+and the behaviour is unchanged; for a dylib it holds every global definition
+the export list allows. The patterns are matched against the link's own symbols
+rather than interned, because a pattern names nothing: `_rust_metadata_*` is a
+question asked about every definition.
+
+Private externs are deliberately not roots. `N_PEXT` means "resolvable during
+this link and not after it", so nothing outside can enter through one — and
+since it is nearly every symbol rustc emits, including them would make a
+dylib's root set its whole symbol table and the strip a no-op.
+
+Measured on a one-macro proc-macro crate: 1 580 317 bytes unstripped,
+**510 573** stripped, against `ld64`'s 488 336 — 4.6% larger, and the macro
+still expands inside rustc.
