@@ -1,63 +1,64 @@
 # blinker
 
-An incremental Mach-O linker for repeated Rust development builds on Apple
-Silicon, aimed at cutting the link latency in edit–build–test loops run by
-humans, IDEs, and coding agents.
+A resident, incremental Mach-O linker for Rust on Apple Silicon.
 
-**Status: it links Rust, and it links itself.** blinker builds its own 5.4 MB
-binary from 921 objects, dead-strips it, signs it, and the result links other
-programs.
+**It makes a `cargo build`'s linking 2.7× faster, out of the box.**
+
+```
+a full build of this workspace — 15 links, 23 inputs at the median
+
+  ld64 (cc)            765, 859, 857 ms
+  blinker              304, 296, 296 ms      2.7×
+```
+
+That is the whole claim, and it is deliberately the *build*'s number rather
+than a link's. Set `linker = "…/blinker"` and nothing else; it links internally
+by default and starts a resident linker for the next link if none is running.
+
+## Why this is the number
+
+A linker is not slow. A *build* is slow, and it is slow because it links the
+same programs over and over with almost nothing changed between them — and a
+linker that exits after every link has to be told the whole program again each
+time.
+
+So the thing worth attacking is not the cost of one link. It is the cost of the
+hundredth link of a program the linker has already seen ninety-nine times. That
+is why blinker is resident: staying alive is worth **1.6×** on its own here
+(296 ms against 484 for the same links one-shot), before any incremental
+machinery does anything at all.
+
+It is also why the median matters more than the maximum. A real build's links
+have 23 inputs at the median and 132 at the largest. Optimising the tail is
+optimising the case that happens once.
+
+## Where it stands
 
 | | |
 |---|---|
-| C programs | work; behaviour matches the system linker |
-| Rust, `panic=abort` and `panic=unwind` | work, including caught panics, destructors and symbolized backtraces |
-| `cargo test` binaries | work |
-| Debug information | `SO`/`OSO`/`FUN` debug map emitted; `dsymutil` reads it back |
-| Dylibs, bundles, partial links | delegated to the system linker, with a recorded reason |
-| A whole `cargo build`'s links | **2.7×** the system toolchain, out of the box |
-| Output size | **0.85×** `ld-prime`'s on a large link, with dead-stripping |
-| Cold link, small (238 objects) | **1.03×** `ld-prime` — inside the spread |
-| Cold link, large (5,637 objects) | **1.70×** `ld-prime` |
-| Edit relink, small, resident | **20.6 ms** wall against `ld-prime`'s 34.3 ms cold |
-| Edit relink, large, resident | **~390 ms** wall against `ld-prime`'s 367 ms cold |
-| A body edit, debug self (1,099 objects) | **41.9 ms** wall, **31.9 ms** linking |
+| **A whole `cargo build`'s links** | **2.7×** the system toolchain |
+| **Edit relink, resident** | **20.6 ms** wall against `ld-prime`'s 34.3 ms |
+| A body edit, debug self-link (1,099 objects) | 41.9 ms wall, 31.9 ms linking |
+| Cold link, 238 objects | 1.03× `ld-prime` — inside the spread |
+| Output size | 0.85× `ld-prime`'s on a large link, with dead-stripping |
+| Cold link, 5,637 objects | **1.70× slower** |
+| Edit relink, 5,637 objects | level — ~390 ms against 367 ms |
 
-The per-link rows are where the two scales disagree, and the disagreement is
-the honest summary of where this is: on a small link the resident linker is
-comfortably ahead of a cold `ld-prime`, and on a large one it is level with it.
-Cold, it is still 1.7× slower on the large link — a resident linker's first
-link pays for the state every link after it reuses.
+The last two rows are the honest cost of the design. A resident linker's first
+link pays for state that no link has reused yet, and on a very large program
+that bill arrives all at once. blinker wins on repetition and on the common
+case; it does not yet win on a single cold link of a huge program.
 
-Wall clock is what a build feels, so the per-link rows quote it; the internal
-link is 14.3 ms and ~360 ms respectively, and the gap is process startup and
-dyld. Per-link figures are minima over eight alternating relinks
-(`scripts/relink.py <workload> --daemon`), which is the statistic that survives
-a loaded machine; medians run 5–15% higher.
+`cargo test` binaries, `panic=abort` and `panic=unwind`, caught panics,
+destructors, symbolized backtraces and a `dsymutil`-readable debug map all work.
+Output kinds blinker cannot produce — `-dynamiclib`, so every proc-macro crate —
+are delegated automatically with the reason recorded.
 
-The first row is the one a developer feels, and it took until finding 189 to
-measure. `cargo build` on this workspace performs sixteen links with a median of
-23 inputs — the 5,637-object link the rows below are taken from is the tail, not
-the shape. Across a build's worth of links:
+## What the large link spends its time on
 
-```
-ld64 (cc)             732-812 ms
-blinker              283-305 ms
-blinker one-shot      470-498 ms
-```
-
-`scripts/build-links.py` produces that. The middle row is what
-`linker = "…/blinker"` gets you, with no other configuration: blinker links
-internally by default and engages a resident linker by default, starting one
-for the next link if none is running. The third row is what that second default
-is worth, measured by turning it off with `--blinker-no-daemon`.
-
-Both of those were opt-in until finding 190, which means the documented setup
-used to install a program that delegated every link to Apple's linker and never
-started the daemon it was built around.
-
-What the large relink spends its time on, when 1 object in 5,637 has a
-reachability projection that moved and 197 of 506,405 addresses changed:
+Kept because it is where the remaining work is, not because it is the headline.
+On a relink where 1 object in 5,637 has a reachability projection that moved and
+197 of 506,405 addresses changed:
 
 ```
   read_and_parse   71 ms      of which ~29 ms is the extraction frontier
@@ -69,21 +70,19 @@ reachability projection that moved and 197 of 506,405 addresses changed:
   write            14 ms
 ```
 
-Every one of those is proportional to the whole program rather than to the
-edit. That is the work of findings 191 onward, and the largest single item so
-far was not a stage at all but a 1.7-million-element clone sitting in the gap
-*between* two measured stages (199).
+Every one is proportional to the whole program rather than to the edit. That is
+the work of findings 191 onward — and the largest single item found so far was
+not a stage at all but a 1.7-million-element clone sitting in the gap *between*
+two measured stages (199).
 
-Three of that work's results are built, verified and switched off, each behind
-a flag and each for a reason recorded in the findings rather than a plan to get
-to it: `BLINKER_DELTA_LIVENESS` (2 ms), `BLINKER_RETAIN_STRINGS` (14 ms, and it
+Three results of that work are built, verified and switched off, each behind a
+flag and each for a reason recorded in the findings rather than a plan to get to
+it: `BLINKER_DELTA_LIVENESS` (2 ms) and `BLINKER_RETAIN_STRINGS` (14 ms, and it
 costs the warm-equals-cold byte comparison the test suite leans on).
 `BLINKER_MEMORY_BUDGET` bounds the per-target state in megabytes, default 1024.
 
-Output kinds blinker cannot produce — `-dynamiclib`, so every proc-macro crate
-— are still delegated automatically, with the reason recorded.
-`--blinker-delegate` delegates everything, and `--blinker-no-daemon` or
-`BLINKER_NO_DAEMON=1` links in-process. `--blinker-daemon-stop` stops a
+`--blinker-delegate` delegates everything, `--blinker-no-daemon` or
+`BLINKER_NO_DAEMON=1` links in-process, and `--blinker-daemon-stop` stops a
 resident linker.
 
 See [PRODUCT_SPEC.md](PRODUCT_SPEC.md) for the product definition,
@@ -93,10 +92,10 @@ plan — several of them contradicting earlier entries in the same file.
 
 ## What is not done
 
-- **Speed at scale.** 1.75× the system linker on a large cold link, against
-  1.09× on a small one, and the resident relink of a large program is still
-  slower than a cold `ld-prime` — by 10%, where it was 51% at the start of the
-  work recorded in findings 179-186. The reason is that the stages left are
+- **Speed at scale.** 1.70× the system linker on a large cold link, against
+  1.03× on a small one, and the resident relink of a large program is level
+  with a cold `ld-prime` — where it was 51% slower at the start of the work
+  recorded in findings 179-186. The reason is that the stages left are
   proportional to the whole program rather than to the edit: dead stripping
   rebuilds the reachability graph even when one object in 5,637 moved, and the
   image is assembled, hashed and written whole even when 98% of relocations
@@ -110,13 +109,17 @@ plan — several of them contradicting earlier entries in the same file.
 - **Dynamic library output.** Proc-macro crates and `cdylib`s are delegated
   rather than linked. Correct, but it means a workspace is only partly linked
   by blinker.
-- **Bounded, not unbounded, sharing across targets.** A session now holds an
-  input for four links after the last one that mentioned it, and keeps the
-  per-link answers for three targets and the finished images for three. That
-  fixed alternating targets going cold (finding 188 — it was a 2x penalty, and
-  no benchmark here linked more than one program so nothing said so), but the
-  windows are constants rather than a memory budget, and a workspace with more
-  concurrent targets than that still thrashes.
+- **A memory budget aimed at the wrong four hundred megabytes.** Per-target
+  state is now bounded in bytes and evicted least-recently-used —
+  `BLINKER_MEMORY_BUDGET`, default 1024 MB — which replaced three counts that
+  each counted a different unit. It reports itself: 291 MB held on an ordinary
+  large relink, 400 MB with the retained symbol table on.
+
+  The measurement that made possible then said the budget covers 400 MB of a
+  3.0 GB process. The rest is parsed inputs, still bounded by a window of four
+  links rather than by bytes, and about a third is memory the allocator has
+  freed and not returned — `malloc_zone_pressure_relief` does not move it
+  (finding 201).
 - **Incremental output.** The image is rebuilt and rewritten whole. The layout
   machinery for stable addresses across edits exists, is tested, and holds
   (9,719 of 9,722 contributions keep their address on an ordinary edit) — but
@@ -126,7 +129,7 @@ plan — several of them contradicting earlier entries in the same file.
   Worth less than it sounds, and measured rather than assumed: 59% of the
   output is `__LINKEDIT` and 46% of it is symbol-name text, and one symbol
   added near the front shifts every string offset after it. The ceiling on
-  never touching an unchanged byte is about 9 ms of a 342 ms link — see
+  never touching an unchanged byte is about 9 ms of a large link — see
   finding 187, and finding 186 for the version of it that measured slower than
   writing the file whole.
 - **`x86_64`, universal binaries, LTO.**
