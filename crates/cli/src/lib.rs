@@ -297,9 +297,14 @@ pub fn run_in(
         if unsupported.is_some() {
             record.fallback_reason = Some(blinker_diagnostics::FallbackReason::UnsupportedArgument);
         }
-        fallback::execute(&linker, &parsed.argv)?
+        let code = fallback::execute(&linker, &parsed.argv)?;
+        // Only here. Set unconditionally, an internal link reported a time
+        // under a field whose own documentation says an internal link is not a
+        // fallback — so every record looked delegated to anything reading the
+        // timings rather than `fallback_reason`, including me.
+        record.set_timing_fallback_exec(exec_started.elapsed());
+        code
     };
-    record.set_timing_fallback_exec(exec_started.elapsed());
 
     // The replay scratch directory must outlive the link that writes into it;
     // dropping it here (rather than at an implicit end-of-scope) makes that

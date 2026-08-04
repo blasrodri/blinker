@@ -10105,3 +10105,72 @@ Stating that plainly matters more than the individual millisecond counts,
 because five of this run's seven commits were worth between 2 and 14 ms each and
 it would be easy to read them as adding up to something they do not. What they
 add up to on the large link is parity.
+
+## 203. The build-wide number, and the two things standing in front of it
+
+The README now leads with the claim that matters — a `cargo build`'s linking is
+2.7× faster — and that reframing changes what is worth working on. Five of this
+run's commits went at a 5,637-object debug link. A real build of this workspace
+links fifteen times, with **23 inputs at the median** and 132 at the largest.
+The tail was getting the attention and the median was paying for it.
+
+Re-measured after this run's work, so the headline is not a stale number:
+
+```
+  ld64 (cc)            765, 859, 857 ms
+  blinker              304, 296, 296 ms      2.7×
+  blinker one-shot     472, 496, 484 ms
+```
+
+Residency alone is 1.6× of that, before any incremental machinery runs at all.
+And this run's seven commits barely moved it — 296-304 against 283-305 before —
+because they were all aimed somewhere else.
+
+### Where a small link's wall clock goes
+
+Replaying real recorded links through a warm daemon:
+
+```
+   23 inputs   wall 11.4 ms   linking  5.2 ms
+  132 inputs   wall 16.2 ms   linking  9.7 ms
+   79 inputs   wall 31.7 ms   linking 25.0 ms
+```
+
+About 6.5 ms per link is not linking. Roughly 3.7 of that is the bare process
+spawn — `/usr/bin/true` measures 3.70 ms through the same harness — and about
+2 ms is blinker's own startup, `blinker --version` being 5.73 ms against that
+floor. Across fifteen links that is something like 100 ms of a 296 ms build,
+and only a third of it is blinker's to remove.
+
+### The daemon serialises
+
+The larger finding. `serve` accepts one connection and handles it to
+completion, so links queue whatever target they belong to:
+
+```
+  one link                 31.8 ms
+  2 concurrent            57.6 ms total    1.8× — serial
+  4 concurrent           106.6 ms total    3.4× — serial
+```
+
+`scripts/build-links.py` replays links one at a time, so the 2.7× above does
+not include this and a real `cargo build` — which links twelve build scripts,
+several of them at once — does. Concurrency across targets was item four of the
+plan and was filed under memory; it is not a memory feature, it is the thing
+between the daemon and the number the product is actually about.
+
+Links to the *same* target must still serialise: they share the session state
+that makes them fast. Links to different targets share nothing but the parse
+cache.
+
+### And a diagnostic that says the opposite of the truth
+
+`set_timing_fallback_exec` was called unconditionally after the internal/
+fallback branch, so every internal link recorded a `fallback_exec_ms` — a field
+whose own documentation reads "an internal link is not a fallback". Reading
+those records is what made me believe, for several minutes, that a build's
+links were being delegated. Fixed to the branch it names.
+
+That is the second time this run a measurement lied in the direction of a
+plausible story: finding 199's clone hid in the gap between two timed stages,
+and this one reported a stage that never ran.
