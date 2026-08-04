@@ -15,6 +15,7 @@
 
 pub mod commands;
 pub mod dyld_info;
+pub mod exports;
 pub mod format;
 pub mod image;
 pub mod signature;
