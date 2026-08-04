@@ -220,8 +220,19 @@ pub fn request(socket: &Path, argv: &[String]) -> std::io::Result<Option<(i32, V
     // client that only checked `connect` would report an I/O error and refuse
     // to link. Falling back is always safe — the work has not been done, and
     // doing it here is what happens with no daemon at all.
-    let mut exchange = || -> std::io::Result<(i32, Vec<u8>)> {
+    // "Was the request delivered?" is the whole question. Before it, a failure
+    // means there is no daemon and linking here is what would have happened
+    // anyway. After it, the daemon took the work and died — a panic in a link
+    // is the ordinary way — and falling back silently turns a linker that
+    // crashes on every request into a linker that merely feels slow. That is
+    // not hypothetical: it is how a wrong live set behind an experimental flag
+    // passed a byte-identity harness, because every delta link panicked the
+    // daemon and every client quietly relinked in process and got the right
+    // answer (finding 195).
+    let mut delivered = false;
+    let mut exchange = |delivered: &mut bool| -> std::io::Result<(i32, Vec<u8>)> {
         write_frame(&mut stream, &encode_request(&cwd, argv))?;
+        *delivered = true;
         let response = read_frame(&mut stream)?;
         if response.len() < 4 {
             return Err(std::io::Error::new(
@@ -232,9 +243,14 @@ pub fn request(socket: &Path, argv: &[String]) -> std::io::Result<Option<(i32, V
         let code = i32::from_le_bytes(response[..4].try_into().expect("4 bytes"));
         Ok((code, response[4..].to_vec()))
     };
-    match exchange() {
+    match exchange(&mut delivered) {
         Ok(answer) => Ok(Some(answer)),
-        Err(error) if is_absent(&error) => Ok(None),
+        Err(error) if is_absent(&error) && !delivered => Ok(None),
+        Err(error) if delivered => Err(std::io::Error::other(format!(
+            "the resident linker died while performing this link ({error}); \
+             linking in process. Run it in the foreground to see why: \
+             blinker --blinker-daemon-serve"
+        ))),
         Err(error) => Err(error),
     }
 }
@@ -587,10 +603,11 @@ pub fn engage(argv: &[String]) -> Option<i32> {
         // warning printed into a build's output for a socket that could not be
         // reached is noise the user cannot act on. `--blinker-daemon` is a
         // request, and a request that fails is worth saying so.
+        // Printed whether or not the daemon was asked for by name. The quiet
+        // path above is for "there was none"; this is for "there was one and
+        // it fell over", which the user has to be able to see.
         Err(error) => {
-            if argv.iter().any(|arg| arg == "--blinker-daemon") {
-                eprintln!("blinker: daemon unavailable ({error}); linking in process");
-            }
+            eprintln!("blinker: {error}");
             None
         }
     }

@@ -669,6 +669,106 @@ fn hash_edge(edge: Option<Edge>, hasher: &mut impl std::hash::Hasher) {
 /// are bounded by the atom count, which is six figures.
 const UNRESOLVED: u32 = u32::MAX;
 
+/// Where each object's atoms sit in the flat numbering, and how much room it
+/// has to grow.
+///
+/// # Why atoms are not simply numbered in order
+///
+/// They were, and it made every incremental answer above them worthless.
+/// A running total means an object that gains one atom shifts every index
+/// after it, so the retained live set, the support counts and every edge in
+/// the reachability graph stop describing the program — and rebasing them
+/// costs more than recomputing from scratch (finding 194). One added function
+/// is the ordinary edit, not the rare one.
+///
+/// So an object keeps its base for as long as its atoms fit in the room it was
+/// given, and only an object that outgrows its range moves — to the end, where
+/// it disturbs nobody. Objects that did not change do not move at all, which is
+/// the property the whole delta rests on.
+///
+/// This is the same trick the layout uses for addresses under
+/// `with_stable_layout`, and it is the same trick `__LINKEDIT` will need for
+/// symbol slots and string offsets. Stable identity is not a property of one
+/// stage; it is what makes any of them incremental.
+#[derive(Clone, Default)]
+pub(crate) struct Numbering {
+    /// Per object, where its atoms start.
+    base: Vec<u32>,
+    /// Per object, how many indices it owns from there.
+    capacity: Vec<u32>,
+    /// One past the highest index any object owns.
+    total: u32,
+}
+
+/// How much room an object of `atoms` atoms is given.
+///
+/// An eighth, and at least four. The slack is what an edit spends: adding a
+/// function to a small object has to fit, and an eighth of a large one is a lot
+/// of functions. Too little and every edit renumbers; too much and the live
+/// set, the support counts and the graph's row table all carry the padding.
+fn room_for(atoms: usize) -> u32 {
+    atoms as u32 + (atoms as u32 / 8).max(4)
+}
+
+/// Past this ratio of indices to atoms, the numbering is laid out again.
+///
+/// Objects that outgrow their range go to the end and leave their old range
+/// behind, so a session that relinks one target a hundred times would
+/// otherwise number atoms into the millions. Renumbering costs the next link
+/// its delta, which is the same price as any other link that cannot align.
+const SPREAD: u32 = 2;
+
+impl Numbering {
+    /// Lay out `counts` atoms per object, keeping `previous` wherever it fits.
+    fn assign(previous: Option<&Numbering>, counts: &[usize]) -> Numbering {
+        let occupied: u32 = counts.iter().map(|count| *count as u32).sum();
+        let held = previous.filter(|held| {
+            // A different input list is a different program as far as this is
+            // concerned: object ids are positions in it.
+            held.base.len() == counts.len() && held.total <= SPREAD * occupied.max(1)
+        });
+        let Some(held) = held else {
+            return Numbering::fresh(counts);
+        };
+
+        let mut numbering = Numbering {
+            base: Vec::with_capacity(counts.len()),
+            capacity: Vec::with_capacity(counts.len()),
+            total: held.total,
+        };
+        for (slot, count) in counts.iter().enumerate() {
+            if *count as u32 <= held.capacity[slot] {
+                numbering.base.push(held.base[slot]);
+                numbering.capacity.push(held.capacity[slot]);
+                continue;
+            }
+            // Outgrew its range. Appended rather than shuffled: moving it up
+            // would move everything after it, which is the thing this exists
+            // to avoid.
+            let room = room_for(*count);
+            numbering.base.push(numbering.total);
+            numbering.capacity.push(room);
+            numbering.total += room;
+        }
+        numbering
+    }
+
+    fn fresh(counts: &[usize]) -> Numbering {
+        let mut numbering = Numbering {
+            base: Vec::with_capacity(counts.len()),
+            capacity: Vec::with_capacity(counts.len()),
+            total: 0,
+        };
+        for count in counts {
+            let room = room_for(*count);
+            numbering.base.push(numbering.total);
+            numbering.capacity.push(room);
+            numbering.total += room;
+        }
+        numbering
+    }
+}
+
 /// Every atom of a link, as the objects' own numbering plus a base each.
 pub(crate) struct Atoms<'a> {
     objects: &'a [LoadedObject],
@@ -692,6 +792,9 @@ pub(crate) struct Atoms<'a> {
     /// Where each block's names start in `resolved`.
     resolved_base: Vec<u32>,
     total: usize,
+    /// The layout the flat indices above came from, so the next link can keep
+    /// it. See [`Numbering`].
+    numbering: Numbering,
     /// Sections kept whole because a reference into their middle would not
     /// survive their atoms being moved.
     opaque: HashSet<(u32, u32)>,
@@ -719,12 +822,12 @@ impl<'a> Atoms<'a> {
         objects: &'a [LoadedObject],
         parts: &mut [f64; 3],
         session: &mut crate::session::Session,
+        previous: Option<&Numbering>,
     ) -> Atoms<'a> {
         let step = std::time::Instant::now();
         let mut blocks: Vec<Arc<ObjectAtoms>> = Vec::with_capacity(objects.len());
         let mut base = Vec::with_capacity(objects.len());
         let mut slot = HashMap::default();
-        let mut total = 0usize;
         let mut slot_of: Vec<u32> = Vec::new();
         // Each object's names as ids, in `SymbolId` order. Held only for the
         // length of this function: everything the traversal needs is resolved
@@ -757,10 +860,27 @@ impl<'a> Atoms<'a> {
             let block = session.atoms(&object.parsed, || project(object));
             interned.push(session.interned(&object.parsed));
             slot.insert(object.parsed.id.0, blocks.len());
-            base.push(total);
-            slot_of.resize(total + block.atoms.len(), blocks.len() as u32);
-            total += block.atoms.len();
             blocks.push(block);
+        }
+
+        // Laid out, not counted up: an object keeps the indices it had unless
+        // it outgrew them. See [`Numbering`].
+        let numbering = Numbering::assign(
+            previous,
+            &blocks
+                .iter()
+                .map(|block| block.atoms.len())
+                .collect::<Vec<_>>(),
+        );
+        let total = numbering.total as usize;
+        base.extend(numbering.base.iter().map(|at| *at as usize));
+        // The gaps belong to no object. Nothing reads them — `Atoms::indices`
+        // is what walks real atoms — and the filler is the neighbour on the
+        // left, which is the only slot that could be blamed for a stray read.
+        slot_of.resize(total, 0);
+        for (index, block) in blocks.iter().enumerate() {
+            let at = base[index];
+            slot_of[at..at + block.atoms.len()].fill(index as u32);
         }
 
         parts[0] = step.elapsed().as_secs_f64() * 1000.0;
@@ -804,6 +924,7 @@ impl<'a> Atoms<'a> {
             slot_of,
             slot,
             total,
+            numbering,
             opaque: HashSet::default(),
             owners,
             resolved: Vec::new(),
@@ -874,8 +995,29 @@ impl<'a> Atoms<'a> {
         opaque
     }
 
+    /// The size of the flat numbering, which is not the number of atoms.
+    ///
+    /// Everything indexed by atom — the live set, the support counts, the
+    /// graph's rows — is sized by this, and there are gaps in it. See
+    /// [`Numbering`].
     fn len(&self) -> usize {
         self.total
+    }
+
+    /// Every atom of the link, as its flat index.
+    ///
+    /// Not `0..len()`. The numbering leaves each object room to grow, so an
+    /// index between two objects belongs to no atom and `atom()` on it reads
+    /// whatever is next door. Four scans used the range and are now the only
+    /// reason this exists.
+    fn indices(&self) -> impl Iterator<Item = usize> + '_ {
+        self.blocks
+            .iter()
+            .enumerate()
+            .flat_map(move |(slot, block)| {
+                let at = self.base[slot];
+                (0..block.atoms.len()).map(move |local| at + local)
+            })
     }
 
     /// The atom at a flat index.
@@ -1174,21 +1316,29 @@ impl Graph {
             }
             (flat, lengths, metadata)
         });
-        let (mut atom, mut slot) = (0usize, 0usize);
+        let mut slot = 0usize;
         for (flat, lengths, metadata) in built {
             let chunk = graph.arena.len() as u32;
-            let mut within = 0u32;
-            for length in lengths {
-                graph.start[atom] = chunk + within;
-                graph.len[atom] = length;
-                within += length;
-                atom += 1;
-            }
-            graph.arena.extend_from_slice(&flat);
+            let (mut within, mut taken) = (0u32, 0usize);
             for edges in metadata {
+                // Rows are addressed by atom index, and atom indices are not
+                // consecutive across objects — the numbering leaves each one
+                // room to grow. Walking them with a counter is how this was
+                // wrong: it worked exactly until the layout stopped being a
+                // running total, and then produced a graph missing most of its
+                // edges and a link short of most of its symbols.
+                let at = atoms.base[slot];
+                for local in 0..atoms.blocks[slot].atoms.len() {
+                    let length = lengths[taken + local];
+                    graph.start[at + local] = chunk + within;
+                    graph.len[at + local] = length;
+                    within += length;
+                }
+                taken += atoms.blocks[slot].atoms.len();
                 graph.produced[slot] = edges;
                 slot += 1;
             }
+            graph.arena.extend_from_slice(&flat);
         }
         graph.used = graph.arena.len();
         graph.index_metadata();
@@ -1232,6 +1382,12 @@ impl Graph {
         let own = self.start[a] as usize..self.start[a] as usize + self.len[a] as usize;
         let meta = self.meta_base[a] as usize..self.meta_base[a + 1] as usize;
         (&self.arena[own], &self.meta[meta])
+    }
+
+    /// How many indices object `slot` owns, so the delta can find the tail an
+    /// object left behind when it shrank.
+    fn capacity_of(&self, atoms: &Atoms<'_>, slot: usize) -> usize {
+        atoms.numbering.capacity[slot] as usize
     }
 
     /// Replace atom `a`'s own row, leaving the old space as a hole.
@@ -1359,6 +1515,22 @@ impl Graph {
                     }
                 }
                 rows.push((index, row.clone()));
+            }
+            // An object that shrank leaves live bits and rows behind inside
+            // its own range — the indices are still its own, but the atoms are
+            // gone. Retired here, because nothing else walks them: every scan
+            // over real atoms stops at the object's current count.
+            for index in at + own.len()..at + self.capacity_of(atoms, slot) {
+                if self.len[index] == 0 && !live.set.contains(index) {
+                    continue;
+                }
+                if live.set.contains(index) {
+                    for target in self.edges(index).0.to_vec() {
+                        live.support[target as usize] -= 1;
+                    }
+                    live.set.remove(index);
+                }
+                self.set_row(index, &[]);
             }
             if self.produced[slot] != produced {
                 for (source, target) in &self.produced[slot] {
@@ -1496,7 +1668,7 @@ impl Graph {
 /// Atoms that are live before anything points at them.
 fn roots(atoms: &Atoms<'_>, entry: Option<SymbolNameId>) -> Vec<u32> {
     let mut roots: Vec<u32> = atoms.defining(entry).map(|at| at as u32).collect();
-    for index in 0..atoms.len() {
+    for index in atoms.indices() {
         if atoms.opaque.contains(&atoms.atom(index).key()) {
             roots.push(index as u32);
         }
@@ -1543,7 +1715,7 @@ fn liveness(
     for index in atoms.defining(entry).collect::<Vec<_>>() {
         mark(index, &mut live, &mut worklist);
     }
-    for index in 0..atoms.len() {
+    for index in atoms.indices() {
         if atoms.opaque.contains(&atoms.atom(index).key()) {
             mark(index, &mut live, &mut worklist);
         }
@@ -1894,6 +2066,9 @@ pub(crate) struct ReachState {
     /// why the pair is worth keeping and the digest alone is not.
     resolved: Vec<u32>,
     resolved_base: Vec<u32>,
+    /// The layout the flat indices are in. Handed to the next link's
+    /// `Atoms::build` so unchanged objects keep their atom indices.
+    numbering: Numbering,
     /// The graph, and the live set with the support behind it.
     graph: Graph,
     live: Live,
@@ -1966,9 +2141,19 @@ pub(crate) fn plan(
 ) -> (Strip, Report, StripTimings) {
     let mut timings = StripTimings::default();
 
+    // Taken before the atoms are built, because the layout they are given is
+    // the one the previous link used: an object that has not outgrown its
+    // range keeps its indices, and that is what makes anything retained here
+    // still mean something. See [`Numbering`].
+    let previous = session.reach_state();
     let step = std::time::Instant::now();
     let mut parts = [0.0f64; 3];
-    let atoms = Atoms::build(objects, &mut parts, session);
+    let atoms = Atoms::build(
+        objects,
+        &mut parts,
+        session,
+        previous.as_ref().map(|state| &state.numbering),
+    );
     // Interned after the build, which is what puts every input's names in the
     // table. An entry symbol nothing mentions has no id, and no roots.
     let entry = session.names().get(entry);
@@ -1990,7 +2175,6 @@ pub(crate) fn plan(
     let mut resolved_base = atoms.resolved_base.clone();
     resolved_base.push(atoms.resolved.len() as u32);
 
-    let previous = session.reach_state();
     let moved = match previous.as_ref() {
         Some(state) => state.moved_against(&identities, &projections),
         // No previous state for this target is not "nothing moved". It is the
@@ -2077,6 +2261,19 @@ pub(crate) fn plan(
     // The phased traversal, kept as the thing the graph is checked against.
     // It reads the projections directly and shares no code with the closure,
     // which is what makes the comparison worth anything.
+    // The delta checks itself, always, and fails hard when it is wrong.
+    //
+    // It is wrong today: on the large workload it disagrees with a fresh
+    // closure by 32 words of 15,296 (finding 195), which is why the flag that
+    // reaches it is off. An experimental path that produces a *plausible*
+    // binary is worse than one that stops, and this project has now been
+    // caught twice by a wrong answer that looked like a right one.
+    if delta_liveness() && timings.delta_used {
+        assert!(
+            Graph::build(&atoms, entry).closure().set.bits == live.set.bits,
+            "the updated live set is not the one the graph supports"
+        );
+    }
     if verify_liveness() && delta_liveness() {
         let (expected, revived) = liveness(&atoms, entry, &mut live_parts);
         timings.revived = revived as u64;
@@ -2101,6 +2298,7 @@ pub(crate) fn plan(
         projections,
         bases,
         total: atoms.len() as u32,
+        numbering: atoms.numbering.clone(),
         // Only where something will read them. With the delta off these are
         // 1.5 MB of copying a link to answer a question nobody asks.
         resolved: if delta_liveness() {
@@ -2160,7 +2358,7 @@ fn verify_liveness() -> bool {
 /// is precisely the case where the check already passed.
 fn report_from(objects: &[LoadedObject], atoms: &Atoms<'_>, strip: &Strip) -> Report {
     let mut live = LiveSet::with_capacity(atoms.len());
-    for index in 0..atoms.len() {
+    for index in atoms.indices() {
         let atom = atoms.atom(index);
         if strip
             .remap(atom.object, atom.section, atom.offset)
@@ -2195,7 +2393,7 @@ fn report(objects: &[LoadedObject], atoms: &Atoms<'_>, live: &LiveSet, revived: 
         ..Report::default()
     };
     let mut by_section: HashMap<(u32, u32), (u64, bool)> = HashMap::default();
-    for index in 0..atoms.len() {
+    for index in atoms.indices() {
         let atom = atoms.atom(index);
         if !is_text.contains(&atom.key()) {
             continue;

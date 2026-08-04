@@ -9587,3 +9587,63 @@ fifth, because *stable identity is not a property of the output stage, it is a
 property of the linker*. Atom numbers, symbol slots, string offsets and
 addresses are all the same problem, and none of the deltas above them are worth
 building until the thing underneath stops moving.
+
+## 195. Stable atom identity, and a harness that graded a crash as a pass
+
+Finding 194 ended with the numbering: atom indices were a running total, so one
+object gaining one atom shifted every index after it and nothing retained above
+them survived an ordinary edit.
+
+`Numbering` gives each object a base and room to grow — its atom count plus an
+eighth, at least four. An object keeps its indices for as long as it fits, and
+only one that outgrows its range moves, to the end, where it disturbs nobody.
+The whole numbering is laid out again when it spreads past twice the atoms it
+holds. It is the same trick the layout already uses for addresses under
+`with_stable_layout`, and the same one `__LINKEDIT` will need for symbol slots
+and string offsets.
+
+It works. The delta now fires on the real edit loop — 17 objects of 5,637 —
+and the numbers are what the whole exercise was for:
+
+```
+                      default        with the delta
+  liveness            18.82 ms        7.16 ms
+  dead_strip          35.22 ms       24.06 ms
+  warm relink (min)      300 ms        275 ms
+```
+
+The stable numbering costs nothing on its own: interleaved warm minima 305/300
+before, 298/296 after, byte-identical against a cold link on both workloads.
+
+### The delta is still wrong
+
+With the flag on, the updated live set disagrees with a fresh closure of the
+same graph by 32 words of 15,296. Not found yet; the flag stays off, and the
+path now asserts against a fresh closure on every link rather than producing a
+plausible binary.
+
+### How it got graded as correct
+
+The byte-identity harness — cold link, then alternate two workloads through one
+resident linker, compare every output to its cold link — reported ALL MATCH
+COLD for a run in which **every delta link panicked the daemon**.
+
+`assert!` fired inside the link. The daemon died. The client read end-of-file,
+which `is_absent` cannot distinguish from a stale socket, so it did what it is
+supposed to do when there is no daemon: it linked in process, correctly, and
+exited 0. Six links, six crashes, six correct binaries, one green harness.
+
+The fix is not in the harness. A failure before the request is delivered means
+there is no daemon and linking here is what would have happened anyway; a
+failure after it means the daemon took the work and died, and that is a
+different thing that has to be said out loud:
+
+```
+blinker: the resident linker died while performing this link
+(failed to fill whole buffer); linking in process. Run it in the foreground
+to see why: blinker --blinker-daemon-serve
+```
+
+A fallback that cannot fail is a fallback that hides everything behind it. This
+is the third time this week the measurement was the thing that was broken, and
+the first time it was broken in the direction of good news.
