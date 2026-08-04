@@ -706,19 +706,24 @@ pub fn link_via_daemon(argv: &[String], worker: usize) -> std::io::Result<Option
             .and_then(|at| argv.get(at + 1))
             .map(String::as_str)
             .unwrap_or("?");
-        let output = format!("{worker} {output}");
+        // Formatted whole, then written once. `writeln!` on a `File` issues a
+        // write per fragment, and now that links genuinely overlap, four
+        // clients appending fragments to one file interleave them: the third
+        // round of the first measurement produced a line with two timestamps
+        // spliced together and a span of 6.5e17 ms. `O_APPEND` makes a single
+        // write atomic, so the fix is to only make one.
+        let line = format!(
+            "{} {:.6} {:.6} {waited:.1} {worker} {output}\n",
+            std::process::id(),
+            finished - waited / 1000.0,
+            finished
+        );
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
         {
-            let _ = writeln!(
-                file,
-                "{} {:.6} {:.6} {waited:.1} {output}",
-                std::process::id(),
-                finished - waited / 1000.0,
-                finished
-            );
+            let _ = file.write_all(line.as_bytes());
         }
     }
     if !stderr.is_empty() {
