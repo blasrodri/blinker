@@ -545,9 +545,50 @@ pub fn serve_links() -> std::io::Result<()> {
 pub fn link_via_daemon(argv: &[String]) -> std::io::Result<Option<i32>> {
     let executable = std::env::current_exe()?;
     let socket = socket_path(&executable);
+    let asked = std::time::Instant::now();
     let Some((code, stderr)) = request(&socket, argv)? else {
         return Ok(None);
     };
+    // What the client waited, from the client's side. The daemon serves one
+    // connection at a time, so a link that arrives while another is being
+    // served waits in the listen backlog — where nothing inside the daemon can
+    // see it, and where the served link's own timings look perfectly healthy.
+    //
+    // Appended to the file `BLINKER_TRACE_WAIT` names, not printed. Written to
+    // stderr, every line came back through `rustc` as a linker warning, and
+    // cargo *replays cached warnings* for units it did not rebuild — so a
+    // second build reprinted the first build's timings, to the tenth of a
+    // millisecond, for links that had not happened. Two runs agreeing exactly
+    // is what gave it away.
+    //
+    // A file with pids and wall-clock stamps also answers the question stderr
+    // could not: whether two links overlapped.
+    if let Some(path) = std::env::var_os("BLINKER_TRACE_WAIT") {
+        let finished = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|since| since.as_secs_f64())
+            .unwrap_or(0.0);
+        let waited = asked.elapsed().as_secs_f64() * 1000.0;
+        let output = argv
+            .iter()
+            .position(|arg| arg == "-o")
+            .and_then(|at| argv.get(at + 1))
+            .map(String::as_str)
+            .unwrap_or("?");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(
+                file,
+                "{} {:.6} {:.6} {waited:.1} {output}",
+                std::process::id(),
+                finished - waited / 1000.0,
+                finished
+            );
+        }
+    }
     if !stderr.is_empty() {
         use std::io::Write;
         let _ = std::io::stderr().write_all(&stderr);

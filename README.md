@@ -32,11 +32,16 @@ It is also why the median matters more than the maximum. A real build's links
 have 23 inputs at the median and 132 at the largest. Optimising the tail is
 optimising the case that happens once.
 
-The two things standing in front of this number are measured in finding 203:
-the daemon handles one link at a time — four concurrent links take 3.4× one
-link, and a real build issues them in parallel — and about 6.5 ms per link is
-process spawn and handoff rather than linking, of which roughly 2 ms is
-blinker's own startup.
+The thing standing in front of this number is measured in finding 204. A cold
+build of this workspace submits **eleven links within 129 ms of each other**,
+and the daemon serves one at a time: their round trips climb 35.7 → 205.5 ms in
+a staircase, 301 ms of wall clock for about 40 ms of linking. `build-links.py`
+replays links serially, so the 2.7× above does not include it.
+
+The incremental build does not hit it — after touching one crate this workspace
+issues exactly one link — so concurrency buys the cold and near-cold build and
+buys the edit loop nothing. `BLINKER_TRACE_WAIT=<file>` writes the trace that
+shows either.
 
 ## Where it stands
 
@@ -93,7 +98,7 @@ resident linker.
 
 See [PRODUCT_SPEC.md](PRODUCT_SPEC.md) for the product definition,
 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for the milestone sequence,
-and **[FINDINGS.md](FINDINGS.md)** for the 209 places reality contradicted the
+and **[FINDINGS.md](FINDINGS.md)** for the 210 places reality contradicted the
 plan — several of them contradicting earlier entries in the same file.
 
 ## What is not done

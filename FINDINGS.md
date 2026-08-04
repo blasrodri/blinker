@@ -10174,3 +10174,66 @@ links were being delegated. Fixed to the branch it names.
 That is the second time this run a measurement lied in the direction of a
 plausible story: finding 199's clone hid in the gap between two timed stages,
 and this one reported a stage that never ran.
+
+## 204. Eleven links arrive at once, and the daemon serves them one at a time
+
+Finding 203 measured the daemon serialising and said a real `cargo build` would
+hit it. That was an argument. Here it is measured, with a trace the client
+writes per link — pid, start, end — so overlap is visible.
+
+A cold build of this workspace, the first three tenths of a second:
+
+```
+    0.000s ->   0.036s    35.7 ms  concurrent  8   build_script_build
+    0.002s ->   0.065s    62.6 ms  concurrent  9   build_script_build
+    0.007s ->   0.091s    84.7 ms  concurrent 10   build_script_build
+    0.008s ->   0.121s   113.1 ms  concurrent 10   build_script_build
+    0.013s ->   0.148s   135.0 ms  concurrent 11   build_script_build
+    0.013s ->   0.173s   159.7 ms  concurrent 11   build_script_build
+    0.018s ->   0.199s   181.4 ms  concurrent 11   build_script_build
+    0.033s ->   0.224s   191.1 ms  concurrent 11   build_script_build
+    0.043s ->   0.249s   205.5 ms  concurrent 10   build_script_build
+    0.074s ->   0.275s   200.7 ms  concurrent  9   build_script_build
+    0.129s ->   0.301s   171.7 ms  concurrent  7   build_script_build
+```
+
+Eleven links, submitted within 129 ms of each other, finishing 25 ms apart in a
+neat staircase. That staircase *is* the queue: they arrive together, each waits
+for the one before, and the eleventh pays 205 ms for a link that needs about
+ten. The burst takes 301 ms of wall clock to do maybe 40 ms of linking.
+
+For scale, `build-links.py` measures this workspace's entire linking at 296 ms —
+replaying the same links one at a time, which is precisely the case that hides
+this.
+
+These are eleven *different* targets. They share nothing but the parse cache, so
+there is no correctness reason for them to wait. Links to the same target must
+still serialise: they share the session state that makes them fast.
+
+### The incremental build does not hit it
+
+Worth stating with the same emphasis, because it is the case that happens
+hundreds of times a day. After touching one leaf crate, a build of this
+workspace issues exactly **one** link:
+
+```
+    98.7 ms -> 86.6 ms -> 43.5 ms      three successive builds, daemon warming
+```
+
+No overlap, nothing to parallelise, and the daemon warming visible in the fall
+from 98.7 ms to 43.5 ms. So concurrency buys the cold and near-cold build — the
+one a developer waits on after `git pull`, a branch switch, or a dependency
+bump — and buys the edit loop nothing.
+
+### The instrument had to be fixed before it could answer
+
+The first version printed to stderr. Every line came back through `rustc` as a
+linker warning, and cargo *replays cached warnings for units it did not
+rebuild* — so the second build reprinted the first build's timings, to a tenth
+of a millisecond, for links that had not happened. Two runs agreeing exactly is
+what gave it away.
+
+That is the third time this run a measurement told a plausible story about work
+that did not occur: finding 199's clone hid between two timed stages, finding
+203's `fallback_exec_ms` reported a branch that never ran, and this reported
+links that never happened.
