@@ -429,6 +429,21 @@ impl<'a> SymbolTableBuilder<'a> {
         self
     }
 
+    /// Take a whole batch, in the order given.
+    ///
+    /// The first one is taken outright rather than appended to what is there.
+    /// A caller with 1.7 million symbols has them in a vector already, and
+    /// moving that vector in is the difference between naming the batch and
+    /// copying 81 MB of it.
+    pub fn absorb(&mut self, symbols: Vec<OutputSymbol<'a>>) -> &mut Self {
+        if self.symbols.is_empty() {
+            self.symbols = symbols;
+        } else {
+            self.symbols.extend(symbols);
+        }
+        self
+    }
+
     pub fn len(&self) -> usize {
         self.symbols.len()
     }

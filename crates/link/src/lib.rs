@@ -2148,6 +2148,7 @@ fn link_inner(
             dylibs: &dylibs,
             ..Assembly::default()
         },
+        Vec::new(),
         blinker_output::symtab::StringTable::default(),
     )?;
 
@@ -2379,7 +2380,6 @@ fn link_inner(
         request,
         &Assembly {
             placements: &placements,
-            symbols: &symbols,
             contents: Some(&contents),
             rebases: &rebases,
             binds: &binds,
@@ -2390,6 +2390,7 @@ fn link_inner(
             previous_signature: previous_signature.as_ref(),
             dylibs: &dylibs,
         },
+        symbols,
         session.take_strings(),
     );
     timings.emit_ms = elapsed_ms(step);
@@ -4207,7 +4208,6 @@ struct Assembly<'a> {
     /// and signing what it produces hashes megabytes that are then dropped.
     final_pass: bool,
     placements: &'a [InputPlacement],
-    symbols: &'a [OutputSymbol<'a>],
     contents: Option<&'a HashMap<usize, Vec<u8>>>,
     rebases: &'a [Rebase],
     binds: &'a [Bind],
@@ -4262,14 +4262,20 @@ fn full_sizes(objects: &[LoadedObject]) -> blinker_output::PlacementReservations
 /// handed back on the [`Image`] so the next link can reuse the offsets. The
 /// layout probe passes an empty one: it emits no symbols, so it has nothing to
 /// place and nothing to hand on.
+///
+/// `output_symbols` is *moved* rather than borrowed, and that is not tidiness.
+/// It was a slice, and the loop below cloned every element into the builder:
+/// 1.7 million `OutputSymbol`s at 48 bytes on a debug rust-analyzer link, 81 MB
+/// copied — plus a `String` allocation for each of the debug map's synthesised
+/// names — to hand the builder what the caller had already finished with.
 fn assemble(
     request: &LinkRequest,
     assembly: &Assembly<'_>,
+    output_symbols: Vec<OutputSymbol<'_>>,
     strings: blinker_output::symtab::StringTable,
 ) -> Result<Image, LinkError> {
     let Assembly {
         placements,
-        symbols: output_symbols,
         contents,
         rebases,
         binds,
@@ -4321,9 +4327,7 @@ fn assemble(
         }
     }
 
-    for symbol in output_symbols {
-        builder.symbols().add(symbol.clone());
-    }
+    builder.symbols().absorb(output_symbols);
     for rebase in rebases {
         builder.rebase(*rebase);
     }

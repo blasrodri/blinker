@@ -9848,3 +9848,49 @@ The debug map is already per object and in object order, and it is most of the
 table: of 1,689,759 symbols, 1,398,995 are local and roughly 1.31 million of
 those are stabs. Four out of five entries in this file are debug-map records
 sitting in exactly the shape reuse wants.
+
+## 199. Fourteen milliseconds spent handing the builder what the caller had finished with
+
+While clearing the sort out of the way of per-object symbol reuse, this was
+sitting in `assemble`:
+
+```rust
+for symbol in output_symbols {
+    builder.symbols().add(symbol.clone());
+}
+```
+
+`output_symbols` was a slice, so every element was copied into the builder: 1.7
+million `OutputSymbol`s at 48 bytes on a debug rust-analyzer link — 81 MB — plus
+a `String` allocation for each of the debug map's synthesised names. The caller
+never touched the vector again.
+
+It is now moved. The builder takes the batch outright when it is the first one,
+so the 81 MB is renamed rather than copied.
+
+```
+                       link      output
+  cloned            531.7 ms
+  moved             511.8 ms     identical
+                    -19.9 ms
+```
+
+Three interleaved runs gave -19.9, -9.3 and -14.0 ms against a 4.6 ms noise
+floor, on a machine whose spread reached 51% in the last of them. Call it 14 ms.
+The mechanism is not in doubt even where the arithmetic is noisy: 81 MB of
+copying and seventeen thousand allocations stopped happening, and the output is
+byte-identical — the same hashes as before the change, warm and cold.
+
+### Why it survived this long
+
+`emit_ms` is measured around `assemble`, and `EmitTimings` starts its clock
+*inside* `ImageBuilder::build`. The clone loop ran between the two, in the gap
+where nothing was looking. `emit` was 62.6 ms and its parts summed to 48; the
+missing 15 was this, sitting in plain sight in a five-line loop, for as long as
+findings 99, 101, 130 and 197 have all been reasoning about which part of
+`emit` to make incremental.
+
+The lesson is not "profile more". `EmitTimings` exists *because* finding 101
+chose wrongly against a single number, and it still left a hole big enough to
+hide the largest item in the stage. A breakdown answers questions about the
+parts it names, and says nothing at all about the space between them.
