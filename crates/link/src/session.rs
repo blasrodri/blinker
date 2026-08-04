@@ -159,9 +159,16 @@ const RETAINED_LINKS: u64 = 4;
 /// wrongly (finding 188).
 ///
 /// Small and linear because it is: three entries, compared by a `u64`.
-#[derive(Default)]
 struct Recent<V> {
     held: Vec<(u64, V)>,
+}
+
+impl<V> Default for Recent<V> {
+    /// Written out because the derive would require `V: Default`, which an
+    /// empty map does not need and a held reachability graph cannot supply.
+    fn default() -> Self {
+        Recent { held: Vec::new() }
+    }
 }
 
 impl<V> Recent<V> {
@@ -170,6 +177,21 @@ impl<V> Recent<V> {
             .iter()
             .find(|(held, _)| *held == key)
             .map(|(_, value)| value)
+    }
+
+    /// Read an entry and mark it as the most recent.
+    ///
+    /// Eviction drops the *oldest inserted*, so an entry that is read on every
+    /// link and rewritten on none of them ages out while it is still in use.
+    /// That is exactly what a target whose answer keeps being reused does, and
+    /// it is how a held answer becomes a cold link: three targets alternating,
+    /// two of them recomputing, and the one that never had to is the one thrown
+    /// away.
+    fn touch(&mut self, key: u64) -> Option<&V> {
+        let at = self.held.iter().position(|(held, _)| *held == key)?;
+        let entry = self.held.remove(at);
+        self.held.push(entry);
+        self.held.last().map(|(_, value)| value)
     }
 
     fn put(&mut self, key: u64, value: V) {
@@ -341,14 +363,6 @@ pub struct Session {
     /// reason: without it a resident linker's memory grows with every build
     /// rather than with the program.
     used_content: FastMap<[u8; 32], u64>,
-    /// The last link's dead-strip answer, and the per-object projection
-    /// digests it was computed from.
-    ///
-    /// Whole-link state, so it is keyed by the whole vector: if every object
-    /// contributes the atoms, edges and roots it contributed last time, then
-    /// the owners map, the opaque set, the live set and the compaction are all
-    /// the same, and so is this.
-    strip: Recent<(Vec<u64>, std::sync::Arc<crate::reachability::Strip>)>,
     memo: FastMap<usize, Memo>,
     /// Every symbol name this session has ever seen, interned once.
     ///
@@ -374,11 +388,17 @@ pub struct Session {
     /// dependency lists for as many again; computing them from the text each
     /// time was 140 ms of a link whose point is that the text did not change.
     digests: Arc<Vec<blinker_cache::NameHash>>,
-    /// Each object's reachability digest, as the last link computed it.
+    /// This target's reachability, as the last link left it.
     ///
-    /// Keyed by object id, which is positional and stable for as long as the
-    /// input list is — the same precondition the whole session runs under.
-    reach: Recent<FastMap<u32, u64>>,
+    /// One structure rather than the two it replaces — a strip keyed by the
+    /// whole projection vector, and a separate map of digests for the report.
+    /// Those answered "is last time's answer still exactly right?", which one
+    /// changed object in 5,637 says no to. This holds the state the answer was
+    /// derived from, so a later link can update it instead of asking.
+    ///
+    /// See [`crate::reachability::ReachState`] for why the atom numbering it
+    /// carries has to travel with it.
+    reach: Recent<Arc<crate::reachability::ReachState>>,
     /// How many digests moved on this link, and how many were compared.
     reach_moved: u64,
     reach_total: u64,
@@ -1122,52 +1142,34 @@ impl Session {
         self.memo.retain(|_, memo| memo.used_at > keep);
     }
 
-    /// The previous link's strip, if every object's projection is unchanged.
-    pub(crate) fn strip(
-        &self,
-        digests: &[u64],
-    ) -> Option<std::sync::Arc<crate::reachability::Strip>> {
-        let (recorded, strip) = self.strip.get(self.target)?;
-        (recorded == digests).then(|| std::sync::Arc::clone(strip))
+    /// This target's reachability as the previous link left it.
+    ///
+    /// Per target, because an object id is a position in *this* link's input
+    /// list and means a different object in another's — and because the atom
+    /// numbering a live set is expressed in is a running total over one link's
+    /// objects. Sharing either across targets would not merely be a wrong
+    /// number; it would be a live set read against the wrong graph.
+    /// `&mut` because reading it is what keeps it: see [`Recent::touch`]. A
+    /// link that reuses this answer stores nothing, so the read is the only
+    /// evidence the target is still being built.
+    pub(crate) fn reach_state(&mut self) -> Option<Arc<crate::reachability::ReachState>> {
+        let target = self.target;
+        self.reach.touch(target).map(Arc::clone)
     }
 
-    /// Remember this link's strip against the projections that produced it.
-    pub(crate) fn store_strip(
-        &mut self,
-        digests: Vec<u64>,
-        strip: std::sync::Arc<crate::reachability::Strip>,
-    ) {
-        self.strip.put(self.target, (digests, strip));
+    /// Replace it with what this link computed.
+    pub(crate) fn store_reach(&mut self, state: crate::reachability::ReachState) {
+        self.reach.put(self.target, Arc::new(state));
     }
 
-    /// Record this link's reachability digests and report how many moved.
+    /// Record how much of the reachability graph moved, for the report.
     ///
     /// A digest that moved means some atom boundary or some edge in that object
     /// changed; if none moved, the live set cannot have changed and the whole
     /// strip is reusable.
-    pub fn note_reachability(&mut self, digests: &[(u32, u64)]) -> (u64, u64) {
-        // Per target, because an object id is a position in *this* link's input
-        // list and means a different object in another's. Comparing across two
-        // targets would not be a wrong binary — nothing reads this but the
-        // report — but it would be a wrong number, which is its own kind of
-        // damage in a file like FINDINGS.
-        let mut moved = 0;
-        let held = self.reach.get(self.target);
-        let comparable = held.is_some_and(|held| !held.is_empty());
-        for (object, digest) in digests {
-            if comparable && held.and_then(|held| held.get(object)) != Some(digest) {
-                moved += 1;
-            }
-        }
-        self.reach
-            .put(self.target, digests.iter().copied().collect());
-        self.reach_moved = if comparable {
-            moved
-        } else {
-            digests.len() as u64
-        };
-        self.reach_total = digests.len() as u64;
-        (self.reach_moved, self.reach_total)
+    pub fn note_reachability(&mut self, moved: u64, total: u64) {
+        self.reach_moved = moved;
+        self.reach_total = total;
     }
 
     /// How many objects' reachability projection moved on the last link.
@@ -1578,5 +1580,30 @@ mod tests {
                 .is_none(),
             "a rewritten object was served from memory"
         );
+    }
+
+    /// An entry that is read on every link and rewritten on none of them must
+    /// not age out while it is being used.
+    ///
+    /// Eviction drops the oldest *insertion*, and a target whose answer keeps
+    /// being reused never inserts. Three targets alternating is enough: the
+    /// one that never has to recompute is the one thrown away, and the next
+    /// link for it is cold. `Recent::touch` is what makes reading count.
+    #[test]
+    fn reading_a_recent_entry_keeps_it() {
+        let mut recent: Recent<&str> = Recent::default();
+        for (key, value) in [(1, "a"), (2, "b"), (3, "c")] {
+            recent.put(key, value);
+        }
+        assert_eq!(recent.held.len(), RECENT_TARGETS);
+
+        // Target 1 is the oldest insertion and the one about to be dropped —
+        // unless reading it counts.
+        assert_eq!(recent.touch(1), Some(&"a"));
+        recent.put(4, "d");
+
+        assert_eq!(recent.get(1), Some(&"a"), "the entry in use was evicted");
+        assert_eq!(recent.get(2), None, "the unread entry survived instead");
+        assert_eq!(recent.get(4), Some(&"d"));
     }
 }

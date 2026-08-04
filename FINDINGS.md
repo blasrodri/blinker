@@ -9373,3 +9373,53 @@ symbol undefined when the linker reaches it.
 
 A test that asserts the current behaviour will keep asserting it after the
 behaviour becomes the bug.
+
+## 191. Reachability gets a state, not a shortcut
+
+Everything reachability retained before this was an answer. `ObjectAtoms` was
+memoised per parse, and the previous `Strip` was held under a key that was the
+entire projection vector — so one object of 5,637 moving discarded it, and the
+common case rebuilt the graph and traversed it whole. That is what "incremental"
+meant here: a fast path for the case where nothing happened.
+
+`ReachState` is the target's reachability *state*, held per target by the
+session: the object ids in link order, their projection digests, the atom
+numbering, the live set, and the strip. It replaces two separate caches — the
+projection-keyed strip and a digest map kept only for the report — with one
+thing that a link can update.
+
+**This commit makes nothing faster, on purpose.** Every field is filled by the
+same full traversal that filled local variables before, and the measurements
+say so: interleaved warm minima 319/304 and 324/333 ms before, 317/310 and
+330/322 after. Cold and warm outputs are byte-identical on both workloads, with
+`BLINKER_VERIFY_LIVENESS=1` recomputing and comparing.
+
+What changes is who owns the graph. A delta update needs three things that did
+not survive a link: the previous live set to subtract from, the numbering that
+live set is expressed in, and which object contributed which part of it. There
+was nowhere for an incremental liveness pass to stand.
+
+### The numbering has to travel with the live set
+
+`LiveSet` is indexed by flat atom number, which is a running total over the
+objects *in this link's order*. An object gaining one atom shifts every atom
+after it. So the state records the numbering it was built in — object ids and
+bases — and `aligned_with` is the check a delta pass makes before believing a
+bit. A live set is not a portable fact; it is a fact about a numbering.
+
+### A read has to count as use
+
+`Recent` evicts the oldest *insertion*. The reuse path stores nothing — that is
+the point of it — so a target whose answer keeps being valid never re-inserts,
+and with three targets alternating it is the one thrown away. The target that
+never needed to recompute becomes the one that always does.
+
+That bug was already in the code this replaces: `store_strip` ran only on the
+recompute path, and what hid it was `note_reachability` writing its separate
+digest map on every link, which kept the *other* half of the state warm. Two
+caches for one fact, aging at different rates, and the one that was never read
+was the one keeping the pair alive.
+
+`Recent::touch` promotes on read. Merging the two halves is what made the
+discrepancy visible: one structure cannot disagree with itself about whether it
+is in use.

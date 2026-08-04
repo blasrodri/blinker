@@ -1322,6 +1322,95 @@ pub(crate) struct StripTimings {
     pub reused_strip: bool,
 }
 
+/// What one target's reachability was, last time this session linked it.
+///
+/// # Why this exists
+///
+/// Everything reachability retained before this was a *shortcut*: a memo of one
+/// object's projection, and an all-or-nothing copy of the previous `Strip` under
+/// a key that was the entire projection vector. One object out of 5,637 moving
+/// discarded the second one, so the common case — a body edit — rebuilt the
+/// whole graph and traversed it whole. Retention was reuse of an answer, and
+/// answers are all-or-nothing by nature.
+///
+/// This is the other thing: the target's reachability *state*, which a link
+/// updates rather than recomputes. It is deliberately introduced with no
+/// updating in it — every field here is still filled by the same full traversal
+/// that filled the local variables before, and this commit makes nothing
+/// faster. What it changes is who owns the graph. A delta update needs the
+/// previous live set to subtract from, the numbering that live set was built
+/// in, and which object contributed which part of it; none of those survived a
+/// link before, so there was nowhere for an incremental liveness pass to stand.
+///
+/// # The numbering
+///
+/// [`LiveSet`] is indexed by flat atom number, which is a running total over
+/// the objects *in this link's order*. That numbering is not stable across
+/// links: an object gaining an atom shifts every atom after it. So the state
+/// records the numbering it was built in — object ids and their bases — and a
+/// reader has to check it before believing a bit. [`ReachState::aligned_with`]
+/// is that check, and it is what a delta pass will use to decide between
+/// remapping and starting over.
+pub(crate) struct ReachState {
+    /// Object ids in link order, and each one's projection digest.
+    ///
+    /// Parallel arrays rather than a map: the whole-vector comparison is the
+    /// hot use, and it is a `memcmp` on the digests.
+    objects: Vec<u32>,
+    projections: Vec<u64>,
+    /// Where each object's atoms begin in the flat numbering `live` uses.
+    bases: Vec<u32>,
+    /// Atoms in that numbering.
+    total: u32,
+    /// The live set the traversal produced, in the numbering above.
+    live: LiveSet,
+    /// What that live set was compacted into.
+    strip: Arc<Strip>,
+}
+
+impl ReachState {
+    /// Whether `digests` is exactly what produced this state.
+    ///
+    /// The identity check the old `Session::strip` performed, minus the
+    /// question of *which* objects: two links whose object lists differ cannot
+    /// have equal-length digest vectors unless the counts match, and this is
+    /// also asked about object ids, which are positions in the input list.
+    fn matches(&self, objects: &[u32], digests: &[u64]) -> bool {
+        self.objects == objects && self.projections == digests
+    }
+
+    /// Whether this state's atom numbering is still the current one.
+    ///
+    /// Weaker than [`ReachState::matches`] and the condition a delta update
+    /// needs: the objects and their atom counts are the same, so a flat atom
+    /// index means the same atom, even though some object's *edges* moved.
+    #[allow(dead_code, reason = "the delta pass this was retained for")]
+    fn aligned_with(&self, objects: &[u32], bases: &[u32], total: u32) -> bool {
+        self.objects == objects && self.bases == bases && self.total == total
+    }
+
+    /// How many objects' projections differ from the ones recorded here.
+    ///
+    /// Positional, because the digests are recorded in link order and this is
+    /// only reached when the object lists are equal.
+    fn moved_against(&self, objects: &[u32], digests: &[u64]) -> u64 {
+        if self.objects != objects {
+            return digests.len() as u64;
+        }
+        self.projections
+            .iter()
+            .zip(digests)
+            .filter(|(held, now)| held != now)
+            .count() as u64
+    }
+
+    /// The live set, in the numbering [`ReachState::aligned_with`] describes.
+    #[allow(dead_code, reason = "the delta pass this was retained for")]
+    pub(crate) fn live(&self) -> &LiveSet {
+        &self.live
+    }
+}
+
 /// Decide what a link keeps.
 pub(crate) fn plan(
     objects: &[LoadedObject],
@@ -1346,15 +1435,21 @@ pub(crate) fn plan(
     // wrong (154). The projection is built by now and carries its own.
     let digest_step = std::time::Instant::now();
     let projections: Vec<u64> = atoms.blocks.iter().map(|block| block.digest).collect();
-    let identified: Vec<(u32, u64)> = objects
-        .iter()
-        .zip(&projections)
-        .map(|(object, digest)| (object.parsed.id.0, *digest))
-        .collect();
-    let (moved, total) = session.note_reachability(&identified);
+    let identities: Vec<u32> = objects.iter().map(|object| object.parsed.id.0).collect();
+    let bases: Vec<u32> = atoms.base.iter().map(|at| *at as u32).collect();
+
+    let previous = session.reach_state();
+    let moved = match previous.as_deref() {
+        Some(state) => state.moved_against(&identities, &projections),
+        // No previous state for this target is not "nothing moved". It is the
+        // cold case, and reporting zero would make a first link indistinguishable
+        // from a perfectly reused one in every stat this feeds.
+        None => projections.len() as u64,
+    };
+    session.note_reachability(moved, projections.len() as u64);
     timings.digest_ms = digest_step.elapsed().as_secs_f64() * 1000.0;
     timings.reach_moved = moved;
-    timings.reach_total = total;
+    timings.reach_total = projections.len() as u64;
 
     // Every object contributes what it contributed last time, so the owners
     // map, the opaque set, the live set and the compaction are all the same as
@@ -1362,7 +1457,9 @@ pub(crate) fn plan(
     // recomputes and compares: stripping an atom that is still reachable
     // produces a binary that links, runs, and crashes somewhere else later, so
     // this is not a place to trust an argument.
-    let held = session.strip(&projections);
+    let held = previous
+        .filter(|state| state.matches(&identities, &projections))
+        .map(|state| Arc::clone(&state.strip));
     // "The held answer was valid", not "the shortcut was taken". Under
     // verification the work is done anyway and the two answers compared, and a
     // flag that flipped with the verification mode would mean every test of it
@@ -1396,9 +1493,20 @@ pub(crate) fn plan(
              reused an answer that the graph no longer supports"
         );
     }
-    session.store_strip(projections, std::sync::Arc::new(strip.clone()));
+    let report = report(objects, &atoms, &live, revived);
+    // The live set is stored, which is the whole of what this commit adds. It
+    // is 1.7 million bits — 210 KB on the largest workload — against the
+    // `Strip` beside it, and nothing reads it yet.
+    session.store_reach(ReachState {
+        objects: identities,
+        projections,
+        bases,
+        total: atoms.len() as u32,
+        live,
+        strip: Arc::new(strip.clone()),
+    });
 
-    (strip, report(objects, &atoms, &live, revived), timings)
+    (strip, report, timings)
 }
 
 /// Whether to recompute liveness and compare it against the held answer.
