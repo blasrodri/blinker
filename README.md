@@ -71,7 +71,7 @@ resident linker.
 
 See [PRODUCT_SPEC.md](PRODUCT_SPEC.md) for the product definition,
 [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for the milestone sequence,
-and **[FINDINGS.md](FINDINGS.md)** for the 206 places reality contradicted the
+and **[FINDINGS.md](FINDINGS.md)** for the 207 places reality contradicted the
 plan — several of them contradicting earlier entries in the same file.
 
 ## What is not done

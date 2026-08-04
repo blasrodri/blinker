@@ -129,6 +129,9 @@ pub struct LinkTimings {
     /// of how many there were.
     pub symbols_reused: u64,
     pub symbols_total: u64,
+    /// Bytes of per-target state the session holds, and its budget.
+    pub held_bytes: u64,
+    pub budget_bytes: u64,
     /// Work between the named stages that no stage owned: building placements,
     /// scanning `__eh_frame` for personality fields, sizing the unwind table,
     /// and collecting commons. It was 1.9 ms of "unmeasured" and the only
@@ -4782,6 +4785,17 @@ impl SymbolState {
         [locals, self.buckets[DEFS_EXTERNAL].clone(), Vec::new()]
     }
 
+    /// Roughly what holding this costs. The entries dominate: 1.7 million of
+    /// them at sixteen bytes is 27 MB on a debug rust-analyzer link.
+    pub(crate) fn held_bytes(&self) -> usize {
+        let entries: usize = self.buckets.iter().map(|bucket| bucket.len()).sum();
+        let bounds: usize = self.bounds.iter().map(|bound| bound.len()).sum();
+        entries * std::mem::size_of::<NlistEntry>()
+            + bounds * std::mem::size_of::<(u32, u32)>()
+            + self.digests.len() * std::mem::size_of::<u64>()
+            + self.appended.len() * std::mem::size_of::<u32>()
+    }
+
     /// How much of the string table the runs held here are still speaking for.
     fn live_bytes(&self) -> usize {
         self.appended.iter().map(|bytes| *bytes as usize).sum()
@@ -6328,6 +6342,9 @@ pub fn link_to_file_in(
     let overall = std::time::Instant::now();
     let image = link_inner(request, &mut timings, session)?;
     let (held, read) = session.counts();
+    let (bytes, budget) = session.held_memory();
+    timings.held_bytes = bytes;
+    timings.budget_bytes = budget;
     timings.inputs_held = held as u64;
     timings.inputs_read = read as u64;
     let (replayed, resolution) = session.reused();

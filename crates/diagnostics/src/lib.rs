@@ -192,6 +192,9 @@ pub struct LinkStages {
     /// Objects whose symbol-table entries were kept, of how many there were.
     pub symbols_reused: u64,
     pub symbols_total: u64,
+    /// Bytes of per-target state the session holds, and its budget.
+    pub held_bytes: u64,
+    pub budget_bytes: u64,
     /// Inside `prepare`: placements, eh personalities, unwind sizing, commons.
     pub prepare_breakdown: [f64; 4],
     pub changed_addresses: u64,
@@ -275,6 +278,11 @@ pub struct Counters {
     pub symbols_reused: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub symbols_total: Option<u64>,
+    /// Bytes of per-target state held, and the budget it is held against.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub held_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub budget_bytes: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub changed_addresses: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -402,6 +410,8 @@ impl LinkRecord {
             reach_total,
             symbols_reused,
             symbols_total,
+            held_bytes,
+            budget_bytes,
             prepare_breakdown,
             changed_addresses,
             total_addresses,
@@ -433,6 +443,10 @@ impl LinkRecord {
         if symbols_total > 0 {
             self.counters.symbols_reused = Some(symbols_reused);
             self.counters.symbols_total = Some(symbols_total);
+        }
+        if budget_bytes > 0 {
+            self.counters.held_bytes = Some(held_bytes);
+            self.counters.budget_bytes = Some(budget_bytes);
         }
         if prepare_breakdown.iter().any(|v| *v > 0.0) {
             self.timings.link_placements_ms = Some(prepare_breakdown[0]);

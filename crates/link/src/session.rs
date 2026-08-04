@@ -147,74 +147,148 @@ type HeldStubs = (Vec<(PathBuf, blinker_cache::InputKey)>, Arc<StubExports>);
 /// on from within a few links.
 const RETAINED_LINKS: u64 = 4;
 
-/// A few answers from recent links, keyed by which link asked.
+/// Everything one target's previous link left behind.
 ///
-/// Every one of these was a single slot, which is correct for a linker that
-/// serves one program and silently wrong for a daemon that serves several: the
-/// slot holds whichever target linked last, so an alternating pair misses it
-/// every time. Two of them were *only* a miss; `imports` was worse, because its
-/// guard asks whether any interface moved and nothing there knows the target
-/// changed at all. What kept that safe was the eviction this finding removed —
-/// a different target emptied the session, so nothing was held to serve
-/// wrongly (finding 188).
+/// One structure rather than six maps keyed by the same number. The maps
+/// evicted independently and each on its own count, and every count was a guess
+/// about a different unit — three reachability graphs beside three string
+/// tables beside three finished images at 178 MB each. A resident linker does
+/// not have a budget of *answers*; it has a number of bytes it may hold, and
+/// which target they belong to is the only thing that decides what to drop.
 ///
-/// Small and linear because it is: three entries, compared by a `u64`.
-struct Recent<V> {
-    held: Vec<(u64, V)>,
+/// Grouping them also makes eviction coherent. A target's symbol runs name
+/// their symbols by offset into that target's string table, so keeping one
+/// without the other holds 27 MB that can never be used. Nothing checked that;
+/// the `offsets_id` comparison caught it and threw the runs away, which is
+/// safe and silent. Now they leave together.
+#[derive(Default)]
+struct TargetState {
+    stubs: Option<HeldStubs>,
+    extraction: Option<ExtractionOrder>,
+    imports: Option<Vec<String>>,
+    reach: Option<crate::reachability::ReachState>,
+    strings: Option<blinker_output::symtab::StringTable>,
+    symbols: Option<crate::SymbolState>,
+    /// The previous link's cache, and the output path it describes.
+    ///
+    /// The path is kept beside it rather than used as the key, because the
+    /// question asked of it is "is this the cache for the file I am writing?"
+    /// and a target that somehow reached a different output must miss rather
+    /// than be served a cache for another binary.
+    cache: Option<(PathBuf, blinker_cache::LinkCache)>,
 }
 
-impl<V> Default for Recent<V> {
-    /// Written out because the derive would require `V: Default`, which an
-    /// empty map does not need and a held reachability graph cannot supply.
-    fn default() -> Self {
-        Recent { held: Vec::new() }
+impl TargetState {
+    fn held_bytes(&self) -> usize {
+        let strings = |strings: &blinker_output::symtab::StringTable| strings.held_bytes();
+        self.reach
+            .as_ref()
+            .map_or(0, crate::reachability::ReachState::held_bytes)
+            + self.strings.as_ref().map_or(0, strings)
+            + self
+                .symbols
+                .as_ref()
+                .map_or(0, crate::SymbolState::held_bytes)
+            + self
+                .cache
+                .as_ref()
+                .map_or(0, |(_, cache)| cache.held_bytes())
+        // The other three are kilobytes against those four's megabytes: a list
+        // of archive paths, a list of import names, and the SDK's export table
+        // behind an `Arc` the session may not even be the last holder of. Left
+        // out rather than counted badly.
     }
 }
 
-impl<V> Recent<V> {
-    fn get(&self, key: u64) -> Option<&V> {
+/// Per-target state, bounded by bytes and dropped least-recently-used first.
+#[derive(Default)]
+struct TargetStore {
+    /// Least recently used first, so eviction is `remove(0)`.
+    held: Vec<(u64, TargetState)>,
+}
+
+impl TargetStore {
+    /// This target's state, created empty if it has none, and marked as the
+    /// most recently used.
+    fn state(&mut self, target: u64) -> &mut TargetState {
+        let at = match self.held.iter().position(|(held, _)| *held == target) {
+            Some(at) => at,
+            None => {
+                self.held.push((target, TargetState::default()));
+                self.held.len() - 1
+            }
+        };
+        // To the back, which is the end this evicts away from. A target whose
+        // answers stay valid and are only ever *read* would otherwise age out
+        // exactly like one nothing asks for — the bug `Recent::take` worked
+        // around by making every read an insertion.
+        let entry = self.held.remove(at);
+        self.held.push(entry);
+        &mut self.held.last_mut().expect("just pushed").1
+    }
+
+    /// This target's state without disturbing the order, for a look that should
+    /// not count as a use.
+    fn peek(&self, target: u64) -> Option<&TargetState> {
         self.held
             .iter()
-            .find(|(held, _)| *held == key)
-            .map(|(_, value)| value)
+            .find(|(held, _)| *held == target)
+            .map(|(_, state)| state)
     }
 
-    /// Remove an entry and hand it over.
+    fn held_bytes(&self) -> usize {
+        self.held.iter().map(|(_, state)| state.held_bytes()).sum()
+    }
+
+    /// Drop least-recently-used targets until the budget is met.
     ///
-    /// The reachability state is updated in place and put back, which is worth
-    /// twenty megabytes of copying a link — and it is also what keeps it. This
-    /// map evicts the oldest *insertion*, so a target whose answer stays valid
-    /// and is only ever read would be the one thrown away; taking and putting
-    /// back makes every use an insertion.
-    fn take(&mut self, key: u64) -> Option<V> {
-        let at = self.held.iter().position(|(held, _)| *held == key)?;
-        Some(self.held.remove(at).1)
-    }
-
-    fn put(&mut self, key: u64, value: V) {
-        self.held.retain(|(held, _)| *held != key);
-        self.held.push((key, value));
-        if self.held.len() > RECENT_TARGETS {
-            self.held.remove(0);
+    /// `keep` is never dropped whatever it costs. It is the target being linked
+    /// right now, and evicting it would not save anything — the link is holding
+    /// what it needs regardless, and the state would simply be rebuilt.
+    fn trim(&mut self, keep: u64, budget: usize) {
+        while self.held_bytes() > budget {
+            let Some(at) = self.held.iter().position(|(held, _)| *held != keep) else {
+                return;
+            };
+            self.held.remove(at);
         }
     }
 
-    fn clear(&mut self) {
-        self.held.clear();
+    /// Forget one kind of answer, for every target.
+    fn clear_extraction(&mut self) {
+        for (_, state) in &mut self.held {
+            state.extraction = None;
+        }
     }
 }
 
-/// How many targets keep their per-link answers.
-const RECENT_TARGETS: usize = 3;
-
-/// How many finished images a session holds at once.
+/// How many bytes of per-target state a session may hold.
 ///
-/// Much smaller than [`RETAINED_LINKS`] because the unit is different: an input
-/// is a mapped file the page cache owns anyway, and one of these is a 178 MB
-/// binary on the heap. Two is what an alternating pair needs; three leaves room
-/// for the third target of a workspace without holding half a gigabyte for the
-/// fourth.
-const RETAINED_CACHES: usize = 3;
+/// # Why a byte budget rather than a count
+///
+/// The counts this replaces were three targets' worth of answers and three
+/// finished images, chosen separately and each defensible on its own. Together
+/// they said nothing about how large the process would get, because the things
+/// counted differ by three orders of magnitude: an extraction order is a few
+/// kilobytes and a `LinkCache` carries a 178 MB binary. Adding a retained
+/// string table and its symbol runs — another 110 MB per target — to a bound
+/// expressed in answers would have been adding a tenth of a gigabyte to a
+/// number that could not see it.
+///
+/// A gibibyte holds roughly three targets fully warmed, which is what the
+/// counts held in practice, and now says so in the unit that decides whether a
+/// developer's machine minds.
+fn memory_budget() -> usize {
+    const DEFAULT: usize = 1024;
+    static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BUDGET.get_or_init(|| {
+        let megabytes = std::env::var("BLINKER_MEMORY_BUDGET")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(DEFAULT);
+        megabytes * 1024 * 1024
+    })
+}
 
 /// Parsed inputs held across links.
 ///
@@ -248,7 +322,8 @@ pub struct Session {
     /// Kept whole rather than per file: it is one answer to one question —
     /// "which names does the system provide?" — and the files behind it are
     /// part of the SDK, so they change when Xcode changes and not otherwise.
-    stubs: Recent<HeldStubs>,
+    /// Everything the previous link left behind, per target, byte-budgeted.
+    store: TargetStore,
     /// Members already pulled out of archives and parsed. A Rust link extracts
     /// several hundred of them and parses every one on every link; holding the
     /// archive's bytes without holding what was parsed out of them leaves the
@@ -282,7 +357,7 @@ pub struct Session {
     /// a different set of archives. Storing them together is what lets the
     /// order survive an input list that changed *elsewhere* — which is every
     /// debug rebuild, because rustc renames the loose objects (finding 144).
-    extraction: Recent<ExtractionOrder>,
+
     /// A digest of each input's *symbol interface* — what it defines and what
     /// it leaves undefined — from when it was last parsed.
     ///
@@ -395,15 +470,15 @@ pub struct Session {
     ///
     /// See [`crate::reachability::ReachState`] for why the atom numbering it
     /// carries has to travel with it.
-    reach: Recent<crate::reachability::ReachState>,
+
     /// This target's `__LINKEDIT` string table, as the last link left it.
     ///
     /// Per target for the reason the reachability state is: the offsets in it
     /// are only meaningful alongside the symbol table that refers to them, and
     /// two targets do not share one.
-    strings: Recent<blinker_output::symtab::StringTable>,
+
     /// This target's symbol table, per object, resolved against `strings`.
-    symbols: Recent<crate::SymbolState>,
+
     /// How many digests moved on this link, and how many were compared.
     reach_moved: u64,
     reach_total: u64,
@@ -428,7 +503,7 @@ pub struct Session {
     ///
     /// Bounded separately from everything else here, and tightly: each of
     /// these holds a finished binary, 178 MB on a debug rust-analyzer link.
-    caches: FastMap<PathBuf, (u64, blinker_cache::LinkCache)>,
+
     /// How many inputs' interfaces moved, and the first one that did.
     ///
     /// A boolean says the replay was refused; this says by whom. Three of this
@@ -443,7 +518,6 @@ pub struct Session {
     /// strengths. That is precisely what [`interface_digest`] covers, so the
     /// answer stands whenever no interface moved *and* the SDK's exports are
     /// the ones it was computed against.
-    imports: Recent<Vec<String>>,
     stubs_reparsed: bool,
     hits: usize,
     misses: usize,
@@ -489,6 +563,11 @@ impl Session {
         self.generation += 1;
         let now = self.generation;
         self.target = target;
+        // Before this link rather than after it. A link that writes no cache
+        // would otherwise never trim — the budget would be enforced only on the
+        // path that happens to end by storing something, which is the shape of
+        // bound that holds until the one time it matters.
+        self.store.trim(target, memory_budget());
         for path in inputs {
             match self.used_at.get_mut(path) {
                 Some(stamp) => *stamp = now,
@@ -738,7 +817,7 @@ impl Session {
 
     /// The SDK's exports, if the stub files behind them are unchanged.
     pub fn stub_exports(&self, stubs: &[PathBuf]) -> Option<Arc<StubExports>> {
-        let (recorded, exports) = self.stubs.get(self.target)?;
+        let (recorded, exports) = self.store.peek(self.target)?.stubs.as_ref()?;
         if recorded.len() != stubs.len() {
             return None;
         }
@@ -760,14 +839,15 @@ impl Session {
             return None;
         }
         let target = self.target;
-        self.imports.get(target)?;
+        self.store.peek(target)?.imports.as_ref()?;
         self.held_resolution = true;
-        self.imports.get(target).map(Vec::as_slice)
+        self.store.state(target).imports.as_deref()
     }
 
     /// Remember what resolution decided.
     pub fn store_imports(&mut self, imports: &[String]) {
-        self.imports.put(self.target, imports.to_vec());
+        let target = self.target;
+        self.store.state(target).imports = Some(imports.to_vec());
     }
 
     /// Remember the SDK's exports.
@@ -782,7 +862,8 @@ impl Session {
             };
             recorded.push((path.clone(), key));
         }
-        self.stubs.put(self.target, (recorded, exports));
+        let target = self.target;
+        self.store.state(target).stubs = Some((recorded, exports));
     }
 
     /// The extraction order the last link settled on, if it must still hold.
@@ -795,7 +876,7 @@ impl Session {
         if self.interfaces_changed {
             return None;
         }
-        let (recorded, order) = self.extraction.get(self.target)?;
+        let (recorded, order) = self.store.peek(self.target)?.extraction.as_ref()?;
         if recorded != archives {
             return None;
         }
@@ -831,7 +912,7 @@ impl Session {
     /// Discard a replay that turned out not to hold, so this link recomputes
     /// and the next one is not offered the same wrong answer.
     pub fn abandon_extraction(&mut self) {
-        self.extraction.clear();
+        self.store.clear_extraction();
         self.replayed_extraction = false;
         self.interfaces_changed = true;
     }
@@ -906,7 +987,8 @@ impl Session {
 
     /// Remember which members were extracted, and in what order.
     pub fn store_extraction(&mut self, archives: Vec<PathBuf>, order: Vec<(usize, u32)>) {
-        self.extraction.put(self.target, (archives, order));
+        let target = self.target;
+        self.store.state(target).extraction = Some((archives, order));
     }
 
     /// Inputs served from memory, and inputs that had to be read.
@@ -1159,12 +1241,13 @@ impl Session {
     /// answer whole still has to store it again — see `store_reach`.
     pub(crate) fn reach_state(&mut self) -> Option<crate::reachability::ReachState> {
         let target = self.target;
-        self.reach.take(target)
+        self.store.state(target).reach.take()
     }
 
     /// Replace it with what this link computed.
     pub(crate) fn store_reach(&mut self, state: crate::reachability::ReachState) {
-        self.reach.put(self.target, state);
+        let target = self.target;
+        self.store.state(target).reach = Some(state);
     }
 
     /// This target's string table, or an empty one for a target never linked
@@ -1172,14 +1255,15 @@ impl Session {
     /// appended to and handed back, not copied.
     pub(crate) fn take_strings(&mut self) -> blinker_output::symtab::StringTable {
         let target = self.target;
-        self.strings.take(target).unwrap_or_default()
+        self.store.state(target).strings.take().unwrap_or_default()
     }
 
     pub(crate) fn store_strings(&mut self, strings: blinker_output::symtab::StringTable) {
         if !retain_strings() {
             return;
         }
-        self.strings.put(self.target, strings);
+        let target = self.target;
+        self.store.state(target).strings = Some(strings);
     }
 
     /// This target's symbol table as the last link built it, per object.
@@ -1189,14 +1273,15 @@ impl Session {
     /// exists. The two are stored and dropped together.
     pub(crate) fn take_symbols(&mut self) -> Option<crate::SymbolState> {
         let target = self.target;
-        self.symbols.take(target)
+        self.store.state(target).symbols.take()
     }
 
     pub(crate) fn store_symbols(&mut self, symbols: crate::SymbolState) {
         if !retain_strings() {
             return;
         }
-        self.symbols.put(self.target, symbols);
+        let target = self.target;
+        self.store.state(target).symbols = Some(symbols);
     }
 
     /// Record how much of the reachability graph moved, for the report.
@@ -1220,12 +1305,26 @@ impl Session {
     /// produces the next, and handing out a reference would mean cloning a
     /// structure that contains the whole output image.
     pub fn take_cache(&mut self, path: &Path) -> Option<blinker_cache::LinkCache> {
-        self.caches.remove(path).map(|(_, cache)| cache)
+        let target = self.target;
+        let held = self.store.state(target).cache.take()?;
+        // Put it back if it describes a different output. `take` is what the
+        // caller wants for the common case; handing over a cache for another
+        // binary is the one thing this must not do.
+        if held.0 != path {
+            self.store.state(target).cache = Some(held);
+            return None;
+        }
+        Some(held.1)
     }
 
     /// The cache held for `path`, for writing it out.
     pub fn cache_for(&self, path: &Path) -> Option<&blinker_cache::LinkCache> {
-        self.caches.get(path).map(|(_, cache)| cache)
+        self.store
+            .peek(self.target)?
+            .cache
+            .as_ref()
+            .filter(|(held, _)| held == path)
+            .map(|(_, cache)| cache)
     }
 
     /// Hold the cache this link produced, and say whether it must also be
@@ -1238,23 +1337,21 @@ impl Session {
     /// every cache is validated against its inputs before it is believed.
     pub fn store_cache(&mut self, path: &Path, cache: blinker_cache::LinkCache) -> bool {
         let first = self.cache_written.insert(path.to_path_buf());
-        self.caches
-            .insert(path.to_path_buf(), (self.generation, cache));
-        // Least recently stored first, and only ever one over: each of these is
-        // a finished binary, so the bound is about memory and not about hit
-        // rate.
-        while self.caches.len() > RETAINED_CACHES {
-            let Some(oldest) = self
-                .caches
-                .iter()
-                .min_by_key(|(_, (at, _))| *at)
-                .map(|(path, _)| path.clone())
-            else {
-                break;
-            };
-            self.caches.remove(&oldest);
-        }
+        let target = self.target;
+        self.store.state(target).cache = Some((path.to_path_buf(), cache));
+        self.store.trim(target, memory_budget());
         first
+    }
+
+    /// Bytes of per-target state this session is holding, and the budget it is
+    /// held against.
+    ///
+    /// Reported rather than trusted. A bound nobody measures is a bound that
+    /// holds until the first thing it does not know how to count, and this one
+    /// deliberately counts four things and ignores three others (see
+    /// [`TargetState::held_bytes`]).
+    pub fn held_memory(&self) -> (u64, u64) {
+        (self.store.held_bytes() as u64, memory_budget() as u64)
     }
 
     /// How many interfaces moved, and the first one that did.

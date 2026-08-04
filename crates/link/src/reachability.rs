@@ -719,6 +719,10 @@ fn room_for(atoms: usize) -> u32 {
 const SPREAD: u32 = 2;
 
 impl Numbering {
+    fn held_bytes(&self) -> usize {
+        (self.base.len() + self.capacity.len()) * std::mem::size_of::<u32>()
+    }
+
     /// Lay out `counts` atoms per object, keeping `previous` wherever it fits.
     fn assign(previous: Option<&Numbering>, counts: &[usize]) -> Numbering {
         let occupied: u32 = counts.iter().map(|count| *count as u32).sum();
@@ -1104,6 +1108,10 @@ pub(crate) struct LiveSet {
 }
 
 impl LiveSet {
+    fn held_bytes(&self) -> usize {
+        self.bits.len() * std::mem::size_of::<u64>()
+    }
+
     fn with_capacity(atoms: usize) -> LiveSet {
         LiveSet {
             bits: vec![0; atoms.div_ceil(64)],
@@ -1229,6 +1237,12 @@ pub(crate) struct Live {
     support: Vec<u32>,
 }
 
+impl Live {
+    fn held_bytes(&self) -> usize {
+        self.set.held_bytes() + self.support.len() * std::mem::size_of::<u32>()
+    }
+}
+
 impl From<LiveSet> for Live {
     /// A live set with no support behind it, for the path that computed one
     /// without a graph. Nothing may update it — `Graph::update` needs counts —
@@ -1242,6 +1256,25 @@ impl From<LiveSet> for Live {
 }
 
 impl Graph {
+    fn held_bytes(&self) -> usize {
+        let words = |count: usize| count * std::mem::size_of::<u32>();
+        words(self.start.len())
+            + words(self.len.len())
+            + words(self.arena.len())
+            + words(self.meta.len())
+            + words(self.meta_base.len())
+            + words(self.roots.len())
+            + self.root.held_bytes()
+            + self
+                .produced
+                .iter()
+                .map(|edges| {
+                    std::mem::size_of::<Vec<(u32, u32)>>()
+                        + edges.len() * std::mem::size_of::<(u32, u32)>()
+                })
+                .sum::<usize>()
+    }
+
     /// The edges every atom of one object contributes, as `(source, target)`.
     ///
     /// Own edges and metadata edges are collected together because both are
@@ -1878,6 +1911,18 @@ struct Compacted {
     size: u64,
 }
 
+impl Strip {
+    fn held_bytes(&self) -> usize {
+        self.sections
+            .values()
+            .map(|compacted| {
+                std::mem::size_of::<((u32, u32), Compacted)>()
+                    + compacted.pieces.len() * std::mem::size_of::<Piece>()
+            })
+            .sum()
+    }
+}
+
 /// Where every surviving input byte moved to.
 ///
 /// An absent section is one that lost nothing, and maps to itself. That is the
@@ -2110,6 +2155,24 @@ pub(crate) struct ReachState {
 }
 
 impl ReachState {
+    /// Roughly what holding this costs a resident linker.
+    ///
+    /// The graph's edge arena dominates — 1.5 million local edges and 1.2
+    /// million by name on a debug rust-analyzer link — followed by the strip,
+    /// which is a piece list per section that lost bytes.
+    pub(crate) fn held_bytes(&self) -> usize {
+        let words = |count: usize| count * std::mem::size_of::<u32>();
+        words(self.objects.len())
+            + self.projections.len() * std::mem::size_of::<u64>()
+            + words(self.bases.len())
+            + words(self.resolved.len())
+            + words(self.resolved_base.len())
+            + self.numbering.held_bytes()
+            + self.graph.held_bytes()
+            + self.live.held_bytes()
+            + self.strip.held_bytes()
+    }
+
     /// Whether `digests` is exactly what produced this state.
     ///
     /// The identity check the old `Session::strip` performed, minus the

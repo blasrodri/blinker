@@ -345,6 +345,39 @@ impl LinkCache {
     pub fn matches(&self, inputs: &[(PathBuf, InputKey)], request: &[u8; 32]) -> bool {
         !self.image.is_empty() && &self.request == request && self.inputs == inputs
     }
+
+    /// Roughly what holding this costs, for a caller keeping several.
+    ///
+    /// The finished image dominates by two orders of magnitude — 178 MB against
+    /// a few for everything else on a debug rust-analyzer link — so the
+    /// approximations below matter far less than counting it at all. `deps` is
+    /// shared between entries and is counted once per holder rather than
+    /// tracked, which over-counts; erring high is the safe direction for a
+    /// number a budget evicts on.
+    pub fn held_bytes(&self) -> usize {
+        let entries: usize = self
+            .entries
+            .iter()
+            .map(|entry| {
+                std::mem::size_of::<Entry>()
+                    + entry.ranges.len() * std::mem::size_of::<Range>()
+                    + entry.deps.len() * std::mem::size_of::<NameHash>()
+                    + entry.binds.len() * std::mem::size_of::<CachedBind>()
+                    + entry.rebases.len() * std::mem::size_of::<CachedRebase>()
+            })
+            .sum();
+        let sections: usize = self
+            .sections
+            .iter()
+            .map(|(_, bytes)| bytes.len() + std::mem::size_of::<(u32, Vec<u8>)>())
+            .sum();
+        self.image.len()
+            + self.page_hashes.len() * 32
+            + self.addresses.len() * std::mem::size_of::<(NameHash, u64)>()
+            + self.inputs.len() * std::mem::size_of::<(PathBuf, InputKey)>()
+            + entries
+            + sections
+    }
 }
 
 impl LinkCache {

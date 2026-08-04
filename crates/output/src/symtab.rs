@@ -407,6 +407,18 @@ impl StringTable {
         &self.bytes
     }
 
+    /// Roughly what holding this costs. The blob dominates — 82 MB against a
+    /// few for the indexes on a debug rust-analyzer link.
+    pub fn held_bytes(&self) -> usize {
+        self.bytes.len()
+            + self.by_key.len() * std::mem::size_of::<u32>()
+            + self
+                .by_text
+                .keys()
+                .map(|name| name.len() + std::mem::size_of::<(Box<str>, u32)>())
+                .sum::<usize>()
+    }
+
     /// Where `name` sits, appending it if this is the first time it is asked
     /// for. `key` is the caller's identity for the name, or
     /// [`OutputSymbol::UNKEYED`].

@@ -468,6 +468,13 @@ def main():
             first = counters.get("first_interface_change") or ""
             print(f"           {changes} interface(s) moved, first: {_os.path.basename(first)}")
 
+    bytes_held = counters.get("held_bytes")
+    if bytes_held is not None:
+        budget = counters.get("budget_bytes") or 1
+        print(f"  memory: {bytes_held / 2**20:.0f} MB of per-target state held"
+              f" of {budget / 2**20:.0f} MB budgeted"
+              f" ({100 * bytes_held / budget:.0f}%)")
+
     reused = counters.get("symbols_reused")
     if reused is not None:
         total = counters.get("symbols_total") or 1

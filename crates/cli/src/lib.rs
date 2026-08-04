@@ -216,6 +216,8 @@ pub fn run_in(
                 reach_total: phases.reach_total,
                 symbols_reused: phases.symbols_reused,
                 symbols_total: phases.symbols_total,
+                held_bytes: phases.held_bytes,
+                budget_bytes: phases.budget_bytes,
                 prepare_breakdown: [
                     phases.placements_ms,
                     phases.personality_ms,

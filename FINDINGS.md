@@ -9976,3 +9976,80 @@ adding a tenth of a gigabyte to an unbounded thing is not a default.
 Turning it on also means converting five byte-identity tests to equivalence
 tests, which weakens the oracle for every future change and not just this one.
 Both of those belong with the byte-budgeted store, not ahead of it.
+
+## 201. A budget in bytes, and the discovery that it bounds the wrong four hundred megabytes
+
+Finding 200 left the retained symbol table switched off for memory: 110 MB per
+target on a daemon whose RSS was 3.6 GB, against bounds expressed in *counts* —
+three targets' worth of answers, three finished images. Those counts were each
+defensible and together said nothing, because the things counted differ by
+three orders of magnitude: an extraction order is a few kilobytes and a
+`LinkCache` carries a 178 MB binary. Adding a tenth of a gigabyte per target to
+a bound that could not see it was not a default.
+
+So the six per-target maps are now one `TargetState` — stub exports, extraction
+order, imports, reachability, string table, symbol runs, cache — in a store
+bounded by bytes and evicted least-recently-used, `BLINKER_MEMORY_BUDGET`
+megabytes, default 1024.
+
+Grouping them fixed something nobody had noticed. A target's symbol runs name
+their symbols by offset into *that target's* string table, and the two lived in
+separate maps that evicted independently: keeping one without the other holds
+27 MB that can never be used. Nothing checked it — the `offsets_id` comparison
+caught the mismatch and threw the runs away, safely and silently. They leave
+together now.
+
+The store reports itself, which is the point:
+
+```
+  retention off   291 MB of per-target state held of 1024 MB budgeted
+  retention on    400 MB
+```
+
+109 MB — the estimate finding 200 refused to switch on for, confirmed to within
+a megabyte by counting rather than guessing.
+
+### And the number that matters is somewhere else
+
+The same measurement says the budget bounds 400 MB of a 3.0 GB process. `vmmap`
+on the resident daemon:
+
+```
+  MALLOC_SMALL           781.5M resident      live: parsed objects
+  MALLOC_LARGE           535.7M resident
+  MALLOC_LARGE (empty)     1.2G resident      freed, never returned
+  MALLOC_SMALL (empty)    82.6M resident
+  Physical footprint       3.1G
+```
+
+A third of the footprint is memory the allocator has already freed and kept.
+The rest is parsed inputs, which are bounded by a window of four links rather
+than by bytes.
+
+`malloc_zone_pressure_relief` is the obvious answer to the first third, and it
+does not work. It halves `MALLOC_LARGE (empty)` — 1.2 GB to 639 MB — and the
+footprint does not follow. Measured properly, one binary and an off-switch, six
+links each from a fresh daemon:
+
+```
+  relief off    RSS 2981 MB
+  relief on     RSS 3106 MB
+```
+
+Slightly worse, which at this spread means "no effect". It is reverted rather
+than kept with an explanation, because a fix that does not move the number is a
+comment claiming otherwise.
+
+### What this actually established
+
+The budget is right and it is aimed at the wrong 400 MB. That is worth knowing
+in exactly this order: the derived state now has a bound that a new retained
+structure cannot silently escape, and the measurement it forced says the next
+memory work is the parse cache and the allocator, not the answers.
+
+`BLINKER_RETAIN_STRINGS` therefore stays off for one more reason than before,
+and a better one. It is no longer "110 MB is too much to add blindly" — the
+budget can see it now, and 400 of 1024 has room. It is that turning it on
+converts five byte-identity tests into equivalence tests, and that oracle is
+worth more than 14 ms until the thing it guards has stopped changing every
+other commit.
