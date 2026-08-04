@@ -21,14 +21,35 @@
 //! worth protecting: a daemon that interprets arguments differently from the
 //! one-shot path is a second linker with a shared name.
 //!
-//! # Why one link at a time
+//! # Why four processes and not four threads
 //!
-//! The session is `&mut` and holds every parsed input; serving two links at
-//! once would mean either two sessions — which halves the point — or locking
-//! around the thing every stage touches. Requests queue. A build system that
-//! links twelve crates in parallel gets them one after another, each ~19 ms
-//! rather than ~42, which is still ahead; making it concurrent is a later
-//! question about sharing a session, not about sockets.
+//! One daemon serves one link at a time, and finding 204 measured the cost:
+//! a real cold build submits eleven links at once, and they queue into a
+//! 35.7 → 205.5 ms staircase in which every served link's own timings look
+//! perfectly healthy. The queue is invisible from inside the daemon.
+//!
+//! Threads were the obvious fix and are the wrong one, for a reason that has
+//! nothing to do with the session. Relative paths in a request are resolved
+//! against the *caller's* directory, and the way that is done is `chdir` —
+//! which is a property of the process, not the thread. Two links running
+//! concurrently in one process would resolve each other's relative paths, and
+//! a linker that reads the wrong object file produces a wrong binary rather
+//! than an error. Making that safe means resolving every path in a request by
+//! hand — inputs, `-o`, `-L`, `-F`, response files — where one missed flag is
+//! silently the wrong file.
+//!
+//! Separate processes keep `chdir` correct for free, and the pid turns out to
+//! be load-bearing twice more: the output is written to `.blinker-{pid}.tmp`
+//! beside its destination and the cache to `.tmp{pid}`, both published by
+//! rename. Every one of those is safe across processes and would have been a
+//! collision across threads.
+//!
+//! So: [`WORKERS`] resident linkers, each owning one session, each serving one
+//! link at a time. A request is routed to one of them by hashing its output
+//! path ([`worker_of`]), which keeps a target on the worker that already holds
+//! its state and serialises two links to the same output — which they require
+//! anyway, since they write the same file. Workers are started on demand, so a
+//! build that links one crate still runs one daemon.
 //!
 //! # Why the socket name carries the linker's identity
 //!
@@ -94,14 +115,97 @@ const STARTUP_WINDOW: Duration = Duration::from_secs(10);
 /// second and nothing on the latency of a link.
 const TICK: Duration = Duration::from_secs(1);
 
-/// Where this linker's daemon listens.
+/// How many resident linkers serve one build.
+///
+/// Four because that is the width a cargo build actually presents: finding 204
+/// caught eleven links submitted at once, but they arrive in waves as crates
+/// finish, and the useful width is bounded by how many crates are ready at the
+/// same moment rather than by how many the build contains. Each worker holds a
+/// session, so the number is also a memory multiplier — see [`start`], which
+/// divides the budget between them rather than handing each the whole thing.
+pub const WORKERS: usize = 4;
+
+/// Where one of this linker's daemons listens.
 ///
 /// Per user and per executable: see the module docs on why the executable's
 /// identity is in the name, and why the two halves of that identity are
-/// separable.
-pub fn socket_path(executable: &Path) -> PathBuf {
-    let (_, name) = socket_name(executable);
+/// separable. The worker index is last so the set is legible in the temporary
+/// directory — `…-0.sock` through `…-3.sock` — which matters because these are
+/// processes nobody started deliberately and may have to look for.
+pub fn socket_path(executable: &Path, worker: usize) -> PathBuf {
+    let (_, name) = socket_name(executable, worker);
     std::env::temp_dir().join(name)
+}
+
+/// Which worker serves this invocation.
+///
+/// The output path is the key, because it is what "target" means to everything
+/// downstream: one binary is one session's worth of retained state, and two
+/// links writing the same binary must not run at once whatever else is true.
+/// Hashing it keeps a target on one worker for the life of the daemon, so the
+/// state a link leaves behind is state the next link to that target will find.
+///
+/// The key is built lexically — joined to the working directory if relative,
+/// then `.` and `..` removed — and never with `canonicalize`. Resolving it on
+/// disk reads better and is wrong: the answer would depend on whether the
+/// output's directory exists *yet*, so a target would route one way on the
+/// link that creates its directory and another way afterwards, losing the
+/// session it had just filled. A test caught exactly that. It also spends a
+/// syscall per path component on every link, in a path being measured against
+/// a 2 ms budget.
+///
+/// What lexical costs is that two spellings of one file through a symlink —
+/// `/tmp/x/prog` and `/private/tmp/x/prog` — route apart. No build system
+/// spells its own output two ways within a build, and two concurrent links to
+/// one output file are a build error before they are a linker's problem; the
+/// property being bought here is that a *given* spelling always lands on the
+/// same worker, and that one is exact.
+pub fn worker_of(argv: &[String]) -> usize {
+    let Some(output) = argv
+        .iter()
+        .position(|arg| arg == "-o")
+        .and_then(|at| argv.get(at + 1))
+    else {
+        // No output named: not a link this router can place, and worker 0 is
+        // as good as any. It will still be served correctly — routing decides
+        // where, never whether.
+        return 0;
+    };
+    let path = Path::new(output);
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(_) => path.to_path_buf(),
+        }
+    };
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(lexical(&absolute).as_os_str().as_encoded_bytes());
+    let digest = u64::from_le_bytes(hasher.finalize().as_bytes()[..8].try_into().expect("8"));
+    (digest % WORKERS as u64) as usize
+}
+
+/// An absolute path with `.` and `..` removed, without touching the disk.
+///
+/// `..` is popped rather than resolved, which differs from what the filesystem
+/// would say when the component above is a symlink. That is the documented
+/// limit of [`worker_of`]: this decides which worker, never whether.
+fn lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 /// The socket's file name, and the prefix every daemon for this *path* shares.
@@ -110,7 +214,7 @@ pub fn socket_path(executable: &Path) -> PathBuf {
 /// under the same prefix was started from the same executable path, and
 /// everything under the same prefix with a different suffix was started from
 /// different bytes at that path.
-fn socket_name(executable: &Path) -> (String, String) {
+fn socket_name(executable: &Path, worker: usize) -> (String, String) {
     let mut path = blake3::Hasher::new();
     path.update(executable.as_os_str().as_encoded_bytes());
     let mut content = blake3::Hasher::new();
@@ -130,6 +234,11 @@ fn socket_name(executable: &Path) -> (String, String) {
     // grouping key, and a collision costs one unnecessary retirement; forty-
     // eight bits of content is the identity that must not collide, and its
     // input includes an mtime in nanoseconds.
+    //
+    // The worker suffix spends two more of those bytes. It is worth naming
+    // that this is the budget it comes out of: the name is around 40 bytes on
+    // top of a temporary directory of about 50, so there is room for a
+    // one-digit worker index and not for a second hash.
     let prefix = format!(
         "blinker-{}-{}-",
         // The uid keeps two users on one machine from sharing a socket, which
@@ -138,7 +247,10 @@ fn socket_name(executable: &Path) -> (String, String) {
         unsafe { libc::getuid() },
         &path.finalize().to_hex()[..8]
     );
-    let name = format!("{prefix}{}.sock", &content.finalize().to_hex()[..12]);
+    let name = format!(
+        "{prefix}{}-{worker}.sock",
+        &content.finalize().to_hex()[..12]
+    );
     (prefix, name)
 }
 
@@ -206,7 +318,11 @@ fn decode_request(payload: &[u8]) -> Option<(PathBuf, Vec<String>)> {
 /// `Ok(None)` means there is no daemon — no socket, or one nothing is
 /// listening on. That is not an error: the caller links in-process instead,
 /// which is what every invocation did before this existed.
-pub fn request(socket: &Path, argv: &[String]) -> std::io::Result<Option<(i32, Vec<u8>)>> {
+pub fn request(
+    socket: &Path,
+    argv: &[String],
+    worker: usize,
+) -> std::io::Result<Option<(i32, Vec<u8>)>> {
     let mut stream = match UnixStream::connect(socket) {
         Ok(stream) => stream,
         Err(error) if is_absent(&error) => return Ok(None),
@@ -249,7 +365,7 @@ pub fn request(socket: &Path, argv: &[String]) -> std::io::Result<Option<(i32, V
         Err(error) if delivered => Err(std::io::Error::other(format!(
             "the resident linker died while performing this link ({error}); \
              linking in process. Run it in the foreground to see why: \
-             blinker --blinker-daemon-serve"
+             blinker --blinker-daemon-serve={worker}"
         ))),
         Err(error) => Err(error),
     }
@@ -469,7 +585,19 @@ pub fn stop(socket: &Path) {
 /// worth of parsed objects until its idle timeout. Under active development
 /// that is one abandoned process per rebuild.
 pub fn retire_superseded(executable: &Path) {
-    let (prefix, current) = socket_name(executable);
+    // Every worker of *this* build is kept, not just the caller's own. They
+    // share a path prefix and differ only in the content hash, so a worker
+    // that swept on "not my socket name" would stop its three siblings on
+    // startup — and each of them would stop it back.
+    let keep: Vec<String> = (0..WORKERS)
+        .map(|worker| socket_name(executable, worker).1)
+        .collect();
+    sweep(executable, &keep);
+}
+
+/// Stop every daemon under this executable's prefix except the names in `keep`.
+fn sweep(executable: &Path, keep: &[String]) {
+    let (prefix, _) = socket_name(executable, 0);
     let directory = std::env::temp_dir();
     let Ok(entries) = std::fs::read_dir(&directory) else {
         return;
@@ -477,7 +605,10 @@ pub fn retire_superseded(executable: &Path) {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if !name.starts_with(&prefix) || !name.ends_with(".sock") || name == current {
+        if !name.starts_with(&prefix) || !name.ends_with(".sock") {
+            continue;
+        }
+        if keep.iter().any(|kept| kept == name) {
             continue;
         }
         stop(&directory.join(name));
@@ -488,9 +619,9 @@ pub fn retire_superseded(executable: &Path) {
 ///
 /// The session lives here and nowhere else: one per daemon, handed to every
 /// request, which is the entire reason the daemon exists.
-pub fn serve_links() -> std::io::Result<()> {
+pub fn serve_links(worker: usize) -> std::io::Result<()> {
     let executable = std::env::current_exe()?;
-    let socket = socket_path(&executable);
+    let socket = socket_path(&executable, worker);
     // Before binding, not after: if this process loses the race to bind, the
     // daemon that won is this same executable and the sweep was still the
     // right thing to have done.
@@ -505,7 +636,7 @@ pub fn serve_links() -> std::io::Result<()> {
     // exactly when it stops being findable.
     let identity = socket.clone();
     let superseded = move || {
-        std::env::current_exe().is_ok_and(|executable| socket_path(&executable) != identity)
+        std::env::current_exe().is_ok_and(|executable| socket_path(&executable, worker) != identity)
     };
 
     serve(
@@ -542,11 +673,11 @@ pub fn serve_links() -> std::io::Result<()> {
 /// Ask a resident linker to perform this link.
 ///
 /// `Ok(None)` means there is none, and the caller should link in-process.
-pub fn link_via_daemon(argv: &[String]) -> std::io::Result<Option<i32>> {
+pub fn link_via_daemon(argv: &[String], worker: usize) -> std::io::Result<Option<i32>> {
     let executable = std::env::current_exe()?;
-    let socket = socket_path(&executable);
+    let socket = socket_path(&executable, worker);
     let asked = std::time::Instant::now();
-    let Some((code, stderr)) = request(&socket, argv)? else {
+    let Some((code, stderr)) = request(&socket, argv, worker)? else {
         return Ok(None);
     };
     // What the client waited, from the client's side. The daemon serves one
@@ -575,6 +706,7 @@ pub fn link_via_daemon(argv: &[String]) -> std::io::Result<Option<i32>> {
             .and_then(|at| argv.get(at + 1))
             .map(String::as_str)
             .unwrap_or("?");
+        let output = format!("{worker} {output}");
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -604,13 +736,19 @@ pub fn link_via_daemon(argv: &[String]) -> std::io::Result<Option<i32>> {
 /// be idle, of an experiment.
 pub fn stop_resident() -> std::io::Result<()> {
     let executable = std::env::current_exe()?;
-    stop(&socket_path(&executable));
-    // The current build's daemon is one of possibly several: every previous
-    // build of blinker at this path may have left one, and "stop the linker"
-    // should not mean "stop the newest of them".
-    retire_superseded(&executable);
+    for worker in 0..WORKERS {
+        stop(&socket_path(&executable, worker));
+    }
+    // The current build's daemons are some of possibly many: every previous
+    // build of blinker at this path may have left a set, and "stop the linker"
+    // should not mean "stop the newest of them". Nothing is kept — this is the
+    // one sweep that is allowed to take the current build's workers too, and
+    // they have already been asked to stop above.
+    sweep(&executable, &[]);
     // A marker left behind would suppress the next start for its whole window.
-    let _ = std::fs::remove_file(starting(&socket_path(&executable)));
+    for worker in 0..WORKERS {
+        let _ = std::fs::remove_file(starting(&socket_path(&executable, worker)));
+    }
     Ok(())
 }
 
@@ -628,14 +766,21 @@ pub fn engage(argv: &[String]) -> Option<i32> {
         return None;
     }
     let executable = std::env::current_exe().ok()?;
-    let socket = socket_path(&executable);
-    match link_via_daemon(argv) {
+    // Routed before anything is asked of any daemon: which worker owns this
+    // target decides which socket is even looked for, so a target that has a
+    // resident linker never falls back because a *different* worker is the one
+    // that has not started yet.
+    let worker = worker_of(argv);
+    let socket = socket_path(&executable, worker);
+    match link_via_daemon(argv, worker) {
         Ok(Some(code)) => Some(code),
         Ok(None) => {
             // The first link of a build is the one that pays for the rest: it
             // links here, and by the time the second arrives there is a daemon
-            // to answer it.
-            start(&executable, &socket);
+            // to answer it. Per worker, so a build reaches its full width only
+            // as it presents targets that hash to each of them — which is the
+            // right shape: a one-crate build never starts four processes.
+            start(&executable, &socket, worker);
             None
         }
         // Quiet unless the daemon was asked for by name. It is the default
@@ -671,7 +816,7 @@ fn wanted(argv: &[String]) -> bool {
 /// Waiting would hand this link to it, which sounds like a saving and is not:
 /// the daemon's value is entirely in the state it accumulates, and it has none
 /// yet. Starting it costs a fork; linking here costs what it always did.
-fn start(executable: &Path, socket: &Path) {
+fn start(executable: &Path, socket: &Path, worker: usize) {
     if !claim(&starting(socket)) {
         return;
     }
@@ -679,12 +824,37 @@ fn start(executable: &Path, socket: &Path) {
     // Detached from this process's streams. A daemon inheriting them would
     // write into whatever `rustc` is reading, and would keep a pipe open long
     // after the build that started it finished.
-    let _ = std::process::Command::new(executable)
-        .arg("--blinker-daemon-serve")
+    let mut command = std::process::Command::new(executable);
+    command
+        .arg(format!("--blinker-daemon-serve={worker}"))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+        .stderr(Stdio::null());
+    // `BLINKER_MEMORY_BUDGET` is what a user means by "do not hold more than
+    // this much", and they mean it about the linker rather than about one of
+    // four processes they did not know existed. Finding 201 gave the session a
+    // byte budget precisely so retained state would be bounded; four workers
+    // each honouring the whole number would quietly quadruple it.
+    let share = (blinker_link::memory_budget() / WORKERS / (1024 * 1024)).max(1);
+    command.env("BLINKER_MEMORY_BUDGET", share.to_string());
+    let _ = command.spawn();
+}
+
+/// The worker index in `--blinker-daemon-serve[=N]`, if this is that request.
+///
+/// The bare spelling is worker 0 and is what a person types: the error a client
+/// prints when a daemon dies tells them to run one in the foreground, and it
+/// names the worker, but the common case of looking at any of them should not
+/// require knowing the routing.
+pub fn serving(argv: &[String]) -> Option<usize> {
+    argv.iter().find_map(|arg| {
+        let rest = arg.strip_prefix("--blinker-daemon-serve")?;
+        match rest.strip_prefix('=') {
+            Some(index) => index.parse().ok(),
+            None if rest.is_empty() => Some(0),
+            None => None,
+        }
+    })
 }
 
 /// The marker saying a start is in progress.
@@ -751,7 +921,7 @@ mod tests {
         let argv = vec!["-o".to_string(), "out".to_string(), "a.o".to_string()];
         let mut answer = None;
         for _ in 0..200 {
-            match request(&socket, &argv) {
+            match request(&socket, &argv, 0) {
                 Ok(Some(response)) => {
                     answer = Some(response);
                     break;
@@ -772,7 +942,7 @@ mod tests {
     #[test]
     fn no_socket_is_not_a_failure() {
         let scratch = Scratch::dir("daemon-absent").expect("scratch");
-        let answer = request(&scratch.join("nothing.sock"), &[]).expect("not an error");
+        let answer = request(&scratch.join("nothing.sock"), &[], 0).expect("not an error");
         assert!(answer.is_none());
     }
 
@@ -787,7 +957,7 @@ mod tests {
             socket.exists(),
             "the socket file should outlive the listener"
         );
-        assert!(request(&socket, &[]).expect("not an error").is_none());
+        assert!(request(&socket, &[], 0).expect("not an error").is_none());
     }
 
     /// And `serve` takes that stale file over rather than refusing to start.
@@ -810,7 +980,7 @@ mod tests {
         };
         let mut answer = None;
         for _ in 0..200 {
-            if let Ok(Some(response)) = request(&socket, &["a".to_string(), "b".to_string()]) {
+            if let Ok(Some(response)) = request(&socket, &["a".to_string(), "b".to_string()], 0) {
                 answer = Some(response);
                 break;
             }
@@ -968,18 +1138,59 @@ mod tests {
         let scratch = Scratch::dir("daemon-name").expect("scratch");
         let executable = scratch.join("blinker");
         std::fs::write(&executable, b"one").expect("written");
-        let (prefix, first) = socket_name(&executable);
+        let (prefix, first) = socket_name(&executable, 0);
 
         // Rebuilt in place: a different size, so a different content hash.
         std::fs::write(&executable, b"a longer build").expect("rewritten");
-        let (again, second) = socket_name(&executable);
+        let (again, second) = socket_name(&executable, 0);
 
         assert_eq!(prefix, again, "the path half moved");
         assert_ne!(first, second, "the content half did not");
         assert!(second.starts_with(&prefix) && second.ends_with(".sock"));
 
-        let (elsewhere, _) = socket_name(&scratch.join("other/blinker"));
+        let (elsewhere, _) = socket_name(&scratch.join("other/blinker"), 0);
         assert_ne!(prefix, elsewhere, "two paths shared a prefix");
+    }
+
+    /// Workers of one build must be distinguishable and must not be mistaken
+    /// for predecessors: they share every hash and differ only in the suffix,
+    /// which is what `retire_superseded` has to keep rather than sweep.
+    #[test]
+    fn every_worker_of_one_build_gets_its_own_name_under_one_prefix() {
+        let scratch = Scratch::dir("daemon-workers").expect("scratch");
+        let executable = scratch.join("blinker");
+        std::fs::write(&executable, b"one").expect("written");
+        let names: Vec<(String, String)> = (0..WORKERS)
+            .map(|worker| socket_name(&executable, worker))
+            .collect();
+        let prefix = &names[0].0;
+        assert!(names.iter().all(|(p, _)| p == prefix), "prefixes diverged");
+        let distinct: std::collections::BTreeSet<&String> =
+            names.iter().map(|(_, name)| name).collect();
+        assert_eq!(distinct.len(), WORKERS, "two workers share a socket");
+        // The budget from `socket_name`'s comment, checked rather than
+        // asserted in prose: `sockaddr_un` is 104 bytes on macOS and the
+        // temporary directory is most of it.
+        let longest = std::env::temp_dir().join(&names[WORKERS - 1].1);
+        assert!(
+            longest.as_os_str().len() < 104,
+            "the socket path no longer fits: {}",
+            longest.display()
+        );
+    }
+
+    /// Routing decides *where*, and has to give the same answer every time for
+    /// one output — including when the spelling changes but the file does not.
+    #[test]
+    fn one_output_always_routes_to_one_worker() {
+        let argv = |output: &str| vec!["-o".to_string(), output.to_string()];
+        let direct = worker_of(&argv("/a/b/prog"));
+        assert_eq!(direct, worker_of(&argv("/a/./b/prog")));
+        assert_eq!(direct, worker_of(&argv("/a/x/../b/prog")));
+        assert!(direct < WORKERS);
+        // And an invocation with no output still routes somewhere rather than
+        // failing: routing never decides whether a link happens.
+        assert!(worker_of(&["a.o".to_string()]) < WORKERS);
     }
 
     /// A length field larger than the cap is refused rather than allocated.

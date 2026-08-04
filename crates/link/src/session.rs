@@ -278,7 +278,11 @@ impl TargetStore {
 /// A gibibyte holds roughly three targets fully warmed, which is what the
 /// counts held in practice, and now says so in the unit that decides whether a
 /// developer's machine minds.
-fn memory_budget() -> usize {
+/// The bytes a session may hold across links.
+///
+/// Public because the daemon divides it: a user setting `BLINKER_MEMORY_BUDGET`
+/// is bounding the linker, not each of the four processes it runs.
+pub fn memory_budget() -> usize {
     const DEFAULT: usize = 1024;
     static BUDGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *BUDGET.get_or_init(|| {

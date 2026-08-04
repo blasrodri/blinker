@@ -61,7 +61,7 @@ mod parallel;
 mod session;
 use hashing::FastMap;
 pub use identity::ContributionKeys;
-pub use session::Session;
+pub use session::{memory_budget, Session};
 
 pub mod error;
 pub use error::LinkError;

@@ -23,8 +23,8 @@ fn main() -> ExitCode {
 
     // Serving is a mode, not a link: the process becomes the resident linker
     // and does not return until it has been idle long enough to be pointless.
-    if argv.iter().any(|a| a == "--blinker-daemon-serve") {
-        return match blinker_cli::daemon::serve_links() {
+    if let Some(worker) = blinker_cli::daemon::serving(&argv) {
+        return match blinker_cli::daemon::serve_links(worker) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("blinker: daemon: {error}");

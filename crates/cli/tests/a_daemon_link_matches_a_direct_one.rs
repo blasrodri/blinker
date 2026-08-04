@@ -56,14 +56,16 @@ fn link_args(objects: &[PathBuf], output: &Path) -> Vec<String> {
 /// still using it. A short directory per test gives each its own daemon, and
 /// short because a socket path has to fit in `sockaddr_un`.
 struct Daemon {
-    child: Child,
+    children: Vec<Child>,
     sockets: PathBuf,
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        for child in &mut self.children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         let _ = std::fs::remove_dir_all(&self.sockets);
     }
 }
@@ -74,32 +76,48 @@ impl Daemon {
     /// Waiting is not politeness. A client that finds no daemon starts one and
     /// links in-process, so a test that raced its own daemon would measure the
     /// fallback and leave behind a second daemon that nothing owns.
+    ///
+    /// The whole set, not one. A client routes by output path, so which worker
+    /// a link goes to is a hash the test does not control — and a worker that
+    /// is not running is a client that falls back in process, silently passing
+    /// every assertion below.
     fn start(tag: &str) -> Daemon {
         let sockets = PathBuf::from(format!("/tmp/bd-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&sockets);
         std::fs::create_dir_all(&sockets).expect("socket directory");
-        let child = Command::new(workspace_binary("blinker"))
-            .env("TMPDIR", &sockets)
-            .arg("--blinker-daemon-serve")
-            .spawn()
-            .expect("the daemon starts");
-        let daemon = Daemon { child, sockets };
+        let children = (0..blinker_cli::daemon::WORKERS)
+            .map(|worker| {
+                Command::new(workspace_binary("blinker"))
+                    .env("TMPDIR", &sockets)
+                    .arg(format!("--blinker-daemon-serve={worker}"))
+                    .spawn()
+                    .expect("the daemon starts")
+            })
+            .collect();
+        let daemon = Daemon { children, sockets };
 
         let deadline = Instant::now() + Duration::from_secs(30);
-        while Instant::now() < deadline && daemon.socket().is_none() {
+        while Instant::now() < deadline && !daemon.all_answering() {
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(daemon.socket().is_some(), "the daemon never came up");
+        assert!(daemon.all_answering(), "the daemons never came up");
         daemon
     }
 
-    /// The socket it bound, once it has bound one.
-    fn socket(&self) -> Option<PathBuf> {
-        let entries = std::fs::read_dir(&self.sockets).ok()?;
-        entries.flatten().map(|entry| entry.path()).find(|path| {
-            path.extension().is_some_and(|kind| kind == "sock")
-                && blinker_cli::daemon::is_alive(path)
-        })
+    /// Whether every worker has bound and is answering.
+    fn all_answering(&self) -> bool {
+        let Ok(entries) = std::fs::read_dir(&self.sockets) else {
+            return false;
+        };
+        let alive = entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension().is_some_and(|kind| kind == "sock")
+                    && blinker_cli::daemon::is_alive(path)
+            })
+            .count();
+        alive == blinker_cli::daemon::WORKERS
     }
 
     /// Link through this daemon.

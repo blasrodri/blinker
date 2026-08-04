@@ -252,7 +252,7 @@ OPTIONS:
                                        under --blinker-daemon; a loss for one-shot links
     --blinker-daemon                   Link via a resident linker (the default)
     --blinker-no-daemon                Link in this process, and start no daemon
-    --blinker-daemon-serve             Become the resident linker
+    --blinker-daemon-serve[=N]         Become resident linker N (default 0, of 4)
     --blinker-daemon-stop              Stop the resident linker, if any
     --blinker-print-stats              Print the human-readable summary
     --blinker-strict-fingerprints      Hash every input (slower, exact identity)
