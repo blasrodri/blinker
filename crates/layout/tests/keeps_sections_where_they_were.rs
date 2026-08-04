@@ -19,7 +19,7 @@
 //! `__eh_frame` dies in the unwinder, and dyld rejects a `__thread_vars` whose
 //! size is not a multiple of its record size.
 
-use blinker_layout::{compute_layout_with_slop, InputPlacement, Layout, Slop};
+use blinker_layout::{compute_layout_with_slop, ImageKind, InputPlacement, Layout, Slop};
 use blinker_macho::{ObjectId, SectionId, SectionKind};
 
 fn section(object: u32, name: &str, kind: SectionKind, size: u64) -> InputPlacement {
@@ -57,9 +57,19 @@ fn address_of(layout: &Layout, name: &str) -> u64 {
 /// exactly where it was.
 #[test]
 fn an_edit_within_the_stride_moves_nothing_after_it() {
-    let before = compute_layout_with_slop(&inputs(100_000), 0x1000, Slop::DEFAULT);
+    let before = compute_layout_with_slop(
+        ImageKind::Executable,
+        &inputs(100_000),
+        0x1000,
+        Slop::DEFAULT,
+    );
     // 768 bytes: the size change a real one-crate edit produced.
-    let after = compute_layout_with_slop(&inputs(100_768), 0x1000, Slop::DEFAULT);
+    let after = compute_layout_with_slop(
+        ImageKind::Executable,
+        &inputs(100_768),
+        0x1000,
+        Slop::DEFAULT,
+    );
 
     for name in ["__const", "__cstring", "__eh_frame"] {
         assert_eq!(
@@ -77,8 +87,10 @@ fn an_edit_within_the_stride_moves_nothing_after_it() {
 /// these sections at aligned addresses for unrelated reasons.
 #[test]
 fn without_a_stable_layout_the_same_edit_moves_them_all() {
-    let before = compute_layout_with_slop(&inputs(100_000), 0x1000, Slop::NONE);
-    let after = compute_layout_with_slop(&inputs(100_768), 0x1000, Slop::NONE);
+    let before =
+        compute_layout_with_slop(ImageKind::Executable, &inputs(100_000), 0x1000, Slop::NONE);
+    let after =
+        compute_layout_with_slop(ImageKind::Executable, &inputs(100_768), 0x1000, Slop::NONE);
 
     let moved = ["__const", "__cstring", "__eh_frame"]
         .iter()
@@ -100,8 +112,18 @@ fn without_a_stable_layout_the_same_edit_moves_them_all() {
 /// is a different mechanism.
 #[test]
 fn a_change_larger_than_the_stride_still_moves_what_follows() {
-    let before = compute_layout_with_slop(&inputs(100_000), 0x1000, Slop::DEFAULT);
-    let after = compute_layout_with_slop(&inputs(140_000), 0x1000, Slop::DEFAULT);
+    let before = compute_layout_with_slop(
+        ImageKind::Executable,
+        &inputs(100_000),
+        0x1000,
+        Slop::DEFAULT,
+    );
+    let after = compute_layout_with_slop(
+        ImageKind::Executable,
+        &inputs(140_000),
+        0x1000,
+        Slop::DEFAULT,
+    );
     assert_ne!(
         address_of(&before, "__const"),
         address_of(&after, "__const"),
@@ -114,8 +136,14 @@ fn a_change_larger_than_the_stride_still_moves_what_follows() {
 /// section rather than growing with the content.
 #[test]
 fn the_padding_costs_at_most_one_stride_per_section() {
-    let unpadded = compute_layout_with_slop(&inputs(100_000), 0x1000, Slop::NONE);
-    let padded = compute_layout_with_slop(&inputs(100_000), 0x1000, Slop::DEFAULT);
+    let unpadded =
+        compute_layout_with_slop(ImageKind::Executable, &inputs(100_000), 0x1000, Slop::NONE);
+    let padded = compute_layout_with_slop(
+        ImageKind::Executable,
+        &inputs(100_000),
+        0x1000,
+        Slop::DEFAULT,
+    );
 
     let end = |layout: &Layout| {
         layout

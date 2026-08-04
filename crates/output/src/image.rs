@@ -34,8 +34,8 @@ pub type PlacementKeys = std::collections::HashMap<(u32, u32), ContributionKey>;
 pub type PlacementReservations = std::collections::HashMap<(u32, u32), u64>;
 
 use blinker_layout::{
-    align_up, compute_layout_reusing, compute_layout_with_slop, ContributionKey, InputPlacement,
-    Layout, PreviousLayout, Slop, PAGE_SIZE,
+    align_up, compute_layout_reusing, compute_layout_with_slop, ContributionKey, ImageKind,
+    InputPlacement, Layout, PreviousLayout, Slop, PAGE_SIZE,
 };
 
 use crate::commands::{self, LinkEditLayout};
@@ -108,6 +108,13 @@ pub struct ImageBuilder<'a> {
     /// know its own output path here, so the caller sets it; the default is
     /// what an unnamed link produces.
     identifier: String,
+    /// Executable or dylib. Decides the header, the address the image is laid
+    /// out from, whether `__PAGEZERO` exists, and which of `LC_MAIN` and
+    /// `LC_ID_DYLIB` is emitted — one set of consequences, so one field.
+    kind: ImageKind,
+    /// The path a dylib records for itself in `LC_ID_DYLIB`. Unused by an
+    /// executable. See [`ImageBuilder::dylib_output`].
+    install_name: String,
 }
 
 #[derive(Debug)]
@@ -237,7 +244,23 @@ impl<'a> ImageBuilder<'a> {
             // the bytes that determine its value are still being produced.
             uuid: [0; 16],
             identifier: "a.out".to_string(),
+            kind: ImageKind::Executable,
+            install_name: String::new(),
         }
+    }
+
+    /// Produce a dylib rather than an executable, recording `install_name` as
+    /// the path anything linking against it will look for.
+    ///
+    /// Everything else that differs follows from this: the image is laid out
+    /// from address 0 with no `__PAGEZERO`, carries `MH_DYLIB` and
+    /// `LC_ID_DYLIB`, and has neither `LC_MAIN` nor `LC_LOAD_DYLINKER` — a
+    /// dylib names no entry point and does not choose the dynamic linker, since
+    /// whatever loaded it already did.
+    pub fn dylib_output(&mut self, install_name: &str) -> &mut Self {
+        self.kind = ImageKind::Dylib;
+        self.install_name = install_name.to_string();
+        self
     }
 
     /// Set the identifier embedded in the ad-hoc signature.
@@ -363,6 +386,7 @@ impl<'a> ImageBuilder<'a> {
         // Pass one: discover the shape with a nominal reservation.
         let lay_out = |reservation: u64| match &self.previous {
             Some((previous, keys)) => compute_layout_reusing(
+                self.kind,
                 &self.inputs,
                 reservation,
                 self.slop,
@@ -379,16 +403,23 @@ impl<'a> ImageBuilder<'a> {
                         .unwrap_or(0)
                 },
             ),
-            None => compute_layout_with_slop(&self.inputs, reservation, self.slop),
+            None => compute_layout_with_slop(self.kind, &self.inputs, reservation, self.slop),
         };
 
         let mut timings = EmitTimings::default();
         let started = std::time::Instant::now();
-        let dylib_bytes: usize = self
+        let mut dylib_bytes: usize = self
             .dylibs
             .iter()
             .map(|d| commands::command_size_with_path(24, &d.install_name))
             .sum();
+        // `LC_ID_DYLIB` is the same `dylib_command`, so it is sized the same
+        // way. A dylib also drops `LC_MAIN` and `LC_LOAD_DYLINKER`, which
+        // `command_size_for_shape` still counts — 56 bytes of over-reservation,
+        // in the direction that is documented as harmless there.
+        if self.kind == ImageKind::Dylib {
+            dylib_bytes += commands::command_size_with_path(24, &self.install_name);
+        }
         // Over-reserves by three `linkedit_data_command`s: LC_FUNCTION_STARTS,
         // LC_DATA_IN_CODE and LC_CODE_SIGNATURE are not emitted yet but will
         // be. Reserving space we do not use is harmless; running out is not.
@@ -600,7 +631,11 @@ impl<'a> ImageBuilder<'a> {
             .sections
             .iter()
             .any(|s| s.kind == blinker_macho::SectionKind::ThreadLocal);
-        let header = MachHeader::executable().with_thread_local_variables(has_thread_locals);
+        let header = match self.kind {
+            ImageKind::Executable => MachHeader::executable(),
+            ImageKind::Dylib => MachHeader::dylib(),
+        }
+        .with_thread_local_variables(has_thread_locals);
         header.write(&mut writer);
 
         let mut command_count = 0u32;
@@ -626,6 +661,15 @@ impl<'a> ImageBuilder<'a> {
         commands::write_segment(&mut writer, &link_edit_segment, &layout.sections);
         command_count += 1;
 
+        // Directly after the segments, which is where ld64 puts it.
+        if self.kind == ImageKind::Dylib {
+            // Timestamp 1 and version 0.0.0 twice, which is what ld64 writes
+            // for a library given no versions — read off `cc -dynamiclib`
+            // output and confirmed against a Rust proc-macro dylib.
+            commands::write_id_dylib(&mut writer, &self.install_name, 1, 0, 0);
+            command_count += 1;
+        }
+
         // Counted per emission rather than in a batch: a hand-maintained
         // total drifts the moment a command is added, and the header would
         // then claim a count the walk disagrees with.
@@ -635,8 +679,12 @@ impl<'a> ImageBuilder<'a> {
         command_count += 1;
         commands::write_dysymtab(&mut writer, &symbols.groups);
         command_count += 1;
-        commands::write_load_dylinker(&mut writer, DYLD_PATH);
-        command_count += 1;
+        // Only a main executable names the dynamic linker: by the time a dylib
+        // is mapped, dyld is already the thing doing the mapping.
+        if self.kind == ImageKind::Executable {
+            commands::write_load_dylinker(&mut writer, DYLD_PATH);
+            command_count += 1;
+        }
         // Where the 16 payload bytes land, so `build` can hash the finished
         // image and write the result back over them. The command header is two
         // `u32`s, so the payload starts eight bytes in.
@@ -647,8 +695,13 @@ impl<'a> ImageBuilder<'a> {
         command_count += 1;
         commands::write_source_version(&mut writer, 0);
         command_count += 1;
-        commands::write_main(&mut writer, self.entry_offset, 0);
-        command_count += 1;
+        // A dylib has no entry point. `LC_MAIN` in one is not merely unused:
+        // dyld reads it as "this file is a program", and a library claiming to
+        // be one is rejected rather than loaded.
+        if self.kind == ImageKind::Executable {
+            commands::write_main(&mut writer, self.entry_offset, 0);
+            command_count += 1;
+        }
 
         for dylib in &self.dylibs {
             commands::write_load_dylib(

@@ -25,6 +25,8 @@ pub const CPU_SUBTYPE_ARM64_ALL: u32 = 0;
 
 /// A fully linked executable.
 pub const MH_EXECUTE: u32 = 0x2;
+/// A dynamically linked shared library.
+pub const MH_DYLIB: u32 = 0x6;
 
 // Header flags. The real binary carries 0x00a00085, which is the union below.
 /// No undefined references remain.
@@ -37,6 +39,9 @@ pub const MH_TWOLEVEL: u32 = 0x80;
 pub const MH_PIE: u32 = 0x0020_0000;
 /// The image defines thread-local variable descriptors.
 pub const MH_HAS_TLV_DESCRIPTORS: u32 = 0x0080_0000;
+/// No dylib this one loads is re-exported through it, so dyld need not walk
+/// them looking for one. `ld64` sets it on every dylib that re-exports nothing.
+pub const MH_NO_REEXPORTED_DYLIBS: u32 = 0x0010_0000;
 /// Safe to link into an app extension. Notably **not** set by the toolchain
 /// for a Rust executable, which is why it is absent from
 /// [`BASE_EXECUTABLE_FLAGS`].
@@ -54,10 +59,24 @@ pub const MH_APP_EXTENSION_SAFE: u32 = 0x0200_0000;
 /// A real Rust executable therefore still comes to `0x00a00085`.
 pub const BASE_EXECUTABLE_FLAGS: u32 = MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE;
 
+/// Flags every arm64 dylib carries: `0x00100085`.
+///
+/// Read off `cc -dynamiclib` output and confirmed against a Rust proc-macro
+/// dylib, which carries the same set plus `MH_HAS_TLV_DESCRIPTORS`.
+///
+/// `MH_PIE` is *not* among them, which looks like an omission and is not: the
+/// bit asks the kernel to load a **main executable** at a random base, and a
+/// dylib is always mapped at a slide dyld chooses. `ld64` leaves it clear, and
+/// setting it would be a claim about a load the dylib does not control.
+pub const BASE_DYLIB_FLAGS: u32 = MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_NO_REEXPORTED_DYLIBS;
+
 // Load command identifiers, in the order a real binary emits them.
 pub const LC_SYMTAB: u32 = 0x2;
 pub const LC_DYSYMTAB: u32 = 0xb;
 pub const LC_LOAD_DYLIB: u32 = 0xc;
+/// A dylib's own identity: the path it will be recorded as when something links
+/// against it. Same payload as [`LC_LOAD_DYLIB`], pointing at itself.
+pub const LC_ID_DYLIB: u32 = 0xd;
 pub const LC_LOAD_DYLINKER: u32 = 0xe;
 pub const LC_UUID: u32 = 0x1b;
 pub const LC_SEGMENT_64: u32 = 0x19;
@@ -253,6 +272,15 @@ impl MachHeader {
         }
     }
 
+    /// A header for an arm64 dynamic library.
+    pub fn dylib() -> Self {
+        MachHeader {
+            file_type: MH_DYLIB,
+            flags: BASE_DYLIB_FLAGS,
+            ..MachHeader::executable()
+        }
+    }
+
     /// Declare that the image defines thread-local variable descriptors.
     ///
     /// `MH_HAS_TLV_DESCRIPTORS` is a *property of the image*, not a constant.
@@ -326,6 +354,47 @@ mod tests {
             0x00, 0x00, 0x00, 0x00, // reserved
         ];
         assert_eq!(w.as_slice(), &expected);
+    }
+
+    /// The exact 32 bytes `cc -dynamiclib` produced for a one-function library.
+    #[test]
+    fn dylib_header_matches_a_real_dylib_byte_for_byte() {
+        let mut header = MachHeader::dylib();
+        header.command_count = 14;
+        header.command_size = 656;
+
+        let mut w = Writer::new();
+        header.write(&mut w);
+
+        let expected: [u8; 32] = [
+            0xcf, 0xfa, 0xed, 0xfe, // magic
+            0x0c, 0x00, 0x00, 0x01, // cputype  = 0x0100000C
+            0x00, 0x00, 0x00, 0x00, // cpusubtype
+            0x06, 0x00, 0x00, 0x00, // filetype = MH_DYLIB
+            0x0e, 0x00, 0x00, 0x00, // ncmds = 14
+            0x90, 0x02, 0x00, 0x00, // sizeofcmds = 656
+            0x85, 0x00, 0x10, 0x00, // flags = 0x00100085
+            0x00, 0x00, 0x00, 0x00, // reserved
+        ];
+        assert_eq!(w.as_slice(), &expected);
+    }
+
+    /// A dylib is not position-independent in the sense `MH_PIE` means, and it
+    /// does re-export nothing — two bits an executable's flags get backwards.
+    #[test]
+    fn a_dylib_and_an_executable_differ_in_exactly_two_flags() {
+        assert_eq!(BASE_DYLIB_FLAGS & MH_PIE, 0, "MH_PIE is for main programs");
+        assert_eq!(BASE_EXECUTABLE_FLAGS & MH_NO_REEXPORTED_DYLIBS, 0);
+        assert_eq!(
+            BASE_DYLIB_FLAGS ^ BASE_EXECUTABLE_FLAGS,
+            MH_PIE | MH_NO_REEXPORTED_DYLIBS
+        );
+        // Thread-locals are a property of content, so both kinds take the bit
+        // the same way — a Rust proc-macro dylib carries 0x00900085.
+        assert_eq!(
+            MachHeader::dylib().with_thread_local_variables(true).flags,
+            0x0090_0085
+        );
     }
 
     #[test]

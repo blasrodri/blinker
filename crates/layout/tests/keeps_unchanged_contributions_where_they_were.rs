@@ -12,8 +12,8 @@
 //! rather than a benchmark that got slower.
 
 use blinker_layout::{
-    compute_layout_reusing, compute_layout_with_slop, ContributionKey, InputPlacement, Layout,
-    PreviousLayout, Slop,
+    compute_layout_reusing, compute_layout_with_slop, ContributionKey, ImageKind, InputPlacement,
+    Layout, PreviousLayout, Slop,
 };
 use blinker_macho::{ObjectId, SectionId, SectionKind};
 
@@ -74,12 +74,18 @@ fn record(layout: &Layout) -> PreviousLayout {
 /// The property. One object's code grows; the three after it do not move.
 #[test]
 fn a_neighbour_growing_does_not_move_anything_else() {
-    let first = compute_layout_with_slop(&code([1000, 2000, 3000, 4000]), 0x1000, Slop::DEFAULT);
+    let first = compute_layout_with_slop(
+        ImageKind::Executable,
+        &code([1000, 2000, 3000, 4000]),
+        0x1000,
+        Slop::DEFAULT,
+    );
     let previous = record(&first);
 
     // Object 1 gains 900 bytes — more than its own size class, and enough that
     // sequential packing would push everything after it along.
     let second = compute_layout_reusing(
+        ImageKind::Executable,
         &code([1000, 2900, 3000, 4000]),
         0x1000,
         Slop::DEFAULT,
@@ -101,8 +107,18 @@ fn a_neighbour_growing_does_not_move_anything_else() {
 /// — so the test above is measuring reuse and not an accident of alignment.
 #[test]
 fn without_the_previous_layout_the_same_edit_moves_them() {
-    let first = compute_layout_with_slop(&code([1000, 2000, 3000, 4000]), 0x1000, Slop::DEFAULT);
-    let second = compute_layout_with_slop(&code([1000, 2900, 3000, 4000]), 0x1000, Slop::DEFAULT);
+    let first = compute_layout_with_slop(
+        ImageKind::Executable,
+        &code([1000, 2000, 3000, 4000]),
+        0x1000,
+        Slop::DEFAULT,
+    );
+    let second = compute_layout_with_slop(
+        ImageKind::Executable,
+        &code([1000, 2900, 3000, 4000]),
+        0x1000,
+        Slop::DEFAULT,
+    );
 
     let moved = [2, 3]
         .iter()
@@ -119,11 +135,17 @@ fn without_the_previous_layout_the_same_edit_moves_them() {
 /// the mover pushed its neighbours along.
 #[test]
 fn one_that_outgrows_its_slot_moves_alone() {
-    let first = compute_layout_with_slop(&code([1000, 2000, 3000, 4000]), 0x1000, Slop::DEFAULT);
+    let first = compute_layout_with_slop(
+        ImageKind::Executable,
+        &code([1000, 2000, 3000, 4000]),
+        0x1000,
+        Slop::DEFAULT,
+    );
     let previous = record(&first);
 
     // Ten times its size: far past any reservation.
     let second = compute_layout_reusing(
+        ImageKind::Executable,
         &code([1000, 20_000, 3000, 4000]),
         0x1000,
         Slop::DEFAULT,
@@ -150,9 +172,15 @@ fn one_that_outgrows_its_slot_moves_alone() {
 /// most edits change a function body without changing much of its size.
 #[test]
 fn growth_inside_the_reservation_keeps_the_address() {
-    let first = compute_layout_with_slop(&code([1000, 2000, 3000, 4000]), 0x1000, Slop::DEFAULT);
+    let first = compute_layout_with_slop(
+        ImageKind::Executable,
+        &code([1000, 2000, 3000, 4000]),
+        0x1000,
+        Slop::DEFAULT,
+    );
     let previous = record(&first);
     let second = compute_layout_reusing(
+        ImageKind::Executable,
         &code([1000, 2010, 3000, 4000]),
         0x1000,
         Slop::DEFAULT,
@@ -174,7 +202,12 @@ fn growth_inside_the_reservation_keeps_the_address() {
 /// otherwise every edit that replaces an object grows the image forever.
 #[test]
 fn a_removed_contribution_leaves_room_for_a_new_one() {
-    let first = compute_layout_with_slop(&code([1000, 2000, 3000, 4000]), 0x1000, Slop::DEFAULT);
+    let first = compute_layout_with_slop(
+        ImageKind::Executable,
+        &code([1000, 2000, 3000, 4000]),
+        0x1000,
+        Slop::DEFAULT,
+    );
     let previous = record(&first);
     let end = |layout: &Layout| {
         layout
@@ -191,6 +224,7 @@ fn a_removed_contribution_leaves_room_for_a_new_one() {
     inputs.push(contribution(4, "__text", SectionKind::Code, 2000));
 
     let second = compute_layout_reusing(
+        ImageKind::Executable,
         &inputs,
         0x1000,
         Slop::DEFAULT,
@@ -229,11 +263,17 @@ fn a_section_that_cannot_hold_holes_is_packed_from_the_start() {
             .collect()
     };
 
-    let first = compute_layout_with_slop(&unwind([400, 800, 1200]), 0x1000, Slop::DEFAULT);
+    let first = compute_layout_with_slop(
+        ImageKind::Executable,
+        &unwind([400, 800, 1200]),
+        0x1000,
+        Slop::DEFAULT,
+    );
     let previous = record(&first);
     let mut inputs = unwind([400, 800, 1200]);
     inputs.remove(1);
     let second = compute_layout_reusing(
+        ImageKind::Executable,
         &inputs,
         0x1000,
         Slop::DEFAULT,
@@ -262,9 +302,15 @@ fn a_section_that_cannot_hold_holes_is_packed_from_the_start() {
 /// reproduce it exactly. Without this, every relink drifts.
 #[test]
 fn relaying_out_unchanged_inputs_reproduces_the_layout() {
-    let first = compute_layout_with_slop(&code([1000, 2000, 3000, 4000]), 0x1000, Slop::DEFAULT);
+    let first = compute_layout_with_slop(
+        ImageKind::Executable,
+        &code([1000, 2000, 3000, 4000]),
+        0x1000,
+        Slop::DEFAULT,
+    );
     let previous = record(&first);
     let second = compute_layout_reusing(
+        ImageKind::Executable,
         &code([1000, 2000, 3000, 4000]),
         0x1000,
         Slop::DEFAULT,
@@ -301,12 +347,18 @@ fn relaying_out_unchanged_inputs_reproduces_the_layout() {
 /// a second time, and would leave every other size delta failing silently.
 #[test]
 fn growth_from_liveness_moves_an_input_that_did_not_change() {
-    let first = compute_layout_with_slop(&code([1000, 2000, 3000, 4000]), 0x1000, Slop::DEFAULT);
+    let first = compute_layout_with_slop(
+        ImageKind::Executable,
+        &code([1000, 2000, 3000, 4000]),
+        0x1000,
+        Slop::DEFAULT,
+    );
     let previous = record(&first);
 
     // Object 2's file is identical. Dead-stripping simply kept more of it,
     // because something that changed elsewhere now reaches further in.
     let second = compute_layout_reusing(
+        ImageKind::Executable,
         &code([1000, 2000, 6000, 4000]),
         0x1000,
         Slop::DEFAULT,

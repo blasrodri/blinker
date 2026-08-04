@@ -49,6 +49,37 @@ pub const PAGEZERO_SIZE: u64 = 0x1_0000_0000;
 /// Where the image proper begins, immediately above `__PAGEZERO`.
 pub const TEXT_BASE: u64 = PAGEZERO_SIZE;
 
+/// What kind of image is being laid out.
+///
+/// The difference is address space, not content. An executable owns its
+/// process's address space and is mapped above a 4 GiB unmapped guard segment,
+/// so that a pointer truncated to 32 bits faults. A dylib owns nothing: dyld
+/// maps it wherever it likes, at a slide added to every address in it. So a
+/// dylib is laid out from zero and has no `__PAGEZERO` — one in a dylib would
+/// be a claim on the low 4 GiB of whatever process loaded it, which is not the
+/// dylib's to make.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ImageKind {
+    #[default]
+    Executable,
+    Dylib,
+}
+
+impl ImageKind {
+    /// Address the first mapped segment begins at.
+    pub fn text_base(self) -> u64 {
+        match self {
+            ImageKind::Executable => TEXT_BASE,
+            ImageKind::Dylib => 0,
+        }
+    }
+
+    /// Whether the image opens with the unmapped guard segment.
+    pub fn has_page_zero(self) -> bool {
+        matches!(self, ImageKind::Executable)
+    }
+}
+
 /// Round `value` up to a multiple of `alignment`.
 ///
 /// `alignment` is assumed to be a power of two, which every Mach-O alignment
@@ -453,18 +484,25 @@ impl Slop {
     }
 }
 
-/// Lay out with no padding. See [`compute_layout_with_slop`].
+/// Lay out an executable with no padding. See [`compute_layout_with_slop`].
 pub fn compute_layout(inputs: &[InputPlacement], header_reservation: u64) -> Layout {
-    compute_layout_with_slop(inputs, header_reservation, Slop::NONE)
+    compute_layout_with_slop(
+        ImageKind::Executable,
+        inputs,
+        header_reservation,
+        Slop::NONE,
+    )
 }
 
 /// Lay out, leaving `slop` after each contribution.
 pub fn compute_layout_with_slop(
+    kind: ImageKind,
     inputs: &[InputPlacement],
     header_reservation: u64,
     slop: Slop,
 ) -> Layout {
     compute(
+        kind,
         inputs,
         header_reservation,
         slop,
@@ -493,6 +531,7 @@ pub fn compute_layout_with_slop(
 /// thousand relocations survived a fourteen-rlib edit. An address is kept here
 /// because it is read back, not because the arithmetic came out the same.
 pub fn compute_layout_reusing(
+    kind: ImageKind,
     inputs: &[InputPlacement],
     header_reservation: u64,
     slop: Slop,
@@ -501,6 +540,7 @@ pub fn compute_layout_reusing(
     reserve_of: &dyn Fn(&InputPlacement) -> u64,
 ) -> Layout {
     compute(
+        kind,
         inputs,
         header_reservation,
         slop,
@@ -524,8 +564,11 @@ pub fn compute_layout_reusing(
 /// second pass moves every address and cannot add or remove a section
 /// (finding 183).
 ///
-/// `__PAGEZERO` and `__LINKEDIT` are here because [`compute`] always emits
-/// them, with no sections each.
+/// `__PAGEZERO` and `__LINKEDIT` are here because [`compute`] emits them with
+/// no sections each. A dylib has no `__PAGEZERO`, so its shape is one segment
+/// command too large — the reservation is then 72 bytes wider than the commands
+/// need, which is the harmless direction to be wrong in (see
+/// [`crate::compute_layout_with_slop`]'s caller, which errors on the other).
 pub fn output_shape(inputs: &[InputPlacement]) -> Vec<usize> {
     let mut per_segment: BTreeMap<&'static str, BTreeSet<String>> = BTreeMap::new();
     for input in inputs {
@@ -543,6 +586,9 @@ pub fn output_shape(inputs: &[InputPlacement]) -> Vec<usize> {
 }
 
 fn compute(
+    // Named apart from the `kind` a section has, which this function also
+    // handles a few lines down.
+    image_kind: ImageKind,
     inputs: &[InputPlacement],
     header_reservation: u64,
     slop: Slop,
@@ -696,6 +742,7 @@ fn compute(
     }
 
     let segments = assign_addresses(
+        image_kind,
         &mut sections,
         &segment_members,
         header_reservation,
@@ -771,6 +818,7 @@ fn output_section_name(name: &str, kind: SectionKind) -> String {
 
 /// Second pass: assign virtual addresses and file offsets.
 fn assign_addresses(
+    image_kind: ImageKind,
     sections: &mut [OutputSection],
     segment_members: &BTreeMap<String, Vec<usize>>,
     header_reservation: u64,
@@ -781,21 +829,24 @@ fn assign_addresses(
 
     // __PAGEZERO occupies address space but nothing else: no sections, no file
     // bytes. It exists so that a null or truncated pointer dereference faults.
-    segments.push(OutputSegment {
-        name: "__PAGEZERO".to_string(),
-        vm_address: 0,
-        vm_size: PAGEZERO_SIZE,
-        file_offset: 0,
-        file_size: 0,
-        sections: Vec::new(),
-        max_protection: Protection::NONE,
-        init_protection: Protection::NONE,
-    });
+    // Only an executable has one — see [`ImageKind`].
+    if image_kind.has_page_zero() {
+        segments.push(OutputSegment {
+            name: "__PAGEZERO".to_string(),
+            vm_address: 0,
+            vm_size: PAGEZERO_SIZE,
+            file_offset: 0,
+            file_size: 0,
+            sections: Vec::new(),
+            max_protection: Protection::NONE,
+            init_protection: Protection::NONE,
+        });
+    }
 
     let mut names: Vec<&String> = segment_members.keys().collect();
     names.sort_by_key(|n| segment_rank(n));
 
-    let mut vm_address = TEXT_BASE;
+    let mut vm_address = image_kind.text_base();
     let mut file_offset = 0u64;
 
     for name in names {
@@ -1282,6 +1333,7 @@ mod slop_tests {
     #[test]
     fn a_contribution_can_grow_without_moving_its_neighbours() {
         let before = compute_layout_with_slop(
+            ImageKind::Executable,
             &[text(0, 4000), text(1, 4000), text(2, 4000)],
             0x1000,
             Slop::DEFAULT,
@@ -1289,6 +1341,7 @@ mod slop_tests {
         // The middle contribution grows by 92 bytes — the worst body edit
         // measured in finding 43 — which is inside its 5% (200 byte) budget.
         let after = compute_layout_with_slop(
+            ImageKind::Executable,
             &[text(0, 4000), text(1, 4092), text(2, 4000)],
             0x1000,
             Slop::DEFAULT,
@@ -1305,12 +1358,14 @@ mod slop_tests {
     #[test]
     fn outgrowing_the_padding_does_move_later_contributions() {
         let before = compute_layout_with_slop(
+            ImageKind::Executable,
             &[text(0, 4000), text(1, 4000), text(2, 4000)],
             0x1000,
             Slop::DEFAULT,
         );
         // 5% of 4000 is 200; 400 does not fit.
         let after = compute_layout_with_slop(
+            ImageKind::Executable,
             &[text(0, 4000), text(1, 4400), text(2, 4000)],
             0x1000,
             Slop::DEFAULT,
@@ -1341,7 +1396,12 @@ mod slop_tests {
         let inputs = [text(0, 4000), text(1, 1234), text(2, 77)];
         assert_eq!(
             offsets(&compute_layout(&inputs, 0x1000)),
-            offsets(&compute_layout_with_slop(&inputs, 0x1000, Slop::NONE)),
+            offsets(&compute_layout_with_slop(
+                ImageKind::Executable,
+                &inputs,
+                0x1000,
+                Slop::NONE
+            )),
         );
     }
 
@@ -1349,7 +1409,12 @@ mod slop_tests {
     /// consumer would copy bytes that are not there.
     #[test]
     fn a_contributions_size_excludes_its_padding() {
-        let layout = compute_layout_with_slop(&[text(0, 4000)], 0x1000, Slop::DEFAULT);
+        let layout = compute_layout_with_slop(
+            ImageKind::Executable,
+            &[text(0, 4000)],
+            0x1000,
+            Slop::DEFAULT,
+        );
         let contribution = &layout.sections[0].contributions[0];
         assert_eq!(contribution.size, 4000);
     }
@@ -1396,7 +1461,8 @@ mod shape_tests {
         ];
 
         let mut predicted = output_shape(&inputs);
-        let layout = compute_layout_with_slop(&inputs, PAGE_SIZE, Slop::NONE);
+        let layout =
+            compute_layout_with_slop(ImageKind::Executable, &inputs, PAGE_SIZE, Slop::NONE);
         let mut actual: Vec<usize> = layout.segments.iter().map(|s| s.sections.len()).collect();
 
         // Compared as multisets: the caller sums them, so the order the two
@@ -1418,8 +1484,9 @@ mod shape_tests {
             input(0, "__TEXT", "__text", SectionKind::Code),
             input(0, "__DATA", "__data", SectionKind::Data),
         ];
-        let small = compute_layout_with_slop(&inputs, PAGE_SIZE, Slop::NONE);
-        let large = compute_layout_with_slop(&inputs, PAGE_SIZE * 64, Slop::NONE);
+        let small = compute_layout_with_slop(ImageKind::Executable, &inputs, PAGE_SIZE, Slop::NONE);
+        let large =
+            compute_layout_with_slop(ImageKind::Executable, &inputs, PAGE_SIZE * 64, Slop::NONE);
         // Sorted: `output_shape` documents no order, because its only caller
         // sums it.
         let shape = |l: &Layout| -> Vec<usize> {

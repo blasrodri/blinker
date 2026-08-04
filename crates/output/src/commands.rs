@@ -253,10 +253,54 @@ pub fn write_load_dylib(
     current_version: u32,
     compatibility_version: u32,
 ) {
+    write_dylib_command(
+        writer,
+        LC_LOAD_DYLIB,
+        path,
+        timestamp,
+        current_version,
+        compatibility_version,
+    );
+}
+
+/// Emit `LC_ID_DYLIB` — the name a dylib records for itself.
+///
+/// Whatever links against this library copies `path` into its own
+/// `LC_LOAD_DYLIB` verbatim, so this is the string dyld will search for at
+/// runtime, not the path the file happens to sit at now. `ld64` defaults it to
+/// the output path and `-install_name` overrides it; the two differ for
+/// anything that will be installed somewhere else, which is why the flag
+/// exists.
+pub fn write_id_dylib(
+    writer: &mut Writer,
+    path: &str,
+    timestamp: u32,
+    current_version: u32,
+    compatibility_version: u32,
+) {
+    write_dylib_command(
+        writer,
+        LC_ID_DYLIB,
+        path,
+        timestamp,
+        current_version,
+        compatibility_version,
+    );
+}
+
+/// The `dylib_command` body both of the above share.
+fn write_dylib_command(
+    writer: &mut Writer,
+    command: u32,
+    path: &str,
+    timestamp: u32,
+    current_version: u32,
+    compatibility_version: u32,
+) {
     let command_size = command_size_with_path(24, path);
     let start = writer.len();
     writer
-        .u32(LC_LOAD_DYLIB)
+        .u32(command)
         .u32(command_size as u32)
         .u32(24)
         .u32(timestamp)

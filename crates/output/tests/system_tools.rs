@@ -216,6 +216,96 @@ fn otool_reports_sections_with_their_sizes() {
     );
 }
 
+/// The same shape, built as a dynamic library.
+fn sample_dylib(install_name: &str) -> Image {
+    let mut builder = ImageBuilder::new();
+    builder.dylib_output(install_name);
+    builder.input(section(0, "__TEXT", "__text", SectionKind::Code, 64));
+    builder.input(section(1, "__DATA", "__data", SectionKind::Data, 32));
+    builder.dylib(Dylib::lib_system());
+    builder
+        .symbols()
+        // Addresses start at zero here, not above __PAGEZERO: that is the
+        // difference this whole image kind is about.
+        .add(OutputSymbol::exported("_answer", 1, 0x4000))
+        .add(OutputSymbol::undefined("_malloc", 1));
+    builder.content(0, vec![0x1F; 64]);
+    builder.content(1, vec![0x2F; 32]);
+    builder.build().expect("dylib builds")
+}
+
+/// A dylib is a different *file type*, and `otool` is the one that says so.
+///
+/// Four things distinguish it, and each is a way to produce a file that walks
+/// perfectly and does not load: the filetype itself, the absent `__PAGEZERO`,
+/// the base address that follows from it, and `LC_ID_DYLIB` in place of the
+/// `LC_MAIN` that would claim this library is a program.
+#[test]
+fn otool_sees_a_dylib_as_a_dylib() {
+    let image = sample_dylib("/usr/local/lib/libsample.dylib");
+    let artifact = artifact("libsample", &image.bytes);
+
+    let (ok, header, stderr) = run("otool", &["-hv", &artifact.as_str()]);
+    assert!(ok, "otool -h failed: {stderr}");
+    assert!(
+        header.contains("DYLIB"),
+        "not reported as a dylib:\n{header}"
+    );
+    // The flags a real `cc -dynamiclib` carries, and not MH_PIE.
+    assert!(
+        header.contains("NOUNDEFS DYLDLINK TWOLEVEL NO_REEXPORTED_DYLIBS"),
+        "the flags are not the ones ld64 writes:\n{header}"
+    );
+    assert!(
+        !header.contains("PIE"),
+        "a dylib must not claim PIE:\n{header}"
+    );
+
+    let (ok, commands, stderr) = run("otool", &["-l", &artifact.as_str()]);
+    assert!(ok, "otool -l failed: {stderr}");
+    assert!(
+        !commands.contains("malformed") && !stderr.contains("malformed"),
+        "otool called the dylib malformed:\n{commands}\n{stderr}"
+    );
+    assert!(
+        commands.contains("LC_ID_DYLIB"),
+        "no LC_ID_DYLIB, so nothing could record what to load:\n{commands}"
+    );
+    assert!(
+        commands.contains("/usr/local/lib/libsample.dylib"),
+        "LC_ID_DYLIB does not carry the install name:\n{commands}"
+    );
+    assert!(
+        !commands.contains("LC_MAIN"),
+        "a dylib with an entry point is a program dyld will refuse:\n{commands}"
+    );
+    assert!(
+        !commands.contains("LC_LOAD_DYLINKER"),
+        "a dylib does not name the dynamic linker:\n{commands}"
+    );
+    assert!(
+        !commands.contains("__PAGEZERO"),
+        "the low 4 GiB is not this library's to claim:\n{commands}"
+    );
+    // __TEXT therefore starts at zero: every address in the image is an offset
+    // from wherever dyld maps it.
+    assert!(
+        commands.contains("segname __TEXT") && commands.contains("vmaddr 0x0000000000000000"),
+        "__TEXT is not based at zero:\n{commands}"
+    );
+
+    assert!(
+        image.layout.segment("__PAGEZERO").is_none(),
+        "the layout still holds a __PAGEZERO"
+    );
+    let segments = commands.matches("LC_SEGMENT_64").count();
+    assert_eq!(
+        segments,
+        image.layout.segments.len(),
+        "otool found a different number of segments than the layout has"
+    );
+}
+
 /// An empty image is a degenerate but legal case, and must still be walkable.
 #[test]
 fn even_an_empty_image_is_well_formed() {
