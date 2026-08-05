@@ -144,6 +144,13 @@ fn section_flags(section: &OutputSection) -> u32 {
             S_THREAD_LOCAL_VARIABLE_POINTERS
         }
         SectionKind::ThreadLocal => S_THREAD_LOCAL_REGULAR,
+        // Initialiser and terminator tables. dyld finds these by section
+        // *type*, not by name, so leaving them `S_REGULAR` produces a program
+        // whose static constructors never run — it links, loads, and returns
+        // the right exit code with none of its globals constructed, which is
+        // the worst way for this to be wrong.
+        _ if section.name == "__mod_init_func" => S_MOD_INIT_FUNC_POINTERS,
+        _ if section.name == "__mod_term_func" => S_MOD_TERM_FUNC_POINTERS,
         _ if section.name == "__cstring" => S_CSTRING_LITERALS,
         _ if section.name == "__got" => S_NON_LAZY_SYMBOL_POINTERS,
         _ if section.name == "__la_symbol_ptr" => S_LAZY_SYMBOL_POINTERS,

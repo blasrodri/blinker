@@ -1844,6 +1844,10 @@ fn undefined_references(
     let mut out: Vec<String> = undefined
         .into_iter()
         .filter_map(|id| names.resolve(id).map(str::to_string))
+        // A linker-defined name is neither undefined nor an import: it gets an
+        // address from the layout below, so letting it through here would file
+        // it as a dynamic binding against a library that does not have it.
+        .filter(|name| !is_linker_defined(name))
         .collect();
     out.sort();
     out
@@ -2297,6 +2301,16 @@ fn link_inner(
         // `address_map` never saw it, and every consumer asks by id.
         let id = session.names_mut().intern(name);
         addresses.global.insert(id, value);
+    }
+    // The linker's own symbols, which no input defines and which therefore
+    // reach here with no address. Inserted after the probe because their value
+    // *is* the layout: `___dso_handle` is where the mach header ended up.
+    for name in ["___dso_handle"] {
+        let Some(value) = linker_defined_address(name, &probe) else {
+            continue;
+        };
+        let id = session.names_mut().intern(name);
+        addresses.global.entry(id).or_insert(value);
     }
     // Taken after the last name is interned, so it covers every id above.
     let name_digests = session.digests();
@@ -3073,6 +3087,40 @@ fn indirect_entries(
 
 fn elapsed_ms(start: std::time::Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
+}
+
+/// Symbols the *linker* defines, which no input and no library provides.
+///
+/// `___dso_handle` is the only one so far. It is the address of the image's
+/// mach header, and C++ passes it to `__cxa_atexit` as the token identifying
+/// which image a destructor belongs to — so every program that links a C++
+/// static initialiser references it, and no object file defines it.
+///
+/// Nothing here defined it, so a link of any C++ program failed naming
+/// `___dso_handle` as undefined, and the name pointed at nothing the user
+/// could act on: it is not their symbol and not a library they forgot.
+///
+/// A list rather than one comparison because ld64 defines a family of these —
+/// `__mh_execute_header`, section start and end markers — and the next one
+/// added should land beside this comment rather than in a second mechanism.
+fn is_linker_defined(name: &str) -> bool {
+    name == "___dso_handle"
+}
+
+/// Where a linker-defined symbol lands, once layout has run.
+///
+/// The mach header's address, which is where `__TEXT` begins because the
+/// header lives inside it. Zero for a dylib, which is laid out from zero.
+fn linker_defined_address(name: &str, image: &blinker_output::Image) -> Option<u64> {
+    match name {
+        "___dso_handle" => Some(
+            image
+                .layout
+                .segment("__TEXT")
+                .map_or(0, |text| text.vm_address),
+        ),
+        _ => None,
+    }
 }
 
 /// Undefined references, checked against what `libSystem` actually exports.

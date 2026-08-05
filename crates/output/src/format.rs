@@ -118,6 +118,15 @@ pub const S_NON_LAZY_SYMBOL_POINTERS: u32 = 0x6;
 pub const S_LAZY_SYMBOL_POINTERS: u32 = 0x7;
 /// Symbol stubs, the indirection a lazily-bound call goes through.
 pub const S_SYMBOL_STUBS: u32 = 0x8;
+/// Pointers to functions dyld runs before `main`.
+///
+/// The *type* is what makes them run. A `__mod_init_func` section left
+/// `S_REGULAR` is laid out correctly, holds the right pointers, and is simply
+/// never looked at — so a C++ program links, loads, and runs with none of its
+/// static constructors having executed.
+pub const S_MOD_INIT_FUNC_POINTERS: u32 = 0x9;
+/// Pointers to functions dyld runs at unload, the destructor counterpart.
+pub const S_MOD_TERM_FUNC_POINTERS: u32 = 0xa;
 /// Thread-local variable descriptors.
 /// Initialised thread-local data — the template copied per thread.
 pub const S_THREAD_LOCAL_REGULAR: u32 = 0x11;

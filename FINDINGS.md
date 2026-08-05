@@ -11142,3 +11142,69 @@ system libraries in the dyld shared cache, not on disk. The test passed by
 returning early — the same silent-skip shape as the bug it was written for.
 Replaced with a dylib built by `cc` in a scratch directory, which also gets the
 universal-binary case and the no-stub-beside-it case honestly.
+
+---
+
+## 219. A C++ program linked, ran, returned the right answer, and constructed none of its globals
+
+Finding 218 got a real project past its undefined symbols. Two remained, and
+the second one was worse than a failed link.
+
+### `___dso_handle`
+
+Undefined, and nothing could have defined it. `___dso_handle` is the address of
+the image's own mach header; C++ passes it to `__cxa_atexit` as the token
+saying which image a destructor belongs to. **The linker defines it.** No object
+file does, no library exports it, and blinker had no notion of a linker-defined
+symbol at all — so every C++ program failed, naming a symbol the user could do
+nothing about: not theirs, and not a library they had forgotten.
+
+Fixed by filtering it out of the undefined set and inserting its address into
+the global address map after layout, because its value *is* the layout — it is
+where the mach header ended up, which is `__TEXT`'s vmaddr.
+
+### The one that produced a working-looking program
+
+With that done the program linked, loaded, ran, and exited 7 — the right answer
+— and printed neither `ctor` nor `dtor`. ld64's build of the same object
+printed both.
+
+`__mod_init_func` was present, in the right segment, at the right address,
+holding the right pointer. Its section *type* was `S_REGULAR` instead of
+`S_MOD_INIT_FUNC_POINTERS`, and **dyld finds initialisers by type, not by
+name**. So the table was laid out perfectly and never looked at.
+
+```
+  input object      flags 0x00000009      S_MOD_INIT_FUNC_POINTERS
+  blinker output    flags 0x00000000      S_REGULAR
+```
+
+The cause is a shape this codebase now has twice in one day: `section_flags`
+is a whitelist of names — `__cstring`, `__got`, `__la_symbol_ptr`, `__stubs` —
+with `_ => S_REGULAR` at the bottom. Anything it was not taught gets a
+plausible default rather than a refusal, exactly like the `.tbd`-only filter of
+finding 218. Spec §5 says never silently ignore unknown input; a `_ =>` arm
+that returns a *valid* value is how that rule gets broken without anyone
+writing code that looks wrong.
+
+### Why no existing test caught it
+
+Every safety property this project leans on is a comparison: warm bytes against
+cold bytes, blinker's sections against ld64's. **Both linkers' outputs were
+self-consistent**, and blinker's was byte-identical warm-to-cold, because the
+flag was wrong the same way every time. A byte oracle cannot see a bug that is
+deterministic. Neither can a section-by-section diff that compares names,
+addresses and sizes but not type bits.
+
+The regression test therefore *runs the program* and reads its stdout, and a
+companion test runs the same object through `cc` so the expectation comes from
+the platform rather than from this file. Rust programs are unaffected — the 16
+links of this workspace stay byte-identical — which is precisely why this
+survived: nothing in the Rust world emits `__mod_init_func`.
+
+### What it cost
+
+Nothing yet, and that is the unsettling part. Any C++ dependency linked by
+blinker before today would have had its static constructors silently skipped —
+uninitialised singletons, unregistered factories, empty tables — presenting as
+a logic bug in the user's program with no reason to suspect the linker.
