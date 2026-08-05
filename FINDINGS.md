@@ -10530,3 +10530,145 @@ a recording made by hand should replay too.
 Every recording of a `-dynamiclib` link taken before this was unreplayable, and
 the corpus that FINDINGS is built from contains none — because until this week
 those links were delegated and never reached the recorder at all.
+
+---
+
+## 209. Three quarters of a cold link was reading one file three times
+
+**Spec assumption.** §12 treats resolving against the SDK's stub libraries as
+bookkeeping: read what the system exports, answer "does this name exist". No
+line of the spec suggests it could be the largest stage of a link.
+
+**Observed.** On a cold link of this workspace's own binary — 70 inputs, 724
+objects, 26.4 ms internal — the stage breakdown was
+
+```
+read+parse    16.2 ms   61%      of which stub parse  16.1 ms
+relocate       2.9 ms   11%
+dead-strip     1.7 ms    7%
+emit+sign      1.2 ms    5%
+```
+
+`read_and_parse` runs the object reads and the SDK stub parse on separate
+threads and costs whichever is slower. Reading and parsing all 70 inputs took
+1.3 ms. Parsing the stubs took 16.1 ms — twelve times as long — so the stage
+was not reading objects at all. It was reading `libSystem.B.tbd`.
+
+**Why it was three times.** `rustc` passes `-lSystem -lc -lm` on every link.
+The SDK ships
+
+```
+libSystem.tbd -> libSystem.B.tbd
+libc.tbd      -> libSystem.tbd
+libm.tbd      -> libSystem.tbd
+```
+
+Three names, one 326 KB file. Each was resolved to its own path, opened,
+parsed into a YAML tree of some thirty thousand `String`s, walked for its 9,264
+exported symbols, and inserted into a `BTreeMap` — and the second and third
+passes contributed **nothing**, because every symbol they found was already
+owned by the install name the first pass registered. `StubExports::library`
+deduplicates by install name and always had; the waste was upstream of it, in
+deciding to parse at all.
+
+Deduplicating by what the path *resolves to* — `canonicalize`, three extra
+syscalls — took the cold link from 25.7 ms to 20.2 ms, interleaved A/B over 21
+iterations, byte-identical output. A whole `cargo build`'s sixteen links went
+from 491 ms to 390 ms one-shot.
+
+**Why nobody saw it.** Every stage number in this document before now came from
+a *relink* of the largest workload available, where a resident session holds the
+stub exports and the parse does not happen. The cold profile had never been
+broken down at all. The stage was 61% of a link nobody had measured.
+
+### What it cost
+
+Every cold link since stub resolution existed. `-lc` and `-lm` are not exotic;
+they are on the command line of every Rust link on macOS.
+
+---
+
+## 210. Overlapped work is worth nothing until it stops being overlapped, and then it is worth 25%
+
+**Observed.** After finding 209 the stub parse was still 5.7 ms of a 19.8 ms
+cold link — the largest single item left, and a pure function of a file that
+does not change. Replacing the general YAML parser with a scanner for the TBD
+v4 subset halved it, to 3.2 ms.
+
+On the workload the whole project had been measured against, that bought
+**0.2 ms**:
+
+```
+link     20.2 ->   20.0 ms   (0.990x)
+```
+
+Because `read_and_parse` costs the slower of its two halves, and after the
+deduplication the other half — reading 724 objects and pulling 654 archive
+members — had become the slower one at 10.7 ms. The stub parse was entirely
+hidden behind it. Finding 91 cached this same parse, measured nothing, and
+reverted on exactly this reasoning.
+
+On the *median* link of a real build — 32 arguments, a build script binary, the
+kind of link `cargo build` runs fourteen of — it bought
+
+```
+link     10.5 ->    8.4 ms   (0.799x)
+```
+
+A small link has few objects to read, so nothing hides the stub parse and it is
+most of the link. Both numbers are correct; the first one describes the tail and
+the second describes the median. `build-links.py` exists because of exactly this
+gap, and it still took two measurements to stop optimising against the tail.
+
+**The safety argument, since a hand-written parser for a real format is how
+symbols go missing.** The scanner refuses every construct it was not taught —
+folded scalars, unexpected indents, escapes in double-quoted scalars, content
+outside a document — and `parse_tbd` falls back to the YAML parser rather than
+guessing. Being wrong therefore requires *misreading something it claims to
+understand*. That claim is checked against the corpus Apple ships: all 6,098
+`.tbd` files in the SDK are parsed both ways and asserted equal, and the number
+that fell back is asserted to be zero — because agreement is worthless if the
+scanner is quietly refusing everything and the fallback is answering for it.
+
+### What it cost
+
+Nothing, but only because the median workload was measured too. The scanner
+would have been reverted on the tail number alone.
+
+---
+
+## 211. This machine has no efficiency cores, and the chunked map already handles the ones it does have
+
+**Spec assumption.** None; this is a correction to a claim made in conversation
+and never checked.
+
+**Observed.** The plan to size the thread pool by P-core count, and to raise the
+daemon's QoS class so its workers stop being scheduled onto E-cores, rested on
+two premises. Neither survived a `sysctl`:
+
+```
+hw.nperflevels             2
+hw.perflevel0.name         Super         5 cores,  16 MB L2
+hw.perflevel1.name         Performance  10 cores,   8 MB L2
+```
+
+Fifteen cores in two performance classes, and *neither class is efficiency*.
+There are no E-cores to be parked on. A pool sized by `perflevel0.logicalcpu`
+would have used five cores of fifteen.
+
+The second premise — that a detached spawn drops QoS — is also false. A child
+`fork`/`exec`ed with null stdio, which is how `daemon::start` spawns a worker,
+reports the same `QOS_CLASS_USER_INTERACTIVE` as its parent.
+
+And the third, that equal chunks on unequal cores waste the fast ones, was
+answered by the code four months ago: `map_chunks` cuts the work into *four
+chunks per thread* and hands them out through an atomic cursor. A slower core
+claims fewer chunks. Heterogeneity is already absorbed by the same mechanism
+that absorbs an object ten times the size of its neighbours.
+
+### What it cost
+
+Nothing, because it was measured before it was built. It is recorded because
+all three claims were plausible, widely repeated, and wrong on this machine —
+and because the reasoning that produced them ("Apple Silicon has E-cores") is
+the kind that sounds like knowledge.

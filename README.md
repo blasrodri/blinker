@@ -156,13 +156,19 @@ after every link has to be told the whole program again each time.
 
 So the thing worth attacking is not the cost of one link. It is the cost of the
 hundredth link of a program the linker has already seen ninety-nine times. That
-is why blinker is resident: staying alive is worth **1.5×** on its own here
-(319 ms against 491 for the same links one-shot), before any incremental
-machinery does anything.
+is why blinker is resident, and staying alive used to be worth 1.5× on its own —
+319 ms against 491 for the same links one-shot.
+
+It is now worth about **1.1×**, because the one-shot path caught up: the same
+sixteen links run in 342 ms with nothing held between them. That is not the
+resident path getting worse. It is findings 209 and 210 taking 5.5 ms and then
+2.1 ms out of every *cold* link, which residency had been hiding rather than
+fixing.
 
 It is also why the median matters more than the maximum. A real build's links
 have 23 inputs at the median and 132 at the largest. Optimising the tail is
-optimising the case that happens once.
+optimising the case that happens once — and measuring only the tail is how a
+change worth 25% of the median link measures as 1% (finding 210).
 
 ### Concurrency
 
@@ -177,7 +183,25 @@ near-cold build and buys the edit loop nothing. `BLINKER_TRACE_WAIT=<file>`
 writes a trace of every link's client-side wait; `scripts/link-burst.py` reports
 the burst in it.
 
-### Where the time goes on a large link
+### Where the time goes on a cold link
+
+The first link of a program, which is what a newcomer's first build is made of.
+This workspace's own binary — 70 inputs, 724 objects, 2.9 MB out:
+
+```
+  read+parse     10.7 ms      objects 1.3, archive members ~9, stubs 3.2 alongside
+  relocate        2.8 ms
+  dead-strip      1.5 ms
+  emit+sign       1.1 ms
+  layout          0.8 ms
+  total          19.6 ms      was 26.4 before findings 209-210
+```
+
+Reading the 70 files on the command line costs 1.3 ms of it. Nearly everything
+else in that stage is pulling 654 members out of rlibs and parsing them, and
+that is where the next cold work is.
+
+### Where the time goes on a large relink
 
 Kept because it is where the remaining work is, not because it is the headline.
 On a relink where 1 object in 5,637 has a reachability projection that moved and
