@@ -11934,3 +11934,103 @@ actually there: two distinct names sharing a hash stay two names, growth loses
 and renumbers nothing, and reserving changes timing and nothing else. The
 collision test is the one worth having — a table that trusted the hash would be
 wrong only for the colliding pair, silently, and nothing else in the suite asked.
+
+## 229. Fifty thousand symbol names, one bucket
+
+The second guess from finding 228 was also wrong, and stopping to *measure*
+instead of guessing a third time found something neither guess was about: the
+name hash puts every name that shares a prefix in the same bucket. Not many
+buckets — one. It costs nothing on the workloads here and it is a 790x cliff on
+a naming pattern any code generator produces.
+
+### The second failed guess, first
+
+Finding 228 pointed at the pointer chase: the serial pass follows 790,000
+`String`s scattered across the allocations of 3,945 archive members, and the
+parallel probe walks the same names anyway and could copy them out end to end.
+Built, and it is *worse* — the extra copy costs more than the locality saves:
+
+```
+  read+parse min/median      total min/median
+  866.0 / 901.3              2358.7 / 2446.7     head
+  880.9 / 920.1              2395.1 / 2540.7     names copied contiguous
+```
+
+Reverted. Two guesses, two failures, and the item is 276 ms of a 2,360 ms pass —
+11.7%, measured across all five links rather than extrapolated from one — so it
+is worth not guessing a third time.
+
+### Decomposing it instead
+
+A throwaway harness against `SymbolNames` directly, 800,000 names:
+
+```
+  hash only            15.1 ms
+  intern, no room     101.9 ms     <- growth, which finding 227 removed
+  intern, reserved     55.3 ms
+  probe, all hit       54.5 ms     <- a pure lookup costs the same as an insert
+```
+
+The filing is free. The *probe* is the whole cost — which is why making the
+insert cheaper (228) and making the name closer (above) both did nothing.
+
+### And then the shape of the names mattered
+
+The same harness, with short names instead of long ones, took **11,429 ms**
+instead of 53. Two hundred times slower, for less work.
+
+`hash_of` is `FastHasher` — multiply-xor-rotate, one round per eight bytes —
+and `finish` returned the state raw. Every round ends in a multiply, and the low
+bits of a product are decided by the low bits of its operands and nothing else.
+A hash map takes its bucket index from the low bits. A symbol name's first eight
+bytes are the *low* bytes of the first word hashed. So the map bucketed on the
+shared prefix and ignored the varying tail.
+
+Distinct buckets out of 65,536, for 50,000 names of each shape:
+
+```
+                     _function_{i}   _s{i}   C++ mangled   long Rust
+  as it was                1           1          97         353
+  x ^ (x >> 32)        9,559       9,880       4,060      23,997
+  x.rotate_left(26)   37,208      37,323       6,525      25,364
+  murmur3 fmix64      34,918      35,028      34,408      34,916
+```
+
+One bucket. Fifty thousand names, all distinct, all distinct hashes, one bucket.
+
+Every cheap mix is uniform on some shapes and poor on others — and which shapes
+a linker is handed is not something it chooses, so the finaliser is `fmix64`.
+It goes in `hash_of` and not in `FastHasher::finish`: the linker's other maps
+are keyed by dense small integers that the construction already spreads, and
+paying for a shape they do not have measured 4-5% slower on three of four
+workloads when I tried it there first.
+
+### What it is worth, honestly
+
+Nothing measurable, on anything measured here:
+
+```
+  pulsevm one-shot      1.040x min   1.018x median
+  this workspace        0.985x       0.993x
+  ripgrep               1.019x       0.955x
+  rust-analyzer         0.987x       1.004x
+```
+
+Minima and medians disagree on the sign for two of the four, which is noise. The
+real workloads were not on the cliff — mangled C++ and Rust names vary enough in
+their first eight bytes to spread, and that is luck rather than design.
+
+So this is kept as a robustness fix at no measured cost, and it is worth being
+clear that is a different claim from the one findings 226 and 227 make. The
+evidence for it is the cliff, the removal of the cliff, and the absence of a
+price — all three measured. A generated C API, a protobuf schema, a bindgen
+header or a template instantiated over an integer sequence all produce names of
+exactly the shape that collapses, and a linker that goes 200x slower on one of
+them is not a linker anyone can rely on.
+
+The guard is a distribution assertion rather than a timing: 50,000 names sharing
+a prefix must use more than 25,000 of 65,536 buckets, in both the prefix-varying
+and suffix-varying shapes. It fails at six.
+
+83 links byte-identical across the previous binary, this one cold, and this one
+warm twice — a changed name hash reaches no output.

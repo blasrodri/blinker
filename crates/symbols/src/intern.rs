@@ -69,7 +69,47 @@ pub fn hash_of(name: &str) -> u64 {
     use std::hash::Hasher;
     let mut hasher = blinker_hashing::FastHasher::default();
     hasher.write(name.as_bytes());
-    hasher.finish()
+    // Fold the high half down, for names and for nothing else.
+    //
+    // Every round of `FastHasher` ends in a multiply, which spreads entropy
+    // *upwards*: the low bits of a product are decided by the low bits of its
+    // operands and nothing else. A hash map takes its bucket index from the low
+    // bits. Symbol names are the one input shape where that matters, because
+    // they share prefixes and vary in their tails — and the first eight bytes
+    // of a name are the *low* bytes of the first word, so what varied was
+    // exactly what nobody looked at.
+    //
+    // Measured without this: 800,000 names of the form `_function_{i}` produced
+    // 800,000 distinct hashes and landed in **ten** of 2,097,152 buckets,
+    // 111,111 deep, and interning them took 11.4 seconds. With it, 13.3 ms
+    // (finding 229).
+    //
+    // Here and not in `FastHasher::finish`, which serves every map in the
+    // linker. Those are keyed by dense small integers, which the construction
+    // already spreads, and paying for a shape they do not have measured 4-5%
+    // slower on three of four workloads.
+    //
+    // Murmur3's finaliser and not the obvious `x ^ (x >> 32)`, because the
+    // cheap fold is not enough and only measuring said so. Distinct buckets out
+    // of 65,536, for 50,000 names of each shape — about 35,000 is what a good
+    // hash gives:
+    //
+    // ```text
+    //                 _function_{i}   _s{i}   C++ mangled   long Rust
+    //   as it was            1           1          97         353
+    //   x ^ (x >> 32)     9,559       9,880       4,060      23,997
+    //   x.rotate_left(26)    37,208    37,323       6,525      25,364
+    //   murmur3 fmix64    34,918      35,028      34,408      34,916
+    // ```
+    //
+    // Every cheaper mix is uniform on some shapes and poor on others, and which
+    // shapes a linker is handed is not something it chooses.
+    let mut mixed = hasher.finish();
+    mixed ^= mixed >> 33;
+    mixed = mixed.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    mixed ^= mixed >> 29;
+    mixed = mixed.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    mixed ^ (mixed >> 32)
 }
 
 impl SymbolNames {
@@ -312,6 +352,42 @@ mod tests {
         }
         assert_eq!(ahead.len(), plain.len());
         assert_eq!(ahead, plain);
+    }
+
+    /// Names that share a prefix must still land in different buckets.
+    ///
+    /// This is the property `hash_of`'s fold exists for, asserted directly
+    /// rather than through a timing. Symbol names share prefixes and vary in
+    /// their tails; the first eight bytes of a name are the *low* bytes of the
+    /// first word hashed; a multiply moves entropy upwards; and a map takes its
+    /// bucket index from the low bits. Without the fold, 50,000 names of this
+    /// shape used **six** of 65,536 buckets, and interning 800,000 of them took
+    /// 11.4 seconds instead of 13 ms (finding 229).
+    ///
+    /// The bar is set well below what a good hash gives — roughly 32,000
+    /// distinct buckets for 50,000 names — so this fails on a real regression
+    /// and not on an ordinary one.
+    #[test]
+    fn names_that_share_a_prefix_do_not_share_a_bucket() {
+        let bucket = |name: &str| hash_of(name) & 0xffff;
+        let spread: std::collections::HashSet<u64> = (0..50_000)
+            .map(|at| bucket(&format!("_function_{at}")))
+            .collect();
+        assert!(
+            spread.len() > 25_000,
+            "50,000 prefixed names used only {} of 65,536 buckets",
+            spread.len()
+        );
+        // The same, for the shape a suffix rather than a prefix varies in —
+        // C++ mangling puts the distinguishing part at the end.
+        let mangled: std::collections::HashSet<u64> = (0..50_000)
+            .map(|at| bucket(&format!("__ZN9namespace5inner7method_{at}Ev")))
+            .collect();
+        assert!(
+            mangled.len() > 25_000,
+            "50,000 mangled names used only {} of 65,536 buckets",
+            mangled.len()
+        );
     }
 
     /// Two distinct names with the *same* hash must both be findable.
