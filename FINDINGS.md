@@ -11601,3 +11601,55 @@ reasoning was good and the result was not:
 The second is the more interesting failure: the idea is probably still right,
 and it was tested through a switch that was not wired to the thing it was meant
 to control. Which is worth knowing before it is tried again.
+
+---
+
+## 225. A link that cannot be cached is no longer cached
+
+Finding 224 tried this and reported it made things worse. It did — because the
+flag was wired to the wrong switch. Wired to the right one it is **1.69x** on
+the workload that motivated it.
+
+### The switch that was not connected
+
+`Session::retains()` was extended to answer false for a link whose inputs alone
+exceed the memory budget. But the five functions that actually *store* things
+guarded on `self.discards` — the transient-session flag — and not on
+`retains()`. So the new answer reached only the probing path: the link lost its
+reuse and kept every cost of pretending to have some. Measured worse, and
+correctly reverted.
+
+Retargeting `store_object`, `store_member`, `store_archive`, `seed_interfaces`
+and `store_extraction` at `retains()` is the whole change.
+
+`store_stub_exports` deliberately stays on `discards`. The SDK's exports are
+not this program's inputs: they are small, identical for every link, and worth
+13 ms of a cold link (finding 209). A bound on *this program being too large*
+has nothing to say about them.
+
+### Measured, interleaved
+
+```
+  pulsevm            12415 -> 7339 ms/pass      1.69x
+  this workspace       226.3 -> 228.0 ms        0.992x — the flag never fires
+```
+
+Resident on pulsevm goes from 3.6x slower than one-shot to about 1.8x. The
+defect is not closed, but it is halved, and the remaining gap is no longer
+about holding inputs — what is left is the per-target state (`reach`,
+`strings`, `symbols`, the cache), which has its own byte bound, and the plain
+fact that a resident process must free what a one-shot process abandons by
+exiting.
+
+### The test, and the bug in the test
+
+The guard is that declining to cache may change *what is remembered* and never
+what is *emitted*, so the test links the same object twice — once normally,
+once with `BLINKER_MEMORY_BUDGET=0` — and compares bytes.
+
+Its first version compared outputs named `held` and `dropped`, and failed. The
+output's file name is part of the image's identity and reaches its UUID, so
+those are two different binaries for a reason that has nothing to do with
+caching. Linking both to `prog` in different directories, they are identical.
+Recorded because a test that reports a linker bug that is its own is worse than
+no test: it spends the credibility that makes a failing test worth reading.

@@ -216,3 +216,62 @@ fn a_program_links_against_a_dylib_that_has_no_text_stub() {
         "the dependency should be recorded by its install name"
     );
 }
+
+/// A link the session declines to cache must produce the same bytes as one it
+/// caches. `BLINKER_MEMORY_BUDGET=0` makes every link "oversized", which is the
+/// path finding 224 added: inputs too large to hold are not held.
+///
+/// Byte equality is the point. The bail-out changes *what is remembered*, and
+/// remembering less may never change what is emitted.
+///
+/// Both outputs are named `prog`, in different directories. The output's file
+/// name is part of the image's identity and reaches its UUID — linking to
+/// `held` and `dropped` produces two different binaries for a reason that has
+/// nothing to do with caching, which is how the first version of this test came
+/// to report a linker bug that was its own.
+#[test]
+fn declining_to_cache_a_link_does_not_change_its_output() {
+    let scratch = Scratch::dir("oversized").expect("scratch");
+    let Some(object) = compile(&scratch, "program.cc", A_PROGRAM, &["-O2"]) else {
+        return;
+    };
+    let held_dir = scratch.join("held");
+    let dropped_dir = scratch.join("dropped");
+    std::fs::create_dir_all(&held_dir).expect("mkdir");
+    std::fs::create_dir_all(&dropped_dir).expect("mkdir");
+
+    let held = held_dir.join("prog");
+    let linked = link(&held, &[&object], &["-lc++", "-Wl,-dead_strip"]);
+    assert!(linked.status.success());
+
+    // The same link, with a budget nothing can fit inside.
+    let dropped = dropped_dir.join("prog");
+    let sdk = blinker_link::sdk_root().expect("an SDK to link against");
+    let mut command = blinker();
+    let done = no_daemon(&mut command)
+        .env("BLINKER_MEMORY_BUDGET", "0")
+        .args(["-arch", "arm64"])
+        .args(["-platform_version", "macos", "26.0.0", "26.5"])
+        .arg("-syslibroot")
+        .arg(&sdk)
+        .arg("-o")
+        .arg(&dropped)
+        .arg(&object)
+        .args(["-lc++", "-Wl,-dead_strip", "-lSystem"])
+        .output()
+        .expect("blinker should run");
+    assert!(
+        done.status.success(),
+        "an uncacheable link should still link: {}",
+        String::from_utf8_lossy(&done.stderr)
+    );
+
+    assert_eq!(
+        std::fs::read(&held).expect("read"),
+        std::fs::read(&dropped).expect("read"),
+        "declining to cache changed the output bytes"
+    );
+    let (said, code) = run(&dropped);
+    assert!(said.contains("constructed"), "and it must still run");
+    assert_eq!(code, run(&held).1);
+}

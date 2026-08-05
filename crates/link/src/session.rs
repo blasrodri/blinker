@@ -581,6 +581,11 @@ pub struct Session {
     /// makes a resident linker silently stop being one, and nothing in a
     /// timing would say which link it was.
     discards: bool,
+    /// Whether *this* link's inputs are too large for holding them to pay.
+    ///
+    /// A fact about the program being linked, not about the session, so it is
+    /// recomputed per link. See [`Session::retains`].
+    oversized: bool,
 }
 
 /// What the `.tbd` stubs say the dynamic libraries export, and which exports
@@ -602,8 +607,25 @@ impl Session {
     }
 
     /// Whether anything derived from this link will be read again.
+    ///
+    /// False for a transient session, and false for a link whose inputs alone
+    /// exceed the memory budget — because then holding them cannot pay.
+    ///
+    /// The second case is finding 223. A daemon rotating five 1.4 GB programs
+    /// held none of them long enough to reuse: each link evicted the last
+    /// one's inputs to make room for its own, so every link re-read and
+    /// re-parsed everything exactly as a one-shot link does — and then paid
+    /// three times over for the privilege. It paid to probe inputs it would
+    /// not reuse, to prove archive members unchanged against members it no
+    /// longer held, and to *free* hundreds of thousands of parses one
+    /// allocation at a time, which a one-shot linker skips entirely by
+    /// exiting.
+    ///
+    /// So a link that cannot be cached is not cached. The daemon still serves
+    /// it — no spawn, no cold start — it simply stops pretending that
+    /// remembering a program larger than the budget will help.
     pub(crate) fn retains(&self) -> bool {
-        !self.discards
+        !self.discards && !self.oversized
     }
 
     /// Begin a link over `inputs`, discarding anything that cannot apply.
@@ -633,6 +655,15 @@ impl Session {
         self.generation += 1;
         let now = self.generation;
         self.target = target;
+        // Asked of the file system, because the decision is needed before
+        // anything is read. `metadata` on a few hundred paths is microseconds
+        // against the gigabytes it decides about.
+        let wanted: u64 = inputs
+            .iter()
+            .filter_map(|path| std::fs::metadata(path).ok())
+            .map(|found| found.len())
+            .sum();
+        self.oversized = wanted as usize > memory_budget();
         // Before this link rather than after it. A link that writes no cache
         // would otherwise never trim — the budget would be enforced only on the
         // path that happens to end by storing something, which is the shape of
@@ -831,7 +862,7 @@ impl Session {
     /// state that was actually read, or — if it changed again — a key that will
     /// fail on the next probe, which is the safe direction to be wrong in.
     pub fn store_object(&mut self, path: &Path, parsed: &Arc<ParsedObject>, data: &Arc<Backing>) {
-        if self.discards {
+        if !self.retains() {
             return;
         }
         let Some(key) = blinker_cache::InputKey::probe(path) else {
@@ -887,7 +918,7 @@ impl Session {
         range: std::ops::Range<usize>,
         data: &Arc<Backing>,
     ) {
-        if self.discards {
+        if !self.retains() {
             return;
         }
         // A member's interface is noted under a path of its own, so two
@@ -908,7 +939,7 @@ impl Session {
         data: &Arc<Backing>,
         symbols: u64,
     ) {
-        if self.discards {
+        if !self.retains() {
             return;
         }
         let Some(key) = blinker_cache::InputKey::probe(path) else {
@@ -1077,7 +1108,7 @@ impl Session {
     pub(crate) fn seed_interfaces(&mut self, parses: &[Arc<ParsedObject>]) {
         // An interface digest exists to tell the *next* link whether this
         // input's symbols moved. Nothing else reads one.
-        if self.discards {
+        if !self.retains() {
             return;
         }
         let missing: Vec<&Arc<ParsedObject>> = parses
@@ -1124,7 +1155,7 @@ impl Session {
 
     /// Remember which members were extracted, and in what order.
     pub fn store_extraction(&mut self, archives: Vec<PathBuf>, order: Vec<(usize, u32)>) {
-        if self.discards {
+        if !self.retains() {
             return;
         }
         let target = self.target;
