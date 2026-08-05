@@ -190,6 +190,64 @@ fn a_daemon_served_link_is_byte_identical() {
     assert_eq!(run(&served), "42\n");
 }
 
+/// The same property for a dylib, which the session now has more state about.
+///
+/// A dylib link carries three things an executable's does not — the output
+/// kind, the install name, and the export list — and all three reach the image
+/// through a session that is keyed by request and reused across links. A warm
+/// link that kept an executable's shape, or another target's exports, would
+/// still produce a loadable library, and only a byte comparison against a cold
+/// link says which one it is.
+#[test]
+fn a_daemon_served_dylib_is_byte_identical() {
+    let scratch = Scratch::dir("daemon-dylib").expect("scratch");
+    let object = compile(
+        &scratch,
+        "lib.c",
+        "int helper(int x) { return x * 7; }\nint answer(void) { return helper(6); }\n",
+    );
+    let list = scratch.join("exports.txt");
+    std::fs::write(&list, "_answer\n").expect("list written");
+
+    let dylib_args = |output: &std::path::Path| {
+        let mut argv = link_args(std::slice::from_ref(&object), output);
+        argv.push("-dynamiclib".to_string());
+        argv.push("-lSystem".to_string());
+        argv.push("-Wl,-dead_strip".to_string());
+        argv.push("-Wl,-exported_symbols_list".to_string());
+        argv.push(format!("-Wl,{}", list.display()));
+        // Fixed, because ld64 defaults it to the output path and the two
+        // outputs below deliberately differ in directory: without this the
+        // images would differ for a reason that is not the daemon.
+        argv.push("-Wl,-install_name".to_string());
+        argv.push("-Wl,/usr/local/lib/libanswer.dylib".to_string());
+        argv
+    };
+
+    let direct = output_in(&scratch, "direct-dylib").with_file_name("libanswer.dylib");
+    let status = blinker()
+        .args(dylib_args(&direct))
+        .status()
+        .expect("blinker runs");
+    assert!(status.success(), "the direct dylib link failed");
+
+    let daemon = Daemon::start("dylib");
+    let served = output_in(&scratch, "served-dylib").with_file_name("libanswer.dylib");
+    // Twice: the first fills the session, the second is the one served from a
+    // worker that already holds this target's state.
+    for round in 0..2 {
+        assert!(
+            daemon.link(&dylib_args(&served), &served),
+            "round {round}: the daemon never produced a dylib"
+        );
+        assert_eq!(
+            std::fs::read(&served).expect("served"),
+            std::fs::read(&direct).expect("direct"),
+            "round {round}: the daemon produced a different library"
+        );
+    }
+}
+
 /// And the case the session makes possible: a second link through the same
 /// daemon, after an edit, must see the edit.
 ///
