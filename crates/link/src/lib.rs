@@ -3996,6 +3996,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
             .collect();
         gap!(_lap, "round: parse");
         session.seed_interned(&derivable);
+        gap!(_lap, "round: seed_interned");
         let digestible: Vec<Arc<ParsedObject>> = todo
             .iter()
             .filter_map(|at| parsed[*at].as_ref().ok())
@@ -4023,7 +4024,7 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
             }
         }
 
-        gap!(_lap, "round: seed + store");
+        gap!(_lap, "round: interfaces + store");
         for loaded in parsed {
             let loaded = loaded?;
             let ids = session.interned(&loaded.parsed);

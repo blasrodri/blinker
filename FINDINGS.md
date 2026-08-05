@@ -10930,6 +10930,9 @@ and nothing re-derives its assumptions when the thing it measures moves.
   blinker one-shot   328 ms      2.4x
 ```
 
+(Superseded by finding 217, which took the resident arm to 213 ms and the
+headline to 3.7x.)
+
 ---
 
 ## 216. Three things that turned out not to be worth doing, and why they looked like they were
@@ -10978,3 +10981,86 @@ measurement. `rustc` spawns the linker with `posix_spawn`, not through Python.
 Nothing, because all three were measured before anything was built. Recorded
 because "it's a pipeline, use a ring buffer" and "half the time is process
 startup" are both the kind of claim that sounds like knowledge.
+
+---
+
+## 217. 413 threads a link, created and destroyed to do microseconds of work
+
+Finding 216 said the link touches its atomic cursors about sixty times against
+half a million relocations, and concluded the queue was the wrong end of the
+problem. That was right about the queue and wrong about what it implied. The
+cursor is free. **Arranging the threads that read it was not**, and nobody had
+looked because `map_chunks` reads as one call.
+
+A link makes 29 `map_chunks` calls. Each one spawned `available_parallelism()`
+scoped threads and joined them — **413 OS threads per link**, on a machine with
+15 cores. Creating and joining fifteen scoped threads costs 0.11–0.15 ms here
+whatever they do, so the calls doing little work paid far more to arrange the
+parallelism than the parallelism returned: an extraction round of 415 names
+took 0.17 ms, essentially all of it spawn.
+
+The fix is the obvious one — make the threads once, park them, wake them per
+call — with nothing else changed: the same chunk bounds, the same atomic cursor
+handing out the same chunk indices, the same merge in chunk order. All sixteen
+links of this workspace are byte-identical to what the spawning version
+produced, cold and warm.
+
+```
+  16 links, resident       231 ms  ->  211 ms      1.10x
+  16 links, one-shot       318 ms  ->  298 ms      1.07x
+```
+
+Headline: **3.4x -> 3.7x** (794 ms ld64 against 213 ms), with ld64 measured in
+the same session at 794 ms against the 803 it read before, so the move is ours.
+
+### Why they park rather than spin
+
+The natural next step is to have the workers spin on the epoch rather than park
+on a condvar — the trading-system answer, and the one finding 216's question was
+really about. Measured, it is the **worst of the three**:
+
+```
+  spawn per call            0.111 ms
+  parked pool               0.042 ms
+  spinning pool             0.080 ms
+```
+
+and with the ~400 us of serial work a real link puts between two calls, the
+spinning pool degrades to 0.18–0.23 ms while the parked one holds at 0.05.
+A spinning worker is not free to the rest of the machine: fourteen of them
+compete for cores with the submitter, which is running a chunk itself, and with
+whatever else the developer has open. Busy-waiting buys latency with a core.
+A trading system owns its cores and can pay; a linker on a shared desktop
+cannot. **The technique is not wrong, its precondition is absent** — which is
+the same shape as finding 216, arrived at from the other side.
+
+### The bug, and why every single-threaded test passed
+
+The first version deadlocked `cargo test`, and the reason is worth keeping.
+The pool has one job slot and one outstanding-worker count, so it assumes a
+single submitter. `cargo test` runs test functions on concurrent threads:
+
+```
+  A: running = 14; epoch = 1     wakes the workers
+  B: running = 14; epoch = 2     overwrites A's count
+```
+
+Each worker decrements once per wake-up, but a worker that never woke for epoch
+1 — because epoch 2 had already replaced it — decrements once where two jobs'
+worth was charged. `running` never reaches zero and both submitters wait
+forever. Every test passed under `--test-threads=1`; the hang needed two of them
+at once, which is exactly the condition no test asserted.
+
+Fixed with a submit lock taken by `try_lock`, not waited on: a second concurrent
+submitter spawns its own threads, which is what every call did before this pool
+existed. Waiting would have serialised two links that could have run side by
+side. The test that would have caught it — eight threads calling `map_chunks`
+in a loop — now exists, along with ones for chunk order, panic propagation, and
+nesting.
+
+### What it cost
+
+Half a day, and one deadlock that a two-minute tool timeout was nearly mistaken
+for a slow build. The distinction mattered: a slow build is an annoyance, and a
+hang was a real defect in code that had already been measured, verified
+byte-identical, and was about to be committed.

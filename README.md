@@ -2,13 +2,13 @@
 
 A resident, incremental Mach-O linker for Rust on Apple Silicon.
 
-**It makes a `cargo build`'s linking 3.4× faster, out of the box.**
+**It makes a `cargo build`'s linking 3.7× faster, out of the box.**
 
 ```
 a full build of this workspace — 16 links, 23 inputs at the median
 
-  ld64 (cc)            803, 817, 819, 828 ms
-  blinker              235, 236, 238, 240 ms      3.4×
+  ld64 (cc)            794, 839, 840, 841 ms
+  blinker              213, 215, 216, 217 ms      3.7×
 ```
 
 Every one of those 16 links is blinker's, including the proc-macro dylib that
@@ -130,7 +130,7 @@ captured link arguments, not a synthetic benchmark. See
 
 | | blinker | system linker | |
 |---|---|---|---|
-| **A whole `cargo build`'s links** (16 links) | **235 ms** | 803 ms `cc`/ld64 | **3.4×** |
+| **A whole `cargo build`'s links** (16 links) | **213 ms** | 794 ms `cc`/ld64 | **3.7×** |
 | **Edit relink, resident** | **15.7 ms** | 31.8 ms `ld64` | **2.0×** |
 
 The relink row holds 68 of 70 inputs in memory, replays the archive extraction
@@ -163,8 +163,8 @@ after every link has to be told the whole program again each time.
 
 So the thing worth attacking is not the cost of one link. It is the cost of the
 hundredth link of a program the linker has already seen ninety-nine times. That
-is why blinker is resident: staying alive is worth **1.40×** on its own here
-(235 ms against 328 for the same links one-shot), before any incremental
+is why blinker is resident: staying alive is worth **1.46×** on its own here
+(213 ms against 312 for the same links one-shot), before any incremental
 machinery does anything.
 
 That number was zero until finding 214. A session forgot an input after four
