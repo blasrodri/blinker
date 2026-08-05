@@ -11474,11 +11474,69 @@ the next attempt should start by finding out what inside `read_and_parse` costs
 four times more with a warm session than with a cold one — a question this
 finding does not answer.
 
+### The mechanism, measured
+
+Not the probe. Every workload content-hashes about the same *share* of its
+bytes each link — 2% here, 2% for this workspace, 2% for rust-analyzer, 7% for
+ripgrep — so freshness checking is not what separates them.
+
+What separates them is size:
+
+```
+                   inputs/link      bytes/link
+  this workspace        38            28 MB
+  ripgrep               53            28 MB
+  rust-analyzer         47            44 MB
+  pulsevm              510          1427 MB        50x
+```
+
+And the failure appears at a *threshold in how many of those a daemon holds at
+once*:
+
+```
+  1 program rotating    232 ms/link
+  2 programs            241
+  3 programs            332
+  5 programs           2481          collapses
+```
+
+The page-in counters say what is actually happening, per pass of five links:
+
+```
+  resident   9872 ms/pass    228,297 pages in   =  3741 MB read from disk
+  one-shot   2971 ms/pass      7,184 pages in   =   118 MB read from disk
+```
+
+**Thirty-two times the disk traffic.** The held state — five programs' mapped
+inputs and their parses — is larger than the machine will keep resident, so it
+does not survive between links: every link faults its inputs back in from disk
+anyway. And having filled memory with a cache that does not survive, the daemon
+has also evicted the page cache the one-shot arm was quietly relying on. That
+is why holding state is not merely *not helping* here but is actively worse
+than holding nothing.
+
+The Rust workloads never approach the threshold: 28-44 MB per link, a few
+programs, a few hundred megabytes held in total. The cache genuinely persists,
+and residency is worth the 1.4-1.5x it is credited with.
+
+### Two separate problems, not one
+
+Worth keeping apart, because they have different fixes:
+
+1. **One-shot is 1.8x slower than ld64 at this scale.** That is the tail
+   weakness already recorded — a cold link of a very large program — and it has
+   nothing to do with residency.
+2. **Residency turns 1.8x into 4.5x.** That is this finding, and the fix is a
+   bound on held state that is expressed in the resource that actually runs
+   out. Not the estimate that was tried and reverted above: the bound has to
+   make the daemon hold *less than the machine can keep resident*, and to know
+   when holding nothing is the better answer.
+
 ### Why it was never seen
 
-Every workload measured until today was Rust: 23 inputs at the median, tens of
-megabytes. This one is 552 inputs and hundreds of megabytes, and the failure
-needs *several large programs sharing one worker* — which is what a real
-C++ workspace is and what none of the benchmarks were.
+Every workload measured until today was Rust: tens of inputs, tens of
+megabytes. This one is 510 inputs and 1.4 GB per link, and the failure needs
+*several* such programs alive at once — which is what a real C++ workspace is
+and what none of the benchmarks were.
 
 The headline numbers stand for what they measure. They do not cover this.
