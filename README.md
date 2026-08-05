@@ -25,13 +25,21 @@ and keeps a resident linker alive for the next link.
 You need an Apple Silicon Mac, a stable Rust toolchain, and Xcode command line
 tools (`/usr/bin/cc` must exist). `aarch64-apple-darwin` is the only target.
 
+From the project you want to link faster:
+
 ```bash
-curl -fsSL https://raw.githubusercontent.com/blasrodri/blinker/master/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/blasrodri/blinker/master/install.sh | sh -s -- --use
 ```
 
-That downloads the latest release, checks its SHA-256, and puts `blinker` in
-`~/.cargo/bin`. It configures nothing — which projects use blinker is the next
-step, and yours to make. Set `BLINKER_INSTALL_DIR` to put it elsewhere.
+That is the whole of it. `cargo build` now links with blinker.
+
+It downloads the latest release, checks its SHA-256, puts `blinker` in
+`~/.cargo/bin`, and writes the linker setting into this project's
+`.cargo/config.toml`. Set `BLINKER_INSTALL_DIR` to put the binary elsewhere.
+`blinker --blinker-uninstall` puts the project back exactly as it was.
+
+Drop the `--use` and it installs the binary and configures nothing, which is
+the right order if you would rather try it first — see step 1 below.
 
 Or build it yourself:
 
