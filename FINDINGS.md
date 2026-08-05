@@ -10672,3 +10672,48 @@ Nothing, because it was measured before it was built. It is recorded because
 all three claims were plausible, widely repeated, and wrong on this machine —
 and because the reasoning that produced them ("Apple Silicon has E-cores") is
 the kind that sounds like knowledge.
+
+---
+
+## 212. The stub parse is finished as a target, and it is finished below the floor
+
+**Observed.** After finding 210 the stub parse was 3.1 ms on the median link.
+Two further changes were made to it, both of them the cache-locality kind the
+project keeps finding wins in: `StubExports`' owner table went from
+`BTreeMap<String, u16>` — 9,264 separate allocations reached by comparing text
+down a pointer-chased tree — to a hash map, and the intermediate
+`BTreeSet<String>` between the parse and that table was replaced by a visitor,
+removing a full second copy of every name.
+
+They worked. The stage went **3.07 ms to 1.94 ms**, 1.6×.
+
+The link did not move:
+
+```
+  link      9.3 ->    9.1 ms  (0.980x)   sd 0.5/0.3, spread 28%
+```
+
+`read_and_parse` was 3.66 ms before and 3.61 ms after, because the *other* half
+of that stage — reading the objects and pulling archive members — costs 3.6 ms
+and the stub parse had already gone under it. There is no workload in the corpus
+where it is exposed: it was 3.1 ms against a 3.6 ms floor on the smallest real
+link and 3.2 against 10.7 on the largest.
+
+Both changes were reverted. They are strictly less work than what they replaced
+and they still buy nothing, which is the whole point of recording this: the
+question "is this stage faster" and the question "is the link faster" have
+different answers, and only the second one is the product.
+
+**What this leaves.** Cold link time is now object loading. On this workspace's
+own link that is 10.7 ms of a 19.6 ms link, of which 1.3 ms is reading the 70
+files on the command line and the rest is extracting and parsing 654 archive
+members. That is the next cold target, and the stub parse is done — the
+measurement above is recorded so that a later change which lowers the object
+floor knows there is 1.1 ms sitting behind it, ready.
+
+### What it cost
+
+Nothing, and it is the third time in this document that overlapped work has
+been optimised after it stopped being the slower half (findings 91, 210, this).
+The lesson is not learned by knowing it; it is learned by measuring the stage
+*and* the link, every time.
