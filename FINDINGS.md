@@ -10492,3 +10492,41 @@ dylib's root set its whole symbol table and the strip a no-op.
 Measured on a one-macro proc-macro crate: 1 580 317 bytes unstripped,
 **510 573** stripped, against `ld64`'s 488 336 — 4.6% larger, and the macro
 still expands inside rustc.
+
+## 208. A test can pin a spelling the compiler never uses
+
+Linking dylibs made the build-links harness fail on its own recording:
+
+```
+ld: -exported_symbols_list file '…/rustcFeTVLN/list' could not be opened, errno=2
+```
+
+`rustc` writes that list into the temporary directory it deletes the moment the
+linker returns, which is the exact problem the recorder exists to solve, and
+`-exported_symbols_list` had been in `FILE_VALUED_FLAGS` since the day that list
+existed. It had never once been copied.
+
+The archiver scanned `argv` for a bare `-exported_symbols_list` followed by a
+path. rustc passes `-Wl,-exported_symbols_list` and then `-Wl,<path>` — two
+arguments, neither of which is either of those things. So the flag matched
+nothing, no list was ever archived, and `rewrite_argv` had nothing to rewrite.
+The unit test alongside it passed throughout, because it was written in the
+spelling `ld64` accepts rather than the one rustc emits.
+
+This is the same defect, in a second place, as the one that made
+`-exported_symbols_list` silently do nothing in the linker itself: the option
+and its value arrive tunnelled and split across two arguments. Both were found
+the same way — by running a real proc-macro link rather than a constructed one
+— and neither would have been found by any test written from the option's
+documentation.
+
+Both are fixed by flattening a run of `-Wl,` arguments into one sequence before
+reading it, and the archiver now rewrites paths *inside* the tunnel. The new
+tests use rustc's spelling; the old one is kept, because `ld64` accepts both and
+a recording made by hand should replay too.
+
+### What it cost
+
+Every recording of a `-dynamiclib` link taken before this was unreplayable, and
+the corpus that FINDINGS is built from contains none — because until this week
+those links were delegated and never reached the recorder at all.

@@ -91,13 +91,15 @@ pub fn archive_side_files(
     dest: &Path,
 ) -> std::io::Result<HashMap<PathBuf, PathBuf>> {
     let mut mapping = HashMap::new();
-    for (index, arg) in argv.iter().enumerate() {
-        if !FILE_VALUED_FLAGS.contains(&arg.as_str()) {
+    let elements = flatten(argv);
+    for (at, (index, element)) in elements.iter().enumerate() {
+        if !FILE_VALUED_FLAGS.contains(&element.as_str()) {
             continue;
         }
-        let Some(value) = argv.get(index + 1) else {
+        let Some((_, value)) = elements.get(at + 1) else {
             continue;
         };
+        let index = *index;
         let source = Path::new(value);
         if !source.is_file() {
             continue;
@@ -114,15 +116,56 @@ pub fn archive_side_files(
     Ok(mapping)
 }
 
+/// Every argument as the linker will read it, paired with the argv index it
+/// came from.
+///
+/// A `-Wl,a,b` argument is three things at once — a driver flag, an ld64
+/// option, and that option's value — and the option's value is a *file* this
+/// module has to copy. rustc writes the pair as two arguments,
+/// `-Wl,-exported_symbols_list` then `-Wl,/path/to/list`, so neither the flag
+/// nor its value is ever a bare argv element and a scan over argv alone finds
+/// nothing. That is exactly what happened: the flag was in the list from the
+/// day the list existed, the test used the spelling `ld64` accepts, and rustc
+/// has never used that spelling — so no recording of a dylib link was ever
+/// replayable.
+fn flatten(argv: &[String]) -> Vec<(usize, String)> {
+    let mut out = Vec::with_capacity(argv.len());
+    for (index, arg) in argv.iter().enumerate() {
+        match arg.strip_prefix("-Wl,") {
+            Some(payload) => out.extend(
+                payload
+                    .split(',')
+                    .filter(|e| !e.is_empty())
+                    .map(|e| (index, e.to_string())),
+            ),
+            None => out.push((index, arg.clone())),
+        }
+    }
+    out
+}
+
 /// Rewrite an argument vector so input paths point at their archived copies.
 ///
 /// Arguments with no mapping pass through unchanged, so flags, library
-/// requests, and the output path are preserved exactly.
+/// requests, and the output path are preserved exactly — and a path tunnelled
+/// through `-Wl,` is rewritten inside the tunnel, since that is where rustc
+/// puts the ones this module archives.
 pub fn rewrite_argv(argv: &[String], mapping: &HashMap<PathBuf, PathBuf>) -> Vec<String> {
+    let replace = |text: &str| match mapping.get(Path::new(text)) {
+        Some(archived) => archived.display().to_string(),
+        None => text.to_string(),
+    };
     argv.iter()
-        .map(|arg| match mapping.get(Path::new(arg)) {
-            Some(archived) => archived.display().to_string(),
-            None => arg.clone(),
+        .map(|arg| match arg.strip_prefix("-Wl,") {
+            Some(payload) => format!(
+                "-Wl,{}",
+                payload
+                    .split(',')
+                    .map(replace)
+                    .collect::<Vec<String>>()
+                    .join(",")
+            ),
+            None => replace(arg),
         })
         .collect()
 }
@@ -293,6 +336,76 @@ mod side_file_tests {
         );
         assert_eq!(std::fs::read_to_string(archived).unwrap(), "_main\n");
         assert_eq!(replayed[3], "program", "unrelated arguments were rewritten");
+    }
+
+    /// The spelling rustc actually uses, which is the one that matters: the
+    /// flag and its value arrive as two separate `-Wl,` arguments, so neither
+    /// is a bare argv element. This test exists because the one above passed
+    /// for months against a spelling rustc has never emitted, and every
+    /// recording of a dylib link was unreplayable the whole time — `cc`
+    /// refusing with "file could not be opened" the moment it was replayed.
+    #[test]
+    fn the_spelling_rustc_uses_is_archived_too() {
+        let scratch = Scratch::dir("archive-side-files-wl").unwrap();
+        let temporary = scratch.join("rustcYYYY");
+        std::fs::create_dir_all(&temporary).unwrap();
+        let list = temporary.join("list");
+        std::fs::write(&list, "_answer\n").unwrap();
+
+        let argv = vec![
+            "-Wl,-exported_symbols_list".to_string(),
+            format!("-Wl,{}", list.display()),
+            "-dynamiclib".to_string(),
+            "-o".to_string(),
+            "libthing.dylib".to_string(),
+        ];
+        let dest = scratch.join("inputs");
+        let mapping = archive_side_files(&argv, &dest).unwrap();
+        let replayed = rewrite_argv(&argv, &mapping);
+
+        std::fs::remove_dir_all(&temporary).unwrap();
+
+        let archived = replayed[1]
+            .strip_prefix("-Wl,")
+            .expect("still tunnelled, because that is how it must reach ld64");
+        assert!(
+            Path::new(archived).is_file(),
+            "the replay argv still names the deleted file: {}",
+            replayed[1]
+        );
+        assert_eq!(std::fs::read_to_string(archived).unwrap(), "_answer\n");
+        assert_eq!(
+            replayed[0], "-Wl,-exported_symbols_list",
+            "the flag itself was rewritten"
+        );
+        assert_eq!(replayed[4], "libthing.dylib");
+    }
+
+    /// The comma-joined form, which a hand-written command line uses.
+    #[test]
+    fn a_flag_and_value_in_one_tunnel_are_archived() {
+        let scratch = Scratch::dir("archive-side-files-joined").unwrap();
+        let temporary = scratch.join("rustcZZZZ");
+        std::fs::create_dir_all(&temporary).unwrap();
+        let list = temporary.join("list");
+        std::fs::write(&list, "_answer\n").unwrap();
+
+        let argv = vec![format!("-Wl,-exported_symbols_list,{}", list.display())];
+        let dest = scratch.join("inputs");
+        let mapping = archive_side_files(&argv, &dest).unwrap();
+        let replayed = rewrite_argv(&argv, &mapping);
+
+        std::fs::remove_dir_all(&temporary).unwrap();
+
+        let archived = replayed[0]
+            .rsplit(',')
+            .next()
+            .expect("a value follows the flag");
+        assert!(
+            Path::new(archived).is_file(),
+            "the replay argv still names the deleted file: {}",
+            replayed[0]
+        );
     }
 
     /// A flag whose value is missing or is not a file is left alone rather than

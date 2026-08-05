@@ -2,14 +2,17 @@
 
 A resident, incremental Mach-O linker for Rust on Apple Silicon.
 
-**It makes a `cargo build`'s linking 2.7× faster, out of the box.**
+**It makes a `cargo build`'s linking 2.5× faster, out of the box.**
 
 ```
-a full build of this workspace — 15 links, 23 inputs at the median
+a full build of this workspace — 16 links, 23 inputs at the median
 
-  ld64 (cc)            765, 859, 857 ms
-  blinker              304, 296, 296 ms      2.7×
+  ld64 (cc)            801, 826, 837 ms
+  blinker              319, 320, 324 ms      2.5×
 ```
+
+Every one of those 16 links is blinker's, including the proc-macro dylib that
+used to be handed to `ld`.
 
 Set it as your linker and change nothing else. It links internally by default
 and keeps a resident linker alive for the next link.
@@ -117,7 +120,7 @@ captured link arguments, not a synthetic benchmark. See
 
 | | blinker | system linker | |
 |---|---|---|---|
-| **A whole `cargo build`'s links** (15 links) | **296 ms** | 765 ms `cc`/ld64 | **2.7×** |
+| **A whole `cargo build`'s links** (16 links) | **319 ms** | 801 ms `cc`/ld64 | **2.5×** |
 | **Edit relink, resident** | **20.6 ms** | 34.3 ms `ld-prime` | **1.7×** |
 
 ### By workload
@@ -143,8 +146,8 @@ after every link has to be told the whole program again each time.
 
 So the thing worth attacking is not the cost of one link. It is the cost of the
 hundredth link of a program the linker has already seen ninety-nine times. That
-is why blinker is resident: staying alive is worth **1.6×** on its own here
-(296 ms against 484 for the same links one-shot), before any incremental
+is why blinker is resident: staying alive is worth **1.5×** on its own here
+(319 ms against 491 for the same links one-shot), before any incremental
 machinery does anything.
 
 It is also why the median matters more than the maximum. A real build's links
@@ -410,5 +413,5 @@ milestone deliverable.
 
 - [PRODUCT_SPEC.md](PRODUCT_SPEC.md) — what the product is
 - [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) — the milestone sequence
-- **[FINDINGS.md](FINDINGS.md)** — the 207 places reality contradicted the plan,
+- **[FINDINGS.md](FINDINGS.md)** — the 208 places reality contradicted the plan,
   several of them contradicting earlier entries in the same file
