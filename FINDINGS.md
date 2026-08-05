@@ -11208,3 +11208,58 @@ Nothing yet, and that is the unsettling part. Any C++ dependency linked by
 blinker before today would have had its static constructors silently skipped —
 uninitialised singletons, unregistered factories, empty tables — presenting as
 a logic bug in the user's program with no reason to suspect the linker.
+
+---
+
+## 220. An undefined symbol nobody calls is not an undefined symbol
+
+The last symbol standing in the real project was
+`__ZN9chainbase8database5flushEv`. Nothing in the link defines it —
+`libpulsevm_ffi.a` refers to `chainbase::database::flush()` and no archive,
+rlib or dylib anywhere on the machine has a definition. `ld64` links the
+program without a word.
+
+It is right to. The reference lives in code that `-dead_strip` removes, so the
+function is never called and its absence cannot matter. blinker computed
+`undefined_references` by walking **every** object's symbol table and never
+asked whether the code holding the reference had survived — so it refused to
+link a program that works, naming a symbol the user cannot supply and does not
+need.
+
+### Fixed in the error, not in the import list
+
+The obvious fix — filter the undefined set by liveness — is the wrong one. That
+set also produces the *import* list, and a symbol referenced only from dead code
+would then drop out of the dylib bind table, changing the shape of every
+executable blinker has ever produced for a reason unrelated to this bug.
+
+So liveness is asked only about names that are already missing and about to
+fail. A link that is going to succeed never walks a relocation for it, and the
+16 links of this workspace stay byte-identical. `Strip::remap` answers `None`
+for bytes that did not survive, which is exactly the question.
+
+### The test that needed the system linker to arbitrate
+
+The first fixture linked with `-dead_strip` and failed anyway, which looked
+like the fix not working. It was the *flag*: blinker takes `-dead_strip` only
+through `-Wl,`-expansion, as rustc passes it, and a bare `-dead_strip` on the
+command line is not the same argument. The test now links the same object with
+`cc` first and only asserts against blinker if the system linker accepted it —
+so a bad fixture reports itself as a bad fixture instead of as a linker bug.
+
+### Where the real project now stands
+
+Past symbol resolution entirely, and failing further in:
+
+```
+  blinker: object 1337: cannot apply PageOff12: ARM64_RELOC_PAGEOFF12
+           at 0x10082e250: value 3278 is not 16-byte aligned
+  blinker: object 1236: ... value 107 is not 8-byte aligned
+```
+
+The encoder is not wrong to complain: an `LDR` with an unsigned 12-bit offset
+scales the immediate by its access width, so 107 cannot be encoded for an
+8-byte load. The *target address* is misaligned, which means something upstream
+— atom alignment through dead-strip compaction, or an addend — placed a symbol
+where it could not go. That is the next thing to find, and it is a correctness
+bug in the same class as this one rather than a missing feature.

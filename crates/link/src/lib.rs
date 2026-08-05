@@ -2028,8 +2028,13 @@ fn link_inner(
     let imports = match session.imports() {
         Some(held) => held.to_vec(),
         None => {
-            let imports =
-                resolve_imports(&objects, &interned, session.names(), exported.as_deref())?;
+            let imports = resolve_imports(
+                &objects,
+                &interned,
+                session.names(),
+                exported.as_deref(),
+                &strip,
+            )?;
             // Resolution runs for its diagnostics: it is what turns a
             // genuinely missing definition into a named error rather than a
             // relocation against zero.
@@ -3123,12 +3128,57 @@ fn linker_defined_address(name: &str, image: &blinker_output::Image) -> Option<u
     }
 }
 
+/// Which of `wanted` some *surviving* relocation still points at.
+///
+/// A name in an object's symbol table is not yet a reason to fail: the code
+/// that referenced it may have been dead-stripped, and then the program never
+/// calls it and the definition is not needed. `ld64` reports an undefined
+/// symbol only when live code reaches it, which is how a real project links
+/// against a static library that mentions a function nobody kept.
+///
+/// Asked only about names that are already known to be missing, and only when
+/// something is about to fail, so a link that is going to succeed never walks
+/// a relocation for this.
+fn live_references(
+    objects: &[LoadedObject],
+    interned: &[Arc<Vec<SymbolNameId>>],
+    strip: &Strip,
+    wanted: &HashSet<SymbolNameId>,
+) -> HashSet<SymbolNameId> {
+    let mut live: HashSet<SymbolNameId> = HashSet::default();
+    for (slot, object) in objects.iter().enumerate() {
+        let ids = &interned[slot];
+        for relocation in &object.parsed.relocations {
+            let blinker_macho::RelocationTarget::Symbol(symbol) = relocation.target else {
+                continue;
+            };
+            let Some(name) = ids.get(symbol.0 as usize) else {
+                continue;
+            };
+            if !wanted.contains(name) || live.contains(name) {
+                continue;
+            }
+            // `remap` answers `None` for bytes that did not survive, which is
+            // exactly the question: did the field holding this reference get
+            // stripped?
+            if strip
+                .remap(object.parsed.id, relocation.section, relocation.offset)
+                .is_some()
+            {
+                live.insert(*name);
+            }
+        }
+    }
+    live
+}
+
 /// Undefined references, checked against what `libSystem` actually exports.
 fn resolve_imports(
     objects: &[LoadedObject],
     interned: &[Arc<Vec<SymbolNameId>>],
     names: &SymbolNames,
     exported: Option<&libraries::StubExports>,
+    strip: &Strip,
 ) -> Result<Vec<String>, LinkError> {
     let undefined = undefined_references(objects, interned, names);
     if undefined.is_empty() {
@@ -3151,7 +3201,27 @@ fn resolve_imports(
         }
     }
     if !missing.is_empty() {
-        return Err(LinkError::UndefinedSymbols { names: missing });
+        // Only the ones live code still reaches. A static library routinely
+        // mentions a function the program never calls — `libpulsevm_ffi.a`
+        // referred to `chainbase::database::flush()`, which nothing in the
+        // link defines and nothing kept — and reporting that is refusing to
+        // link a program the system linker builds without comment.
+        //
+        // Filtered here rather than in `undefined_references`, deliberately:
+        // the import list above must not change, or a symbol that only dead
+        // code imports would drop out of the dylib bind table and every
+        // executable blinker has produced would change shape for a reason
+        // unrelated to the bug being fixed.
+        let asked: HashSet<SymbolNameId> =
+            missing.iter().filter_map(|name| names.get(name)).collect();
+        let live = live_references(objects, interned, strip, &asked);
+        let reachable: Vec<String> = missing
+            .into_iter()
+            .filter(|name| names.get(name).is_some_and(|id| live.contains(&id)))
+            .collect();
+        if !reachable.is_empty() {
+            return Err(LinkError::UndefinedSymbols { names: reachable });
+        }
     }
     Ok(imports)
 }

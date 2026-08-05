@@ -145,3 +145,53 @@ fn a_linker_defined_dso_handle_needs_no_library() {
         String::from_utf8_lossy(&linked.stderr)
     );
 }
+
+/// A reference from code that dead-stripping removes is not an undefined
+/// symbol. `ld64` links such a program without comment; blinker used to refuse
+/// it, because it read every object's symbol table and never asked whether the
+/// code holding the reference had survived.
+#[test]
+fn a_reference_only_dead_code_makes_is_not_an_error() {
+    let scratch = Scratch::dir("dead-reference").expect("scratch");
+    let source = r#"
+extern "C" void a_function_nothing_defines(void);
+// Never called, so `-dead_strip` removes it along with its reference.
+extern "C" void unused_caller(void) { a_function_nothing_defines(); }
+int main(void) { return 0; }
+"#;
+    let Some(object) = compile(&scratch, "dead", source) else {
+        return;
+    };
+    let output = scratch.join("program");
+    let sdk = blinker_link::sdk_root().expect("an SDK to link against");
+
+    let linked = no_daemon(&mut blinker())
+        .args(["-arch", "arm64"])
+        .args(["-platform_version", "macos", "26.0.0", "26.5"])
+        .arg("-syslibroot")
+        .arg(&sdk)
+        .arg("-o")
+        .arg(&output)
+        .arg(&object)
+        .args(["-lc++", "-lSystem", "-Wl,-dead_strip"])
+        .output()
+        .expect("blinker should run");
+
+    // The system linker is the arbiter: if it refuses this too, the fixture is
+    // wrong rather than the linker.
+    let reference = Command::new("cc")
+        .arg(&object)
+        .arg("-o")
+        .arg(scratch.join("ld64-program"))
+        .args(["-lc++", "-Wl,-dead_strip"])
+        .output()
+        .expect("cc should run");
+    if !reference.status.success() {
+        return;
+    }
+    assert!(
+        linked.status.success(),
+        "ld64 links this; blinker should too: {}",
+        String::from_utf8_lossy(&linked.stderr)
+    );
+}
