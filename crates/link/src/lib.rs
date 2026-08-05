@@ -405,6 +405,14 @@ pub struct LinkRequest {
     /// file's base name.
     pub identifier: String,
     pub dylibs: Vec<Dylib>,
+    /// Directories to record for dyld to search when resolving an
+    /// `@rpath/...` dependency, in command-line order.
+    ///
+    /// Empty for a program that loads only absolute-path libraries, which is
+    /// every pure-Rust one — and why their absence went unnoticed until a
+    /// program linked a relocatable library and died at load with
+    /// "no LC_RPATH's found".
+    pub rpaths: Vec<String>,
     /// `.tbd` stubs describing what the dylibs export.
     pub stub_libraries: Vec<PathBuf>,
     /// Where the incremental cache lives, when one is wanted.
@@ -464,6 +472,7 @@ impl LinkRequest {
             exported_symbols: None,
             entry_symbol: "_main".to_string(),
             identifier: "a.out".to_string(),
+            rpaths: Vec::new(),
             dylibs: vec![Dylib::lib_system()],
             stub_libraries: default_stub_library().into_iter().collect(),
             cache_path: None,
@@ -538,6 +547,12 @@ impl LinkRequest {
     /// Additive rather than replacing when the list is empty, so a caller that
     /// resolved nothing keeps the default libSystem — an in-process API user
     /// linking a pure-Rust program passes no `-l` at all.
+    /// Directories dyld will search for `@rpath/...` dependencies.
+    pub fn with_rpaths(mut self, paths: Vec<String>) -> Self {
+        self.rpaths = paths;
+        self
+    }
+
     pub fn stub_libraries(mut self, paths: Vec<PathBuf>) -> Self {
         if !paths.is_empty() {
             self.stub_libraries = paths;
@@ -4608,6 +4623,9 @@ fn assemble(
     }
     for dylib in assembly.dylibs {
         builder.dylib(dylib.clone());
+    }
+    for path in &request.rpaths {
+        builder.rpath(path.clone());
     }
     builder.identifier(&request.identifier);
     match request.kind {

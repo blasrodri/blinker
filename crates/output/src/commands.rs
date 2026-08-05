@@ -252,6 +252,26 @@ pub fn write_load_dylinker(writer: &mut Writer, path: &str) {
     writer.pad_to(start + command_size);
 }
 
+/// Emit `LC_RPATH`.
+///
+/// One per `-rpath` on the command line, in order. Without these an
+/// `@rpath/libfoo.dylib` dependency has nowhere to be looked for, and the
+/// program links cleanly and then dies at load with "no LC_RPATH's found" —
+/// which is how every program linking a vendored or relocatable library
+/// behaved before this existed.
+pub fn write_rpath(writer: &mut Writer, path: &str) {
+    let command_size = command_size_with_path(12, path);
+    let start = writer.len();
+    writer
+        .u32(LC_RPATH)
+        .u32(command_size as u32)
+        // Offset of the path within the command.
+        .u32(12)
+        .bytes(path.as_bytes())
+        .bytes(&[0]);
+    writer.pad_to(start + command_size);
+}
+
 /// Emit `LC_LOAD_DYLIB`.
 pub fn write_load_dylib(
     writer: &mut Writer,

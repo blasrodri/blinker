@@ -2547,3 +2547,68 @@ fn report(objects: &[LoadedObject], atoms: &Atoms<'_>, live: &LiveSet, revived: 
         .sum();
     report
 }
+
+#[cfg(test)]
+mod placement_tests {
+    use super::placement_of;
+
+    /// The invariant the whole function exists for: an atom keeps its offset
+    /// modulo the section's alignment, so every symbol inside it keeps the
+    /// alignment the assembler assumed when it chose an instruction.
+    #[test]
+    fn an_atom_keeps_its_congruence() {
+        for alignment in [1u64, 2, 4, 8, 16, 32] {
+            for offset in 0u64..200 {
+                for cursor in 0u64..200 {
+                    let to = placement_of(cursor, offset, alignment);
+                    assert!(to >= cursor, "an atom may not move backwards");
+                    assert_eq!(
+                        to % alignment.max(1),
+                        offset % alignment.max(1),
+                        "congruence lost for offset {offset} at cursor {cursor} \
+                         with alignment {alignment}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// It must not waste more than it has to, or a strip that compacts nothing
+    /// would still grow the output.
+    #[test]
+    fn it_takes_the_least_position_that_works() {
+        for alignment in [1u64, 2, 4, 8, 16] {
+            for offset in 0u64..64 {
+                for cursor in 0u64..64 {
+                    let to = placement_of(cursor, offset, alignment);
+                    assert!(
+                        to - cursor < alignment.max(1),
+                        "moved {} for alignment {alignment}",
+                        to - cursor
+                    );
+                }
+            }
+        }
+    }
+
+    /// The case every single-symbol atom has, and the one the old
+    /// alignment-based version already got right: an atom starting on a
+    /// boundary is placed on a boundary.
+    #[test]
+    fn an_aligned_atom_is_placed_aligned() {
+        assert_eq!(placement_of(0, 0, 16), 0);
+        assert_eq!(placement_of(1, 0, 16), 16);
+        assert_eq!(placement_of(17, 0x80, 16), 32);
+    }
+
+    /// The bug, as a test. An atom at 0x74 of a 16-byte-aligned section holds a
+    /// symbol at 0x80; the atom must land 4 past a boundary so that the symbol
+    /// lands on one.
+    #[test]
+    fn a_symbol_inside_an_atom_stays_aligned() {
+        let (atom, symbol, alignment) = (0x74u64, 0x80u64, 16u64);
+        let to = placement_of(46, atom, alignment);
+        let moved = to + (symbol - atom);
+        assert_eq!(moved % alignment, 0, "the symbol landed at {moved:#x}");
+    }
+}

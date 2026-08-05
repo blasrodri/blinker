@@ -378,6 +378,25 @@ fn wants_dead_strip(parsed: &ParsedInvocation) -> bool {
         .any(|(_, arg)| matches!(arg, LinkerArg::LinkerFlag(flag) if flag == "-dead_strip"))
 }
 
+/// Every `-rpath`, in the order it was given.
+///
+/// `-rpath` is parsed with an argument and was then classified as
+/// `KnownUnmodelled` — recognised and dropped. A program linking an
+/// `@rpath/...` library therefore linked cleanly and died at load with "no
+/// LC_RPATH's found", which no pure-Rust program ever does and so nothing
+/// caught.
+fn run_paths(parsed: &ParsedInvocation) -> Vec<String> {
+    parsed
+        .args
+        .iter()
+        .filter_map(|(_, arg)| match arg {
+            LinkerArg::KnownUnmodelled(flag) => flag.strip_prefix("-rpath "),
+            _ => None,
+        })
+        .map(str::to_string)
+        .collect()
+}
+
 /// The `.tbd` stubs the command line's `-l` and `-framework` requests name.
 ///
 /// `-L` and `-F` accumulate first because a search path applies to every
@@ -505,6 +524,7 @@ fn internal_link(
         .identifier(&identifier)
         .dead_stripped(wants_dead_strip(parsed))
         .stub_libraries(stub_libraries(parsed))
+        .with_rpaths(run_paths(parsed))
         // Reserved slack pays for itself only across links, so it is turned on
         // with the cache — but it is applied to the cold link too, so that the
         // cached output is the one a cold link with the same options produces.

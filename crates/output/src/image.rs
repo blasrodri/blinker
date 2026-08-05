@@ -84,6 +84,8 @@ pub struct ImageBuilder<'a> {
     /// empty, which produces the offsets a from-scratch build always did.
     strings: crate::symtab::StringTable,
     dylibs: Vec<Dylib>,
+    /// Directories dyld will search for `@rpath/...` dependencies.
+    rpaths: Vec<String>,
     rebases: Vec<Rebase>,
     binds: Vec<Bind>,
     entry_offset: u64,
@@ -249,6 +251,7 @@ impl<'a> ImageBuilder<'a> {
             symbols: SymbolTableBuilder::new(),
             strings: crate::symtab::StringTable::new(),
             dylibs: Vec::new(),
+            rpaths: Vec::new(),
             rebases: Vec::new(),
             binds: Vec::new(),
             entry_offset: 0,
@@ -313,6 +316,12 @@ impl<'a> ImageBuilder<'a> {
 
     pub fn dylib(&mut self, dylib: Dylib) -> &mut Self {
         self.dylibs.push(dylib);
+        self
+    }
+
+    /// A directory to record in `LC_RPATH`, in command-line order.
+    pub fn rpath(&mut self, path: String) -> &mut Self {
+        self.rpaths.push(path);
         self
     }
 
@@ -435,6 +444,13 @@ impl<'a> ImageBuilder<'a> {
         if self.kind == ImageKind::Dylib {
             dylib_bytes += commands::command_size_with_path(24, &self.install_name);
         }
+        // `LC_RPATH` is a path-carrying command like the rest, and unreserved
+        // it would push the commands past the header and be refused.
+        dylib_bytes += self
+            .rpaths
+            .iter()
+            .map(|path| commands::command_size_with_path(12, path))
+            .sum::<usize>();
         // Over-reserves by three `linkedit_data_command`s: LC_FUNCTION_STARTS,
         // LC_DATA_IN_CODE and LC_CODE_SIGNATURE are not emitted yet but will
         // be. Reserving space we do not use is harmless; running out is not.
@@ -800,6 +816,12 @@ impl<'a> ImageBuilder<'a> {
                 dylib.current_version,
                 dylib.compatibility_version,
             );
+            command_count += 1;
+        }
+
+        // After the dylibs, which is where `ld64` puts them.
+        for path in &self.rpaths {
+            commands::write_rpath(&mut writer, path);
             command_count += 1;
         }
 

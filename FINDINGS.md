@@ -11352,3 +11352,59 @@ decoding `0x39c00108` by hand.
 blinker and runs**. That is the first project outside this workspace with a
 non-trivial native dependency to do so. The 16 links of this workspace remain
 byte-identical, and the gate passes.
+
+---
+
+## 222. The gate could not have caught any of the last five bugs
+
+Findings 218 through 221 were five real defects, four of them silent, all found
+by pointing the linker at one project it had not seen. The uncomfortable part
+is not that they existed — it is that **the gate was green through all of
+them**, and would have stayed green through their reintroduction.
+
+Every safety property this project leans on is a comparison, and all of them
+compare the wrong things for this class of bug:
+
+- **warm bytes against cold bytes** — blind to anything deterministic. The
+  `__mod_init_func` type was wrong the same way every time, so both sides
+  agreed.
+- **blinker against ld64 on the corpus** — the corpus is Rust. Nothing in it
+  emits `__mod_init_func`, references `___dso_handle`, links a non-SDK dylib,
+  or uses `@rpath`.
+- **the differential section diff** — compares names, addresses and sizes. Not
+  section *type* bits, which is where finding 219 lived.
+
+So the gate now links C, C++ and a dynamic library with no `.tbd` beside it,
+and — because the worst of these bugs produced a program that ran and returned
+the right exit code while doing the wrong thing — it **runs what it links** and
+compares stdout and exit status against the system linker's build of the same
+objects. A test that only checked "it linked" would have passed while the
+constructors silently did not run.
+
+### One more bug, found by writing the test
+
+The dylib test linked, and then died:
+
+```
+  dyld: Library not loaded: @rpath/libanswer.dylib
+  Reason: no LC_RPATH's found
+```
+
+`-rpath` is parsed, with an argument, and was classified `KnownUnmodelled` —
+recognised and dropped. blinker emitted no `LC_RPATH` at all. Any program
+loading a relocatable or vendored library linked cleanly and failed at load,
+and no pure-Rust program does that, so nothing noticed. Now implemented:
+`LC_RPATH` per `-rpath`, in command-line order, sized into the header
+reservation like every other path-carrying command.
+
+That is six bugs from one afternoon of pointing the thing at real software,
+and the fifth and sixth were found by *writing the test for the first four*.
+
+### The invariant, as a property test
+
+`placement_of` — the compaction fix from 221 — is now checked by exhaustive
+property tests over every alignment, offset and cursor in a small range: an
+atom never moves backwards, it keeps its offset modulo the section alignment,
+and it never wastes more than `alignment - 1` bytes. The bug itself is a named
+case: an atom at `0x74` of a 16-byte-aligned section holding a symbol at
+`0x80`, which must land 4 past a boundary so the symbol lands on one.

@@ -78,6 +78,12 @@ pub const LC_LOAD_DYLIB: u32 = 0xc;
 /// against it. Same payload as [`LC_LOAD_DYLIB`], pointing at itself.
 pub const LC_ID_DYLIB: u32 = 0xd;
 pub const LC_LOAD_DYLINKER: u32 = 0xe;
+/// A directory dyld searches when resolving an `@rpath/...` dependency.
+///
+/// `LC_REQ_DYLD` is part of the value: a loader that does not understand the
+/// command must refuse the image rather than ignore it, because ignoring it
+/// means silently failing to find the libraries it points at.
+pub const LC_RPATH: u32 = 0x8000_001c;
 pub const LC_UUID: u32 = 0x1b;
 pub const LC_SEGMENT_64: u32 = 0x19;
 
