@@ -113,30 +113,27 @@ enum Entry {
 }
 
 impl Entry {
-    /// The input's bytes **that cost this process memory**.
+    /// The bytes of input this entry keeps the *machine* holding.
     ///
-    /// A mapped file counts as nothing. Its pages are clean, file-backed and
-    /// reclaimable — the kernel drops them under pressure and reads them back
-    /// if they are wanted, which is the whole reason inputs are mapped rather
-    /// than read (see [`crate::mapping`]). Counting them against a budget meant
-    /// for heap evicts a parse the process was not paying for: measured, the
-    /// byte bound applied to mappings held 243 of 611 inputs where the window
-    /// alone held all 611, and cost 1.57× on link time to protect memory that
-    /// was never allocated (finding 214).
+    /// Mapped and heap alike, which reverses half of finding 214 and is not a
+    /// mistake being repeated. That finding removed mapped pages from a budget
+    /// meant for **heap**, and was right to: a mapping is clean, file-backed
+    /// and reclaimable, and evicting a parse to protect memory nobody
+    /// allocated cost 1.57x for nothing.
     ///
-    /// A file under `mapping::MAP_THRESHOLD` is read onto the heap instead, and
-    /// that is real. `symbols.o` is 2.7 KB and a Rust link has hundreds.
+    /// This budget is a different question. What ran out on a large C++ build
+    /// was not the heap but the machine's *working set*: five programs' worth
+    /// of mapped inputs is 7 GB, the kernel cannot keep that resident, and so
+    /// the mapping that was supposed to be free is faulted back off disk on
+    /// every link — 3.7 GB of page-ins per pass against the one-shot linker's
+    /// 118 MB (finding 223). A page that has to be read again is not free
+    /// however clean it is.
     ///
-    /// What the parse derived from the bytes is not counted either: it is what
-    /// holding the input is *for*, and a bound including it would be a bound on
-    /// the wrong thing, measured badly.
-    fn resident_bytes(&self) -> usize {
-        let backing = match self {
-            Entry::Object(_, backing) | Entry::Archive(_, backing) => backing,
-        };
-        match &**backing {
-            Backing::Heap(bytes) => bytes.len(),
-            Backing::Mapped(_) => 0,
+    /// So: reclaimable does not mean weightless, and the bound counts every
+    /// byte the daemon asks the machine to keep.
+    fn held_bytes(&self) -> usize {
+        match self {
+            Entry::Object(_, backing) | Entry::Archive(_, backing) => backing.len(),
         }
     }
 }
@@ -708,7 +705,7 @@ impl Session {
         let mut bytes: usize = self
             .entries
             .values()
-            .map(|(_, entry)| entry.resident_bytes())
+            .map(|(_, entry)| entry.held_bytes())
             .sum();
         if bytes <= budget {
             return;
@@ -726,7 +723,7 @@ impl Session {
                 break;
             }
             if let Some((_, entry)) = self.entries.get(&path) {
-                bytes = bytes.saturating_sub(entry.resident_bytes());
+                bytes = bytes.saturating_sub(entry.held_bytes());
             }
             self.used_at.remove(&path);
         }

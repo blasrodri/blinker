@@ -11540,3 +11540,64 @@ megabytes. This one is 510 inputs and 1.4 GB per link, and the failure needs
 and what none of the benchmarks were.
 
 The headline numbers stand for what they measure. They do not cover this.
+
+---
+
+## 224. Reclaimable does not mean weightless — a fifth of finding 223, and not the rest
+
+Finding 223 left the bound measuring the wrong thing. It now measures the right
+thing, which is worth 1.21x on the workload that motivated it and does not fix
+it.
+
+### What changed
+
+`Entry::held_bytes` counts **every byte of input the daemon asks the machine to
+keep** — mapped and heap alike. That reverses half of finding 214, and the
+reversal is the point rather than a repeat of the mistake:
+
+- 214 removed mapped pages from a budget meant for **heap**, and was right.
+  A mapping is clean, file-backed and reclaimable; evicting parses to protect
+  memory nobody allocated cost 1.57x for nothing.
+- This budget answers a different question. What ran out on a large C++ build
+  was the machine's **working set**. Five programs of mapped inputs is 7 GB,
+  the kernel cannot keep that resident, and the mapping that was supposed to be
+  free is faulted back off disk on every link.
+
+A page that has to be read again is not free however clean it is.
+
+### Measured, interleaved, both workloads
+
+```
+  pulsevm            12328 -> 10187 ms/pass        1.21x
+  this workspace       217.7 -> 221.0 ms (min)     0.985x, medians equal
+```
+
+214's 1.57x regression does not reproduce, and the reason is worth stating: the
+budget is 1 GB per worker, and the Rust workload never comes close to it, so
+counting its mappings changes nothing about what is held. 214 measured a bound
+that *bit* on a workload that did not need it; this one does not bite there at
+all. The same code is right or wrong depending on a threshold neither finding
+could see from its own workload alone.
+
+### What it does not fix
+
+Resident is still **3.6x slower than one-shot** on pulsevm. The defect of
+finding 223 stands.
+
+Two things were tried and reverted on the way, both recorded because the
+reasoning was good and the result was not:
+
+- **Bounding the daemon's own RSS** via the kernel's `resident_size`. It did
+  what it claimed — 5.8 GB down to 3.9 GB — and the time did not move. It
+  bounds one process where the thing overflowing is the whole machine's working
+  set across four workers *plus* the page cache.
+- **Refusing to cache a link whose inputs alone exceed the budget.** Sound in
+  principle: a program too large to hold cannot benefit from being held. It
+  made things *worse* (7.8 s -> 8.9 s per pass), because the flag reached only
+  the probing path — the `store_*` guards key off `discards`, not `retains` —
+  so nothing actually stopped accumulating and the link lost its reuse without
+  losing its cost.
+
+The second is the more interesting failure: the idea is probably still right,
+and it was tested through a switch that was not wired to the thing it was meant
+to control. Which is worth knowing before it is tried again.
