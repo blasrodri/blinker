@@ -11653,3 +11653,105 @@ those are two different binaries for a reason that has nothing to do with
 caching. Linking both to `prog` in different directories, they are identical.
 Recorded because a test that reports a linker bug that is its own is worse than
 no test: it spends the credibility that makes a failing test worth reading.
+
+## 226. The largest thing a session held was the one its budget could not see
+
+Finding 225 stopped an oversized link *storing* its inputs. It did not stop it
+*interning* them, and interning is where the memory was. Emptying the session
+after a link it has already declined to keep is **2.1x** on pulsevm, and takes
+residency from a penalty on that workload to roughly free.
+
+### Three megabytes reported, nine hundred held
+
+`held_memory()` said 3.4 MB and `inputs_held` said 0 — the bail-out was working
+exactly as finding 225 describes. Four idle daemon workers were nevertheless
+sitting on 3.6 GB between links.
+
+`vmmap` put 1.4 GB of one worker in dirty `MALLOC_SMALL` pages, which is not
+free-list residue; `heap` put 884 MB of it in 1.48 million *live* nodes of 16
+to 192 bytes. That is what a million interned symbol names and their digests
+look like. Nothing was leaked and nothing was wrong with the byte budget's
+arithmetic: the budget measures `TargetStore`, and the name table is not in it.
+
+```
+  Session
+    store: TargetStore   <- 3.4 MB, and the only thing held_memory() counts
+    names: SymbolNames   <- every name ever seen, monotonic, uncounted
+    digests              <- blake3 per name, 32 bytes each, uncounted
+```
+
+The table is monotonic *on purpose*: a `SymbolNameId` is a position in it, the
+id vector memoised beside every held parse is only meaningful against the table
+that issued it, and renumbering would invalidate all of them. So it grows on
+every link and shrinks on none — which is the right trade when the parses it
+numbers are still held, and pure cost when finding 225 has just thrown them
+away.
+
+### Why held memory is not idle memory
+
+A gigabyte a linker is not using is not free on a 24 GB machine linking 7 GB of
+inputs per pass. It is a gigabyte the *page cache* does not have, and the page
+cache is where the inputs live. The cost lands on the one phase that reads
+files:
+
+```
+  link_read_and_parse    resident 3777 ms   one-shot 1075 ms   +2702
+  everything else                            (sum)            +1041
+```
+
+72% of the whole resident-vs-one-shot gap was in re-reading inputs from disk
+that a one-shot process — which exits, and gives its gigabyte back — still
+found in cache.
+
+### The change
+
+A session that declines to retain forgets:
+
+```rust
+if session.declined_to_retain() {
+    session.forget();
+    blinker_link::release_free_memory();
+}
+```
+
+`forget` keeps what a session *is* — resident, discarding — and drops
+everything it has learnt. All of it together, because names and the parses
+numbered against them cannot be separated: dropping the table while keeping the
+memos would not lose an answer, it would serve one object's names for
+another's. The result is exactly a session the daemon had just created, which
+is the state every cold link in the gate already proves emits identical bytes.
+
+`release_free_memory` is `malloc_zone_pressure_relief(NULL, 0)` — what the
+system calls under pressure, called deliberately. Freeing does not return
+memory in a resident process; `libmalloc` keeps the pages, which is right for a
+process that will allocate the same shape again and wrong for one that has just
+said it will not. Measured separately, it is worth a further 6% on top of
+`forget` (2780 -> 2607 ms/pass, 3 reps, both orders).
+
+### Measured
+
+Interleaved, alternating order, one daemon alive at a time — because two
+resident arms holding 3 GB each is a measurement of the harness:
+
+```
+  pulsevm                5510 -> 2509 ms/pass    2.19x   (read+parse 2852 -> 902)
+  this workspace          220.7 -> 223.9 ms      0.99x — the flag never fires
+  ripgrep                   160 -> 160 ms        1.00x
+  rust-analyzer            1366 -> 1371 ms       1.00x
+```
+
+Three arms on pulsevm afterwards: ld64 1522 ms, blinker resident 3040 ms,
+blinker one-shot 2917 ms. Residency is no longer a penalty on this workload —
+it is now within noise of one-shot, from 4.5x worse three findings ago. What
+remains is that blinker is ~2x slower than ld64 on a cold link at this scale,
+which is a different problem and was never a residency one.
+
+### What this says about the bound
+
+Two findings in a row (214, 224) adjusted *what the budget counts* about inputs.
+This one is about something the budget was never pointed at. A bound that
+reports 3 MB while the process holds 900 MB is not a loose bound; it is a bound
+measuring a different object, and it will keep reading healthy however wrong it
+gets. The guard is a unit test that interns a name, forgets, and asserts the
+table is empty — cheap, and the only thing in the suite that would have
+noticed.

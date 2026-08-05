@@ -677,10 +677,23 @@ pub fn serve_links(worker: usize) -> std::io::Result<()> {
                 .filter(|arg| *arg != "--blinker-daemon")
                 .cloned()
                 .collect();
-            match crate::run_in(&argv, &mut session) {
+            let served = match crate::run_in(&argv, &mut session) {
                 Ok(outcome) => (outcome.exit_code, Vec::new()),
                 Err(error) => (1, format!("blinker: {error}\n").into_bytes()),
+            };
+            // A link too large to cache leaves behind a gigabyte of interned
+            // names, digests and memos held for a reuse this session has
+            // already ruled out — and then the allocator holds the pages after
+            // they are freed. Both are the right default for a process that
+            // will link the same program again; this one has just said it will
+            // not. Emptying and handing the pages back costs milliseconds and
+            // stops four idle workers sitting on 3.6 GB of a machine whose page
+            // cache is where the *inputs* live.
+            if session.declined_to_retain() {
+                session.forget();
+                blinker_link::release_free_memory();
             }
+            served
         },
         superseded,
         IDLE_TIMEOUT,

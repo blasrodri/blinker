@@ -149,8 +149,9 @@ one interleaved A/B.
 | Output size, large link with dead-stripping | 0.85× `ld-prime`'s |
 | **Cold link, 5,637 objects** | **1.70× slower** |
 | Edit relink, 5,637 objects | level — ~390 ms against 367 ms |
+| **Five C++ programs, 552 inputs each** | **~2× slower** cold; residency is free rather than costly |
 
-The last two rows are the honest cost of the design. A resident linker's first
+The last three rows are the honest cost of the design. A resident linker's first
 link pays for state no link has reused yet, and on a very large program that
 bill arrives all at once. blinker wins on repetition and on the common case; it
 does not yet win on a single cold link of a huge program.

@@ -328,6 +328,39 @@ pub fn memory_budget() -> usize {
     })
 }
 
+/// Hand the allocator's free memory back to the operating system.
+///
+/// # Why a linker has to ask
+///
+/// Freeing memory in a resident process does not return it. `libmalloc` keeps
+/// freed regions in its magazines, ready for the next allocation, which is the
+/// right trade for a program that will allocate the same shape again. A linker
+/// is not that program: it allocates a gigabyte of parses, atoms and
+/// relocations, frees all of it, and may not link that program again for
+/// minutes.
+///
+/// Measured on pulsevm — five programs, 1.4 GB of inputs each — four idle
+/// daemon workers sat on 5.1 GB between links while reporting three megabytes
+/// of session state. Nothing was leaked and nothing was retained; it was the
+/// allocator holding what a one-shot process returns by exiting. That memory is
+/// not idle in its effects: it evicts the page cache the *inputs* live in, so
+/// the next link re-reads 1.4 GB from disk. Read-and-parse took 3777 ms
+/// resident against 1075 ms one-shot, which is 72% of the whole gap between
+/// them, for links that held nothing either way (finding 226).
+///
+/// `malloc_zone_pressure_relief(NULL, 0)` is what the system itself calls under
+/// memory pressure, applied to every zone. Doing it deliberately after a link
+/// costs a few milliseconds and is the difference between a resident linker and
+/// a resident linker that has quietly taken the machine's file cache.
+pub fn release_free_memory() -> usize {
+    // In libSystem, declared by `<malloc/malloc.h>`. A null zone means every
+    // zone, and a goal of zero means "as much as you can".
+    extern "C" {
+        fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+    }
+    unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) }
+}
+
 /// Parsed inputs held across links.
 ///
 /// Created once by a resident linker and passed to every link it performs. A
@@ -626,6 +659,51 @@ impl Session {
     /// remembering a program larger than the budget will help.
     pub(crate) fn retains(&self) -> bool {
         !self.discards && !self.oversized
+    }
+
+    /// Whether the link just performed was one this session declined to keep.
+    ///
+    /// A resident linker asks this after serving, to decide whether to empty
+    /// itself. See [`Session::forget`].
+    pub fn declined_to_retain(&self) -> bool {
+        self.oversized
+    }
+
+    /// Empty this session, keeping only what it *is* rather than what it knows.
+    ///
+    /// # Why a session that declines to retain must also forget
+    ///
+    /// Finding 225 stopped an oversized link storing its parses. It did not
+    /// stop the link *interning*, and interning is not optional: resolving a
+    /// program's symbols means giving every distinct name an id, and the table
+    /// that hands them out is held across links because the ids it issues are
+    /// what makes a held object's names free the second time.
+    ///
+    /// So the table grew on every link and shrank on none. Measured on pulsevm
+    /// — five programs, five targets, nothing retained — four idle daemon
+    /// workers held 3.6 GB between links while `held_memory` reported three
+    /// megabytes, because the byte budget can only see the per-target store.
+    /// `heap` put 884 MB of it in 1.48 million live nodes at 16 to 192 bytes
+    /// each, which is what a million interned names and their digests look
+    /// like. Nothing was leaked. It was simply held for a reuse that this
+    /// session had already decided would never happen (finding 226).
+    ///
+    /// Emptying is all-or-nothing on purpose. A `SymbolNameId` means a position
+    /// in `names`, and the memoised id vector beside every held parse is only
+    /// meaningful against the table that issued it — so dropping the names
+    /// while keeping the parses would not lose an answer, it would serve one
+    /// object's names for another's. They go together or not at all.
+    ///
+    /// What survives is what a session *is* and not what it has learnt: whether
+    /// it is resident, and whether it discards. That makes the result exactly a
+    /// session the daemon had just created, which is the state every cold link
+    /// in the gate already proves produces identical bytes.
+    pub fn forget(&mut self) {
+        *self = Session {
+            resident: self.resident,
+            discards: self.discards,
+            ..Session::default()
+        };
     }
 
     /// Begin a link over `inputs`, discarding anything that cannot apply.
@@ -1705,6 +1783,38 @@ mod tests {
         assert!(
             session.stub_exports(&stubs).is_none(),
             "a changed SDK was served from memory"
+        );
+    }
+
+    /// Forgetting drops what a session has learnt and keeps what it is.
+    ///
+    /// The interned name table is the point: it is the largest thing a session
+    /// holds, the byte budget cannot see it, and nothing else in these tests
+    /// would notice it staying (finding 226).
+    #[test]
+    fn forgetting_empties_the_session_but_not_its_identity() {
+        let scratch = Scratch::dir("session-forget").expect("scratch");
+        let path = scratch.join("libSystem.tbd");
+        std::fs::write(&path, "--- !tapi-tbd\n").expect("written");
+        let stubs = vec![path.clone()];
+
+        let mut session = Session::default();
+        session.set_resident(true);
+        session.store_stub_exports(&stubs, exports(&["_malloc"]));
+        session.names_mut().intern("_main");
+        assert_eq!(session.names().len(), 1, "the fixture interned nothing");
+
+        session.forget();
+
+        assert_eq!(session.names().len(), 0, "the name table survived");
+        assert!(
+            session.stub_exports(&stubs).is_none(),
+            "a forgotten session still answered"
+        );
+        assert_eq!(session.held_memory().0, 0, "per-target state survived");
+        assert!(
+            session.is_resident(),
+            "forgetting must not stop a daemon being resident"
         );
     }
 
