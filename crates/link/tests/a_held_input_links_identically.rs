@@ -722,3 +722,57 @@ fn two_programs_alternating_through_one_session_each_link_correctly() {
         "nothing was held at all, so this proves nothing"
     );
 }
+
+/// A session that will never be asked again skips the bookkeeping whose only
+/// reader would have been the next link — and must still produce the same
+/// bytes.
+///
+/// The property is easy to state and easy to break: what gets skipped is
+/// storing parses, digesting interfaces and recording the extraction order,
+/// and every one of them sits in a function the *current* link also calls.
+/// `store_stub_exports` is the near miss — it sets a flag this link reads
+/// before it stores anything for the next one.
+#[test]
+fn a_transient_session_links_to_the_same_bytes_as_a_retaining_one() {
+    let scratch = Scratch::dir("session-transient").expect("scratch");
+    let request = LinkRequest::new(inputs(&scratch));
+
+    let retaining = scratch.join("retaining");
+    link_to_file_in(&request, &retaining, &mut Session::default()).expect("the retaining link");
+
+    let transient = scratch.join("transient");
+    link_to_file_in(&request, &transient, &mut Session::transient()).expect("the transient link");
+
+    assert_eq!(
+        std::fs::read(&transient).expect("transient"),
+        std::fs::read(&retaining).expect("retaining"),
+        "a transient session produced different bytes"
+    );
+    assert_eq!(run(&transient), run(&retaining));
+}
+
+/// The other half: a transient session must hold nothing, so a second link
+/// through it re-reads everything. Without this, `transient` could quietly
+/// become an alias for `default` and the test above would still pass.
+#[test]
+fn a_transient_session_holds_nothing_for_a_second_link() {
+    let scratch = Scratch::dir("session-transient-empty").expect("scratch");
+    let request = LinkRequest::new(inputs(&scratch));
+
+    let mut session = Session::transient();
+    let first = scratch.join("first");
+    link_to_file_in(&request, &first, &mut session).expect("the first link");
+    let second = scratch.join("second");
+    let timings = link_to_file_in(&request, &second, &mut session).expect("the second link");
+
+    assert_eq!(
+        timings.inputs_held, 0,
+        "a transient session held {} input(s)",
+        timings.inputs_held
+    );
+    assert!(timings.inputs_read > 0, "nothing was read either");
+    assert_eq!(
+        std::fs::read(&second).expect("second"),
+        std::fs::read(&first).expect("first"),
+    );
+}

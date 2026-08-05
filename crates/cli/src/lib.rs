@@ -100,7 +100,11 @@ pub struct Outcome {
 ///
 /// `argv` excludes the program name.
 pub fn run(argv: &[String]) -> Result<Outcome, DriverError> {
-    run_in(argv, &mut blinker_link::Session::default())
+    // Transient, because this process links once and exits. Everything a link
+    // stores is stored for a next link, and `run` is the entry point of the
+    // invocation that does not have one — the daemon's session is built in
+    // `daemon::serve` and outlives every request it serves.
+    run_in(argv, &mut blinker_link::Session::transient())
 }
 
 /// Run one invocation, keeping parsed inputs in `session` for the next.

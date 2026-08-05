@@ -1845,10 +1845,20 @@ pub fn link(request: &LinkRequest) -> Result<Image, LinkError> {
 macro_rules! gap {
     ($t:expr, $name:expr) => {{
         #[allow(clippy::print_stderr)]
-        if std::env::var_os("BLINKER_GAP_PARTS").is_some() {
+        if let Some(setting) = std::env::var_os("BLINKER_GAP_PARTS") {
+            // The value is the threshold in milliseconds, and 1.0 when it is
+            // not a number — which is what `=1` meant before it was one. A
+            // stage worth looking at inside a *cold* link is a tenth of what
+            // one is worth inside the relink these were written against, and
+            // the extraction rounds report a gap each, so the interesting
+            // ones were all under the floor and invisible (finding 213).
+            let floor = setting
+                .to_str()
+                .and_then(|value| value.parse::<f64>().ok())
+                .unwrap_or(1.0);
             let ms = $t.elapsed().as_secs_f64() * 1000.0;
-            if ms > 1.0 {
-                eprintln!("  gap {:>28}: {ms:6.1} ms", $name);
+            if ms > floor {
+                eprintln!("  gap {:>28}: {ms:6.2} ms", $name);
             }
         }
         $t = std::time::Instant::now();
@@ -3582,13 +3592,22 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
     // this phase. Nothing here touches the session, which is what makes it
     // possible — the serial pass exists because the session is not shareable,
     // not because the probing is not.
-    let probes = parallel::map_chunks(paths, |_, chunk| {
-        chunk
-            .iter()
-            .map(|path| blinker_cache::InputKey::probe(path))
-            .collect::<Vec<_>>()
-    });
-    let probes: Vec<Option<blinker_cache::InputKey>> = probes.into_iter().flatten().collect();
+    //
+    // Not probed at all when nothing is held and nothing will be: the probe's
+    // only two readers are the lookup below, which is guaranteed to miss, and
+    // the store afterwards, which a transient session skips.
+    let probes: Vec<Option<blinker_cache::InputKey>> = match session.retains() {
+        false => paths.iter().map(|_| None).collect(),
+        true => parallel::map_chunks(paths, |_, chunk| {
+            chunk
+                .iter()
+                .map(|path| blinker_cache::InputKey::probe(path))
+                .collect::<Vec<_>>()
+        })
+        .into_iter()
+        .flatten()
+        .collect(),
+    };
 
     let mut todo: Vec<usize> = Vec::with_capacity(paths.len());
     for (at, path) in paths.iter().enumerate() {
@@ -3870,35 +3889,42 @@ fn load_objects(paths: &[PathBuf], session: &mut Session) -> Result<Vec<LoadedOb
         // (174). Nothing here mutates the session, so the only thing the
         // chunking has to preserve is the position each answer belongs at, and
         // `map_chunks` returns them in order.
+        //
+        // Skipped outright by a transient session, which holds no member and
+        // will hold none: every `memcmp` in here would be a lookup into an
+        // empty map, and the round's members all have to be parsed regardless.
         let archives_ref = &archives;
         let held_session = &*session;
-        let held: Vec<Option<LoadedObject>> = parallel::map_chunks(&round, |start, chunk| {
-            chunk
-                .iter()
-                .enumerate()
-                .map(|(offset, (archive_index, member_id))| {
-                    let at = start + offset;
-                    let (path, index, data) = &archives_ref[*archive_index];
-                    let entry = index.member(*member_id)?;
-                    let fresh = blinker_archive::member_data(data, entry, path).ok()?;
-                    let (parsed, _) = held_session.member(path, member_id.0, fresh)?;
-                    if parsed.id != ObjectId(base + at as u32) {
-                        return None;
-                    }
-                    let begin = entry.offset as usize;
-                    Some(LoadedObject {
-                        parsed,
-                        data: SourceBytes::window(data, begin..begin + fresh.len()),
-                        path: Arc::from(path.as_path()),
-                        member: Some(Arc::from(entry.name.as_str())),
-                        unchanged: true,
+        let held: Vec<Option<LoadedObject>> = match session.retains() {
+            false => round.iter().map(|_| None).collect(),
+            true => parallel::map_chunks(&round, |start, chunk| {
+                chunk
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, (archive_index, member_id))| {
+                        let at = start + offset;
+                        let (path, index, data) = &archives_ref[*archive_index];
+                        let entry = index.member(*member_id)?;
+                        let fresh = blinker_archive::member_data(data, entry, path).ok()?;
+                        let (parsed, _) = held_session.member(path, member_id.0, fresh)?;
+                        if parsed.id != ObjectId(base + at as u32) {
+                            return None;
+                        }
+                        let begin = entry.offset as usize;
+                        Some(LoadedObject {
+                            parsed,
+                            data: SourceBytes::window(data, begin..begin + fresh.len()),
+                            path: Arc::from(path.as_path()),
+                            member: Some(Arc::from(entry.name.as_str())),
+                            unchanged: true,
+                        })
                     })
-                })
-                .collect::<Vec<_>>()
-        })
-        .into_iter()
-        .flatten()
-        .collect();
+                    .collect::<Vec<_>>()
+            })
+            .into_iter()
+            .flatten()
+            .collect(),
+        };
         gap!(_lap, "round: prove held");
         let todo: Vec<usize> = (0..round.len()).filter(|at| held[*at].is_none()).collect();
 

@@ -297,8 +297,8 @@ pub fn memory_budget() -> usize {
 /// Parsed inputs held across links.
 ///
 /// Created once by a resident linker and passed to every link it performs. A
-/// one-shot link uses [`Session::default`] and gets exactly the previous
-/// behaviour: every probe misses, and nothing is retained past the call.
+/// process that will link once uses [`Session::transient`], which skips the
+/// bookkeeping whose only reader would have been the link that never comes.
 #[derive(Default)]
 pub struct Session {
     /// Which link each held input was last part of.
@@ -533,6 +533,20 @@ pub struct Session {
     /// three of this session's wrong turns were exactly that.
     replayed_extraction: bool,
     held_resolution: bool,
+    /// Whether this session will be dropped the moment the link returns.
+    ///
+    /// A one-shot link builds a session's worth of state and then exits.
+    /// Storing a parse, digesting an interface, recording an extraction order
+    /// — every one of them is an answer for the *next* link, and there is no
+    /// next link, so on a cold one-shot they were 4.4 ms of a 19.6 ms link
+    /// spent filling a map that is about to be dropped (finding 213).
+    ///
+    /// Spelled as the negative so that `Default` — which every test and every
+    /// in-process caller uses — retains. Getting this wrong in the direction
+    /// of retaining costs what it always cost; getting it wrong the other way
+    /// makes a resident linker silently stop being one, and nothing in a
+    /// timing would say which link it was.
+    discards: bool,
 }
 
 /// What the `.tbd` stubs say the dynamic libraries export, and which exports
@@ -540,6 +554,24 @@ pub struct Session {
 pub type StubExports = crate::libraries::StubExports;
 
 impl Session {
+    /// A session for a process that will link once and exit.
+    ///
+    /// Everything a link stores is stored for the next one. There is no next
+    /// one here, so the stores are skipped — and only the stores: what a link
+    /// works out for *itself* (interned names, the parses it is using now) is
+    /// untouched, and the output is byte-identical either way.
+    pub fn transient() -> Session {
+        Session {
+            discards: true,
+            ..Session::default()
+        }
+    }
+
+    /// Whether anything derived from this link will be read again.
+    pub(crate) fn retains(&self) -> bool {
+        !self.discards
+    }
+
     /// Begin a link over `inputs`, discarding anything that cannot apply.
     ///
     /// A changed input list used to discard *everything*, on the grounds that
@@ -716,6 +748,9 @@ impl Session {
     /// state that was actually read, or — if it changed again — a key that will
     /// fail on the next probe, which is the safe direction to be wrong in.
     pub fn store_object(&mut self, path: &Path, parsed: &Arc<ParsedObject>, data: &Arc<Backing>) {
+        if self.discards {
+            return;
+        }
         let Some(key) = blinker_cache::InputKey::probe(path) else {
             return;
         };
@@ -769,6 +804,9 @@ impl Session {
         range: std::ops::Range<usize>,
         data: &Arc<Backing>,
     ) {
+        if self.discards {
+            return;
+        }
         // A member's interface is noted under a path of its own, so two
         // members of one archive cannot overwrite each other's digest.
         let named = member_path(archive, member);
@@ -787,6 +825,9 @@ impl Session {
         data: &Arc<Backing>,
         symbols: u64,
     ) {
+        if self.discards {
+            return;
+        }
         let Some(key) = blinker_cache::InputKey::probe(path) else {
             return;
         };
@@ -857,8 +898,12 @@ impl Session {
     /// Remember the SDK's exports.
     pub fn store_stub_exports(&mut self, stubs: &[PathBuf], exports: Arc<StubExports>) {
         // Re-reading the SDK means the set of importable names may have moved,
-        // and resolution's answer with it.
+        // and resolution's answer with it. Set before the early return below:
+        // this one is read by *this* link, not by the next.
         self.stubs_reparsed = true;
+        if self.discards {
+            return;
+        }
         let mut recorded = Vec::with_capacity(stubs.len());
         for path in stubs {
             let Some(key) = blinker_cache::InputKey::probe(path) else {
@@ -947,6 +992,11 @@ impl Session {
     /// Seeding is not required for correctness: a parse that misses is digested
     /// where it is asked for, exactly as before.
     pub(crate) fn seed_interfaces(&mut self, parses: &[Arc<ParsedObject>]) {
+        // An interface digest exists to tell the *next* link whether this
+        // input's symbols moved. Nothing else reads one.
+        if self.discards {
+            return;
+        }
         let missing: Vec<&Arc<ParsedObject>> = parses
             .iter()
             .filter(|parse| {
@@ -991,6 +1041,9 @@ impl Session {
 
     /// Remember which members were extracted, and in what order.
     pub fn store_extraction(&mut self, archives: Vec<PathBuf>, order: Vec<(usize, u32)>) {
+        if self.discards {
+            return;
+        }
         let target = self.target;
         self.store.state(target).extraction = Some((archives, order));
     }
