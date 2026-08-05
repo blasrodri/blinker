@@ -159,11 +159,16 @@ hundredth link of a program the linker has already seen ninety-nine times. That
 is why blinker is resident, and staying alive used to be worth 1.5× on its own —
 319 ms against 491 for the same links one-shot.
 
-It is now worth about **1.1×**, because the one-shot path caught up: the same
-sixteen links run in 342 ms with nothing held between them. That is not the
-resident path getting worse. It is findings 209 and 210 taking 5.5 ms and then
-2.1 ms out of every *cold* link, which residency had been hiding rather than
-fixing.
+Across a whole build it is now worth nothing measurable, because the one-shot
+path caught up: the same sixteen links run in **325 ms** with nothing held
+between them, against 322 ms with a daemon. That is not the resident path
+getting worse — it is findings 209, 210 and 213 taking 8 ms out of every *cold*
+link, which residency had been hiding rather than fixing.
+
+Per link, replayed on its own, the daemon still wins 1.4–1.6× at every size.
+Why that does not add up across sixteen different programs rotating through
+four workers is the largest open question here, and it is written down in
+finding 213 rather than smoothed over.
 
 It is also why the median matters more than the maximum. A real build's links
 have 23 inputs at the median and 132 at the largest. Optimising the tail is
@@ -189,17 +194,20 @@ The first link of a program, which is what a newcomer's first build is made of.
 This workspace's own binary — 70 inputs, 724 objects, 2.9 MB out:
 
 ```
-  read+parse     10.7 ms      objects 1.3, archive members ~9, stubs 3.2 alongside
-  relocate        2.8 ms
-  dead-strip      1.5 ms
-  emit+sign       1.1 ms
+  read+parse      8.0 ms      objects 1.3, archive members ~6, stubs 3.2 alongside
+  relocate        2.9 ms
+  dead-strip      1.8 ms
+  emit+sign       1.3 ms
   layout          0.8 ms
-  total          19.6 ms      was 26.4 before findings 209-210
+  total          17.8 ms      was 26.4 before findings 209, 210 and 213
 ```
 
 Reading the 70 files on the command line costs 1.3 ms of it. Nearly everything
 else in that stage is pulling 654 members out of rlibs and parsing them, and
 that is where the next cold work is.
+
+`BLINKER_GAP_PARTS=0.05` prints every part of a link that took longer than the
+threshold you give it, which is how that table was produced.
 
 ### Where the time goes on a large relink
 
@@ -313,6 +321,7 @@ and `--blinker-daemon-stop` are run directly, not through `rustc`.
 | `BLINKER_MEMORY_BUDGET` | Per-target state bound, in MB (default 1024, divided among the four workers) |
 | `BLINKER_FALLBACK_LINKER` | Linker to delegate to |
 | `BLINKER_TRACE_WAIT=<file>` | Append one line per link with its client-side wait |
+| `BLINKER_GAP_PARTS=<ms>` | Print every part of a link slower than this threshold |
 | `BLINKER_DELTA_LIVENESS`, `BLINKER_RETAIN_STRINGS` | Built, verified, off — each worth a few ms and each with a recorded reason in FINDINGS |
 
 ### Fallback linker discovery

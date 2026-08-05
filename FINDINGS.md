@@ -10717,3 +10717,88 @@ Nothing, and it is the third time in this document that overlapped work has
 been optimised after it stopped being the slower half (findings 91, 210, this).
 The lesson is not learned by knowing it; it is learned by measuring the stage
 *and* the link, every time.
+
+---
+
+## 213. A link that will never be asked again was spending a fifth of itself answering
+
+**Spec assumption.** §26 describes the resident session as the mechanism that
+makes relinking cheap. It does not consider what that mechanism costs a process
+that links once — which is every `--blinker-no-daemon` link, every link before a
+daemon exists, and every link in a build with the daemon turned off.
+
+**Observed.** With the gap threshold made settable — `BLINKER_GAP_PARTS=0.05`
+rather than a hardcoded 1.0 ms, which had been hiding every part of a cold link
+worth looking at — `read_and_parse` on a cold one-shot link of this workspace
+broke down as
+
+```
+  round: seed + store    3.38 ms   x7 rounds
+  round: parse           1.96 ms   x7
+  load: read the rest    1.30 ms
+  round: pick            1.02 ms   x8
+  round: prove held      0.84 ms   x7
+  load: archive indexes  0.54 ms
+  load: defining map     0.42 ms
+  load: session probe    0.31 ms
+```
+
+`seed + store` is storing parses, interface digests and the extraction order
+for the next link. `prove held` is a `memcmp` per archive member against parses
+the session might hold. `session probe` is a `stat` — or a read and a BLAKE3 —
+per input, to key those stores.
+
+In a process that links once, **every one of those has no reader**. The map
+they fill is dropped when `main` returns. That was 4.4 ms of a 19.6 ms link,
+better than a fifth of it, spent preparing an answer for a question nobody
+would ask.
+
+`Session::transient()` says so, and the stores become no-ops:
+
+```
+  link     20.5 ->   17.8 ms   (0.870x)   output byte-identical
+```
+
+**The one that nearly went wrong.** `store_stub_exports` sets
+`stubs_reparsed`, and *this* link reads it — it is what tells resolution its
+held answer is stale. Returning early before that flag is set would have been a
+silent correctness change on a path with no cold/warm oracle, because a
+transient session has no previous answer to be wrong about. The flag is set
+before the early return, and the test asserts a transient link is byte-for-byte
+a retaining one.
+
+**What the flag defaults to matters more than what it does.** It is spelled
+`discards` rather than `retains` so that `Default` — which every test and every
+in-process caller gets — keeps the old behaviour. Wrong in that direction costs
+what it always cost; wrong in the other makes the daemon silently stop being
+resident, and nothing in a timing would say which link it was. The second test
+exists for exactly that: a transient session must hold *nothing* on a second
+link, or `transient` has quietly become an alias for `default`.
+
+### Where this leaves a cold build
+
+The sixteen links of a `cargo build` of this workspace, one-shot, over the four
+changes of findings 209, 210 and 213: **491 ms to 325 ms**, against ld64's 799.
+
+### The open question it exposed
+
+Per link, replayed on its own, the daemon still wins at every size:
+
+```
+  smallest ( 22 inputs)   one-shot 15.31 ms   daemon 11.05 ms   1.39x
+  median   ( 23 inputs)   one-shot 17.83 ms   daemon 11.52 ms   1.55x
+  largest  (132 inputs)   one-shot 27.57 ms   daemon 17.20 ms   1.60x
+```
+
+Across the whole build it does not. The two arms are now level — 322 against
+325 ms on a quiet machine, 383 against 373 on a loud one. Sixteen *different*
+programs rotate through four worker processes, so each worker holds four of
+them, and the per-link measurement above replays one program twelve times in a
+row. Whatever the daemon is losing between those two situations is worth more
+than everything in this finding, and it is not measured yet.
+
+### What it cost
+
+Nothing was wrong. The session did exactly what it was written to do, in a
+process that had no use for it, and no profile broke down a cold link until
+this week.
