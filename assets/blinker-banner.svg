@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 340" width="1120" height="340" role="img"
+     aria-label="blinker — a resident, incremental Mach-O linker for Apple Silicon">
+  <title>blinker</title>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0.45" y2="1">
+      <stop offset="0" stop-color="#16222E"/>
+      <stop offset="1" stop-color="#0A1017"/>
+    </linearGradient>
+    <linearGradient id="hot" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFCE7A"/>
+      <stop offset="0.55" stop-color="#FF8A3D"/>
+      <stop offset="1" stop-color="#FF5F2E"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1120" height="340" fill="url(#bg)"/>
+
+  <!-- The mark, at the proportions of assets/blinker-mark.svg. -->
+  <g transform="translate(84 71) scale(0.773)" fill="none">
+    <g transform="rotate(-19 128 128)">
+      <g stroke="#47606F" stroke-width="15">
+        <rect x="22" y="97" width="88" height="62" rx="31"/>
+        <rect x="146" y="97" width="88" height="62" rx="31"/>
+      </g>
+      <rect x="84" y="97" width="88" height="62" rx="31" stroke="#111A23" stroke-width="24"/>
+      <rect x="84" y="97" width="88" height="62" rx="31" stroke="url(#hot)" stroke-width="15"/>
+    </g>
+  </g>
+
+  <!-- Lengths are pinned, because the font this renders in is whatever the
+       viewer happens to have and an unpinned wordmark overflows the banner. -->
+  <g font-family="ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, monospace">
+    <text x="330" y="192" font-size="88" font-weight="600" fill="#EEF3F7"
+          textLength="382" lengthAdjust="spacing">blinker</text>
+    <text x="334" y="238" font-size="22" fill="#8DA4B4"
+          textLength="700" lengthAdjust="spacing">a resident, incremental Mach-O linker for Apple Silicon</text>
+  </g>
+</svg>

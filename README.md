@@ -1,4 +1,5 @@
-# blinker
+<img src="assets/blinker-banner.svg" width="620"
+     alt="blinker — a resident, incremental Mach-O linker for Apple Silicon">
 
 A resident, incremental Mach-O linker for Rust on Apple Silicon.
 

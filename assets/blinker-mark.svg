@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="blinker">
+  <title>blinker</title>
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="0.4" y2="1">
+      <stop offset="0" stop-color="#1A2836"/>
+      <stop offset="1" stop-color="#0B1118"/>
+    </linearGradient>
+    <linearGradient id="hot" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FFCE7A"/>
+      <stop offset="0.55" stop-color="#FF8A3D"/>
+      <stop offset="1" stop-color="#FF5F2E"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="256" height="256" rx="58" fill="url(#tile)"/>
+
+  <!-- A chain, tilted onto the tile's diagonal. Two links are cold; the middle
+       one is being re-forged, which is the whole product in one picture. -->
+  <g transform="rotate(-19 128 128)" fill="none">
+    <g stroke="#47606F" stroke-width="15">
+      <rect x="22" y="97" width="88" height="62" rx="31"/>
+      <rect x="146" y="97" width="88" height="62" rx="31"/>
+    </g>
+    <!-- A hairline of tile behind the hot link, so it reads as in front. -->
+    <rect x="84" y="97" width="88" height="62" rx="31" stroke="#111A23" stroke-width="24"/>
+    <rect x="84" y="97" width="88" height="62" rx="31" stroke="url(#hot)" stroke-width="15"/>
+  </g>
+</svg>
