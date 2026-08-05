@@ -11408,3 +11408,77 @@ atom never moves backwards, it keeps its offset modulo the section alignment,
 and it never wastes more than `alignment - 1` bytes. The bug itself is a named
 case: an atom at `0x74` of a 16-byte-aligned section holding a symbol at
 `0x80`, which must land 4 past a boundary so the symbol lands on one.
+
+---
+
+## 223. Residency makes a large C++ build four times slower, and one-shot proves it
+
+`pulsevm` links five binaries, 552 inputs at the median, outputs of 111 MB and
+207 MB. It is the first workload here that is not mostly Rust, and it inverts
+the product's central claim:
+
+```
+  ld64 (cc)          1757 ms
+  blinker one-shot   3153 ms      1.8x slower
+  blinker resident   7991 ms      4.5x slower
+```
+
+**The resident linker is 2.5x slower than the one that throws everything away.**
+
+### It degrades, and it is the session
+
+Running the same five links repeatedly through one daemon:
+
+```
+  pass 0   5.0 s      pass 3   12.5 s
+  pass 1   5.0 s      pass 4   13.4 s
+  pass 2   9.8 s      pass 5   12.6 s        daemon RSS 5-7 GB
+```
+
+It gets 2.6x worse and plateaus. The control settles it — the same five links
+with `--blinker-no-daemon`, which builds a transient session and holds nothing:
+
+```
+  pass 0   6.2 s      pass 2   3.2 s      pass 4   3.4 s
+  pass 1   3.5 s      pass 3   3.2 s
+```
+
+Flat. So this is not the machine, not the page cache warming, and not the
+workload: **holding state across these five programs makes each link four times
+slower than holding nothing.** A single one of the five links, repeated, is
+0.23 s resident against 0.55 s one-shot — residency works perfectly when one
+program's state fits. Five do not.
+
+82% of a degraded link is `read_and_parse`, and the daemon sits at 5-7 GB on a
+24 GB machine.
+
+### What was tried, and reverted
+
+The memory bound is measured wrongly — `Entry::resident_bytes` counts only
+heap-backed *input bytes*, and every one of pulsevm's inputs is large enough to
+be mapped, so the estimate is approximately zero while gigabytes of derived
+parses go uncounted. That is the same class of error as finding 214, from the
+other side: 214 fixed "counting pages that cost nothing" and over-corrected
+into "counting almost nothing at all".
+
+Replacing the estimate with the kernel's own `resident_size` — the number that
+actually decides whether the machine pages — was implemented and **reverted**.
+It did what it claimed (RSS 5.8 GB -> 3.9 GB) and **did not fix the problem**
+(still 12.4 s), while costing something on the workload that already worked.
+Finding 212's precedent applies: a change that does not demonstrate the win it
+was written for does not land, however much better its reasoning looks.
+
+So the estimate is still wrong and the bound is still ineffective. What that
+means is that **the memory bound is not the cause**, or not the only one, and
+the next attempt should start by finding out what inside `read_and_parse` costs
+four times more with a warm session than with a cold one — a question this
+finding does not answer.
+
+### Why it was never seen
+
+Every workload measured until today was Rust: 23 inputs at the median, tens of
+megabytes. This one is 552 inputs and hundreds of megabytes, and the failure
+needs *several large programs sharing one worker* — which is what a real
+C++ workspace is and what none of the benchmarks were.
+
+The headline numbers stand for what they measure. They do not cover this.
