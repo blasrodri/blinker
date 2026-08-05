@@ -11,61 +11,160 @@ a full build of this workspace — 15 links, 23 inputs at the median
   blinker              304, 296, 296 ms      2.7×
 ```
 
-That is the whole claim, and it is deliberately the *build*'s number rather
-than a link's. Set `linker = "…/blinker"` and nothing else; it links internally
-by default and starts a resident linker for the next link if none is running.
+Set it as your linker and change nothing else. It links internally by default
+and keeps a resident linker alive for the next link.
 
-## Why this is the number
+---
 
-A linker is not slow. A *build* is slow, and it is slow because it links the
-same programs over and over with almost nothing changed between them — and a
-linker that exits after every link has to be told the whole program again each
-time.
+## Quick start
+
+You need an Apple Silicon Mac, a stable Rust toolchain, and Xcode command line
+tools (`/usr/bin/cc` must exist). `aarch64-apple-darwin` is the only target.
+
+```bash
+git clone <this repo> && cd blinker
+cargo build --release                    # the binary lands at target/release/blinker
+```
+
+**1. Try it on your project, changing nothing.** From the project's directory:
+
+```bash
+/path/to/blinker/target/release/blinker --blinker-try build
+```
+
+This builds into `target/blinker-try/` with blinker as the linker. It writes no
+configuration, and it does not disturb your normal `target/`, so the next
+ordinary `cargo build` rebuilds nothing.
+
+**2. Keep it.** From the same directory:
+
+```bash
+/path/to/blinker/target/release/blinker --blinker-install
+```
+
+That writes the absolute path of the binary that ran into
+`.cargo/config.toml`:
+
+```toml
+[target.aarch64-apple-darwin]
+linker = "/path/to/blinker/target/release/blinker"
+```
+
+An existing config is *edited*, not replaced — comments, ordering and every
+other setting survive. A `linker` already pointing at something that is not
+blinker is reported rather than overwritten. Running it twice does nothing the
+second time.
+
+Now build as normal:
+
+```bash
+cargo build
+cargo test
+```
+
+**3. Undo it.**
+
+```bash
+blinker --blinker-uninstall     # removes the key, and the file if it held nothing else
+blinker --blinker-daemon-stop   # stops the resident linker
+```
+
+(`blinker` below is that same binary — copy it somewhere on your `PATH`, or keep
+spelling out the path to it.)
+
+The resident linker is the only state a build leaves behind, and it exits on its
+own after twenty minutes idle regardless.
+
+## Everyday commands
+
+| I want to… | Command |
+|---|---|
+| Try blinker without configuring anything | `blinker --blinker-try build` (or `test`, `run`, …) |
+| Turn it on for this project | `blinker --blinker-install` |
+| Turn it off again | `blinker --blinker-uninstall` |
+| See what a link cost | add `-C link-arg=--blinker-print-stats` to `RUSTFLAGS` |
+| Rule blinker out as the cause of a bug | `BLINKER_NO_DAEMON=1`, or `--blinker-delegate` to hand every link to the system linker |
+| Stop the resident linker | `blinker --blinker-daemon-stop` |
+| Check the version | `blinker --blinker-version` |
+
+## What works
+
+- **Executables and test binaries**, `panic=abort` and `panic=unwind`, caught
+  panics, destructors, symbolized backtraces, and a `dsymutil`-readable debug
+  map.
+- **Dynamic libraries** — proc-macro crates and `cdylib`s. rustc `dlopen`s a
+  proc-macro dylib inside its own process to expand macros, and does so with
+  the ones blinker links.
+- **Dead stripping** (`-dead_strip`), from the entry point for a program and
+  from every exported symbol for a library.
+- **Anything else** — `-bundle`, `-r`, `-static`, `-shared` — is handed to the
+  system linker automatically, with the reason recorded, so a workspace that
+  contains one never fails to build.
+
+Blinker's output is compared byte-for-byte against a cold link of the same
+inputs by the test suite: a warm, resident, incremental link must produce
+exactly the file a from-scratch link would.
+
+---
+
+## Benchmarks
+
+Every number here is from an interleaved A/B against the system linker on real
+captured link arguments, not a synthetic benchmark. See
+[measuring it](#measuring-it) to reproduce any of them.
+
+### The headline
+
+| | blinker | system linker | |
+|---|---|---|---|
+| **A whole `cargo build`'s links** (15 links) | **296 ms** | 765 ms `cc`/ld64 | **2.7×** |
+| **Edit relink, resident** | **20.6 ms** | 34.3 ms `ld-prime` | **1.7×** |
+
+### By workload
+
+| Workload | Result |
+|---|---|
+| Body edit, debug self-link (1,099 objects) | 41.9 ms wall, 31.9 ms linking |
+| Cold link, 238 objects | 1.03× `ld-prime` — inside the spread |
+| Output size, large link with dead-stripping | 0.85× `ld-prime`'s |
+| **Cold link, 5,637 objects** | **1.70× slower** |
+| Edit relink, 5,637 objects | level — ~390 ms against 367 ms |
+
+The last two rows are the honest cost of the design. A resident linker's first
+link pays for state no link has reused yet, and on a very large program that
+bill arrives all at once. blinker wins on repetition and on the common case; it
+does not yet win on a single cold link of a huge program.
+
+### Why the build's number, not a link's
+
+A linker is not slow. A *build* is slow, because it links the same programs over
+and over with almost nothing changed between them — and a linker that exits
+after every link has to be told the whole program again each time.
 
 So the thing worth attacking is not the cost of one link. It is the cost of the
 hundredth link of a program the linker has already seen ninety-nine times. That
 is why blinker is resident: staying alive is worth **1.6×** on its own here
 (296 ms against 484 for the same links one-shot), before any incremental
-machinery does anything at all.
+machinery does anything.
 
 It is also why the median matters more than the maximum. A real build's links
 have 23 inputs at the median and 132 at the largest. Optimising the tail is
 optimising the case that happens once.
 
-The thing standing in front of this number is measured in finding 204. A cold
-build of this workspace submits **eleven links within 129 ms of each other**,
-and the daemon serves one at a time: their round trips climb 35.7 → 205.5 ms in
-a staircase, 301 ms of wall clock for about 40 ms of linking. `build-links.py`
-replays links serially, so the 2.7× above does not include it.
+### Concurrency
 
-The incremental build does not hit it — after touching one crate this workspace
-issues exactly one link — so concurrency buys the cold and near-cold build and
-buys the edit loop nothing. `BLINKER_TRACE_WAIT=<file>` writes the trace that
-shows either.
+A cold build of this workspace submits **eleven links within 129 ms of each
+other**. Blinker serves links from a pool of four worker processes routed by
+output path, which took the total client wait from 705.8 ms to 517.9 ms (−27%)
+and the median wait per link from 44.6 ms to 28.5 ms (−36%) on this workspace.
 
-## Where it stands
+The incremental build does not hit the queue at all — after touching one crate
+this workspace issues exactly one link — so concurrency buys the cold and
+near-cold build and buys the edit loop nothing. `BLINKER_TRACE_WAIT=<file>`
+writes a trace of every link's client-side wait; `scripts/link-burst.py` reports
+the burst in it.
 
-| | |
-|---|---|
-| **A whole `cargo build`'s links** | **2.7×** the system toolchain |
-| **Edit relink, resident** | **20.6 ms** wall against `ld-prime`'s 34.3 ms |
-| A body edit, debug self-link (1,099 objects) | 41.9 ms wall, 31.9 ms linking |
-| Cold link, 238 objects | 1.03× `ld-prime` — inside the spread |
-| Output size | 0.85× `ld-prime`'s on a large link, with dead-stripping |
-| Cold link, 5,637 objects | **1.70× slower** |
-| Edit relink, 5,637 objects | level — ~390 ms against 367 ms |
-
-The last two rows are the honest cost of the design. A resident linker's first
-link pays for state that no link has reused yet, and on a very large program
-that bill arrives all at once. blinker wins on repetition and on the common
-case; it does not yet win on a single cold link of a huge program.
-
-`cargo test` binaries, `panic=abort` and `panic=unwind`, caught panics,
-destructors, symbolized backtraces and a `dsymutil`-readable debug map all work.
-Output kinds blinker cannot produce — `-dynamiclib`, so every proc-macro crate —
-are delegated automatically with the reason recorded.
-
-## What the large link spends its time on
+### Where the time goes on a large link
 
 Kept because it is where the remaining work is, not because it is the headline.
 On a relink where 1 object in 5,637 has a reachability projection that moved and
@@ -81,90 +180,126 @@ On a relink where 1 object in 5,637 has a reachability projection that moved and
   write            14 ms
 ```
 
-Every one is proportional to the whole program rather than to the edit. That is
-the work of findings 191 onward — and the largest single item found so far was
-not a stage at all but a 1.7-million-element clone sitting in the gap *between*
-two measured stages (199).
+Every one is proportional to the whole program rather than to the edit. The
+largest single item found so far was not a stage at all but a 1.7-million-element
+clone sitting in the gap *between* two measured stages (finding 199).
 
-Three results of that work are built, verified and switched off, each behind a
-flag and each for a reason recorded in the findings rather than a plan to get to
-it: `BLINKER_DELTA_LIVENESS` (2 ms) and `BLINKER_RETAIN_STRINGS` (14 ms, and it
-costs the warm-equals-cold byte comparison the test suite leans on).
-`BLINKER_MEMORY_BUDGET` bounds the per-target state in megabytes, default 1024.
+### A note on the numbers
 
-`--blinker-delegate` delegates everything, `--blinker-no-daemon` or
-`BLINKER_NO_DAEMON=1` links in-process, and `--blinker-daemon-stop` stops a
-resident linker.
+They move a lot. blinker was measured at 0.92× on a 47-object fixture and turned
+out to be **7.44×** on a real binary, because a linear scan that was invisible at
+small scale was quadratic at large (finding 77). Treat any single-fixture
+number here, including these, as a claim about one workload.
 
-See [PRODUCT_SPEC.md](PRODUCT_SPEC.md) for the product definition,
-[IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) for the milestone sequence,
-and **[FINDINGS.md](FINDINGS.md)** for the 211 places reality contradicted the
-plan — several of them contradicting earlier entries in the same file.
+They also go stale. This file said 2.92× and "the daemon is not implemented" for
+long enough that a review of the project reasoned from it and recommended work
+that had already been done. If a number here disagrees with
+[FINDINGS.md](FINDINGS.md), the finding with the higher number was measured
+last.
+
+---
 
 ## What is not done
 
 - **Speed at scale.** 1.70× the system linker on a large cold link, against
   1.03× on a small one, and the resident relink of a large program is level
   with a cold `ld-prime` — where it was 51% slower at the start of the work
-  recorded in findings 179-186. The reason is that the stages left are
-  proportional to the whole program rather than to the edit: dead stripping
-  rebuilds the reachability graph even when one object in 5,637 moved, and the
-  image is assembled, hashed and written whole even when 98% of relocations
-  were reused.
+  recorded in findings 179-186. The stages that are left are proportional to
+  the whole program rather than to the edit: dead stripping rebuilds the
+  reachability graph even when one object in 5,637 moved, and the image is
+  assembled, hashed and written whole even when 98% of relocations were reused.
 
-  Not the reason, though it was believed to be for a long time and this file
-  said so: materialising every symbol name into an owned `String`. Removing that
-  allocation was measured at about 4 ms of a 780 ms link, because the parse has
-  been on every core since finding 161 and 976,000 allocations spread over
-  fifteen cores are not 976,000 allocations (finding 168).
-- **Dynamic library output.** Proc-macro crates and `cdylib`s are delegated
-  rather than linked. Correct, but it means a workspace is only partly linked
-  by blinker.
-- **A memory budget aimed at the wrong four hundred megabytes.** Per-target
-  state is now bounded in bytes and evicted least-recently-used —
-  `BLINKER_MEMORY_BUDGET`, default 1024 MB — which replaced three counts that
-  each counted a different unit. It reports itself: 291 MB held on an ordinary
-  large relink, 400 MB with the retained symbol table on.
-
-  The measurement that made possible then said the budget covers 400 MB of a
-  3.0 GB process. The rest is parsed inputs, still bounded by a window of four
-  links rather than by bytes, and about a third is memory the allocator has
-  freed and not returned — `malloc_zone_pressure_relief` does not move it
-  (finding 201).
+  Not the reason, though this file said so for a long time: materialising every
+  symbol name into an owned `String`. Removing that allocation was worth about
+  4 ms of a 780 ms link, because the parse has been on every core since finding
+  161 and 976,000 allocations spread over fifteen cores are not 976,000
+  allocations (finding 168).
 - **Incremental output.** The image is rebuilt and rewritten whole. The layout
   machinery for stable addresses across edits exists, is tested, and holds
   (9,719 of 9,722 contributions keep their address on an ordinary edit) — but
   unchanged bytes are still copied and re-emitted rather than left where they
   are.
 
-  Worth less than it sounds, and measured rather than assumed: 59% of the
-  output is `__LINKEDIT` and 46% of it is symbol-name text, and one symbol
-  added near the front shifts every string offset after it. The ceiling on
-  never touching an unchanged byte is about 9 ms of a large link — see
-  finding 187, and finding 186 for the version of it that measured slower than
-  writing the file whole.
+  Worth less than it sounds, and measured rather than assumed: 59% of the output
+  is `__LINKEDIT` and 46% of that is symbol-name text, and one symbol added near
+  the front shifts every string offset after it. The ceiling on never touching
+  an unchanged byte is about 9 ms of a large link — see finding 187, and finding
+  186 for the version of it that measured *slower* than writing the file whole.
+- **Memory.** Per-target state is bounded in bytes and evicted
+  least-recently-used (`BLINKER_MEMORY_BUDGET`, default 1024 MB): 291 MB held on
+  an ordinary large relink. That is 400 MB of a 3.0 GB process, though — the
+  rest is parsed inputs, still bounded by a window of four links rather than by
+  bytes, and about a third is memory the allocator has freed and not returned
+  (finding 201).
 - **`x86_64`, universal binaries, LTO.**
 
-## A note on the numbers
+---
 
-Every performance figure above is from an interleaved A/B against the system
-linker on real captured link arguments, not a synthetic benchmark. They moved a
-lot: blinker was measured at 0.92× on a 47-object fixture and turned out to be
-**7.44×** on a real binary, because a linear scan that was invisible at small
-scale was quadratic at large. See finding 77 — and treat any single-fixture
-number here, including these, as a claim about one workload.
+## Reference
 
-They also go stale. This table said 2.92× and "the daemon is not implemented"
-for long enough that a review of the project reasoned from it and recommended
-work that had already been done. The numbers here are re-measured when they
-change; if they disagree with FINDINGS.md, the finding with the higher number
-is the one that was measured last.
+### Options
+
+blinker occupies the position `rustc` invokes as the C compiler driver, so its
+argument vector is full of driver flags (`-o`, `-L`, `-l`, `-arch`, `-Wl,…`).
+Every blinker option therefore carries a `--blinker-` prefix that cannot collide
+with a driver or `ld64` flag, and is stripped before the remaining arguments are
+forwarded.
+
+| Option | Meaning |
+|---|---|
+| `--blinker-try [CARGO ARGS]` | Build through blinker with no configuration, into `target/blinker-try` |
+| `--blinker-install` | Set this binary as the linker for the project in the current directory |
+| `--blinker-uninstall` | Undo that, leaving the project as it was found |
+| `--blinker-daemon-stop` | Stop the resident linker, if any |
+| `--blinker-no-daemon` | Link in this process, and start no daemon |
+| `--blinker-delegate` | Hand every link to the system linker |
+| `--blinker-cache` | Replay an unchanged image from a previous link |
+| `--blinker-print-stats` | Print the human-readable summary |
+| `--blinker-json-diagnostics <PATH>` | Write the machine-readable record to `PATH` |
+| `--blinker-diagnostics <LEVEL>` | `quiet` \| `normal` \| `verbose` |
+| `--blinker-fallback-linker <PATH>` | Linker to delegate to (default: discovered) |
+| `--blinker-record-invocation <DIR>` | Record this invocation, with inputs, into `DIR` |
+| `--blinker-replay-invocation <FILE>` | Replay a recorded invocation |
+| `--blinker-strict-fingerprints` | BLAKE3-hash every input rather than trusting metadata |
+| `--blinker-version`, `--blinker-help` | Version / help |
+
+Options that have to travel through `rustc` to reach the linker are passed as
+`-C link-arg=--blinker-…`. Use the inline `=` form so `rustc` cannot separate an
+option from its value. `--blinker-try`, `--blinker-install`, `--blinker-uninstall`
+and `--blinker-daemon-stop` are run directly, not through `rustc`.
+
+### Environment
+
+| Variable | Meaning |
+|---|---|
+| `BLINKER_NO_DAEMON=1` | Link in-process, start no daemon |
+| `BLINKER_MEMORY_BUDGET` | Per-target state bound, in MB (default 1024, divided among the four workers) |
+| `BLINKER_FALLBACK_LINKER` | Linker to delegate to |
+| `BLINKER_TRACE_WAIT=<file>` | Append one line per link with its client-side wait |
+| `BLINKER_DELTA_LIVENESS`, `BLINKER_RETAIN_STRINGS` | Built, verified, off — each worth a few ms and each with a recorded reason in FINDINGS |
+
+### Fallback linker discovery
+
+Highest precedence first:
+
+1. `--blinker-fallback-linker <PATH>`
+2. the `BLINKER_FALLBACK_LINKER` environment variable
+3. `/usr/bin/cc`, then `/usr/bin/clang`
+
+An explicitly configured path that does not exist is an error rather than a
+silent fall-through to a default — quietly substituting a different linker would
+change link semantics without saying so.
+
+The default is `cc` rather than `ld` because that is what `rustc` itself
+invokes; see [FINDINGS.md](FINDINGS.md).
+
+---
 
 ## Measuring it
 
 Build a workload first. It is rebuilt from the repository rather than found
-lying around, because every workload this project measured before finding 93
-was archived into a temporary directory and is gone:
+lying around, because every workload this project measured before finding 93 was
+archived into a temporary directory and is gone:
 
 ```bash
 scripts/workload.py self                     # blinker linking itself, release
@@ -189,65 +324,11 @@ produced a wrong number that was believed — see the header of
 separately, because on a 60 ms run 20 ms of it is spawn and page cache, and
 measuring that as though it were linking spreads the result by 42%.
 
-## Requirements
-
-- Apple Silicon Mac (`aarch64-apple-darwin` is the only supported target)
-- Rust stable toolchain
-- Xcode command line tools (`/usr/bin/cc` must exist)
-
-## Build
+For a whole build rather than one link:
 
 ```bash
-cargo build --release
+BLINKER_TRACE_WAIT=/tmp/trace cargo build && scripts/link-burst.py /tmp/trace
 ```
-
-The binary lands at `target/release/blinker`.
-
-## Use it as your linker
-
-Try it first, from the project you want to build. This writes no configuration
-and builds into `target/blinker-try`, so nothing about the project changes and
-the next ordinary `cargo build` is not made to rebuild anything:
-
-```bash
-/absolute/path/to/blinker --blinker-try build
-```
-
-Then, from the same directory:
-
-```bash
-/absolute/path/to/blinker --blinker-install
-```
-
-which writes what you would have written by hand, with the running binary's own
-absolute path:
-
-```toml
-# .cargo/config.toml
-[target.aarch64-apple-darwin]
-linker = "/absolute/path/to/blinker"
-```
-
-An existing `.cargo/config.toml` is edited rather than replaced — comments,
-ordering and every other setting survive — and a `linker` already pointing at
-something that is not blinker is reported rather than overwritten. Running it
-twice does nothing the second time.
-
-Then build as normal:
-
-```bash
-cargo build
-cargo test
-```
-
-That is the whole of the setup. Blinker links internally, and the first link
-starts a resident linker that the rest of the build reaches.
-
-**To restore the default linker**, run `blinker --blinker-uninstall` from the
-project — it removes the key it added, and the file and `.cargo` directory too
-if they held nothing else — then `blinker --blinker-daemon-stop`. The daemon is
-the one piece of state a build leaves behind, and it would go on its own twenty
-minutes later regardless.
 
 ## Corpus tooling
 
@@ -267,12 +348,10 @@ there is a spelling the classifier does not understand yet. Before adding one,
 check its arity in `crates/arguments/src/reference.rs` — assuming a value-taking
 option takes none causes its values to be silently read as input files.
 
-See [FINDINGS.md](FINDINGS.md) for what the corpus has established so far.
+### Recording a corpus
 
-## Recording a corpus
-
-Recording captures real linker invocations from real projects, which is how
-the arity table in `blinker-arguments` and most of FINDINGS were derived:
+Recording captures real linker invocations from real projects, which is how the
+arity table in `blinker-arguments` and most of FINDINGS were derived:
 
 ```bash
 cargo build --config 'target.aarch64-apple-darwin.rustflags = ["-C", "link-arg=--blinker-record-invocation=/tmp/corpus"]'
@@ -293,43 +372,7 @@ blinker --blinker-replay-invocation=/tmp/corpus/mycrate-12345.json
 Replay rewrites the output path into a scratch directory, so it can never
 overwrite a real build artifact.
 
-## Options
-
-blinker occupies the position `rustc` invokes as the C compiler driver, so its
-argument vector is full of driver flags (`-o`, `-L`, `-l`, `-arch`, `-Wl,…`).
-Every blinker option therefore carries a `--blinker-` prefix that cannot collide
-with a driver or `ld64` flag, and is stripped before the remaining arguments are
-forwarded.
-
-| Option | Meaning |
-|---|---|
-| `--blinker-fallback-linker <PATH>` | Linker to delegate to (default: discovered) |
-| `--blinker-record-invocation <DIR>` | Record this invocation, with inputs, into `DIR` |
-| `--blinker-replay-invocation <FILE>` | Replay a recorded invocation |
-| `--blinker-json-diagnostics <PATH>` | Write the machine-readable record to `PATH` |
-| `--blinker-diagnostics <LEVEL>` | `quiet` \| `normal` \| `verbose` |
-| `--blinker-print-stats` | Print the human-readable summary |
-| `--blinker-strict-fingerprints` | BLAKE3-hash every input rather than trusting metadata |
-| `--blinker-version`, `--blinker-help` | Version / help |
-
-Because these must travel through `rustc` to reach the linker, pass them as
-`-C link-arg=--blinker-…`. Use the inline `=` form so `rustc` cannot separate an
-option from its value.
-
-### Fallback linker discovery
-
-Highest precedence first:
-
-1. `--blinker-fallback-linker <PATH>`
-2. the `BLINKER_FALLBACK_LINKER` environment variable
-3. `/usr/bin/cc`, then `/usr/bin/clang`
-
-An explicitly configured path that does not exist is an error rather than a
-silent fall-through to a default — quietly substituting a different linker would
-change link semantics without saying so.
-
-The default is `cc` rather than `ld` because that is what `rustc` itself invokes;
-see [FINDINGS.md](FINDINGS.md).
+---
 
 ## Development
 
@@ -346,10 +389,26 @@ milestone deliverable.
 
 | Crate | Role |
 |---|---|
-| `crates/cli` | Entry point, driver, fallback execution, record/replay |
-| `crates/arguments` | Argument classification and response-file expansion |
-| `crates/diagnostics` | JSON record schema, timings, input fingerprints |
-| `crates/test-support` | Fixture generation and the end-to-end harness |
+| `cli` | Entry point, driver, daemon, setup commands, record/replay |
+| `arguments` | Argument classification and response-file expansion |
+| `macho` | Object parsing |
+| `link` | Resolution, dead stripping, relocation, the session |
+| `layout` | Output addresses, and keeping them stable across edits |
+| `output` | Mach-O emission, `__LINKEDIT`, export trie, code signing |
+| `relocations` | Relocation kinds and how each is applied |
+| `symbols` | Symbol resolution structures |
+| `cache` | The on-disk incremental cache |
+| `tbd` | `.tbd` stub libraries — what the system dylibs export |
+| `archive` | `.a` and `.rlib` member extraction |
+| `hashing` | The fast hashers the hot maps use |
+| `diagnostics` | JSON record schema, timings, input fingerprints |
+| `differential` | Output compared against `ld64`'s |
+| `corpus` | Gathering and reporting real link invocations |
+| `test-support` | Fixture generation and the end-to-end harness |
 
-Crates are introduced as milestones need them rather than scaffolded up front;
-the full target layout is in the implementation plan.
+### Documents
+
+- [PRODUCT_SPEC.md](PRODUCT_SPEC.md) — what the product is
+- [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) — the milestone sequence
+- **[FINDINGS.md](FINDINGS.md)** — the 207 places reality contradicted the plan,
+  several of them contradicting earlier entries in the same file
