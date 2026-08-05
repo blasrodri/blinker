@@ -560,7 +560,24 @@ impl LinkRequest {
             return None;
         }
         let mut all = libraries::StubExports::default();
+        // `-lSystem`, `-lc` and `-lm` are three names for one file: the SDK
+        // ships `libc.tbd` and `libm.tbd` as symlinks to `libSystem.B.tbd`.
+        // Every Rust link passes all three, and parsing 334 KB of YAML once
+        // per name was 13 ms of a 26 ms cold link — for nothing, because the
+        // second and third passes found the same 9,264 symbols already owned
+        // by the install name the first one registered.
+        //
+        // Deduplicated by what the path *resolves to* rather than by the path,
+        // which is the only spelling under which the three are the same file.
+        // A resolve that fails leaves the path standing: an unreadable stub is
+        // the next line's problem, and dropping it here would silently lose a
+        // library instead of reporting it.
+        let mut parsed: HashSet<PathBuf> = HashSet::default();
         for path in &self.stub_libraries {
+            let identity = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
+            if !parsed.insert(identity) {
+                continue;
+            }
             let Ok(file) = blinker_tbd::parse_tbd_file(path) else {
                 continue;
             };
@@ -6731,5 +6748,80 @@ mod defining_index_tests {
         assert_eq!(index.at(COLLIDING, "_first"), Some((0, MemberId(1))));
         assert_eq!(index.at(COLLIDING, "_second"), Some((2, MemberId(5))));
         assert_eq!(index.at(COLLIDING, "_absent"), None);
+    }
+}
+
+#[cfg(test)]
+mod stub_library_tests {
+    use super::LinkRequest;
+    use blinker_test_support::Scratch;
+
+    /// A minimal stub exporting `symbols` under `install_name`.
+    fn tbd(install_name: &str, symbols: &[&str]) -> String {
+        format!(
+            "--- !tapi-tbd\ntbd-version:     4\ntargets:         [ arm64e-macos ]\n\
+             install-name:    '{install_name}'\nexports:\n  \
+             - targets:         [ arm64e-macos ]\n    symbols:         [ {} ]\n",
+            symbols.join(", ")
+        )
+    }
+
+    fn exports(scratch: &Scratch, names: &[&str]) -> super::libraries::StubExports {
+        let request = LinkRequest::new(vec![])
+            .stub_libraries(names.iter().map(|n| scratch.join(n)).collect());
+        request
+            .dynamic_symbols()
+            .expect("stub libraries were given")
+    }
+
+    /// The SDK ships `libc.tbd` and `libm.tbd` as symlinks to
+    /// `libSystem.B.tbd`, and every Rust link passes all three. Parsing the
+    /// file once per name cost 5.5 ms of a 25.7 ms cold link and found
+    /// nothing the first pass had not — this is that, and the assertion is
+    /// that skipping the repeats changes no answer.
+    #[test]
+    fn three_names_for_one_file_are_parsed_as_one_library() {
+        let scratch = Scratch::dir("stub-symlinks").expect("scratch");
+        std::fs::write(
+            scratch.join("libSystem.B.tbd"),
+            tbd("/usr/lib/libSystem.B.dylib", &["_malloc", "_free"]),
+        )
+        .expect("written");
+        for alias in ["libSystem.tbd", "libc.tbd", "libm.tbd"] {
+            std::os::unix::fs::symlink("libSystem.B.tbd", scratch.join(alias)).expect("linked");
+        }
+
+        let one = exports(&scratch, &["libSystem.tbd"]);
+        let three = exports(&scratch, &["libSystem.tbd", "libc.tbd", "libm.tbd"]);
+        assert_eq!(one, three, "deduplicating the aliases changed the answer");
+        assert_eq!(three.count(), 2);
+        assert!(three.contains("_malloc") && three.contains("_free"));
+    }
+
+    /// The other half of the same claim: deduplication is by what the path
+    /// resolves to, so two genuinely different stubs both still get parsed —
+    /// and both get their own `LC_LOAD_DYLIB` ordinal, which is what a
+    /// two-level namespace binds against.
+    #[test]
+    fn two_different_files_remain_two_libraries() {
+        let scratch = Scratch::dir("stub-distinct").expect("scratch");
+        std::fs::write(
+            scratch.join("libSystem.tbd"),
+            tbd("/usr/lib/libSystem.B.dylib", &["_malloc"]),
+        )
+        .expect("written");
+        std::fs::write(
+            scratch.join("libiconv.tbd"),
+            tbd("/usr/lib/libiconv.2.dylib", &["_iconv_open"]),
+        )
+        .expect("written");
+
+        let both = exports(&scratch, &["libSystem.tbd", "libiconv.tbd"]);
+        assert_eq!(both.count(), 2);
+        assert_ne!(
+            both.ordinal("_malloc"),
+            both.ordinal("_iconv_open"),
+            "two stubs collapsed onto one ordinal"
+        );
     }
 }
