@@ -23,6 +23,7 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod dylib;
 pub mod relocation;
 pub use relocation::{Arm64RelocationKind, RelocationError, RelocationLength};
 

@@ -578,20 +578,36 @@ impl LinkRequest {
             if !parsed.insert(identity) {
                 continue;
             }
-            let Ok(file) = blinker_tbd::parse_tbd_file(path) else {
-                continue;
-            };
-            // Attributed to the file's *own* install name, not to whichever
-            // sub-document a re-exported symbol was written in. `libSystem`
-            // re-exports forty libraries; `_malloc` lives in
-            // `libsystem_malloc.dylib` and binds against libSystem, because
-            // libSystem is what the image loads and what the ordinal names.
-            let Some(install_name) = file.primary().map(|d| d.install_name.clone()) else {
-                continue;
-            };
-            let library = all.library(&install_name);
-            for name in file.exported_symbols(blinker_tbd::Target::aarch64_macos()) {
-                all.export(library, name);
+            // A text stub if the SDK shipped one, and the library itself
+            // otherwise. Homebrew, `/usr/local`, and any vendored dependency
+            // give a real Mach-O and no stub at all — reading only stubs meant
+            // those libraries contributed nothing and their symbols came out
+            // undefined, which is the whole of finding 218.
+            match blinker_tbd::parse_tbd_file(path) {
+                Ok(file) => {
+                    // Attributed to the file's *own* install name, not to
+                    // whichever sub-document a re-exported symbol was written
+                    // in. `libSystem` re-exports forty libraries; `_malloc`
+                    // lives in `libsystem_malloc.dylib` and binds against
+                    // libSystem, because libSystem is what the image loads and
+                    // what the ordinal names.
+                    let Some(install_name) = file.primary().map(|d| d.install_name.clone()) else {
+                        continue;
+                    };
+                    let library = all.library(&install_name);
+                    for name in file.exported_symbols(blinker_tbd::Target::aarch64_macos()) {
+                        all.export(library, name);
+                    }
+                }
+                Err(_) => {
+                    let Ok(read) = blinker_macho::dylib::read_dylib_exports(path) else {
+                        continue;
+                    };
+                    let library = all.library(&read.install_name);
+                    for name in read.symbols {
+                        all.export(library, name);
+                    }
+                }
             }
         }
         Some(all)

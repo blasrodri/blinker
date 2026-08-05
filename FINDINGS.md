@@ -11064,3 +11064,81 @@ Half a day, and one deadlock that a two-minute tool timeout was nearly mistaken
 for a slow build. The distinction mattered: a slow build is an annoyance, and a
 hang was a real defect in code that had already been measured, verified
 byte-identical, and was about to be committed.
+
+---
+
+## 218. The linker could not link any project with a C dependency
+
+Every number in this file up to here was taken from Rust-only programs: this
+workspace, and a rust-analyzer checkout. Pointed at a third real project — one
+with C and C++ dependencies — blinker did not link it at all:
+
+```
+  blinker: undefined symbols:
+    _ZSTD_CCtx_setParameter
+    _ZSTD_compress2
+    ...
+    __ZN9chainbase8database5flushEv
+    ___dso_handle
+```
+
+The system linker builds the same project without complaint, so this was ours.
+
+### The cause
+
+`-lzstd` resolves to `/opt/homebrew/lib/libzstd.dylib`. `find_library` found
+it correctly — it has always searched `-L` paths and tried `.tbd`, `.dylib`,
+`.a` in that order. The CLI then threw it away:
+
+```rust
+if path.extension().is_some_and(|e| e == "tbd") && seen.insert(path.clone()) {
+    found.push(path);
+}
+```
+
+**Only `.tbd` was collected**, and the parse loop behind it was `let Ok(file) =
+parse_tbd_file(path) else { continue }` — so even had it arrived, a Mach-O
+would have been skipped silently. Two filters, both dropping the library
+without a word, and the failure surfaced hundreds of milliseconds later as a
+list of undefined symbols that named the *callers* rather than the library that
+was discarded.
+
+### Why it survived this long
+
+Apple ships a `.tbd` text stub beside every SDK library. A Rust program that
+touches only `libSystem` — which is every program this project had been tested
+on, including its own test suite and both public benchmarks — never needs
+anything else. The entire class of failure is invisible until a dependency
+comes from Homebrew, `/usr/local`, or a vendored build directory, and then
+*nothing* in the project links.
+
+This is the second time a wrong belief about the SDK has cost something
+(finding 209 was three parses of one file because `-lc` and `-lm` are symlinks
+to `libSystem.B.tbd`). The SDK is not the world.
+
+### The fix
+
+A dylib export reader: `LC_ID_DYLIB` for the install name, the export trie for
+the symbols, and `LC_SYMTAB`'s external definitions as a fallback for a dylib
+that carries no trie — because an empty library is indistinguishable downstream
+from a library that defines nothing, and produces exactly the failure above.
+Universal binaries are read through their arm64 slice, since a Homebrew bottle
+is routinely fat.
+
+The install name is the *recorded* one, not the path the library was found at:
+`/opt/homebrew/lib/libzstd.dylib` is a symlink whose `LC_ID_DYLIB` says
+`/opt/homebrew/opt/zstd/lib/libzstd.1.dylib`, and that second string is what
+dyld will look for at load time.
+
+The CLI filter is now "anything but `.a`" rather than "`.tbd` only", and the
+parse path tries the stub first and the Mach-O second. `.a` stays excluded
+because a static archive is an input to read, not a library to bind against.
+
+### A test that passed by not running
+
+The first fixture for the new reader looked for `/usr/lib/libSystem.B.dylib`
+and skipped the test when it was absent. It is *always* absent: macOS keeps the
+system libraries in the dyld shared cache, not on disk. The test passed by
+returning early — the same silent-skip shape as the bug it was written for.
+Replaced with a dylib built by `cc` in a scratch directory, which also gets the
+universal-binary case and the no-stub-beside-it case honestly.

@@ -415,7 +415,20 @@ fn stub_libraries(parsed: &ParsedInvocation) -> Vec<PathBuf> {
             _ => continue,
         };
         let Some(path) = path else { continue };
-        if path.extension().is_some_and(|e| e == "tbd") && seen.insert(path.clone()) {
+        // Everything that describes a library to import from, which is a
+        // `.tbd` in the SDK and a real Mach-O `.dylib` everywhere else.
+        //
+        // This used to accept `.tbd` alone, and a `-lzstd` that resolved to
+        // `/opt/homebrew/lib/libzstd.dylib` was dropped here without a word —
+        // so every symbol it defines came out undefined and the link failed
+        // naming them. Rust-only programs never noticed, because the SDK ships
+        // a stub for everything they touch; a project with a C dependency
+        // could not be linked at all.
+        //
+        // `.a` is deliberately not here: a static archive is an input to read,
+        // not a library to bind against, and it travels the other path.
+        let static_archive = path.extension().is_some_and(|kind| kind == "a");
+        if !static_archive && seen.insert(path.clone()) {
             found.push(path);
         }
     }
