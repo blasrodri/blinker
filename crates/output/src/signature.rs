@@ -480,25 +480,53 @@ pub(crate) fn page_hashes(
     };
 
     let mut hashes = vec![[0u8; HASH_SIZE]; code_slots];
-    let threads = std::thread::available_parallelism()
-        .map_or(1, |n| n.get())
-        .min(code_slots.max(1));
+    // Four runs per core, and never more threads than there are runs for them.
+    //
+    // The run length is derived from the work and not floored at some number of
+    // pages that sounds small. Flooring it at sixteen was tried, on the
+    // reasoning that a shorter run cannot be worth a queue lock, and it cost
+    // 10% of a whole workspace's links: a 1.6 MB image is 100 pages, sixteen of
+    // those is seven runs, and seven runs is seven threads where there used to
+    // be fifteen. The floor did not make the hashing cheaper, it made half the
+    // machine idle. A run of two pages is 32 KiB of SHA-256 against a lock
+    // measured in nanoseconds, and that trade is not close.
+    let cores = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let grain = code_slots.div_ceil(cores * 4).max(1);
+    let threads = cores.min(code_slots.div_ceil(grain));
     if threads <= 1 {
         for (slot, out) in hashes.iter_mut().enumerate() {
             hash_page(slot, out);
         }
     } else {
-        // Contiguous runs rather than a shared cursor: pages are equal-cost,
-        // so there is nothing for work-stealing to balance, and a `chunks_mut`
-        // split hands each thread a disjoint slice the borrow checker can
-        // prove is disjoint.
-        let per_thread = code_slots.div_ceil(threads);
+        // Many small runs handed out on demand, rather than one contiguous run
+        // per thread.
+        //
+        // The split used to be one run each, on the reasoning that pages are
+        // equal-cost so there is nothing to balance. Pages are equal-cost; the
+        // *cores* are not. This machine has ten performance cores and five
+        // efficiency cores, and an efficiency core takes roughly three times as
+        // long over the same megabyte — so an even division of the work finishes
+        // when the slowest third of it does, and ten cores sit idle waiting.
+        //
+        // Reuse makes it worse in the other direction: on an edit relink most
+        // pages are unchanged and cost a 16 KiB comparison, while the few that
+        // moved cost a SHA-256. Which thread gets the changed run is then the
+        // whole of the time.
+        //
+        // Determinism is untouched. The runs are cut before any thread starts
+        // and each slot still writes to its own index; all that varies is which
+        // thread picks up which run.
+        let queue = std::sync::Mutex::new(hashes.chunks_mut(grain).enumerate());
         std::thread::scope(|scope| {
-            for (chunk, run) in hashes.chunks_mut(per_thread).enumerate() {
-                let hash_page = &hash_page;
-                scope.spawn(move || {
-                    for (offset, out) in run.iter_mut().enumerate() {
-                        hash_page(chunk * per_thread + offset, out);
+            for _ in 0..threads {
+                let (queue, hash_page) = (&queue, &hash_page);
+                scope.spawn(move || loop {
+                    // In its own statement so the lock is released before the
+                    // hashing starts rather than held across it.
+                    let taken = queue.lock().expect("the page queue").next();
+                    let Some((run, slots)) = taken else { return };
+                    for (offset, out) in slots.iter_mut().enumerate() {
+                        hash_page(run * grain + offset, out);
                     }
                 });
             }

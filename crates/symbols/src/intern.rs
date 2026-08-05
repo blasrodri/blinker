@@ -94,21 +94,77 @@ impl SymbolNames {
     /// `hash` is not checked against `name`. A wrong one does not corrupt the
     /// table — the text comparison below still decides — it just files the name
     /// where no lookup will find it, so the same name would intern twice.
+    /// One probe of the index, not two.
+    ///
+    /// This asked `get_hashed` first and then `entry` on the miss, which is two
+    /// walks of the same bucket for every name the table has not seen — and on
+    /// a cold link that is *every* name. `entry` answers both questions at
+    /// once: the occupied case still compares the text, so a name that is
+    /// genuinely present is returned exactly as before, and the vacant case
+    /// skips a lookup that could only ever miss.
+    ///
+    /// It reads as a micro-optimisation and is not. Filing a round's new names
+    /// is the serial half of interning, by construction, and interning is 43%
+    /// of read-and-parse on a 552-input C++ link (finding 227).
     pub fn intern_hashed(&mut self, name: &str, hash: u64) -> SymbolNameId {
-        if let Some(id) = self.get_hashed(name, hash) {
-            return id;
-        }
-        let id = SymbolNameId(self.spans.len() as u32);
-        let start = self.arena.len() as u32;
-        self.arena.extend_from_slice(name.as_bytes());
-        self.spans.push((start, name.len() as u32));
-        match self.lookup.entry(hash) {
-            std::collections::hash_map::Entry::Occupied(mut held) => held.get_mut().push(id),
+        // Destructured so the text comparison can borrow the arena while the
+        // entry holds the index. They are separate fields; only the compiler
+        // needed telling.
+        let Self {
+            arena,
+            spans,
+            lookup,
+        } = self;
+        let file = |arena: &mut Vec<u8>, spans: &mut Vec<(u32, u32)>| {
+            let id = SymbolNameId(spans.len() as u32);
+            let start = arena.len() as u32;
+            arena.extend_from_slice(name.as_bytes());
+            spans.push((start, name.len() as u32));
+            id
+        };
+        match lookup.entry(hash) {
+            std::collections::hash_map::Entry::Occupied(mut held) => {
+                let same = |id: &SymbolNameId| {
+                    spans
+                        .get(id.0 as usize)
+                        .and_then(|&(start, len)| arena.get(start as usize..(start + len) as usize))
+                        == Some(name.as_bytes())
+                };
+                if let Some(id) = held.get().all().find(same) {
+                    return id;
+                }
+                let id = file(arena, spans);
+                held.get_mut().push(id);
+                id
+            }
             std::collections::hash_map::Entry::Vacant(slot) => {
+                let id = file(arena, spans);
                 slot.insert(crate::Few::new(id));
+                id
             }
         }
-        id
+    }
+
+    /// Make room for `names` more names holding `bytes` of text between them.
+    ///
+    /// # Why a caller can know this and the table cannot
+    ///
+    /// Filing a round's new names is serial, and every insert lands on a random
+    /// bucket of a table too large for any cache — so it is memory latency, not
+    /// instructions. Growing by doubling from empty pays that latency again for
+    /// every name already filed, once per doubling: reaching 622,648 names costs
+    /// roughly another 622,648 random inserts in rehashes nobody asked for, and
+    /// on a 552-input C++ link that was most of the 58 ms (finding 227).
+    ///
+    /// The table cannot see this coming. The caller can: the parallel probe that
+    /// precedes the serial pass has already asked, of every name in the round,
+    /// whether the table holds it — so the count of misses is in hand before the
+    /// first insert. It is an over-estimate by the names the round repeats
+    /// within itself, which is the harmless direction for a reservation.
+    pub fn reserve(&mut self, names: usize, bytes: usize) {
+        self.arena.reserve(bytes);
+        self.spans.reserve(names);
+        self.lookup.reserve(names);
     }
 
     /// The name behind an ID.

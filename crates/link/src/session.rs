@@ -1406,8 +1406,13 @@ impl Session {
         }
         let Session { memo, names, .. } = self;
         let held: &SymbolNames = names;
+        // The misses are counted where they are discovered, on every core, and
+        // not by a second walk afterwards: what the serial pass below is about
+        // to cost is decided by how much the table has to grow, and the probe
+        // is the only place that already knows. See [`SymbolNames::reserve`].
         let probed = crate::parallel::map_chunks(&missing, |_, chunk| {
-            chunk
+            let mut fresh = (0usize, 0usize);
+            let answers = chunk
                 .iter()
                 .map(|parse| {
                     parse
@@ -1415,13 +1420,26 @@ impl Session {
                         .iter()
                         .map(|symbol| {
                             let hash = blinker_symbols::hash_of(&symbol.name);
-                            (hash, held.get_hashed(&symbol.name, hash))
+                            let found = held.get_hashed(&symbol.name, hash);
+                            if found.is_none() {
+                                fresh = (fresh.0 + 1, fresh.1 + symbol.name.len());
+                            }
+                            (hash, found)
                         })
                         .collect::<Vec<_>>()
                 })
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>();
+            (answers, fresh)
         });
-        for (parse, answers) in missing.iter().zip(probed.into_iter().flatten()) {
+        let mut answers_by_parse = Vec::with_capacity(missing.len());
+        let (mut fresh, mut bytes) = (0usize, 0usize);
+        for (answers, (count, text)) in probed {
+            answers_by_parse.extend(answers);
+            fresh += count;
+            bytes += text;
+        }
+        names.reserve(fresh, bytes);
+        for (parse, answers) in missing.iter().zip(answers_by_parse) {
             let ids: Vec<SymbolNameId> = parse
                 .symbols
                 .iter()

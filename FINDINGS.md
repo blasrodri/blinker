@@ -11755,3 +11755,115 @@ measuring a different object, and it will keep reading healthy however wrong it
 gets. The guard is a unit test that interns a name, forgets, and asserts the
 table is empty — cheap, and the only thing in the suite that would have
 noticed.
+
+## 227. Where a 552-input C++ link actually spends its cold time
+
+blinker links pulsevm's five programs cold in 2.71 s against ld64's 1.42 s —
+1.9x slower, evenly across all five, and the largest standing weakness in the
+product. This is the measurement of where that time goes, and the two pieces of
+it worth taking first. Together they are 1.02x-1.05x on every workload here.
+
+### The breakdown
+
+Five links, one-shot, summed (`--blinker-json-diagnostics`):
+
+```
+  read_and_parse   955    39%        relocate   410    17%
+  dead_strip       292    12%        emit       262    11%
+  layout           118     5%        symbols    107     4%
+  resolve           83     3%        stub_parse  71     3%
+  survey            60     2%        write       58     2%
+```
+
+`BLINKER_GAP_PARTS` splits the largest of them further, on the largest link:
+
+```
+  load: read the rest          38 ms   <- reading and parsing 1.4 GB of inputs
+  round: parse (x5)            28 ms   <- 3,945 archive members
+  round: seed_interned (x5)    69 ms   <- interning their names
+  load: defining map           21 ms
+```
+
+Reading every byte of every input is 38 ms. **Interning the names is 69 ms**,
+which is 43% of read-and-parse and 13% of the whole link. That is not where I
+would have looked.
+
+### Interning is latency, and doubling pays it twice
+
+Instrumenting `seed_interned` separates its two halves. The parallel probe —
+hash every name, ask the table whether it holds it — costs 19 ms across all
+rounds for 1.3 million symbols. The serial file-away costs 58 ms for the
+789,279 that missed.
+
+75 ns per name is not instructions. Every insert lands on a random bucket of a
+table far too large for any cache, and the next insert cannot start until this
+one finishes, so it is one memory round trip each with nothing to overlap it
+with. Growing from empty by doubling then pays that round trip again for every
+name already filed, once per doubling — reaching 622,648 names costs roughly
+another 622,648 random inserts in rehashes.
+
+The table cannot see that coming. The caller can: the parallel probe has
+already asked, of every name, whether the table holds it, so the count of
+misses is in hand before the first insert. Counting them where they are
+discovered — on every core — and reserving once takes read-and-parse from
+939.5 to 864.5 ms across the five links (**8%**).
+
+`intern_hashed` also stopped probing the index twice, `get_hashed` and then
+`entry` on the miss. That one is honest bookkeeping and not the win: measured
+alone it is under 2%.
+
+### Equal work is not equal time on unequal cores
+
+`page_hashes` divided its pages into one contiguous run per thread, on the
+reasoning that pages are equal-cost so there is nothing to balance. Pages are
+equal-cost. This machine's cores are not — ten performance and five efficiency
+— and an even division finishes when the slowest fifth of it does. Reuse pulls
+the other way on a relink, where most pages cost a 16 KiB comparison and the
+few that moved cost a SHA-256.
+
+Handing out many small runs from a queue instead is 16% of the UUID phase. The
+same argument applies wherever work is cut evenly for cores that are not, which
+in this linker is only here: `map_chunks` has handed out chunk *indices* from a
+cursor since it was written.
+
+### The floor that made half the machine idle
+
+The first version floored the run at sixteen pages, on the reasoning that a
+shorter run cannot be worth a queue lock. It cost **10%** of a whole
+workspace's links — and I nearly committed it, because the workload it was
+written for got faster.
+
+A 1.6 MB image is 100 pages; sixteen of those is seven runs; seven runs is
+seven threads where there had been fifteen. The floor did not make the hashing
+cheaper, it made half the machine idle. Deriving the run length from the work
+(four runs per core, whatever that comes to) fixes it: a two-page run is 32 KiB
+of SHA-256 against a lock measured in nanoseconds.
+
+Worth recording as the shape of mistake, not the instance. A constant chosen
+because it "sounds small" is a constant chosen against no workload at all, and
+the one it silently mis-sizes will be the one nobody re-measured.
+
+### Measured
+
+Interleaved, alternating order, best of each arm:
+
+```
+  pulsevm one-shot        2743.9 -> 2679.3    1.024x
+  pulsevm resident        2638.2 -> 2535.7    1.040x
+  this workspace           217.0 ->  208.4    1.041x
+  ripgrep                  150.8 ->  146.7    1.028x
+  rust-analyzer           1327.9 -> 1263.0    1.051x
+```
+
+32 links byte-identical across the previous binary, this one cold, and this one
+warm twice.
+
+### What is left, and why it is not a list of small things
+
+The gap on this workload is ~190 ms per link and these two are ~20 of it. The
+remainder is spread evenly across phases that are all already parallel, which
+means there is no single stall left to find — the next real move is structural.
+Interning is the clearest candidate: it is serial *by construction*, and
+sharding the table by hash would make it parallel while keeping ids
+deterministic. That changes the numbering, so the byte oracle would have to
+approve it, which is exactly the check that makes it safe to try.
