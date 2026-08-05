@@ -2,13 +2,13 @@
 
 A resident, incremental Mach-O linker for Rust on Apple Silicon.
 
-**It makes a `cargo build`'s linking 2.5× faster, out of the box.**
+**It makes a `cargo build`'s linking 3.3× faster, out of the box.**
 
 ```
 a full build of this workspace — 16 links, 23 inputs at the median
 
-  ld64 (cc)            801, 826, 837 ms
-  blinker              319, 320, 324 ms      2.5×
+  ld64 (cc)            874, 874, 884, 890 ms
+  blinker              268, 272, 275, 294 ms      3.3×
 ```
 
 Every one of those 16 links is blinker's, including the proc-macro dylib that
@@ -130,7 +130,7 @@ captured link arguments, not a synthetic benchmark. See
 
 | | blinker | system linker | |
 |---|---|---|---|
-| **A whole `cargo build`'s links** (16 links) | **319 ms** | 801 ms `cc`/ld64 | **2.5×** |
+| **A whole `cargo build`'s links** (16 links) | **268 ms** | 874 ms `cc`/ld64 | **3.3×** |
 | **Edit relink, resident** | **20.6 ms** | 34.3 ms `ld-prime` | **1.7×** |
 
 ### By workload
@@ -156,19 +156,15 @@ after every link has to be told the whole program again each time.
 
 So the thing worth attacking is not the cost of one link. It is the cost of the
 hundredth link of a program the linker has already seen ninety-nine times. That
-is why blinker is resident, and staying alive used to be worth 1.5× on its own —
-319 ms against 491 for the same links one-shot.
+is why blinker is resident: staying alive is worth **1.47×** on its own here
+(268 ms against 394 for the same links one-shot), before any incremental
+machinery does anything.
 
-Across a whole build it is now worth nothing measurable, because the one-shot
-path caught up: the same sixteen links run in **325 ms** with nothing held
-between them, against 322 ms with a daemon. That is not the resident path
-getting worse — it is findings 209, 210 and 213 taking 8 ms out of every *cold*
-link, which residency had been hiding rather than fixing.
-
-Per link, replayed on its own, the daemon still wins 1.4–1.6× at every size.
-Why that does not add up across sixteen different programs rotating through
-four workers is the largest open question here, and it is written down in
-finding 213 rather than smoothed over.
+That number was zero until finding 214. A session forgot an input after four
+links, a workspace with five or more targets therefore got no reuse at all, and
+the harness meant to catch it was routing all sixteen links to one worker of
+four. Both are fixed, and the eight-program rotation test is there so the window
+cannot quietly become a cliff again.
 
 It is also why the median matters more than the maximum. A real build's links
 have 23 inputs at the median and 132 at the largest. Optimising the tail is

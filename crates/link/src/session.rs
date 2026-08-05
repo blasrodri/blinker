@@ -112,6 +112,35 @@ enum Entry {
     Archive(Arc<blinker_archive::ArchiveIndex>, Arc<Backing>),
 }
 
+impl Entry {
+    /// The input's bytes **that cost this process memory**.
+    ///
+    /// A mapped file counts as nothing. Its pages are clean, file-backed and
+    /// reclaimable — the kernel drops them under pressure and reads them back
+    /// if they are wanted, which is the whole reason inputs are mapped rather
+    /// than read (see [`crate::mapping`]). Counting them against a budget meant
+    /// for heap evicts a parse the process was not paying for: measured, the
+    /// byte bound applied to mappings held 243 of 611 inputs where the window
+    /// alone held all 611, and cost 1.57× on link time to protect memory that
+    /// was never allocated (finding 214).
+    ///
+    /// A file under `mapping::MAP_THRESHOLD` is read onto the heap instead, and
+    /// that is real. `symbols.o` is 2.7 KB and a Rust link has hundreds.
+    ///
+    /// What the parse derived from the bytes is not counted either: it is what
+    /// holding the input is *for*, and a bound including it would be a bound on
+    /// the wrong thing, measured badly.
+    fn resident_bytes(&self) -> usize {
+        let backing = match self {
+            Entry::Object(_, backing) | Entry::Archive(_, backing) => backing,
+        };
+        match &**backing {
+            Backing::Heap(bytes) => bytes.len(),
+            Backing::Mapped(_) => 0,
+        }
+    }
+}
+
 /// A parsed archive member, by the archive it came from and its position in it.
 ///
 /// Held separately from the archive rather than inside it because members are
@@ -139,13 +168,21 @@ type HeldStubs = (Vec<(PathBuf, blinker_cache::InputKey)>, Arc<StubExports>);
 ///
 /// Not one, which is what it was: a daemon serving a workspace alternates
 /// between its targets, and a window of one means each switch empties what the
-/// other just filled. Not unbounded either — a session that never forgets holds
-/// every program the daemon has ever linked, and these are mapped input files.
+/// other just filled (finding 188).
 ///
-/// Four covers the shape the number exists for — a test binary, a build script,
-/// an executable, an example — and still drops a target that a build has moved
-/// on from within a few links.
-const RETAINED_LINKS: u64 = 4;
+/// Then four, on the reasoning that four covers a test binary, a build script,
+/// an executable and an example. It does not. Four targets rotating through one
+/// session put three other links between one target's turns, and an input
+/// stamped at generation `now - 4` fails `stamp > now - 4` by exactly one — so
+/// the fifth distinct target is a cliff and not a slope: 319 inputs held at
+/// four, 8 at five. A workspace with more targets than that got *nothing* out
+/// of residency and paid the full cost of retaining for it (finding 214).
+///
+/// So this is now wide enough that a real workspace does not reach it, and
+/// [`Session::trim_inputs`] is the bound memory actually rests on. A count of
+/// links was never a bound on bytes in the first place: what one link holds is
+/// 30 MB for a build script and 800 MB for rust-analyzer.
+const RETAINED_LINKS: u64 = 64;
 
 /// Everything one target's previous link left behind.
 ///
@@ -613,10 +650,12 @@ impl Session {
             }
         }
         // An input survives the links that do not mention it, for a while. The
-        // window is what makes alternating targets work; the bound is what
-        // stops a long-lived daemon holding every program it has ever linked.
+        // window is what makes alternating targets work; the byte bound below
+        // is what stops a long-lived daemon holding every program it has ever
+        // linked.
         let keep = now.saturating_sub(RETAINED_LINKS);
         self.used_at.retain(|_, stamp| *stamp > keep);
+        self.trim_inputs(now);
         let held = &self.used_at;
         let surviving = |path: &Path| held.contains_key(path);
         self.entries.retain(|path, _| surviving(path));
@@ -644,6 +683,53 @@ impl Session {
         self.stubs_reparsed = false;
         self.replayed_extraction = false;
         self.held_resolution = false;
+    }
+
+    /// Drop least-recently-linked inputs until the resident bytes fit the
+    /// budget.
+    ///
+    /// The link-count window above is the bound on how many *programs* a
+    /// session remembers. It is not a bound on bytes, and cannot be: what one
+    /// link holds is 30 MB for a build script and 800 MB for rust-analyzer.
+    /// This is the bound on bytes, and it counts only what is actually resident
+    /// — see [`Entry::resident_bytes`], which is where the argument for
+    /// excluding mapped files lives.
+    ///
+    /// `now` is never evicted: it is what the link about to run is holding, and
+    /// dropping it would re-read what is already in hand.
+    ///
+    /// Counted over `entries` alone. A member's bytes are a window into its
+    /// archive's `Backing`, which the archive's own entry already counts, and
+    /// `by_content` holds the same `Arc` a path entry does — summing all three
+    /// would count the same input three times and evict on a number three times
+    /// too large.
+    fn trim_inputs(&mut self, now: u64) {
+        let budget = memory_budget();
+        let mut bytes: usize = self
+            .entries
+            .values()
+            .map(|(_, entry)| entry.resident_bytes())
+            .sum();
+        if bytes <= budget {
+            return;
+        }
+        // Oldest first, which is the order they are given up in.
+        let mut by_age: Vec<(u64, PathBuf)> = self
+            .used_at
+            .iter()
+            .filter(|(_, stamp)| **stamp != now)
+            .map(|(path, stamp)| (*stamp, path.clone()))
+            .collect();
+        by_age.sort_unstable();
+        for (_, path) in by_age {
+            if bytes <= budget {
+                break;
+            }
+            if let Some((_, entry)) = self.entries.get(&path) {
+                bytes = bytes.saturating_sub(entry.resident_bytes());
+            }
+            self.used_at.remove(&path);
+        }
     }
 
     /// The entry for `path`, if this process has it and it is still current.

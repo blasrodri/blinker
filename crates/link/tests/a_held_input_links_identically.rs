@@ -776,3 +776,77 @@ fn a_transient_session_holds_nothing_for_a_second_link() {
         std::fs::read(&first).expect("first"),
     );
 }
+
+/// A session must survive a workspace, not a handful of targets.
+///
+/// The retention window was a count of links, and an input stamped at
+/// generation `now - RETAINED_LINKS` failed `stamp > now - RETAINED_LINKS` by
+/// exactly one. So the window was not a slope but a cliff, and it sat one
+/// target past where the constant said: four programs rotating held everything,
+/// five held nothing at all, and a workspace bigger than that got no reuse from
+/// residency while still paying every cost of it.
+///
+/// Eight programs, because the test has to be on the far side of any number
+/// somebody might pick — the previous constant was four, chosen by naming four
+/// plausible targets, which is exactly how a cliff gets built one step past the
+/// examples that motivated it.
+#[test]
+fn eight_programs_rotating_through_one_session_still_hold_their_inputs() {
+    let scratch = Scratch::dir("session-eight-targets").expect("scratch");
+
+    // Eight genuinely separate programs, each with its own object and its own
+    // answer, so a session that confused two of them would print the wrong
+    // number rather than merely reuse nothing.
+    let programs: Vec<(Vec<PathBuf>, String, PathBuf)> = (0..8)
+        .map(|n| {
+            let source = scratch.join(format!("p{n}.c"));
+            std::fs::write(
+                &source,
+                format!("#include <stdio.h>\nint main(void) {{ printf(\"%d\\n\", {n} * 11); return 0; }}\n"),
+            )
+            .expect("source written");
+            let object = source.with_extension("o");
+            let status = Command::new("cc")
+                .args(["-c", "-o"])
+                .arg(&object)
+                .arg(&source)
+                .status()
+                .expect("cc runs");
+            assert!(status.success(), "compiling p{n}.c failed");
+            let cold = scratch.join(format!("cold-{n}"));
+            link_to_file(&LinkRequest::new(vec![object.clone()]), &cold).expect("cold link");
+            (vec![object], format!("{}\n", n * 11), cold)
+        })
+        .collect();
+
+    let mut session = Session::default();
+    let mut last_round_held = 0;
+    for round in 0..4 {
+        for (n, (objects, expected, cold)) in programs.iter().enumerate() {
+            let warm = scratch.join(format!("warm-{n}-{round}"));
+            let timings = link_to_file_in(&LinkRequest::new(objects.clone()), &warm, &mut session)
+                .expect("the link succeeds");
+            assert_eq!(
+                std::fs::read(&warm).expect("warm"),
+                std::fs::read(cold).expect("cold"),
+                "program {n} in round {round} differs from its own cold link"
+            );
+            assert_eq!(
+                &run(&warm),
+                expected,
+                "program {n} printed the wrong answer"
+            );
+            if round == 3 {
+                last_round_held += timings.inputs_held;
+            }
+        }
+    }
+
+    assert_eq!(
+        last_round_held,
+        programs.len() as u64,
+        "eight rotating programs held {last_round_held} of {} inputs — the window \
+         is a cliff again",
+        programs.len()
+    );
+}

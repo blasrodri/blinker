@@ -10802,3 +10802,96 @@ than everything in this finding, and it is not measured yet.
 Nothing was wrong. The session did exactly what it was written to do, in a
 process that had no use for it, and no profile broke down a cold link until
 this week.
+
+---
+
+## 214. The retention window was a cliff, and it sat one target past the four that named it
+
+**Spec assumption.** §26's resident session is the product. Finding 188 already
+established that a window of one link empties on every target switch and set it
+to four, "a test binary, a build script, an executable, an example".
+
+**Observed.** Finding 213 ended on a contradiction. Per link, replayed on its
+own, the daemon won 1.4–1.6×. Across a whole build's sixteen links it won
+nothing. The counters said why:
+
+```
+  inputs_held 1 of 44        held_bytes 413 KB of a 268 MB budget
+  interface_changes 80       inputs_read 43
+```
+
+Holding one input of forty-four, on a replay of a link identical to the one
+before it, with the memory budget at 0.15% — so nothing was being evicted for
+space. It was the window, and the window is off by one:
+
+```
+  Session::begin:  keep = now - RETAINED_LINKS
+                   used_at.retain(|_, stamp| stamp > keep)
+```
+
+Four programs rotating put three other links between one program's turns, so
+its inputs carry stamp `now - 4` when its turn comes round, and `now - 4 >
+now - 4` is false. The window named four and delivered four *minus one*.
+Measured by rotating N programs through one session:
+
+```
+  1 program    held  85   read   0
+  2 programs   held 217   read   0
+  3 programs   held 296   read   0
+  4 programs   held 319   read   0
+  5 programs   held   8   read 334      <- cliff
+  6 programs   held   9   read 355
+```
+
+Not a slope. A cliff, one target past the four that were named when the
+constant was chosen — which is how a cliff usually gets built: by listing the
+cases you thought of and sizing the bound to exactly those.
+
+A workspace with five or more targets therefore got **nothing** from residency
+and paid every cost of it: storing parses, digesting interfaces, `memcmp`ing
+members against a map that no longer held them.
+
+**The second wrong bound.** The obvious fix — widen the window — needs
+something else to bound memory, so held inputs were given a byte budget like
+the target state has. That made things *worse*:
+
+```
+  byte-bounded (268 MB/worker)   held 243 of 611   internal 199.8 ms
+  window only                    held 611 of 611   internal 127.0 ms
+```
+
+Because an input's bytes are a **mapping**, not an allocation. `PROT_READ`,
+`MAP_PRIVATE`, file-backed: clean pages the kernel reclaims under pressure and
+reads back if wanted, which is the entire reason inputs are mapped rather than
+read. Charging them to a budget meant for heap evicted parses to protect memory
+that had never been allocated. The bound now counts `Backing::Heap` only — the
+files under `MAP_THRESHOLD`, which are read and are real — and the window is
+wide enough that a workspace does not reach it.
+
+**The harness was measuring one worker.** `worker_of` routes on the `-o` path,
+and a `--blinker-replay-invocation` client has no `-o` — its output is named
+inside the record. So every replayed link hashed to worker 0, and
+`build-links.py`, the harness written specifically to measure *a whole build's*
+links, has been measuring one worker serving all sixteen programs since the day
+the pool was added. Routing now reads the record when the command line does not
+say. This is not a test-only concern: two recordings replayed together deserve
+two workers for the same reason two crates do.
+
+### What it is worth
+
+The same sixteen links, same machine, same minute:
+
+```
+  ld64 (cc)            874 ms
+  blinker              268 ms       3.26x        was ~320 ms
+  blinker one-shot     394 ms       2.22x
+```
+
+Residency is worth **1.47×** again, and it was worth nothing an hour ago.
+
+### What it cost
+
+Every build of every workspace with more than four targets, since finding 188 —
+which is to say every real workspace. The number was measured when it was
+introduced, on a two-target benchmark, and two is on the safe side of a cliff at
+five.

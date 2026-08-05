@@ -161,11 +161,28 @@ pub fn socket_path(executable: &Path, worker: usize) -> PathBuf {
 /// property being bought here is that a *given* spelling always lands on the
 /// same worker, and that one is exact.
 pub fn worker_of(argv: &[String]) -> usize {
-    let Some(output) = argv
-        .iter()
-        .position(|arg| arg == "-o")
-        .and_then(|at| argv.get(at + 1))
-    else {
+    let replayed;
+    let output = match argv.iter().position(|arg| arg == "-o") {
+        Some(at) => argv.get(at + 1),
+        // A replay names its output inside the record, not on the command
+        // line, so every replayed link hashed to worker 0 — which is what
+        // `build-links.py` drives, so the harness that measures a build's links
+        // has been measuring one worker serving all sixteen programs. Routing
+        // is not a test concern: two recordings replayed together deserve two
+        // workers for the same reason two crates do (finding 214).
+        None => {
+            replayed = argv
+                .iter()
+                .filter_map(|arg| arg.strip_prefix("--blinker-replay-invocation="))
+                .find_map(|path| {
+                    let text = std::fs::read_to_string(path).ok()?;
+                    let record: serde_json::Value = serde_json::from_str(&text).ok()?;
+                    Some(record.get("output_path")?.as_str()?.to_string())
+                });
+            replayed.as_ref()
+        }
+    };
+    let Some(output) = output else {
         // No output named: not a link this router can place, and worker 0 is
         // as good as any. It will still be served correctly — routing decides
         // where, never whether.
