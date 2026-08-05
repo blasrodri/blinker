@@ -159,13 +159,22 @@ def main():
     # is also what starts the daemon — a user's first build pays the same, and
     # measuring it as part of the steady state would be reporting a one-time
     # cost as a recurring one.
+    #
+    # Three passes, not one. One warmed a daemon; it does not warm *four*. A
+    # link is routed to a worker by its output path, so one pass leaves each of
+    # the four holding only the targets that hashed to it, and the pass after
+    # it is still filling the other three. Measured with a single warmup the
+    # arm read 502, 491, 246, 264, 249, 258 — and the first two of those are
+    # not a slow steady state, they are the warmup that was not counted as one.
+    WARMUP = 3
     arms = [
         ("ld64 (cc)", with_cc),
         ("blinker", with_blinker([])),
         ("blinker one-shot", with_blinker(["--blinker-no-daemon"])),
     ]
     for label, run in arms:
-        run()
+        for _ in range(WARMUP):
+            run()
         for _ in range(options.iterations):
             print(f"  {label:<22} {timed(run):7.0f} ms")
     print()

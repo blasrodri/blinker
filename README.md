@@ -2,13 +2,13 @@
 
 A resident, incremental Mach-O linker for Rust on Apple Silicon.
 
-**It makes a `cargo build`'s linking 3.3× faster, out of the box.**
+**It makes a `cargo build`'s linking 3.4× faster, out of the box.**
 
 ```
 a full build of this workspace — 16 links, 23 inputs at the median
 
-  ld64 (cc)            874, 874, 884, 890 ms
-  blinker              268, 272, 275, 294 ms      3.3×
+  ld64 (cc)            803, 817, 819, 828 ms
+  blinker              235, 236, 238, 240 ms      3.4×
 ```
 
 Every one of those 16 links is blinker's, including the proc-macro dylib that
@@ -130,8 +130,15 @@ captured link arguments, not a synthetic benchmark. See
 
 | | blinker | system linker | |
 |---|---|---|---|
-| **A whole `cargo build`'s links** (16 links) | **268 ms** | 874 ms `cc`/ld64 | **3.3×** |
-| **Edit relink, resident** | **20.6 ms** | 34.3 ms `ld-prime` | **1.7×** |
+| **A whole `cargo build`'s links** (16 links) | **235 ms** | 803 ms `cc`/ld64 | **3.4×** |
+| **Edit relink, resident** | **15.7 ms** | 31.8 ms `ld64` | **2.0×** |
+
+The relink row holds 68 of 70 inputs in memory, replays the archive extraction
+order, holds the resolved imports, and reuses 235 of 236 objects and 99% of
+relocations. Its two halves come from two harnesses — `relink.py` for blinker's
+resident number and `bench.py` for the system linker, which has no resident mode
+to measure — so read it as "same link, same machine, same minute" rather than as
+one interleaved A/B.
 
 ### By workload
 
@@ -156,8 +163,8 @@ after every link has to be told the whole program again each time.
 
 So the thing worth attacking is not the cost of one link. It is the cost of the
 hundredth link of a program the linker has already seen ninety-nine times. That
-is why blinker is resident: staying alive is worth **1.47×** on its own here
-(268 ms against 394 for the same links one-shot), before any incremental
+is why blinker is resident: staying alive is worth **1.40×** on its own here
+(235 ms against 328 for the same links one-shot), before any incremental
 machinery does anything.
 
 That number was zero until finding 214. A session forgot an input after four

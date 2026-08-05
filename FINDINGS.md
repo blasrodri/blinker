@@ -10895,3 +10895,86 @@ Every build of every workspace with more than four targets, since finding 188 �
 which is to say every real workspace. The number was measured when it was
 introduced, on a two-target benchmark, and two is on the safe side of a cliff at
 five.
+
+---
+
+## 215. One warmup pass does not warm four workers
+
+**Observed.** Re-measuring the headline on a quiet machine, the resident arm
+read
+
+```
+  blinker    502, 491, 246, 264, 249, 258 ms
+```
+
+The first two are not a slow steady state. `build-links.py` discards one warmup
+pass, which was written when there was one daemon; there are four, a link is
+routed to one of them by its output path, and one pass leaves each worker
+holding only the targets that hashed to it. The pass after it is still filling
+the other three.
+
+So the harness has been reporting its own warmup as a result, and the effect is
+large — 502 against 246 is a factor of two. Three warmup passes now, and the
+reason is in the comment so the next person to add a worker knows to check it.
+
+This is the second measurement defect found in the same harness in one day
+(finding 214 found it routing all sixteen links to worker 0). Both had the same
+cause: the harness was written against a linker that has since changed shape,
+and nothing re-derives its assumptions when the thing it measures moves.
+
+### The headline, measured properly
+
+```
+  ld64 (cc)          803 ms
+  blinker            235 ms      3.4x
+  blinker one-shot   328 ms      2.4x
+```
+
+---
+
+## 216. Three things that turned out not to be worth doing, and why they looked like they were
+
+Recorded because each cost an hour to rule out, and each would otherwise be
+proposed again.
+
+**A pipeline.** A link is stages, and stages suggest a pipeline — overlap them,
+stream between them, hide one behind another. It cannot be done, and the reason
+is a data dependency rather than an implementation gap: **no address exists
+until layout has seen every input**, because object 5,000's size decides where
+object 0's target lands. Dead-stripping is a global fixed point for the same
+reason. The stages are barriers because the data is. The one overlap that is
+available — the SDK stub parse alongside object loading — is already taken, and
+finding 210 is the lesson about what it is worth once it stops being the slower
+half.
+
+**SPSC queues and ring buffers.** The whole link contains three `AtomicUsize`
+cursors, no channels, and no work-stealing runtime; `map_chunks` hands out four
+chunks per thread, so the queue is touched about sixty times against half a
+million relocations. That is the wrong end of the problem by six orders of
+magnitude. The technique answers a different question — an unbounded stream of
+small messages where the handoff *is* the cost — and ours is a fixed batch
+where the handoff is already free and the output order is constrained: a link
+whose output depends on thread scheduling is not a link, which rules out the
+free-for-all work-stealing that makes those structures interesting.
+
+What does transfer from that world is mechanical sympathy about *layout*, and
+that is where every win of the last two days came from: three redundant parses
+of one file, a YAML tree of thirty thousand `String`s, a `BTreeMap` keyed on
+`String`. The hottest structures were already right — names live in an arena
+(`SymbolNames` is `Vec<u8>` plus spans), the maps are fx-hashed rather than
+SipHashed (87 ms of a cold link, recorded), and `InputRelocation` is 40 bytes
+of which the relocate loop reads nearly every field, so array-of-structs is
+correct here and struct-of-arrays would help nothing.
+
+**Process startup.** A resident relink is 15.7 ms of wall against 9.6 ms of
+link, and the 6 ms gap looks like process spawn and IPC — 40% of what a
+developer waits for, apparently outside the linker. It is not. `/usr/bin/true`
+through the same Python harness costs 4.65 ms; `blinker --blinker-version`
+costs 5.36. **Blinker's own startup is 0.7 ms**, and the rest is the
+measurement. `rustc` spawns the linker with `posix_spawn`, not through Python.
+
+### What it cost
+
+Nothing, because all three were measured before anything was built. Recorded
+because "it's a pipeline, use a ring buffer" and "half the time is process
+startup" are both the kind of claim that sounds like knowledge.
