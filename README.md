@@ -131,7 +131,7 @@ captured link arguments, not a synthetic benchmark. See
 | | blinker | system linker | |
 |---|---|---|---|
 | **A whole `cargo build`'s links** (16 links) | **213 ms** | 794 ms `cc`/ld64 | **3.7×** |
-| **Edit relink, resident** | **15.7 ms** | 31.8 ms `ld64` | **2.0×** |
+| **Edit relink, resident** | **15.3 ms** | 31.4 ms `ld64` | **2.1×** |
 
 The relink row holds 68 of 70 inputs in memory, replays the archive extraction
 order, holds the resolved imports, and reuses 235 of 236 objects and 99% of
