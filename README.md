@@ -1,9 +1,16 @@
-<img src="assets/blinker-banner.svg" width="620"
-     alt="blinker — a resident, incremental Mach-O linker for Apple Silicon">
+<img src="assets/blinker-banner.svg" width="620" alt="blinker — a resident, incremental Mach-O linker for Apple Silicon">
 
 A resident, incremental Mach-O linker for Rust on Apple Silicon.
 
 **It makes a `cargo build`'s linking 3.7× faster, out of the box.**
+
+From the project you want to link faster:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/blasrodri/blinker/master/install.sh | sh -s -- --use
+```
+
+That is the whole of it. `cargo build` now links with blinker.
 
 ```
 a full build of this workspace — 16 links, 23 inputs at the median
@@ -25,15 +32,11 @@ and keeps a resident linker alive for the next link.
 You need an Apple Silicon Mac, a stable Rust toolchain, and Xcode command line
 tools (`/usr/bin/cc` must exist). `aarch64-apple-darwin` is the only target.
 
-From the project you want to link faster:
-
 ```bash
 curl -fsSL https://raw.githubusercontent.com/blasrodri/blinker/master/install.sh | sh -s -- --use
 ```
 
-That is the whole of it. `cargo build` now links with blinker.
-
-It downloads the latest release, checks its SHA-256, puts `blinker` in
+That one line downloads the latest release, checks its SHA-256, puts `blinker` in
 `~/.cargo/bin`, and writes the linker setting into this project's
 `.cargo/config.toml`. Set `BLINKER_INSTALL_DIR` to put the binary elsewhere.
 `blinker --blinker-uninstall` puts the project back exactly as it was.
