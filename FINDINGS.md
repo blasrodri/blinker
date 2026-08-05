@@ -11867,3 +11867,70 @@ Interning is the clearest candidate: it is serial *by construction*, and
 sharding the table by hash would make it parallel while keeping ids
 deterministic. That changes the numbering, so the byte oracle would have to
 approve it, which is exactly the check that makes it safe to try.
+
+## 228. Interning is not waiting on the index — a negative result, kept
+
+Finding 227 measured the serial half of interning at 75 ns a name and said it
+was memory latency: a random bucket per insert, strictly ordered, nothing to
+overlap them with. The obvious move follows from that diagnosis, so I made it,
+and it does nothing. Recorded because the diagnosis is what was wrong, and the
+next attempt should not start from it.
+
+### What was built
+
+`FastMap<u64, Few<SymbolNameId>>` replaced with an open-addressed table of
+`(hash, id + 1)` slots. A `HashMap` will not tell you which bucket a key lands
+in, so nothing outside it can prepare for the access; open addressing on the
+hash the caller already has makes the address `hash & mask`, which anyone can
+compute — including several names ahead of the one being filed. That is a
+`SymbolNames::prefetch` issuing a discarded volatile load, called eight names
+ahead from the loop in `seed_interned`.
+
+### What it measured
+
+Three arms, interleaved, six rounds each, on the five pulsevm links:
+
+```
+                 read+parse min/median      total min/median
+  HashMap            876.3 / 925.1           2382.4 / 2489.0
+  open addressed     884.4 / 903.9           2387.4 / 2442.2
+  open + prefetch    858.7 / 913.6           2417.6 / 2489.3
+```
+
+Indistinguishable. The minima and the medians do not even agree on an ordering,
+which is what "no effect" looks like when the arms are honest.
+
+Peak RSS on the largest link went 2260 -> 2216 MB: sixteen bytes a slot against
+a hashed entry plus a control byte plus a `Few`. Real, 2%, and not remotely what
+263 lines of hand-rolled hash table were written for. Reverted on the precedent
+of findings 212 and 224 — a change that does not demonstrate the win it was
+written for does not get kept for a win it was not.
+
+### What it rules out, and what it points at
+
+The index is not the stall. Whatever the 58 ms is, it survives making the
+probe's address predictable and prefetchable, so the next attempt should look
+at the two things the loop does that this did not touch:
+
+- **`parse.symbols[at].name` is a pointer chase.** Every symbol's name is a
+  `String` in a parsed object, scattered across the allocations of 3,945
+  members. The serial pass follows 790,000 of those pointers and copies their
+  bytes into the arena. The parallel probe follows the same pointers — and costs
+  19 ms of wall clock across fifteen cores, which is roughly 285 ms of CPU, far
+  more than the 58 ms being explained. Reading names is expensive; the probe
+  hides it and the serial pass cannot.
+- **The names could arrive contiguous.** The parallel probe already visits every
+  name and already knows which ones missed. It could copy those bytes into a
+  per-chunk buffer, and the serial pass would then append runs of contiguous
+  memory instead of chasing pointers into 3,945 objects.
+
+That is a different change with a different claim, and it should be measured
+against this one's failure rather than on top of it.
+
+### What was kept
+
+Three tests the experiment forced me to write, which apply to the table that is
+actually there: two distinct names sharing a hash stay two names, growth loses
+and renumbers nothing, and reserving changes timing and nothing else. The
+collision test is the one worth having — a table that trusted the hash would be
+wrong only for the colliding pair, silently, and nothing else in the suite asked.

@@ -314,6 +314,71 @@ mod tests {
         assert_eq!(ahead, plain);
     }
 
+    /// Two distinct names with the *same* hash must both be findable.
+    ///
+    /// The index is keyed by hash and the names are told apart by their text,
+    /// so this is the case where a table that trusted the hash would hand out
+    /// one name's id for another's — silently, and only for the pair that
+    /// collided. Forced rather than hoped for: `intern_hashed` takes the hash,
+    /// so the test can simply supply the same one twice.
+    #[test]
+    fn two_names_that_hash_alike_are_still_two_names() {
+        let mut names = SymbolNames::new();
+        let collision = 0x5eed_1234_5678_9abc;
+        let first = names.intern_hashed("_one", collision);
+        let second = names.intern_hashed("_two", collision);
+        assert_ne!(first, second, "the collision merged two names");
+        assert_eq!(names.len(), 2);
+        assert_eq!(names.resolve(first), Some("_one"));
+        assert_eq!(names.resolve(second), Some("_two"));
+        assert_eq!(names.get_hashed("_one", collision), Some(first));
+        assert_eq!(names.get_hashed("_two", collision), Some(second));
+        assert_eq!(names.get_hashed("_three", collision), None);
+        // And sharing a hash must not stop either being found again.
+        assert_eq!(names.intern_hashed("_two", collision), second);
+    }
+
+    /// Growing the index must not lose or renumber anything already in it.
+    #[test]
+    fn names_survive_the_table_growing_under_them() {
+        let mut names = SymbolNames::new();
+        let filed: Vec<(String, SymbolNameId)> = (0..5_000)
+            .map(|at| {
+                let name = format!("_symbol_number_{at}");
+                let id = names.intern(&name);
+                (name, id)
+            })
+            .collect();
+        assert_eq!(names.len(), filed.len());
+        for (name, id) in &filed {
+            assert_eq!(names.get(name), Some(*id), "{name} was lost in a growth");
+            assert_eq!(names.resolve(*id), Some(name.as_str()));
+        }
+        for (name, id) in &filed {
+            assert_eq!(names.intern(name), *id, "{name} was filed twice");
+        }
+        assert_eq!(names.len(), filed.len());
+    }
+
+    /// Reserving changes the timing and nothing else — including when the
+    /// reservation is wrong in either direction.
+    #[test]
+    fn reserving_does_not_change_what_gets_interned() {
+        let names: Vec<String> = (0..2_000).map(|at| format!("_name_{at}")).collect();
+        let mut generous = SymbolNames::new();
+        generous.reserve(10_000, 1 << 20);
+        let mut mean = SymbolNames::new();
+        mean.reserve(1, 1);
+        let mut plain = SymbolNames::new();
+        for name in &names {
+            let id = plain.intern(name);
+            assert_eq!(generous.intern(name), id);
+            assert_eq!(mean.intern(name), id);
+        }
+        assert_eq!(generous, plain);
+        assert_eq!(mean, plain);
+    }
+
     /// The index is derivable, so it is not cached — but a table read back
     /// without repairing it would hand out duplicate IDs for names it already
     /// holds.
