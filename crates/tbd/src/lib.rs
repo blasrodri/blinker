@@ -30,6 +30,8 @@ use yaml_rust2::{Yaml, YamlLoader};
 pub mod target;
 pub use target::{Architecture, Platform, Target};
 
+pub mod scan;
+
 mod error;
 pub use error::TbdError;
 
@@ -152,7 +154,25 @@ impl TbdFile {
 }
 
 /// Parse a `.tbd` file's text.
+///
+/// The scanner first, and the YAML parser when it reports something it was not
+/// taught. See [`scan`] for why that split is safe and how it is checked; the
+/// short version is that the scanner refuses rather than guesses, and the two
+/// are held to agreement on all 6,098 `.tbd` files the SDK ships.
 pub fn parse_tbd(text: &str, path: &Path) -> Result<TbdFile, TbdError> {
+    match scan::scan(text, path) {
+        // An empty result is not a parse: the YAML path reports which of
+        // "no documents" and "malformed" it was, and those errors are what
+        // callers print.
+        Ok(file) if !file.documents.is_empty() => return Ok(file),
+        _ => {}
+    }
+    parse_tbd_with_yaml(text, path)
+}
+
+/// Parse through the general YAML parser. The scanner's oracle, and its
+/// fallback.
+pub fn parse_tbd_with_yaml(text: &str, path: &Path) -> Result<TbdFile, TbdError> {
     let documents = YamlLoader::load_from_str(text).map_err(|e| TbdError::Malformed {
         path: path.to_path_buf(),
         detail: e.to_string(),

@@ -224,3 +224,98 @@ fn corrupted_stubs_are_rejected() {
         }
     }
 }
+
+/// Every `.tbd` in the SDK, parsed both ways, asserted equal.
+///
+/// This is the whole safety argument for [`blinker_tbd::scan`] replacing the
+/// YAML parser on the hot path. A scanner for a subset of a real format is
+/// only as good as the corpus it was checked against, and the SDK ships about
+/// six thousand of these — every framework and every dylib Apple publishes,
+/// written by their tooling rather than by this test's author.
+///
+/// The second assertion is the one that would rot first: agreement is
+/// worthless if the scanner quietly refuses everything and the fallback
+/// answers for it, so the fallback rate is measured and required to be zero.
+#[test]
+fn the_scanner_and_the_yaml_parser_agree_on_every_stub_apple_ships() {
+    let mut stubs = Vec::new();
+    let mut stack = vec![sdk_path()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            // Symlinked, not walked: the SDK links whole framework versions
+            // into themselves, and following that is an unbounded walk.
+            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) == Some("tbd") {
+                stubs.push(path);
+            }
+        }
+    }
+    // Sorted so a failure names the same file on every machine.
+    stubs.sort();
+
+    // On every core: six thousand YAML parses in a debug build is a minute on
+    // one, and this runs in the gate before every commit.
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let cursor = std::sync::atomic::AtomicUsize::new(0);
+    let (stubs, cursor) = (&stubs, &cursor);
+    let claimed: Vec<(usize, Vec<PathBuf>, Vec<PathBuf>)> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(move || {
+                    let (mut checked, mut fell_back, mut disagreed) = (0, Vec::new(), Vec::new());
+                    loop {
+                        let next = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(path) = stubs.get(next) else {
+                            return (checked, fell_back, disagreed);
+                        };
+                        let Ok(text) = std::fs::read_to_string(path) else {
+                            continue;
+                        };
+                        let Ok(expected) = blinker_tbd::parse_tbd_with_yaml(&text, path) else {
+                            continue; // Not a stub this crate claims to read at all.
+                        };
+                        match blinker_tbd::scan::scan(&text, path) {
+                            Ok(actual) if actual == expected => checked += 1,
+                            Ok(_) => disagreed.push(path.clone()),
+                            Err(_) => fell_back.push(path.clone()),
+                        }
+                    }
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().expect("a worker panicked"))
+            .collect()
+    });
+
+    let checked: usize = claimed.iter().map(|(count, _, _)| count).sum();
+    let mut fell_back: Vec<PathBuf> = claimed.iter().flat_map(|(_, f, _)| f.clone()).collect();
+    let mut disagreed: Vec<PathBuf> = claimed.iter().flat_map(|(_, _, d)| d.clone()).collect();
+    fell_back.sort();
+    disagreed.sort();
+
+    assert!(
+        checked > 1000,
+        "expected thousands of stubs, read {checked}"
+    );
+    assert!(
+        disagreed.is_empty(),
+        "{} stub(s) parsed differently, first {}",
+        disagreed.len(),
+        disagreed[0].display()
+    );
+    assert!(
+        fell_back.is_empty(),
+        "{} stub(s) fell back to YAML, first {}",
+        fell_back.len(),
+        fell_back[0].display()
+    );
+}
