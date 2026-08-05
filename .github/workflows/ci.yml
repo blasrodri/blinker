@@ -1,0 +1,28 @@
+name: gate
+
+# The same gate that runs before every commit locally, run again on the branch.
+# `check.sh` is the merge bar; CI exists so a pull request meets it too, not to
+# be a second, weaker definition of "passing".
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  gate:
+    # Apple Silicon. blinker targets aarch64-apple-darwin and nothing else, so
+    # an x86 runner would not be a weaker test — it would be no test at all.
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-
+      - run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+      - name: gate
+        run: ./scripts/check.sh

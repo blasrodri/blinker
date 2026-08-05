@@ -25,7 +25,17 @@ You need an Apple Silicon Mac, a stable Rust toolchain, and Xcode command line
 tools (`/usr/bin/cc` must exist). `aarch64-apple-darwin` is the only target.
 
 ```bash
-git clone <this repo> && cd blinker
+curl -fsSL https://raw.githubusercontent.com/blasrodri/blinker/master/install.sh | sh
+```
+
+That downloads the latest release, checks its SHA-256, and puts `blinker` in
+`~/.cargo/bin`. It configures nothing — which projects use blinker is the next
+step, and yours to make. Set `BLINKER_INSTALL_DIR` to put it elsewhere.
+
+Or build it yourself:
+
+```bash
+git clone https://github.com/blasrodri/blinker && cd blinker
 cargo build --release                    # the binary lands at target/release/blinker
 ```
 
@@ -384,9 +394,14 @@ overwrite a real build artifact.
 ./scripts/check.sh --fast   # skip the slow real-cargo-build tests
 ```
 
-There is no hosted CI. blinker is developed on the same Apple Silicon hardware
-it targets, so the gate script runs locally and is the merge bar for every
-milestone deliverable.
+The same gate runs in CI on an Apple Silicon runner
+([`.github/workflows/ci.yml`](.github/workflows/ci.yml)) — the same script, not
+a weaker second definition of "passing". It runs locally too, as a pre-commit
+hook (`scripts/install-hooks.sh`), because the fast feedback is the point.
+
+Pushing a `v*` tag builds a release, runs the gate against that exact commit,
+and publishes `blinker-aarch64-apple-darwin.tar.gz` with its checksum — which is
+what `install.sh` downloads.
 
 ### Layout
 
