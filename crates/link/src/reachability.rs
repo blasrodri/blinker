@@ -1934,17 +1934,46 @@ pub(crate) struct Strip {
     sections: crate::hashing::FastMap<(u32, u32), Compacted>,
 }
 
-/// The alignment an atom actually had, which compaction must not weaken.
+/// Where an atom originally at `offset` may be put, at or after `cursor`.
 ///
-/// An atom at offset 8 of a 16-byte-aligned section was 8-byte aligned, and
-/// putting it back at a 16-byte boundary would only waste space. An atom at
-/// offset 0 takes the section's own alignment.
-fn alignment_of(offset: u64, section: u64) -> u64 {
-    let section = section.max(1);
-    if offset == 0 {
-        return section;
+/// # Why congruence and not alignment
+///
+/// This used to compute the *atom's* own alignment — the largest power of two
+/// dividing its offset, capped at the section's — and align the cursor to that.
+/// It is wrong, and it produced programs that could not be linked at all.
+///
+/// An atom is not one symbol. `__const` contributions routinely hold several
+/// constants, and an atom beginning at offset 0x74 of a 16-byte-aligned section
+/// can contain a symbol at 0x80 that clang has already decided is 16-byte
+/// aligned — it emits `LDR Q` against it, whose 12-bit immediate is *scaled by
+/// 16* and simply cannot encode an address that is not. Aligning that atom to
+/// 4, which is all its own offset justifies, moved the symbol inside it to a
+/// place where no encoding exists. The link then failed on the relocation:
+///
+/// ```text
+///   cannot apply PageOff12 against l_anon.….48: value 2942 is not 16-byte aligned
+/// ```
+///
+/// What every symbol in an atom actually depends on is its offset *modulo the
+/// section's alignment*, because that is the only thing the assembler could
+/// rely on when it chose the instruction. Preserving the whole congruence
+/// preserves every symbol inside the atom at once, without needing to know
+/// where any of them are: an atom that was `k` past a 16-byte boundary is put
+/// back `k` past one.
+///
+/// Where the offset is a multiple of the section's alignment — the common case,
+/// and every case a single-symbol atom has — this is exactly the old
+/// behaviour. It costs at most `alignment - 1` bytes per atom, and only for
+/// atoms that were not aligned to begin with.
+fn placement_of(cursor: u64, offset: u64, section: u64) -> u64 {
+    let modulus = section.max(1);
+    let wanted = offset % modulus;
+    let here = cursor % modulus;
+    // The least `to >= cursor` with `to % modulus == wanted`.
+    match here <= wanted {
+        true => cursor + (wanted - here),
+        false => cursor + modulus - here + wanted,
     }
-    (1u64 << offset.trailing_zeros().min(63)).min(section)
 }
 
 impl Strip {
@@ -2039,10 +2068,7 @@ impl Strip {
                             continue;
                         }
                     }
-                    let to = blinker_layout::align_up(
-                        cursor,
-                        alignment_of(atom.offset, section.alignment),
-                    );
+                    let to = placement_of(cursor, atom.offset, section.alignment);
                     pieces.push(Piece {
                         from: atom.offset,
                         size: atom.size,

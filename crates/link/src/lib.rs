@@ -3094,6 +3094,20 @@ fn elapsed_ms(start: std::time::Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
 
+/// The name a relocation points at, for a diagnostic.
+///
+/// `None` for a section-relative relocation, which has no name to give.
+fn relocation_symbol_name(
+    object: &LoadedObject,
+    relocation: &blinker_macho::InputRelocation,
+) -> Option<String> {
+    let blinker_macho::RelocationTarget::Symbol(symbol) = relocation.target else {
+        return None;
+    };
+    let symbol = object.parsed.symbol(symbol)?;
+    Some(symbol.name.clone())
+}
+
 /// Symbols the *linker* defines, which no input and no library provides.
 ///
 /// `___dso_handle` is the only one so far. It is the address of the image's
@@ -6012,6 +6026,8 @@ fn apply_relocations(
                         object: object.parsed.id,
                         kind: relocation.kind,
                         source: Box::new(source),
+                        symbol: relocation_symbol_name(object, relocation),
+                        target: minuend,
                     })?;
                     continue;
                 }
@@ -6176,6 +6192,8 @@ fn apply_relocations(
                     object: object.parsed.id,
                     kind: relocation.kind,
                     source: Box::new(source),
+                    symbol: relocation_symbol_name(object, relocation),
+                    target,
                 })?;
             }
 

@@ -11263,3 +11263,92 @@ scales the immediate by its access width, so 107 cannot be encoded for an
 — atom alignment through dead-strip compaction, or an addend — placed a symbol
 where it could not go. That is the next thing to find, and it is a correctness
 bug in the same class as this one rather than a missing feature.
+
+---
+
+## 221. Two alignment bugs that made a working C++ program unlinkable
+
+With the symbols resolved, the real project failed on relocations:
+
+```
+  cannot apply PageOff12 against l_anon.….48 (resolved to 0x102938b7e):
+    ARM64_RELOC_PAGEOFF12: value 2942 is not 16-byte aligned
+```
+
+`ARM64_RELOC_PAGEOFF12` writes the low twelve bits of an address into an
+instruction's `imm12` field, and for a load or store that field is **scaled by
+the access width**. A 16-byte load simply has no encoding for an address that
+is not a multiple of 16. So the complaint was right; the question was why the
+address was misaligned, and the answer turned out to be two separate bugs
+stacked on each other.
+
+### One: compaction preserved an atom's alignment, not its symbols'
+
+Diagnostics, once the error was made to name things:
+
+```
+  l_anon.….48 at +0x80 of __TEXT,__const align 16   ->  remapped to 46
+```
+
+Offset `0x80` is 16-byte aligned; 46 is not — `46 % 16 == 14`, exactly the
+misalignment reported. Dead-strip compaction placed each surviving atom with
+
+```rust
+align_up(cursor, alignment_of(atom.offset, section.alignment))
+```
+
+where `alignment_of` is the largest power of two dividing the atom's own
+offset. **An atom is not one symbol.** A `__const` contribution holds several
+constants, and an atom beginning at an offset that only justifies 4-byte
+alignment can contain a symbol the compiler has already decided is 16-byte
+aligned. Aligning the atom to 4 moved that symbol somewhere no encoding
+reaches.
+
+What every symbol in an atom actually depends on is its offset **modulo the
+section's alignment** — that is the only thing the assembler could rely on when
+it picked the instruction. So the atom is now placed at the least address `>=`
+the cursor that is *congruent* to its original offset: an atom that was `k`
+past a 16-byte boundary goes back `k` past one, and every symbol inside it is
+preserved at once without needing to know where any of them are. Where the
+offset is already a multiple of the section alignment — every single-symbol
+atom — this is exactly what it did before.
+
+### Two: the SIMD test was missing the bit that means SIMD
+
+That fixed those two symbols and revealed another:
+
+```
+  cannot apply PageOff12 against __MergedGlobals: value 871 is not 16-byte
+  aligned (instruction 0x39c00108)
+```
+
+`0x39c00108` decodes as `LDRSB Wt, [Xn, #imm12]` — a **signed byte** load,
+scale 1. `imm12_scale` read it as a 128-bit SIMD access:
+
+```rust
+if size == 0 && opc1 == 1 { 16 } else { 1 << size }
+```
+
+The 128-bit form is `size == 0` with bit [23] set **and the `V` bit at [26]
+set**, and `V` is what says the operand is a vector register at all. `LDRSB Wt`
+is `size == 0` with bit [23] set and `V` clear. Without `V` in the test, every
+signed byte load was treated as a sixteen-byte one, and any reference through
+one was rejected unless its target happened to land on a 16-byte boundary.
+
+### What made this findable
+
+Nothing, at first. The message was `object 1236: cannot apply PageOff12: value
+107 is not 8-byte aligned` — an object number, an encoding rule, and no way to
+tell whether the address was wrong or the decode was. Two additions made it
+solvable in one pass each: the error now names **the symbol and where it
+resolved**, and `Misaligned` carries **the instruction word**, because the
+scale is *decoded* from the instruction and a misalignment is as likely to mean
+the decode was wrong as the address was. The second bug was diagnosed purely by
+decoding `0x39c00108` by hand.
+
+### The result
+
+`pulsevm` — 24 crates, C++ dependencies, Boost, LLVM, wasmer — **links with
+blinker and runs**. That is the first project outside this workspace with a
+non-trivial native dependency to do so. The 16 links of this workspace remain
+byte-identical, and the gate passes.

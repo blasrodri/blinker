@@ -18,7 +18,16 @@ pub enum EncodeError {
     OutOfRange { value: i64, bits: u32 },
     /// The value is not a multiple of the field's scale — a misaligned branch
     /// target, or a load offset that does not match the access size.
-    Misaligned { value: i64, alignment: u64 },
+    Misaligned {
+        value: i64,
+        alignment: u64,
+        /// The instruction whose encoding decided the scale.
+        ///
+        /// The scale is *decoded* from the instruction, so a misalignment is
+        /// as likely to mean the decode was wrong as that the address was.
+        /// Without the word there is no way to tell those apart from a log.
+        instruction: u32,
+    },
 }
 
 impl std::fmt::Display for EncodeError {
@@ -27,9 +36,15 @@ impl std::fmt::Display for EncodeError {
             EncodeError::OutOfRange { value, bits } => {
                 write!(f, "displacement {value} does not fit in {bits} signed bits")
             }
-            EncodeError::Misaligned { value, alignment } => {
-                write!(f, "value {value} is not {alignment}-byte aligned")
-            }
+            EncodeError::Misaligned {
+                value,
+                alignment,
+                instruction,
+            } => write!(
+                f,
+                "value {value} is not {alignment}-byte aligned \
+                 (instruction {instruction:#010x})"
+            ),
         }
     }
 }
@@ -53,6 +68,9 @@ pub fn encode_branch26(instruction: u32, displacement: i64) -> Result<u32, Encod
         return Err(EncodeError::Misaligned {
             value: displacement,
             alignment: 4,
+            // A branch's scale is fixed by the instruction class, not decoded
+            // from the word, so there is nothing informative to report.
+            instruction: 0,
         });
     }
     let imm = displacement >> 2;
@@ -122,10 +140,19 @@ pub fn imm12_scale(instruction: u32) -> u64 {
     }
 
     // `size` at [31:30] gives the access width, except for the 128-bit
-    // SIMD forms, which set the opc bit at [23].
+    // SIMD forms, which are `size == 0` with the opc bit at [23] set.
+    //
+    // The `V` bit at [26] is what says the operand is a vector register at
+    // all, and leaving it out of the test was a real bug: `LDRSB Wt` — a
+    // *signed byte* load — is also `size == 0` with bit [23] set, so it was
+    // read as a 128-bit access and its scale came out 16 instead of 1. Every
+    // reference through one was then rejected as misaligned unless the target
+    // happened to sit on a 16-byte boundary, which is how a working C++
+    // program failed to link with `value 871 is not 16-byte aligned`.
+    let vector = (instruction >> 26) & 0x1 == 1;
     let size = (instruction >> 30) & 0x3;
     let opc1 = (instruction >> 23) & 0x1;
-    if size == 0 && opc1 == 1 {
+    if vector && size == 0 && opc1 == 1 {
         16 // 128-bit SIMD load/store
     } else {
         1u64 << size
@@ -139,6 +166,7 @@ pub fn encode_imm12(instruction: u32, byte_offset: u64) -> Result<u32, EncodeErr
         return Err(EncodeError::Misaligned {
             value: byte_offset as i64,
             alignment: scale,
+            instruction,
         });
     }
     let imm = byte_offset / scale;
@@ -338,5 +366,34 @@ mod tests {
         let ldr = 0xF940_0123u32;
         let encoded = encode_imm12(ldr, 8).expect("fits");
         assert_eq!(encoded & 0x3FF, 0x123, "Rn/Rt were clobbered");
+    }
+}
+
+#[cfg(test)]
+mod scale_tests {
+    use super::imm12_scale;
+
+    /// Real instruction words, decoded by hand against the ARM ARM's
+    /// "Load/store register (unsigned immediate)" encoding. Each of these was
+    /// taken from an object file a real program failed to link.
+    #[test]
+    fn the_scale_matches_the_access_width() {
+        // LDR Xt, [Xn, #imm]  — size=11, V=0, opc=01
+        assert_eq!(imm12_scale(0xf940_0108), 8);
+        // LDR Qt, [Xn, #imm]  — size=00, V=1, opc=11: the 128-bit SIMD form
+        assert_eq!(imm12_scale(0x3dc0_0141), 16);
+        // LDRSB Wt, [Xn, #imm] — size=00, V=0, opc=11. Byte-sized, and the
+        // reason the `V` bit has to be in the test: without it this reads as
+        // the 128-bit form and every reference through it is rejected.
+        assert_eq!(imm12_scale(0x39c0_0108), 1);
+        // ADD Xd, Xn, #imm — not a load/store at all, so unscaled.
+        assert_eq!(imm12_scale(0x9100_0000), 1);
+    }
+
+    /// A byte-sized access can address any offset; a 16-byte one cannot.
+    #[test]
+    fn a_byte_load_encodes_an_odd_offset() {
+        assert!(super::encode_imm12(0x39c0_0108, 871).is_ok());
+        assert!(super::encode_imm12(0x3dc0_0141, 871).is_err());
     }
 }

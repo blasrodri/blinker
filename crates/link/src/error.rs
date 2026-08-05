@@ -73,6 +73,15 @@ pub enum LinkError {
         object: ObjectId,
         kind: Arm64RelocationKind,
         source: Box<blinker_relocations::RelocationError>,
+        /// What the relocation pointed at, and where that landed.
+        ///
+        /// Without these the message named only an object number and an
+        /// encoding rule — "value 107 is not 8-byte aligned" — which says a
+        /// field could not be written but not what was being referred to, so
+        /// there is nothing to look up and nothing to act on. The symbol name
+        /// is what turns it into a report about a program.
+        symbol: Option<String>,
+        target: u64,
     },
     Emit(blinker_output::ImageError),
 }
@@ -135,7 +144,17 @@ impl std::fmt::Display for LinkError {
                 object,
                 kind,
                 source,
-            } => write!(f, "object {}: cannot apply {kind:?}: {source}", object.0),
+                symbol,
+                target,
+            } => match symbol {
+                Some(symbol) => write!(
+                    f,
+                    "object {}: cannot apply {kind:?} against {symbol} \
+                     (resolved to {target:#x}): {source}",
+                    object.0
+                ),
+                None => write!(f, "object {}: cannot apply {kind:?}: {source}", object.0),
+            },
             LinkError::Emit(source) => write!(f, "{source}"),
         }
     }
