@@ -2545,7 +2545,109 @@ fn report(objects: &[LoadedObject], atoms: &Atoms<'_>, live: &LiveSet, revived: 
         .filter(|(_, any_live)| !any_live)
         .map(|(size, _)| *size)
         .sum();
+    strip_parts(objects, atoms, live);
     report
+}
+
+/// Where the dead-strip's leverage went, per section name.
+///
+/// `Report` counts `__text` alone, which was the right thing to count when the
+/// gap against ld64 was two thirds `__text`. On a large C++-flavoured link it
+/// is not: `__TEXT,__const` was 54 MB against ld64's 31, and no number here
+/// could say whether that was liveness or atomisation.
+///
+/// `whole` is the column that answers it — bytes in an input section that
+/// produced exactly one atom, which is a section the strip could not cut and
+/// therefore keeps entirely if anything in it is reachable.
+fn strip_parts(objects: &[LoadedObject], atoms: &Atoms<'_>, live: &LiveSet) {
+    if std::env::var_os("BLINKER_STRIP_PARTS").is_none() {
+        return;
+    }
+    let mut name_of: HashMap<(u32, u32), &str> = HashMap::default();
+    for object in objects {
+        for section in &object.parsed.sections {
+            name_of.insert((object.parsed.id.0, section.id.0), section.name.as_str());
+        }
+    }
+    // (total, live, opaque) bytes per section name.
+    let mut totals: HashMap<&str, (u64, u64, u64)> = HashMap::default();
+    for index in atoms.indices() {
+        let atom = atoms.atom(index);
+        let name = name_of.get(&atom.key()).copied().unwrap_or("?");
+        let row = totals.entry(name).or_insert((0, 0, 0));
+        row.0 += atom.size;
+        if live.contains(index) {
+            row.1 += atom.size;
+        }
+    }
+    // Bytes in sections held opaque — kept whole because something points
+    // into them without landing on a symbol. Recomputed here rather than read
+    // out of the projection: this is a diagnostic, and the loop is the same
+    // one `project` runs.
+    let mut opaque_bytes: HashMap<&str, u64> = HashMap::default();
+    let mut per_object: HashMap<&std::path::Path, u64> = HashMap::default();
+    for object in objects {
+        let mut held: HashSet<u32> = HashSet::default();
+        for relocation in &object.parsed.relocations {
+            let from_metadata = object
+                .parsed
+                .section(relocation.section)
+                .is_some_and(|s| is_metadata(&s.name) || s.kind == SectionKind::Debug);
+            if from_metadata {
+                continue;
+            }
+            match relocation.target {
+                RelocationTarget::Section(section) => {
+                    held.insert(section.0);
+                }
+                RelocationTarget::Symbol(id) => {
+                    if !stores_addend(relocation) || crate::inline_addend(object, relocation) == 0 {
+                        continue;
+                    }
+                    if let Some(symbol) = object.parsed.symbol(id) {
+                        if let Some((section, _)) = offset_of(object, symbol) {
+                            held.insert(section.0);
+                        }
+                    }
+                }
+            }
+        }
+        for section in &object.parsed.sections {
+            if held.contains(&section.id.0) {
+                *opaque_bytes.entry(section.name.as_str()).or_default() += section.size;
+                *per_object.entry(object.path.as_ref()).or_default() += section.size;
+            }
+        }
+    }
+    for (name, bytes) in opaque_bytes {
+        totals.entry(name).or_insert((0, 0, 0)).2 = bytes;
+    }
+    // Which inputs bring the opacity, because "some objects do this" is not
+    // something a fix can be aimed at.
+    let mut by_object: Vec<(u64, &std::path::Path)> = per_object
+        .into_iter()
+        .filter(|(_, bytes)| *bytes > 0)
+        .map(|(path, bytes)| (bytes, path))
+        .collect();
+    by_object.sort_unstable_by_key(|(bytes, _)| std::cmp::Reverse(*bytes));
+    let mut rows: Vec<_> = totals.into_iter().collect();
+    rows.sort_unstable_by_key(|(_, (total, alive, _))| std::cmp::Reverse(total - alive));
+    #[allow(clippy::print_stderr)]
+    {
+        eprintln!(
+            "  strip: {:<20}{:>12}{:>12}{:>12}",
+            "section", "total", "dead", "opaque"
+        );
+        for (name, (total, alive, whole)) in rows.into_iter().take(12) {
+            eprintln!(
+                "  strip: {name:<20}{total:>12}{:>12}{whole:>12}",
+                total - alive
+            );
+        }
+        for (bytes, path) in by_object.into_iter().take(6) {
+            eprintln!("  strip: opaque {bytes:>12}  {}", path.display());
+        }
+    }
 }
 
 #[cfg(test)]

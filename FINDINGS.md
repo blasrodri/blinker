@@ -12388,3 +12388,90 @@ comparison: the same mistake `scripts/relink.py` documents at length and
 guards against, made again in a fixture written beside it.
 
 Six workloads link byte-identically before and after, now including a C one.
+
+## 234. One library pins 45 MB, and blinker's output is 37% larger than ld64's
+
+pulsevm captured, and blinker is **2.0x slower than ld64** on it — interleaved,
+six iterations, 693 MB of input:
+
+```
+  ld64      252.5 ms  (min 238.9)   output  96903 KB
+  blinker   507.1 ms  (min 501.7)   output 132679 KB
+```
+
+The output ratio is the lead. 36 MB is not a rounding difference, and emit and
+write are both proportional to it.
+
+### Where the 36 MB is
+
+```
+  section        ld64      blinker
+  __text         36.6 MB     44.8 MB
+  __TEXT,__const 30.7 MB     53.8 MB     <- 23 MB of it, here
+  __unwind_info  0.49 MB      3.10 MB    <- 6x, separately
+```
+
+Dead-stripping runs and removes 29 MB, so "the strip is off" is not the answer.
+`BLINKER_STRIP_PARTS` — added for this, because `Report` counts `__text` alone
+and `__text` is no longer where the gap is — says what is:
+
+```
+  section              total        dead      opaque
+  __text            73946072    29163212           0
+  __const           62214748     6468269    45134965
+  __cstring          2833649      898050           0
+```
+
+`__const` is 62 MB, of which **45 MB is opaque** — held whole — and only 6.5 MB
+is stripped, 10%. ld64 gets the same input down to 30.7 MB, so roughly 25 MB is
+dead and blinker is keeping it.
+
+Atomisation is not the problem: the sections are cut normally. Opacity is a
+separate rule, at `reachability.rs:439`:
+
+```rust
+RelocationTarget::Section(section) => opaque.push(section.0),
+```
+
+**Any** relocation targeting a section pins that entire section. The comment
+says why — "a reference that does not land on a symbol would follow the bytes
+it meant only by accident once the atoms moved" — and it is correct about the
+hazard. `target_address` resolves a section target to the section's *base*, and
+the caller adds the offset the input recorded; if anything inside that section
+moved, that arithmetic is wrong. Opacity is what makes it true.
+
+### Why nothing had seen it
+
+ripgrep has **zero** opaque bytes. So does every other Rust workload. Attributed
+per input, pulsevm's 45 MB is:
+
+```
+  44940722  libllvm_sys-3a1651d8d218ff60.rlib
+    192678  libpulsevm_ffi-e7257eb416eb99f6.rlib
+      5688  libh2-476ff2feeba424c8.rlib
+```
+
+One library. `llvm-sys` bundles LLVM's own clang-compiled C++ objects inside an
+rlib, and those reach their anonymous constant pools section-relatively —
+rustc's own objects name theirs. The whole corpus was Rust-shaped, so the rule
+had never met the input it is expensive on. That is the fourth time in this
+session's findings that the corpus, not the linker, was the thing that could not
+see something: `self` for 231, Rust-only inputs for 232 and 233, and now this.
+
+### What the fix is, and why it is not in this commit
+
+The machinery already exists in one place: `__compact_unwind`'s function field
+is also a section relocation with an inline offset, and it is resolved by
+recovering the offset and finding the atom that contains it
+(`reachability.rs:520`), then remapped through `Strip::remap` when applied. The
+general fix is that, everywhere: a section-targeted relocation becomes an edge
+to the containing atom rather than opacity for the section, and the relocation
+path remaps the offset instead of adding the recorded one to a section base.
+
+That is a change to the hot relocation path where being wrong means a binary
+that links and crashes, which is the failure this session already refused once
+(finding 230). It wants its own commit, its own reasoning about negative and
+out-of-range addends, and the `revived_atoms` verifier — which exists precisely
+to catch an under-approximated liveness and must stay at zero — pointed at it.
+
+Committed here: the measurement, and the diagnostic that makes it repeatable.
