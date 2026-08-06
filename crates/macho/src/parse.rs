@@ -35,6 +35,18 @@ pub enum ParseError {
     },
     /// The file is not a Mach-O object we can read.
     Malformed { path: PathBuf, detail: String },
+    /// A well-formed file of a format blinker does not link.
+    ///
+    /// Separate from [`ParseError::Malformed`] because the two need different
+    /// answers from the user. Malformed means something is wrong with the file;
+    /// this means nothing is wrong with the file and blinker does not implement
+    /// what produced it. Saying the first when you mean the second sends people
+    /// looking for a corrupt object that does not exist.
+    UnsupportedFormat {
+        path: PathBuf,
+        format: &'static str,
+        remedy: &'static str,
+    },
     /// A valid Mach-O object, but not for the architecture we support.
     UnsupportedArchitecture { path: PathBuf, found: String },
     /// A relocation we will not guess at.
@@ -82,6 +94,17 @@ impl std::fmt::Display for ParseError {
             }
             ParseError::Malformed { path, detail } => {
                 write!(f, "malformed Mach-O object {}: {detail}", path.display())
+            }
+            ParseError::UnsupportedFormat {
+                path,
+                format,
+                remedy,
+            } => {
+                write!(
+                    f,
+                    "{} is {format}, which blinker does not link — {remedy}",
+                    path.display()
+                )
             }
             ParseError::UnsupportedArchitecture { path, found } => {
                 write!(f, "{} is {found}; only arm64 is supported", path.display())
@@ -137,6 +160,17 @@ pub fn parse_object(
     member: Option<&str>,
     id: ObjectId,
 ) -> Result<ParsedObject, ParseError> {
+    // Named before it is rejected. The driver catches bitcode inputs up front
+    // and delegates the whole link, so reaching here means one arrived inside an
+    // archive — where delegating is no longer on the table and a clear sentence
+    // is all that is left to give.
+    if crate::is_bitcode(data) {
+        return Err(ParseError::UnsupportedFormat {
+            path: path.to_path_buf(),
+            format: "LLVM bitcode",
+            remedy: "build without -flto, or set a different linker for this target",
+        });
+    }
     let file = MachOFile64::<LittleEndian, _>::parse(data).map_err(|e| ParseError::Malformed {
         path: path.to_path_buf(),
         detail: e.to_string(),

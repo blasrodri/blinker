@@ -137,6 +137,52 @@ fn every_unsupported_output_kind_delegates() {
     }
 }
 
+/// An input that is bitcode rather than Mach-O, which is what `-flto`
+/// produces.
+///
+/// This used to fail the build with `malformed Mach-O object a.o: Unsupported
+/// Mach-O header` — a sentence that describes a corrupt file, about a file that
+/// is perfectly well formed and simply in a format blinker does not link. The
+/// rule for output kinds applies unchanged to input formats: rustc hands the
+/// same linker every crate, and one C dependency built with `-flto` should not
+/// stop a workspace building.
+///
+/// The deliverable is the running program, not the delegation: what matters is
+/// that the link *worked*, by whatever route.
+#[test]
+fn a_bitcode_input_delegates_and_still_produces_a_program() {
+    let scratch = Scratch::dir("delegate-bitcode").expect("scratch");
+    let source = scratch
+        .write("lto.c", "int main(void) { return 9; }\n")
+        .expect("writable");
+    let object = scratch.join("lto.o");
+    let compiled = Command::new("cc")
+        .args(["-arch", "arm64", DEPLOYMENT_TARGET, "-flto", "-c"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&object)
+        .status()
+        .expect("cc runs");
+    // A toolchain that will not produce bitcode has nothing to say here.
+    if !compiled.success() {
+        return;
+    }
+    let head = std::fs::read(&object).expect("read the object");
+    assert!(
+        blinker_macho::is_bitcode(&head),
+        "the fixture is not bitcode, so it proves nothing"
+    );
+
+    let out = scratch.join("program");
+    let json = link(&scratch, "bitcode", &[], &object, &out);
+    assert!(
+        json.contains("unsupported_input_format"),
+        "a bitcode input was not delegated for that reason:\n{json}"
+    );
+    let status = Command::new(&out).status().expect("the program runs");
+    assert_eq!(status.code(), Some(9), "the delegated link did not work");
+}
+
 /// And the control: an ordinary executable must **not** delegate, or the rule
 /// above would be satisfied by a linker that delegates everything.
 #[test]

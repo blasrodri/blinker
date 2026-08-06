@@ -89,6 +89,7 @@ dependencies = [
  "blinker-cache",
  "blinker-diagnostics",
  "blinker-link",
+ "blinker-macho",
  "blinker-test-support",
  "libc",
  "serde_json",

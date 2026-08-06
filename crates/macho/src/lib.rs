@@ -352,6 +352,32 @@ pub fn classify_section(segment: &str, name: &str) -> SectionKind {
     }
 }
 
+/// Whether these bytes begin an LLVM bitcode file rather than a Mach-O one.
+///
+/// # Why a linker needs to recognise a format it cannot read
+///
+/// `-flto` makes the compiler emit bitcode where an object file would go, and
+/// leaves the code generation for the linker to do. blinker does not do it —
+/// but it was not *saying* so. The bytes reached the Mach-O parser, which
+/// reported `malformed Mach-O object a.o: Unsupported Mach-O header`, and that
+/// reads like a corrupt file rather than a configuration blinker has not
+/// implemented. A user would sooner believe their build is broken than that
+/// their linker is.
+///
+/// Recognising it is what lets the driver hand the whole link to the system
+/// linker instead, which is the same answer it already gives for `-bundle` and
+/// `-r`: a workspace containing one should not fail to build.
+///
+/// Two spellings, because Apple's toolchain uses both. Raw bitcode starts with
+/// `BC\xC0\xDE`; a bitcode *wrapper* — which is what `cc -flto -c` actually
+/// writes on Darwin — starts with `0x0B17C0DE` and carries the raw bitcode
+/// inside it.
+pub fn is_bitcode(data: &[u8]) -> bool {
+    const RAW: &[u8] = &[0x42, 0x43, 0xc0, 0xde];
+    const WRAPPER: &[u8] = &[0xde, 0xc0, 0x17, 0x0b];
+    data.starts_with(RAW) || data.starts_with(WRAPPER)
+}
+
 /// Read and parse an object file from disk.
 pub fn parse_object_file(path: &Path, id: ObjectId) -> Result<ParsedObject, ParseError> {
     let data = std::fs::read(path).map_err(|source| ParseError::Io {

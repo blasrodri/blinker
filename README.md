@@ -122,9 +122,10 @@ own after twenty minutes idle regardless.
   the ones blinker links.
 - **Dead stripping** (`-dead_strip`), from the entry point for a program and
   from every exported symbol for a library.
-- **Anything else** — `-bundle`, `-r`, `-static`, `-shared` — is handed to the
-  system linker automatically, with the reason recorded, so a workspace that
-  contains one never fails to build.
+- **Anything else** — `-bundle`, `-r`, `-static`, `-shared`, and inputs that
+  are LLVM bitcode rather than Mach-O (what `-flto` produces) — is handed to
+  the system linker automatically, with the reason recorded, so a workspace
+  that contains one never fails to build.
 
 Blinker's output is compared byte-for-byte against a cold link of the same
 inputs by the test suite: a warm, resident, incremental link must produce
