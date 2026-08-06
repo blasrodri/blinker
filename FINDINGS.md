@@ -12475,3 +12475,74 @@ out-of-range addends, and the `revived_atoms` verifier — which exists precisel
 to catch an under-approximated liveness and must stay at zero — pointed at it.
 
 Committed here: the measurement, and the diagnostic that makes it repeatable.
+
+## 235. Every pointer into the middle of something pointed at its beginning
+
+Going after the opacity rule of finding 234 turned up something worse on the
+way: blinker was **dropping the addend of every plain pointer**. Not
+mis-scaling it, not misplacing it — never reading it.
+
+Three pointers into one anonymous constant pool:
+
+```c
+static const int pool[8] = {10, 11, 12, 13, 14, 15, 16, 17};
+static const int *const table[3] = { &pool[0], &pool[3], &pool[7] };
+printf("%d %d %d\n", *table[0], *table[1], *table[2]);
+```
+
+```
+  ld64      10 13 17
+  blinker   10 10 10
+```
+
+### Why it was invisible
+
+ARM64 Mach-O stores a plain pointer's addend **in the bytes being patched**;
+`r_addend` is zero on every relocation. `apply` *overwrites* those bytes with
+the target's address, so an addend not read out beforehand is not lost during
+the link — it was never in it.
+
+The linker already knew this. `inline_addend` exists, the pair path uses it,
+`__eh_frame` uses it, and `reachability` reads it to decide opacity. The single
+non-pair path — the common one, the one every `&thing[n]` in a static
+initialiser takes — did not.
+
+Nothing caught it because Rust points *at* symbols far more than *into* them,
+and the whole corpus was Rust. `self` and the C fixture link byte-identically
+with the fix and without it. ripgrep and pulsevm do not — so the bug was
+reaching real output, in the shape of pointers landing 13 bytes early:
+
+```
+  before  d431000100000042      after  e131000100000042
+```
+
+A wrong number, not a crash, which is the kind that survives a test suite.
+Ten ripgrep invocations — regex, globs, context, JSON, multiline, Unicode,
+case-insensitive, inverted, fixed-string, counting — produce output identical
+to an ld64-linked build with the fix in place.
+
+Both sites needed it. The patched field, and `Bind`, which carries the addend
+for dyld when the target is imported: an import can be pointed *into* as well
+as at.
+
+### The section case, fixed alongside
+
+The same fold, for a relocation naming a *section* rather than a symbol: the
+stored value is an address in the object's own space, so the offset is
+recovered and put through `Strip::remap` rather than added raw. `remap` is the
+identity inside a section held whole — which finding 234's opacity rule
+currently guarantees for exactly these sections — and it is the truth if that
+ever stops being so. Which is the point: that is the line the opacity fix will
+need, in place and exercised before it is relied on.
+
+### Tests
+
+Three, each failing without the fix: a pointer into a static array in the same
+object, one into another object's array, and a negative addend — which C cannot
+spell portably (`&array[-1]` is undefined) so it is assembly, with
+`fffffff8 ffffffff` in the bytes to be patched. An implementation folding that
+as unsigned lands four gigabytes away instead of eight bytes back.
+
+The first version of the negative test asserted the wrong element and failed
+against a linker that was right. `_numbers + 12` is the *fourth* `int`, not the
+third; ld64 and blinker both said 400 and the test said 300.

@@ -6263,7 +6263,10 @@ fn apply_relocations(
                                         library_ordinal: exports
                                             .map(|e| e.ordinal(&symbol.name))
                                             .unwrap_or(1),
-                                        addend: relocation.addend,
+                                        // As above: an import can be
+                                        // pointed *into* as well as at.
+                                        addend: relocation.addend
+                                            + inline_addend(object, relocation),
                                     });
                                 }
                                 continue;
@@ -6296,6 +6299,41 @@ fn apply_relocations(
                     (None, None) => {
                         target_address(object, ids, placed, addresses, relocation.target)?
                     }
+                };
+
+                // A plain pointer stores its addend **in the bytes being
+                // patched**, and `apply` overwrites those bytes — so the
+                // addend has to be folded into the target or it is lost. It
+                // was lost: three pointers into one anonymous constant pool
+                // all resolved to the pool's base, and a C program indexing a
+                // table of them read the first element three times (finding
+                // 235).
+                //
+                // Only a plain pointer stores it this way. In an instruction
+                // those bytes are the instruction, and ARM64 Mach-O spells a
+                // non-zero addend with a separate `ARM64_RELOC_ADDEND` entry,
+                // which the parser refuses outright.
+                //
+                // For a section target the stored value is an address in the
+                // object's own space, so the offset is recovered and remapped:
+                // `remap` is the identity inside a section held whole, and the
+                // truth if that ever stops being so. For a symbol target it is
+                // a plain offset from the symbol, whose own address has already
+                // been remapped by the lookup that produced `target`.
+                let target = if relocation.kind == Arm64RelocationKind::Unsigned {
+                    let inline = inline_addend(object, relocation);
+                    match relocation.target {
+                        RelocationTarget::Section(id) => {
+                            let origin =
+                                object.parsed.section(id).map(|s| s.vm_address).unwrap_or(0);
+                            let offset = (inline as u64).saturating_sub(origin);
+                            let moved = strip.remap(object.parsed.id, id, offset).unwrap_or(offset);
+                            target.wrapping_add(moved)
+                        }
+                        RelocationTarget::Symbol(_) => target.wrapping_add(inline as u64),
+                    }
+                } else {
+                    target
                 };
 
                 let Some(buffer) = bytes.contribution(relocation.section) else {
