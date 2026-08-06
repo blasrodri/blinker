@@ -2586,8 +2586,24 @@ fn strip_parts(objects: &[LoadedObject], atoms: &Atoms<'_>, live: &LiveSet) {
     // one `project` runs.
     let mut opaque_bytes: HashMap<&str, u64> = HashMap::default();
     let mut per_object: HashMap<&std::path::Path, u64> = HashMap::default();
+    let (mut section_caused, mut symbol_caused) = (0u64, 0u64);
+    let (mut contained, mut escaping, mut elsewhere) = (0u64, 0u64, 0u64);
+    // Atom spans per (object, section), ascending, so a symbol's atom can be
+    // found by offset.
+    let mut atom_index: HashMap<(u32, u32), Vec<(u64, u64)>> = HashMap::default();
+    for index in atoms.indices() {
+        let atom = atoms.atom(index);
+        atom_index
+            .entry(atom.key())
+            .or_default()
+            .push((atom.offset, atom.offset + atom.size));
+    }
+    for spans in atom_index.values_mut() {
+        spans.sort_unstable();
+    }
     for object in objects {
         let mut held: HashSet<u32> = HashSet::default();
+        let mut via_section: HashSet<u32> = HashSet::default();
         for relocation in &object.parsed.relocations {
             let from_metadata = object
                 .parsed
@@ -2599,15 +2615,42 @@ fn strip_parts(objects: &[LoadedObject], atoms: &Atoms<'_>, live: &LiveSet) {
             match relocation.target {
                 RelocationTarget::Section(section) => {
                     held.insert(section.0);
+                    via_section.insert(section.0);
                 }
                 RelocationTarget::Symbol(id) => {
-                    if !stores_addend(relocation) || crate::inline_addend(object, relocation) == 0 {
+                    let addend = crate::inline_addend(object, relocation);
+                    if !stores_addend(relocation) || addend == 0 {
                         continue;
                     }
-                    if let Some(symbol) = object.parsed.symbol(id) {
-                        if let Some((section, _)) = offset_of(object, symbol) {
+                    let Some(symbol) = object.parsed.symbol(id) else {
+                        continue;
+                    };
+                    match offset_of(object, symbol) {
+                        Some((section, offset)) => {
                             held.insert(section.0);
+                            // Does the addend leave the atom the symbol names?
+                            // If not, nothing has to be pinned: an atom moves
+                            // as a unit and `symbol + addend` moves with it.
+                            let key = (object.parsed.id.0, section.0);
+                            let mine = atom_index.get(&key).map(Vec::as_slice).unwrap_or(&[]);
+                            let found = mine
+                                .partition_point(|(start, _)| *start <= offset)
+                                .checked_sub(1)
+                                .map(|i| mine[i]);
+                            match found {
+                                Some((start, end)) if offset < end => {
+                                    let target = offset as i64 + addend;
+                                    if target < start as i64 || target >= end as i64 {
+                                        escaping += 1;
+                                    } else {
+                                        contained += 1;
+                                    }
+                                }
+                                _ => escaping += 1,
+                            }
                         }
+                        // Defined in another object; this one cannot say.
+                        None => elsewhere += 1,
                     }
                 }
             }
@@ -2616,6 +2659,11 @@ fn strip_parts(objects: &[LoadedObject], atoms: &Atoms<'_>, live: &LiveSet) {
             if held.contains(&section.id.0) {
                 *opaque_bytes.entry(section.name.as_str()).or_default() += section.size;
                 *per_object.entry(object.path.as_ref()).or_default() += section.size;
+                if via_section.contains(&section.id.0) {
+                    section_caused += section.size;
+                } else {
+                    symbol_caused += section.size;
+                }
             }
         }
     }
@@ -2644,6 +2692,8 @@ fn strip_parts(objects: &[LoadedObject], atoms: &Atoms<'_>, live: &LiveSet) {
                 total - alive
             );
         }
+        eprintln!("  strip: opacity bytes: section target {section_caused}, symbol+addend {symbol_caused}");
+        eprintln!("  strip: addends: {contained} inside the symbol's atom, {escaping} escaping it, {elsewhere} to another object");
         for (bytes, path) in by_object.into_iter().take(6) {
             eprintln!("  strip: opaque {bytes:>12}  {}", path.display());
         }

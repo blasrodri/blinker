@@ -12546,3 +12546,52 @@ as unsigned lands four gigabytes away instead of eight bytes back.
 The first version of the negative test asserted the wrong element and failed
 against a linker that was right. `_numbers + 12` is the *fourth* `int`, not the
 third; ld64 and blinker both said 400 and the test said 300.
+
+## 236. The opacity fix in 234 was aimed at the wrong half, and the measurement says so
+
+Finding 234 ended by specifying the fix: section-targeted relocations become
+edges to the containing atom instead of pinning the section. Splitting the 45 MB
+by which rule caused it, before building any of that:
+
+```
+  strip: opacity bytes: section target 0, symbol+addend 45149381
+```
+
+**Zero.** Not one byte of pulsevm's opacity comes from a section-targeted
+relocation. All of it comes from the other rule — a symbol referenced with a
+non-zero addend stored inline, which pins that symbol's whole defining section.
+The fix as specified would have been built, verified, measured, and recovered
+nothing.
+
+That the section-target path is right anyway is not nothing: finding 235's
+remap runs on it, and it is the line the real fix will need. But it is not the
+45 MB.
+
+### What the 45 MB actually needs
+
+The pin exists because `target = symbol_address + addend`, and an addend that
+walks off the end of the symbol's own atom lands on bytes that may have moved
+independently. Counting the relocations that cause it:
+
+```
+  addends: 3734 inside the symbol's atom, 8526 escaping it, 15856 to another object
+```
+
+Only 13% are the easy case — an addend that stays inside the atom needs
+nothing at all, because an atom moves as a unit and `symbol + addend` moves
+with it. Skipping the pin for those is correct and cheap, and it will recover
+almost nothing: a section is held whole if *any* reference into it escapes, and
+28,000 references share a few hundred sections.
+
+The other 87% need the address recomputed rather than reasoned about: resolve
+`symbol_offset + addend` to the atom that contains it *in the defining object*,
+make the edge point there so liveness follows it, and remap the offset at
+application time. For the 15,856 that name a symbol another object defines,
+that needs something the linker does not currently build — a map from a name to
+its definition's object, section and offset, not just to its final address.
+
+So it is a real piece of work with a new data structure in it, and the estimate
+in 234 — "its own commit" — was made before knowing which half it was. Written
+down here so the next attempt starts from the count rather than from the guess.
+
+The diagnostic that says all of the above is committed with it.
