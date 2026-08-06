@@ -12858,12 +12858,20 @@ Two reasons, both about metadata:
   plain pointer. In `__eh_frame` they are a DWARF-encoded one, so reading them
   as an offset moved the edge onto an atom nothing meant;
 - an LSDA is reached through the unwind revival path rather than by an ordinary
-  edge, so over `__gcc_except_tab` the pin was the only thing keeping those
-  atoms *alive*. It was masking a gap in LSDA liveness.
+  edge, so lifting the pin over `__gcc_except_tab` means relying on a route
+  those atoms do not normally take.
 
 Both are handled by excluding metadata in `interior_target`, which is the one
-place the rule lives so the edge and the pin cannot disagree. The masked gap is
-still there, unfixed, and now written down.
+place the rule lives so the edge and the pin cannot disagree.
+
+**Correction.** The first version of this finding said the second reason was a
+*gap in LSDA liveness that the pin had been masking*, stated as fact. It was
+not established: both faults were introduced at once and only the pair was
+observed. Isolating them afterwards — lifting the pin over metadata while
+keeping the DWARF exclusion — links pulsevm, ripgrep and self, so the whole
+failure was the addend misread and there is no gap. The exclusion stays as a
+conservative choice, worth one byte on pulsevm and not worth the unknown, and
+that is a different sentence from the one first written here.
 
 ### What it is worth
 

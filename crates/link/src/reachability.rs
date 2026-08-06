@@ -198,16 +198,18 @@ fn interior_target(
     {
         return None;
     }
-    // Nor *into* metadata: an LSDA is reached through the unwind revival path
-    // rather than by an ordinary edge, so the pin is the only thing keeping
-    // those atoms alive. That is a gap in LSDA liveness the pin has been
-    // masking, and it is a separate thing to fix.
+    // Nor *into* metadata, which is a conservative choice rather than a
+    // necessary one. Liveness for an LSDA runs through the unwind revival path
+    // instead of ordinary edges, so lifting the pin there means relying on a
+    // route these atoms do not normally take — and it was measured as worth
+    // one byte on pulsevm. Not worth finding out.
     if offset_of(object, symbol)
         .and_then(|(section, _)| object.parsed.section(section))
         .is_some_and(|s| is_metadata(&s.name))
     {
         return None;
     }
+
     let (_, offset) = offset_of(object, symbol)?;
     let at = (offset as i64).wrapping_add(crate::inline_addend(object, relocation));
     (at >= 0).then_some(at as u64)
