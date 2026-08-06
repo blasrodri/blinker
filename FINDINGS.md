@@ -12807,3 +12807,82 @@ no test had ever stated.
 ripgrep, pulsevm and the rest link and run unchanged; the tables grow by four
 bytes on pulsevm, which is one more index entry's worth of sentinel being
 correct.
+
+## 240. Lifting the pin for local interior references: 1.07 MB, not 25
+
+Finding 237 left one approach standing: resolve an interior reference to the
+atom that contains it rather than pinning the section around it. Finding 236
+priced it at "a new data structure" because 15,856 of the references name a
+symbol another object defines. Splitting the *bytes* rather than the references
+first:
+
+```
+  pinned bytes resolvable inside one object 29640477, needing a cross-object answer 15508904
+```
+
+Two thirds need no new structure at all. A local symbol's definition is in the
+object referencing it, so `offset_of` gives its section and offset directly,
+`containing` gives the atom at symbol+addend, and `Strip::remap` gives its
+address. No name-to-definition map, no new edge variant.
+
+### Built in two halves
+
+The address half first, on its own: for a **local** definition, resolve the
+target by remapping `symbol_offset + addend` in its own section instead of
+adding the addend to the symbol's resolved address. Identical arithmetic while
+the pins hold, and all four workloads link byte-identically with a determinism
+control — which is the point of doing it separately.
+
+Locals only, and that restriction was found by measurement rather than
+reasoning: the first version accepted any definition in this object and changed
+pulsevm's output. A *global* defined here can still lose resolution to another
+object's copy — every C++ inline function and vtable is such a symbol — and
+resolving against the local copy bypasses that choice. A local cannot be
+shadowed.
+
+Then the liveness half: `edge` points at the atom holding symbol+addend rather
+than the one the symbol names, and the pin is skipped when both atoms exist.
+
+### The pin was doing two jobs
+
+Lifting it failed the link:
+
+```
+  blinker: undefined symbols:
+    GCC_except_table174
+```
+
+Two reasons, both about metadata:
+
+- the bytes a relocation patches are a plain addend only where the field is a
+  plain pointer. In `__eh_frame` they are a DWARF-encoded one, so reading them
+  as an offset moved the edge onto an atom nothing meant;
+- an LSDA is reached through the unwind revival path rather than by an ordinary
+  edge, so over `__gcc_except_tab` the pin was the only thing keeping those
+  atoms *alive*. It was masking a gap in LSDA liveness.
+
+Both are handled by excluding metadata in `interior_target`, which is the one
+place the rule lives so the edge and the pin cannot disagree. The masked gap is
+still there, unfixed, and now written down.
+
+### What it is worth
+
+```
+              size          stripped     revived
+  before   134355021        29163212           0
+  after    133283565        29284028           0
+```
+
+**1.07 MB. 0.8%.** Not the 25 MB this line of work was aimed at, because most
+pinned sections are pinned by a cross-object reference as well as a local one,
+and one such reference is enough.
+
+Kept rather than reverted, and the distinction from findings 212 and 224 is
+worth stating: those were changes that produced *no* measurable effect and were
+reverted. This produces a real one, verified — `revived_atoms` stays at zero,
+which is the counter that exists to catch exactly the failure this change could
+cause; ripgrep's output matches an ld64-linked build; the resident relink still
+reuses 283/292 objects and 99% of relocations. And it is the mechanism the
+remaining 15.5 MB needs, so reverting it means building it again.
+
+But 1.07 MB is what it delivered, and the 25 MB is still there.

@@ -171,6 +171,48 @@ fn stores_addend(relocation: &InputRelocation) -> bool {
 }
 
 /// Boundaries at which a section may be cut, or `None` to keep it whole.
+/// Where in its own section a relocation with an inline addend actually points.
+///
+/// `None` when the addend does not apply: the relocation is not a plain pointer
+/// — only those store one in the bytes they patch — or the symbol is not a
+/// local this object defines. Those are exactly the two conditions under which
+/// the section is still held whole, so this and the pin agree by construction
+/// rather than by two copies of one rule.
+fn interior_target(
+    object: &LoadedObject,
+    relocation: &InputRelocation,
+    symbol: &blinker_macho::InputSymbol,
+) -> Option<u64> {
+    if !stores_addend(relocation) || symbol.visibility != SymbolVisibility::Local {
+        return None;
+    }
+    // Not from metadata. The bytes a relocation patches are a plain addend
+    // only where the field is a plain pointer; in `__eh_frame` they are a
+    // DWARF-encoded one, and reading them as an offset moves the edge onto an
+    // atom nothing meant — which stripped exception tables that were still
+    // named.
+    if object
+        .parsed
+        .section(relocation.section)
+        .is_some_and(|s| is_metadata(&s.name) || s.kind == SectionKind::Debug)
+    {
+        return None;
+    }
+    // Nor *into* metadata: an LSDA is reached through the unwind revival path
+    // rather than by an ordinary edge, so the pin is the only thing keeping
+    // those atoms alive. That is a gap in LSDA liveness the pin has been
+    // masking, and it is a separate thing to fix.
+    if offset_of(object, symbol)
+        .and_then(|(section, _)| object.parsed.section(section))
+        .is_some_and(|s| is_metadata(&s.name))
+    {
+        return None;
+    }
+    let (_, offset) = offset_of(object, symbol)?;
+    let at = (offset as i64).wrapping_add(crate::inline_addend(object, relocation));
+    (at >= 0).then_some(at as u64)
+}
+
 fn boundaries(object: &LoadedObject, section: &InputSection) -> Option<Vec<u64>> {
     if !object.parsed.subsections_via_symbols
         || section.no_dead_strip
@@ -359,7 +401,13 @@ pub(crate) fn project(object: &LoadedObject) -> ObjectAtoms {
         let symbol = object.parsed.symbol(id)?;
         if symbol.strength.is_definition() {
             if let Some((section, offset)) = offset_of(object, symbol) {
-                if let Some(local) = containing(section, offset) {
+                // The atom reached is the one at symbol **plus addend**, not
+                // the one the symbol names: a plain pointer stores its addend
+                // in the bytes it patches, so `&pool[3]` reaches an atom the
+                // symbol's own does not cover. Locals only, which is exactly
+                // the set the pin below is lifted for.
+                let at = interior_target(object, relocation, symbol).unwrap_or(offset);
+                if let Some(local) = containing(section, at) {
                     return Some(Edge::Local(local));
                 }
             }
@@ -444,6 +492,33 @@ pub(crate) fn project(object: &LoadedObject) -> ObjectAtoms {
                 let Some(symbol) = object.parsed.symbol(id) else {
                     continue;
                 };
+                // A **local** definition needs no pin. `edge` above points at
+                // the atom holding symbol+addend so liveness reaches it, and
+                // the relocation path remaps that atom's offset rather than
+                // adding the addend to an address — so nothing has to hold
+                // still (finding 240).
+                //
+                // Neither is possible for a name another object might define:
+                // this object's copy may lose resolution, and every C++ inline
+                // function and vtable is such a symbol. Those still hold their
+                // section whole.
+                //
+                // Metadata sections are excluded: the pin has been doing two
+                // jobs there. It kept them whole *and* it kept their atoms
+                // alive, and an LSDA is reached only through the unwind
+                // revival path rather than by an ordinary edge. Lifting the
+                // pin over `__gcc_except_tab` therefore stripped exception
+                // tables that something still named — `undefined symbols:
+                // GCC_except_table174` — which is a gap in LSDA liveness that
+                // the pin was masking, and a separate thing to fix.
+                let resolved = offset_of(object, symbol).is_some_and(|(section, offset)| {
+                    containing(section, offset).is_some()
+                        && interior_target(object, relocation, symbol)
+                            .is_some_and(|at| containing(section, at).is_some())
+                });
+                if resolved {
+                    continue;
+                }
                 // The addend is measured from the symbol, so the section
                 // holding that symbol is the one at risk — here, and wherever
                 // else the name is defined.
@@ -2588,6 +2663,8 @@ fn strip_parts(objects: &[LoadedObject], atoms: &Atoms<'_>, live: &LiveSet) {
     let mut per_object: HashMap<&std::path::Path, u64> = HashMap::default();
     let (mut section_caused, mut symbol_caused) = (0u64, 0u64);
     let (mut contained, mut escaping, mut elsewhere) = (0u64, 0u64, 0u64);
+    let mut local_only: HashSet<(u32, u32)> = HashSet::default();
+    let mut foreign_names: HashSet<&str> = HashSet::default();
     let mut span_bytes = 0u64;
     let mut spans: HashMap<(u32, u32), Vec<(u64, u64)>> = HashMap::default();
     // Atom spans per (object, section), ascending, so a symbol's atom can be
@@ -2630,6 +2707,7 @@ fn strip_parts(objects: &[LoadedObject], atoms: &Atoms<'_>, live: &LiveSet) {
                     match offset_of(object, symbol) {
                         Some((section, offset)) => {
                             held.insert(section.0);
+                            local_only.insert((object.parsed.id.0, section.0));
                             // Does the addend leave the atom the symbol names?
                             // If not, nothing has to be pinned: an atom moves
                             // as a unit and `symbol + addend` moves with it.
@@ -2662,7 +2740,12 @@ fn strip_parts(objects: &[LoadedObject], atoms: &Atoms<'_>, live: &LiveSet) {
                             }
                         }
                         // Defined in another object; this one cannot say.
-                        None => elsewhere += 1,
+                        None => {
+                            elsewhere += 1;
+                            if let Some(sym) = object.parsed.symbol(id) {
+                                foreign_names.insert(sym.name.as_str());
+                            }
+                        }
                     }
                 }
             }
@@ -2722,6 +2805,29 @@ fn strip_parts(objects: &[LoadedObject], atoms: &Atoms<'_>, live: &LiveSet) {
             union += covered;
         }
         eprintln!("  strip: same-object spans reach {span_bytes} bytes, {union} of them distinct");
+        // Of the pinned bytes, how many sit in a section every interior
+        // reference to which was resolvable inside its own object.
+        let mut resolvable = 0u64;
+        let mut foreign_pinned = 0u64;
+        for object in objects {
+            let defines_foreign = object
+                .parsed
+                .symbols
+                .iter()
+                .any(|s| s.strength.is_definition() && foreign_names.contains(s.name.as_str()));
+            for section in &object.parsed.sections {
+                let key = (object.parsed.id.0, section.id.0);
+                if !local_only.contains(&key) {
+                    continue;
+                }
+                if defines_foreign {
+                    foreign_pinned += section.size;
+                } else {
+                    resolvable += section.size;
+                }
+            }
+        }
+        eprintln!("  strip: pinned bytes resolvable inside one object {resolvable}, needing a cross-object answer {foreign_pinned}");
         for (bytes, path) in by_object.into_iter().take(6) {
             eprintln!("  strip: opaque {bytes:>12}  {}", path.display());
         }

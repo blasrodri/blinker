@@ -6370,7 +6370,37 @@ fn apply_relocations(
                             let moved = strip.remap(object.parsed.id, id, offset).unwrap_or(offset);
                             target.wrapping_add(moved)
                         }
-                        RelocationTarget::Symbol(_) => target.wrapping_add(inline as u64),
+                        // A symbol this object defines can be resolved the
+                        // same way: remap where the target *is*, rather than
+                        // add an offset to a symbol whose neighbours may have
+                        // moved out from under it. Identical to
+                        // `symbol_address + addend` whenever nothing between
+                        // them was stripped — which is what the opacity rule
+                        // currently guarantees — and correct when that rule is
+                        // lifted (finding 240).
+                        //
+                        // Locals only. A *global* defined here may still lose
+                        // resolution to another object's definition — every
+                        // C++ inline function and vtable is such a symbol —
+                        // and resolving it against this object's copy would
+                        // bypass that choice. A local cannot be shadowed: the
+                        // definition in this object is the one, by definition.
+                        RelocationTarget::Symbol(id) => object
+                            .parsed
+                            .symbol(id)
+                            .filter(|symbol| {
+                                symbol.strength.is_definition()
+                                    && symbol.visibility == SymbolVisibility::Local
+                            })
+                            .and_then(|symbol| {
+                                let section = symbol.section?;
+                                let origin = object.parsed.section(section)?.vm_address;
+                                let offset = symbol.value.saturating_sub(origin);
+                                let at = (offset as i64).wrapping_add(inline) as u64;
+                                let moved = strip.remap(object.parsed.id, section, at)?;
+                                Some(placed.address(object.parsed.id, section)? + moved)
+                            })
+                            .unwrap_or_else(|| target.wrapping_add(inline as u64)),
                     }
                 } else {
                     target
