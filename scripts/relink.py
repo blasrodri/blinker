@@ -410,13 +410,24 @@ def main():
                   "emit_layout", "emit_contents", "emit_linkedit",
                   "emit_assemble", "emit_uuid", "emit_sign",
                   "address_map", "contents", "synthetic", "apply"}
-    for name in ["read_and_parse", "stub_parse", "resolve", "layout", "dead_strip",
+    # `input_precheck` and `link_request` are driver-side and have no `link_`
+    # prefix; the loop below prepends one, so they are handled beside it.
+    for name, key in [("input_precheck", "input_precheck_ms"), ("link_request", "link_request_ms")]:
+        value = timings.get(key)
+        if value is None:
+            continue
+        accounted += value
+        print(f"    {name:<16}{value:6.2f} ms  {value / total * 100:5.1f}%  (before the link)")
+    for name in ["read_and_parse", "intern_ids", "stub_parse", "resolve", "layout", "dead_strip",
                  "digest", "atoms", "liveness", "group", "traverse", "strip_build",
                  "prepare", "placements", "personality", "unwind_size", "commons", "accounting", "address_table", "address_diff", "relocate", "emit", "write", "emit_layout", "emit_contents",
                  "emit_linkedit", "emit_assemble", "emit_uuid", "emit_sign",
                  "address_map", "contents", "synthetic", "eh_frame", "tables", "unwind", "apply", "symbols", "survey",
                  "cache_load", "cache_plan",
-                 "cache_build", "cache_store"]:
+                 "cache_build", "cache_store",
+                 # Regions that used to be `unmeasured`; see finding 232.
+                 "strip_stats", "handback", "session_stats", "teardown",
+                 "finished_probe"]:
         value = timings.get(f"link_{name}_ms")
         if value is None:
             continue

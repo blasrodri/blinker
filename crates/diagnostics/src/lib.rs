@@ -68,6 +68,11 @@ pub struct PhaseTimings {
     /// and reporting it in that field made the two indistinguishable in a
     /// record.
     pub internal_link_ms: Option<f64>,
+    /// Reading the first bytes of every input to see whether any is a format
+    /// blinker does not link, and assembling the `LinkRequest` — which
+    /// resolves every `-l` to a file on disk.
+    pub input_precheck_ms: Option<f64>,
+    pub link_request_ms: Option<f64>,
     /// Stages within the internal link.
     pub link_read_and_parse_ms: Option<f64>,
     pub link_resolve_ms: Option<f64>,
@@ -150,6 +155,13 @@ pub struct PhaseTimings {
     pub link_cache_plan_ms: Option<f64>,
     pub link_cache_build_ms: Option<f64>,
     pub link_cache_store_ms: Option<f64>,
+    /// The five formerly unattributed regions; see `LinkStages::residue`.
+    pub link_intern_ids_ms: Option<f64>,
+    pub link_strip_stats_ms: Option<f64>,
+    pub link_handback_ms: Option<f64>,
+    pub link_teardown_ms: Option<f64>,
+    pub link_session_stats_ms: Option<f64>,
+    pub link_finished_probe_ms: Option<f64>,
     pub total_ms: Option<f64>,
 }
 
@@ -179,6 +191,15 @@ pub struct LinkStages {
     /// Work that belonged to no stage: preparation, and the invariant counter.
     pub prepare: f64,
     pub accounting: f64,
+    /// The rest of what belonged to no stage, in order: gathering interned
+    /// name ids, copying the strip's counters, handing the symbol and string
+    /// tables back to the session, freeing everything the link built, and
+    /// reading the session's counters. `teardown` is the fourth: every stage
+    /// timer stops before its locals drop, so a link's *deallocation* was in
+    /// the total and in no stage.
+    pub residue: [f64; 5],
+    /// Probing whether the finished image can be replayed, before the link.
+    pub finished_probe: f64,
     pub address_table: f64,
     pub address_diff: f64,
     /// Inside `synthetic`: eh_frame repair, indirect tables, unwind info.
@@ -382,6 +403,17 @@ impl LinkRecord {
         self.timings.fallback_exec_ms = Some(as_ms(d));
     }
 
+    /// Deciding whether this link is one blinker can do, and building the
+    /// request for it.
+    ///
+    /// Both sit inside `internal_link_ms`, which is measured from the driver
+    /// rather than from the linker, and belonged to no stage — which is where
+    /// a quarter of a ripgrep relink was hiding (finding 232).
+    pub fn set_timing_setup(&mut self, precheck: Duration, request: Duration) {
+        self.timings.input_precheck_ms = Some(as_ms(precheck));
+        self.timings.link_request_ms = Some(as_ms(request));
+    }
+
     /// Record the internal link's total and its per-stage breakdown.
     pub fn set_timing_internal_link(&mut self, total: Duration, stages: LinkStages) {
         let LinkStages {
@@ -401,6 +433,8 @@ impl LinkRecord {
             strip_breakdown,
             prepare,
             accounting,
+            residue,
+            finished_probe,
             address_table,
             address_diff,
             synthetic_breakdown,
@@ -479,6 +513,16 @@ impl LinkRecord {
             self.timings.link_synthetic_ms = Some(relocate_breakdown[2]);
             self.timings.link_apply_ms = Some(relocate_breakdown[3]);
         }
+        for (field, value) in [
+            (&mut self.timings.link_intern_ids_ms, residue[0]),
+            (&mut self.timings.link_strip_stats_ms, residue[1]),
+            (&mut self.timings.link_handback_ms, residue[2]),
+            (&mut self.timings.link_teardown_ms, residue[3]),
+            (&mut self.timings.link_session_stats_ms, residue[4]),
+        ] {
+            *field = (value > 0.0).then_some(value);
+        }
+        self.timings.link_finished_probe_ms = (finished_probe > 0.0).then_some(finished_probe);
         self.timings.link_symbols_ms = (symbols > 0.0).then_some(symbols);
         self.timings.link_survey_ms = (survey > 0.0).then_some(survey);
         self.timings.link_relocate_ms = Some(relocate);

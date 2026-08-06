@@ -214,13 +214,16 @@ pub fn run_in(
             );
         }
     }
+    let precheck_elapsed = exec_started.elapsed();
     let exit_code = if options.internal_link && unsupported.is_none() && foreign.is_none() {
         if options.verbosity == Verbosity::Verbose {
             eprintln!("blinker: linking internally");
         }
-        let phases = internal_link(&parsed, &options, session).map_err(|e| DriverError::Link {
-            detail: e.to_string(),
-        })?;
+        let (phases, request_elapsed) =
+            internal_link(&parsed, &options, session).map_err(|e| DriverError::Link {
+                detail: e.to_string(),
+            })?;
+        record.set_timing_setup(precheck_elapsed, request_elapsed);
         record.set_timing_internal_link(
             exec_started.elapsed(),
             blinker_diagnostics::LinkStages {
@@ -270,6 +273,14 @@ pub fn run_in(
                 ],
                 symbols: phases.symbols_ms,
                 survey: phases.survey_ms,
+                finished_probe: phases.finished_probe_ms,
+                residue: [
+                    phases.intern_ids_ms,
+                    phases.strip_stats_ms,
+                    phases.handback_ms,
+                    phases.teardown_ms,
+                    phases.session_stats_ms,
+                ],
                 cache: blinker_diagnostics::CacheStages {
                     load: phases.cache_load_ms,
                     plan: phases.cache_plan_ms,
@@ -552,11 +563,17 @@ fn link_inputs(parsed: &ParsedInvocation) -> Vec<PathBuf> {
 /// Only object files are accepted so far. An archive or a dylib on the command
 /// line is refused with a message naming it, rather than dropped — a link that
 /// silently ignores an input produces a binary missing whatever was in it.
+/// The link, and how long assembling its request took.
+///
+/// The request is not free — it resolves every `-l` against the search path —
+/// and it is inside the driver's `exec_started`, so leaving it unmeasured put
+/// it in the residual.
 fn internal_link(
     parsed: &ParsedInvocation,
     options: &ProjectOptions,
     session: &mut blinker_link::Session,
-) -> Result<blinker_link::LinkTimings, blinker_link::LinkError> {
+) -> Result<(blinker_link::LinkTimings, std::time::Duration), blinker_link::LinkError> {
+    let request_started = Instant::now();
     let output = parsed
         .output_path()
         .map(Path::to_path_buf)
@@ -609,6 +626,7 @@ fn internal_link(
                 options.json_diagnostics.is_some() || options.verbosity == Verbosity::Verbose,
             );
     }
+    let request_elapsed = request_started.elapsed();
     let timings = blinker_link::link_to_file_in(&request, &output, session)?;
     #[cfg(unix)]
     {
@@ -620,7 +638,7 @@ fn internal_link(
             },
         )?;
     }
-    Ok(timings)
+    Ok((timings, request_elapsed))
 }
 
 /// Build a unique filename for a recorded invocation.

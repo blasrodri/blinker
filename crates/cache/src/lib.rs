@@ -346,6 +346,41 @@ impl LinkCache {
         !self.image.is_empty() && &self.request == request && self.inputs == inputs
     }
 
+    /// The same question `matches` answers, asked as cheaply as the evidence
+    /// allows: whether this cache's finished image is the one `objects` would
+    /// produce.
+    ///
+    /// A key costs either a `stat` or a read and a BLAKE3 of the entire file,
+    /// and which one it costs is decided by the input's *name*. Probing every
+    /// input and then comparing therefore paid the expensive price for all of
+    /// them before looking at any answer — 6.6 ms of a 30 ms ripgrep relink,
+    /// hashing 13 MB of the crate's own objects to establish something the
+    /// first `stat` of a changed `.rlib` already ruled out (finding 232).
+    ///
+    /// So the cheap keys are compared first and the expensive ones only if
+    /// every cheap one agreed, and each pass stops at its first disagreement.
+    /// The order is all that changes: this returns true exactly when `matches`
+    /// would, because it makes the same comparisons.
+    pub fn replays(&self, objects: &[PathBuf], request: &[u8; 32]) -> bool {
+        if self.image.is_empty() || &self.request != request {
+            return false;
+        }
+        // Positional, as `matches` is: the same files in a different order are
+        // a different link, and the cache does not claim otherwise.
+        if self.inputs.len() != objects.len() {
+            return false;
+        }
+        let agrees = |index: usize, path: &Path| {
+            let (recorded_path, recorded_key) = &self.inputs[index];
+            recorded_path == path && InputKey::probe(path).as_ref() == Some(recorded_key)
+        };
+        let (cheap, dear): (Vec<_>, Vec<_>) = objects
+            .iter()
+            .enumerate()
+            .partition(|(_, path)| path_is_content_addressed(path));
+        cheap.into_iter().all(|(i, p)| agrees(i, p)) && dear.into_iter().all(|(i, p)| agrees(i, p))
+    }
+
     /// Roughly what holding this costs, for a caller keeping several.
     ///
     /// The finished image dominates by two orders of magnitude — 178 MB against
@@ -1162,5 +1197,137 @@ mod dep_hash_tests {
     fn hashing_is_stable_across_calls() {
         assert_eq!(name_hash("_main"), name_hash("_main"));
         assert_ne!(name_hash("_main"), name_hash("_other"));
+    }
+}
+
+/// `replays` reorders the comparison `matches` makes. It must not change it.
+///
+/// The reordering exists because a key costs either a `stat` or a read and a
+/// BLAKE3 of the whole file, and probing every input before looking at any
+/// answer paid the expensive price for all of them — 6.6 ms of a 30 ms
+/// ripgrep relink, to establish what the first cheap comparison already ruled
+/// out (finding 232). Cheapening a freshness check is exactly the kind of
+/// change that turns into a stale binary, so the tests below fix the answer
+/// rather than the speed.
+#[cfg(test)]
+mod replay_tests {
+    use super::*;
+
+    /// Two files: one whose name is evidence of its content (`stat`), and one
+    /// whose is not (read and hash). Every case below is built from this pair,
+    /// because the whole point of the reordering is that it treats them
+    /// differently.
+    fn two_inputs(dir: &Path) -> (PathBuf, PathBuf) {
+        let cheap = dir.join("libwhatever-0123456789abcdef.rlib");
+        let dear = dir.join("crate.o");
+        std::fs::write(&cheap, b"an archive").expect("writable");
+        std::fs::write(&dear, b"an object").expect("writable");
+        (cheap, dear)
+    }
+
+    fn cache_of(objects: &[PathBuf]) -> LinkCache {
+        LinkCache {
+            // Non-empty, because an empty image is nothing to replay.
+            image: vec![0u8; 8],
+            inputs: objects
+                .iter()
+                .map(|path| (path.clone(), InputKey::probe(path).expect("probeable")))
+                .collect(),
+            request: [9u8; 32],
+            ..LinkCache::default()
+        }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("blinker-replay-{name}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch");
+        dir
+    }
+
+    /// The property that matters: for every input state, the cheap answer is
+    /// the expensive one.
+    fn agree(cache: &LinkCache, objects: &[PathBuf]) -> bool {
+        let probed: Vec<_> = objects
+            .iter()
+            .filter_map(|path| InputKey::probe(path).map(|key| (path.clone(), key)))
+            .collect();
+        let slow = probed.len() == objects.len() && cache.matches(&probed, &[9u8; 32]);
+        let fast = cache.replays(objects, &[9u8; 32]);
+        assert_eq!(fast, slow, "replays disagreed with matches");
+        fast
+    }
+
+    #[test]
+    fn nothing_changed_still_replays() {
+        let dir = scratch("unchanged");
+        let (cheap, dear) = two_inputs(&dir);
+        let objects = vec![cheap, dear];
+        assert!(agree(&cache_of(&objects), &objects));
+    }
+
+    /// The case the reordering makes fast: a cheap input changed, so nothing
+    /// expensive should need reading — and the answer is still "no".
+    #[test]
+    fn a_changed_archive_does_not_replay() {
+        let dir = scratch("archive");
+        let (cheap, dear) = two_inputs(&dir);
+        let objects = vec![cheap.clone(), dear];
+        let cache = cache_of(&objects);
+        std::fs::write(&cheap, b"a different archive").expect("writable");
+        assert!(!agree(&cache, &objects));
+    }
+
+    /// And the case it must not get wrong: only the expensive input changed,
+    /// so the cheap pass agrees throughout and the answer comes from the hash.
+    #[test]
+    fn a_changed_object_does_not_replay() {
+        let dir = scratch("object");
+        let (cheap, dear) = two_inputs(&dir);
+        let objects = vec![cheap, dear.clone()];
+        let cache = cache_of(&objects);
+        std::fs::write(&dear, b"a different object").expect("writable");
+        assert!(!agree(&cache, &objects));
+    }
+
+    /// Rewriting an object with the same bytes must still replay.
+    ///
+    /// This is the one a cheaper freshness check gets wrong by construction:
+    /// swap the content hash for a timestamp and this file looks changed. It
+    /// is not hypothetical — a build system that rewrites an unchanged output
+    /// is the normal case, and treating that as a change throws away the
+    /// replay every time.
+    #[test]
+    fn rewriting_an_object_with_the_same_bytes_still_replays() {
+        let dir = scratch("rewritten");
+        let (cheap, dear) = two_inputs(&dir);
+        let objects = vec![cheap, dear.clone()];
+        let cache = cache_of(&objects);
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&dear, b"an object").expect("writable");
+        assert!(
+            agree(&cache, &objects),
+            "identical bytes were called a change"
+        );
+    }
+
+    /// An input that vanished is a miss, not a panic.
+    #[test]
+    fn a_missing_input_does_not_replay() {
+        let dir = scratch("missing");
+        let (cheap, dear) = two_inputs(&dir);
+        let objects = vec![cheap, dear.clone()];
+        let cache = cache_of(&objects);
+        std::fs::remove_file(&dear).expect("removable");
+        assert!(!agree(&cache, &objects));
+    }
+
+    /// The same files in another order are another link.
+    #[test]
+    fn reordering_the_inputs_does_not_replay() {
+        let dir = scratch("reordered");
+        let (cheap, dear) = two_inputs(&dir);
+        let cache = cache_of(&[cheap.clone(), dear.clone()]);
+        assert!(!agree(&cache, &[dear, cheap]));
     }
 }

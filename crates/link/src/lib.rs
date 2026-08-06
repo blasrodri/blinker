@@ -230,6 +230,35 @@ pub struct LinkTimings {
     /// Surveying every relocation to discover which GOT, stub and TLV slots the
     /// link needs. Between `resolve` and `layout`, and in neither.
     pub survey_ms: f64,
+    /// Gathering each object's names as ids: an `Arc` clone for a held object,
+    /// real interning for a newly read one. Between `read_and_parse` and
+    /// `dead_strip`, and in neither.
+    pub intern_ids_ms: f64,
+    /// Copying the strip's own counters out, and asking the report how many
+    /// bytes it removed. Diagnostics, between `dead_strip` and `prepare`.
+    pub strip_stats_ms: f64,
+    /// Handing the symbol table and the string table back to the session.
+    /// After `cache_store` and in no stage.
+    pub handback_ms: f64,
+    /// **Freeing** everything the link built.
+    ///
+    /// Every stage timer stops before its locals do, so the cost of releasing
+    /// a link's graph — the parsed objects a one-shot link owns, the address
+    /// maps, the per-object records, the patched section buffers — landed in
+    /// no stage at all while sitting squarely inside the total. It is measured
+    /// as the difference between what `link_inner` says it took and how long
+    /// the call to it actually lasted, which is precisely the drop.
+    pub teardown_ms: f64,
+    /// Asking the session what it held, for the counters. In `link_to_file_in`
+    /// and outside every stage.
+    pub session_stats_ms: f64,
+    /// Probing whether the previous output can be replayed whole.
+    ///
+    /// It runs before the link's own clock starts, so on the far more common
+    /// path — something *did* change — its cost was charged to nothing at all.
+    /// It reads and hashes every input that is not content-addressed by its
+    /// name, which is most of them.
+    pub finished_probe_ms: f64,
     /// Inputs served from memory, and inputs that had to be read. Both zero
     /// for a one-shot link, which holds nothing.
     /// Whether dead-stripping reused the previous link's answer whole.
@@ -2043,10 +2072,12 @@ fn link_inner(
     // object's vector was interned by the link that first parsed it, so this
     // is an `Arc` clone each; a newly read one pays for its own names and
     // nobody else's.
+    let intern_step = std::time::Instant::now();
     let interned: Vec<Arc<Vec<SymbolNameId>>> = objects
         .iter()
         .map(|object| session.interned(&object.parsed))
         .collect();
+    timings.intern_ids_ms = elapsed_ms(intern_step);
 
     // Decided before anything is placed, because it changes how big every
     // contribution is. Everything downstream asks it where an input byte went.
@@ -2071,6 +2102,7 @@ fn link_inner(
 
     timings.dead_strip_ms = elapsed_ms(step);
     gap!(_gap, "after dead_strip");
+    let strip_stats = std::time::Instant::now();
     timings.atoms_ms = strip_timings.atoms_ms;
     timings.liveness_ms = strip_timings.liveness_ms;
     timings.strip_build_ms = strip_timings.build_ms;
@@ -2082,6 +2114,7 @@ fn link_inner(
     timings.reach_total = strip_timings.reach_total;
     timings.stripped_bytes = report.dead_bytes();
     timings.revived_atoms = report.revived as u64;
+    timings.strip_stats_ms = elapsed_ms(strip_stats);
 
     let prep = std::time::Instant::now();
     let mut placements = placements_for(&objects, &strip);
@@ -2743,11 +2776,13 @@ fn link_inner(
     // and gives every name a fresh offset. That is the safe direction — a table
     // half-appended-to by a link that then failed would hand out offsets for
     // names the output never contained.
+    let handback = std::time::Instant::now();
     let mut image = image;
     if let Ok(image) = &mut image {
         session.store_symbols(symbol_state);
         session.store_strings(std::mem::take(&mut image.strings));
     }
+    timings.handback_ms = elapsed_ms(handback);
 
     gap!(_gap, "cache store tail");
     timings.total_ms = elapsed_ms(overall);
@@ -3067,7 +3102,26 @@ fn build_cache(
         entries,
         addresses,
         sections,
-        inputs: input_keys(request).unwrap_or_default(),
+        // Through the same memo the entries used, and so through the session
+        // first. Probing afresh here read and hashed every one of rustc's
+        // objects a second time in the same link — 13 MB on ripgrep, for keys
+        // this function already held (finding 232).
+        inputs: request
+            .objects
+            .iter()
+            .map(|path| {
+                let key = keys
+                    .entry(path.as_path())
+                    .or_insert_with(|| {
+                        session
+                            .key_for(path)
+                            .or_else(|| blinker_cache::InputKey::probe(path))
+                    })
+                    .clone()?;
+                Some((path.clone(), key))
+            })
+            .collect::<Option<Vec<_>>>()
+            .unwrap_or_default(),
         request: request_hash(request),
         // Filled in with the image, for the same reason.
         page_hashes: Vec::new(),
@@ -6750,12 +6804,24 @@ pub fn link_to_file_in(
     output: &Path,
     session: &mut Session,
 ) -> Result<LinkTimings, LinkError> {
-    if let Some(timings) = reuse_finished_image(request, output, session)? {
+    let probe = std::time::Instant::now();
+    let replayed = reuse_finished_image(request, output, session)?;
+    let probe_ms = elapsed_ms(probe);
+    if let Some(mut timings) = replayed {
+        timings.finished_probe_ms = probe_ms;
         return Ok(timings);
     }
-    let mut timings = LinkTimings::default();
+    let mut timings = LinkTimings {
+        finished_probe_ms: probe_ms,
+        ..LinkTimings::default()
+    };
     let overall = std::time::Instant::now();
+    // `link_inner` records its own total before its locals drop, so the
+    // difference between that and how long the call lasted *is* the teardown.
+    let inner = std::time::Instant::now();
     let image = link_inner(request, &mut timings, session)?;
+    timings.teardown_ms = (elapsed_ms(inner) - timings.total_ms).max(0.0);
+    let stats = std::time::Instant::now();
     let (held, read) = session.counts();
     let (bytes, budget) = session.held_memory();
     timings.held_bytes = bytes;
@@ -6768,6 +6834,7 @@ pub fn link_to_file_in(
     let (changes, first) = session.interface_changes();
     timings.interface_changes = changes;
     timings.first_interface_change = first.map(Path::to_path_buf);
+    timings.session_stats_ms = elapsed_ms(stats);
 
     // Inside the total, and timed. It was outside it, and 195 MB reached the
     // filesystem in 19-151 ms depending on what else the machine was doing —
@@ -6845,15 +6912,6 @@ fn request_hash(request: &LinkRequest) -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-/// The input files and the keys that prove them unchanged.
-fn input_keys(request: &LinkRequest) -> Option<Vec<(PathBuf, blinker_cache::InputKey)>> {
-    request
-        .objects
-        .iter()
-        .map(|path| blinker_cache::InputKey::probe(path).map(|key| (path.clone(), key)))
-        .collect()
-}
-
 /// Write the cached binary if it is provably the one this link would produce.
 fn reuse_finished_image(
     request: &LinkRequest,
@@ -6882,12 +6940,9 @@ fn reuse_finished_image(
             }
         }
     };
-    let Some(inputs) = input_keys(request) else {
-        // An input that cannot be examined is one that may have moved; the
-        // full link will produce the real error.
-        return Ok(None);
-    };
-    if !cache.matches(&inputs, &request_hash(request)) {
+    // An input that cannot be examined is one that may have moved, and
+    // `replays` reports that as a miss; the full link produces the real error.
+    if !cache.replays(&request.objects, &request_hash(request)) {
         return Ok(None);
     }
 

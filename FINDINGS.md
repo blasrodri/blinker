@@ -12207,3 +12207,112 @@ was this all along rather than a C++ peculiarity.
 3. The whole-program passes: layout, dead-strip, symbols, survey. Each is
    correct and each redoes the entire program for a two-input edit.
 4. The sidecar, 23% of wall and not in any stage table.
+
+## 232. A quarter of the link belonged to no stage, and it was reading the inputs twice
+
+Finding 231 left 28% of a ripgrep relink unattributed. Nothing should be
+optimised before it is visible, so this attributes it — and the answer was two
+copies of the same 13 MB of BLAKE3, neither of them in any stage.
+
+### Finding it
+
+Five guesses first, all instrumented and all wrong: gathering interned name
+ids (0.00 ms), copying the strip's counters (0.00), handing the symbol table
+back to the session (0.01), reading the session's counters (0.00), and
+**freeing everything the link built** (0.18) — that last one worth measuring
+because every stage timer stops before its locals drop, so a link's
+deallocation genuinely was in the total and in no stage. It is just small.
+
+What located it was comparing the `gap!` chain against the stage timers rather
+than guessing again:
+
+```
+  gap  after read_and_parse: 12.03      read_and_parse 12.03
+  gap      after dead_strip:  4.07      dead_strip      4.06
+  gap       after relocate : 12.08      relocate       12.08
+  gap            after emit:  3.28      emit            3.28
+```
+
+They agree to two decimals, and the chain stops at `emit`. So there was no
+residual *inside* `link_inner` at all — and `internal_link_ms` is measured by
+the **driver**, from `exec_started`, which is a wider bracket than the linker's
+own clock. The missing quarter was never in a stage because it was never in the
+link.
+
+### What was in it
+
+```
+    finished_probe    6.56 ms   21.5%
+    input_precheck    0.92 ms    2.9%
+    unmeasured        0.20 ms    0.7%
+```
+
+`reuse_finished_image` asks whether the previous output can be replayed
+untouched. To answer it, `input_keys` probes every input — and a key is a
+`stat` for a file whose *name* is evidence of its content (rustup's `.rlib`s
+carry a content hash) and a **read plus a BLAKE3 of the whole file** for
+everything else. On ripgrep that is 52 stats and 18 objects totalling 13 MB:
+the crate's own code, which is never content-addressed and is exactly what an
+edit changes.
+
+So on every relink the linker read and hashed 13 MB to decide it could not skip
+the link, having already been told by the first changed `.rlib` — whose key
+costs a `stat` — that it could not.
+
+Then `build_cache` called `input_keys` **again**, hashing the same 13 MB a
+second time in the same link, to record what the link was built from. Its
+per-entry path already asked the session for keys it had proven a moment
+earlier; the input list beside it did not.
+
+### The fix
+
+`LinkCache::replays` makes the comparisons `matches` makes, in a different
+order: every cheap key first, and the expensive ones only if all of those
+agreed. Both passes stop at their first disagreement. It returns true exactly
+when `matches` would — the tests fix that property rather than the speed,
+including the one a cheaper freshness check gets wrong by construction (an
+object rewritten with identical bytes must still replay; swap the hash for a
+timestamp and it does not).
+
+And the cache's input list is built through the same memo its entries use, so
+the session answers for every input it proved.
+
+```
+    finished_probe    6.56 ->  0.02 ms
+    cache_build       6.88 ->  0.32 ms
+```
+
+### What it is worth
+
+Alternating binaries, four rounds, ripgrep incremental relink through the
+daemon (wall median / min):
+
+```
+  before   38.9/36.7   40.6/37.4   38.9/36.6   59.7/57.1
+  after    23.0/22.0   23.4/22.8   32.5/27.3   38.6/33.2
+```
+
+The machine was loaded and the absolute numbers drift by 60%, which is why the
+arms alternate: the new binary wins every round. On minima, **36.6 -> 22.0 ms,
+1.66x** — against ld64's 39.9 ms for the same link cold, which is 1.8x on a
+single medium external binary. That is the claim finding 231 said did not
+survive.
+
+Reuse is unchanged at 283/292 objects and 99% of relocations, all four captured
+workloads link byte-identically to the previous binary, and the cold link is
+untouched (0.92x against ld64, as before).
+
+`self` is a dead heat — 18.3 ms before, 18.5 after. Its own objects are small,
+so there was never 13 MB to hash twice. That is the same blind spot finding 231
+identified: `self` is the workload every number in this file was taken against,
+and it is the one that cannot show this.
+
+### What is left
+
+A C or C++ link has no content-addressed inputs at all, so the cheap pass is
+empty and the probe still hashes until it reaches the first changed object.
+That is strictly better than hashing all of them — `all` short-circuits — but
+it is proportional to where the change happens to sit in the argument list
+rather than to the change. Making it proportional needs a cheap disqualifier
+for content keys, which means recording a stamp beside the hash, which changes
+the cache format. Worth doing, and worth doing on its own.
