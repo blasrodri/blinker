@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "blinker-archive"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blinker-macho",
  "blinker-test-support",
@@ -65,7 +65,7 @@ dependencies = [
 
 [[package]]
 name = "blinker-arguments"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blinker-test-support",
  "serde",
@@ -73,7 +73,7 @@ dependencies = [
 
 [[package]]
 name = "blinker-cache"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "blinker-layout",
@@ -82,7 +82,7 @@ dependencies = [
 
 [[package]]
 name = "blinker-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "blinker-arguments",
@@ -97,7 +97,7 @@ dependencies = [
 
 [[package]]
 name = "blinker-corpus"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blinker-arguments",
  "blinker-test-support",
@@ -106,7 +106,7 @@ dependencies = [
 
 [[package]]
 name = "blinker-diagnostics"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "blinker-test-support",
@@ -116,7 +116,7 @@ dependencies = [
 
 [[package]]
 name = "blinker-differential"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blinker-layout",
  "blinker-macho",
@@ -127,11 +127,11 @@ dependencies = [
 
 [[package]]
 name = "blinker-hashing"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "blinker-layout"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blinker-macho",
  "serde",
@@ -140,7 +140,7 @@ dependencies = [
 
 [[package]]
 name = "blinker-link"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "blinker-archive",
@@ -158,7 +158,7 @@ dependencies = [
 
 [[package]]
 name = "blinker-macho"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blinker-test-support",
  "object",
@@ -168,7 +168,7 @@ dependencies = [
 
 [[package]]
 name = "blinker-output"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blinker-hashing",
  "blinker-layout",
@@ -179,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "blinker-relocations"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blinker-macho",
  "blinker-test-support",
@@ -187,7 +187,7 @@ dependencies = [
 
 [[package]]
 name = "blinker-symbols"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blinker-archive",
  "blinker-hashing",
@@ -198,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "blinker-tbd"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -207,7 +207,7 @@ dependencies = [
 
 [[package]]
 name = "blinker-test-support"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "serde_json",
 ]
