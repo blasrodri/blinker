@@ -3122,6 +3122,13 @@ fn build_cache(
             })
             .collect::<Option<Vec<_>>>()
             .unwrap_or_default(),
+        // One `stat` per input, so the next link can rule most of them out
+        // without reading any of them.
+        stamps: request
+            .objects
+            .iter()
+            .map(|path| blinker_cache::Stamp::of(path))
+            .collect(),
         request: request_hash(request),
         // Filled in with the image, for the same reason.
         page_hashes: Vec::new(),

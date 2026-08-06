@@ -61,7 +61,7 @@ use codec::{Decoder, Encoder};
 /// A stale layout read as a current one is the one failure mode of a cache
 /// that produces a *wrong* binary rather than a slow one, so the version is
 /// checked before any other byte is trusted.
-pub const SCHEMA: u32 = 4;
+pub const SCHEMA: u32 = 5;
 
 const MAGIC: &[u8; 8] = b"BLNKCAC\x01";
 
@@ -215,6 +215,36 @@ pub enum InputKey {
     },
 }
 
+/// What a `stat` says about a file, kept beside its key to disqualify it
+/// cheaply.
+///
+/// Deliberately **not** part of an `InputKey`. A timestamp and a size are not
+/// evidence of content — two different files can share both — so this can only
+/// ever say "this may have changed", never "this is the same". That is exactly
+/// what a disqualifier needs and nothing more, and keeping it out of the key
+/// keeps the key's meaning intact: `InputKey` still answers "are these the
+/// same bytes", and is still the only thing allowed to answer yes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Stamp {
+    pub modified_nanos: u128,
+    pub size: u64,
+}
+
+impl Stamp {
+    pub fn of(path: &Path) -> Option<Stamp> {
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(Stamp {
+            modified_nanos: metadata
+                .modified()
+                .ok()?
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()?
+                .as_nanos(),
+            size: metadata.len(),
+        })
+    }
+}
+
 impl InputKey {
     /// Choose a key for `path`, reading the file only when the path is not
     /// itself evidence of its content.
@@ -303,6 +333,13 @@ pub struct LinkCache {
     /// to link. That ratio is what makes the whole-image path below worth
     /// having.
     pub inputs: Vec<(PathBuf, InputKey)>,
+    /// What a `stat` said about each of `inputs`, in the same order.
+    ///
+    /// Only consulted for inputs whose key is a content hash, because those
+    /// are the ones that cost a read of the whole file to check. An entry is
+    /// `None` when the stamp could not be taken, which disqualifies nothing —
+    /// the hash then decides, as it did before this existed.
+    pub stamps: Vec<Option<Stamp>>,
     /// Everything about the request that is not an input file.
     ///
     /// The entry symbol, the dylibs, the stub libraries, the signing
@@ -374,11 +411,23 @@ impl LinkCache {
             let (recorded_path, recorded_key) = &self.inputs[index];
             recorded_path == path && InputKey::probe(path).as_ref() == Some(recorded_key)
         };
+        // A stamp cannot say two files are the same, only that they may be, so
+        // it is read in one direction: a stamp that moved means the file is
+        // not provably unchanged, and there is nothing to replay. A stamp that
+        // stayed proves nothing, and the hash below still decides.
+        let stamp_moved = |index: usize, path: &Path| {
+            let Some(Some(recorded)) = self.stamps.get(index) else {
+                return false;
+            };
+            Stamp::of(path).is_none_or(|stamp| stamp != *recorded)
+        };
         let (cheap, dear): (Vec<_>, Vec<_>) = objects
             .iter()
             .enumerate()
             .partition(|(_, path)| path_is_content_addressed(path));
-        cheap.into_iter().all(|(i, p)| agrees(i, p)) && dear.into_iter().all(|(i, p)| agrees(i, p))
+        cheap.iter().all(|(i, p)| agrees(*i, p))
+            && !dear.iter().any(|(i, p)| stamp_moved(*i, p))
+            && dear.iter().all(|(i, p)| agrees(*i, p))
     }
 
     /// Roughly what holding this costs, for a caller keeping several.
@@ -592,11 +641,12 @@ fn encode(cache: &LinkCache) -> Vec<u8> {
     }
 
     out.u32(cache.inputs.len() as u32);
-    for (path, key) in &cache.inputs {
+    for (index, (path, key)) in cache.inputs.iter().enumerate() {
         let path = path.to_string_lossy();
         out.u32(path.len() as u32);
         out.bytes_raw(path.as_bytes());
         encode_key(&mut out, key);
+        encode_stamp(&mut out, cache.stamps.get(index).unwrap_or(&None));
     }
     out.bytes_raw(&cache.request);
 
@@ -639,6 +689,33 @@ fn encode(cache: &LinkCache) -> Vec<u8> {
     out.u32(cache.image.len() as u32);
     out.bytes_raw(&cache.image);
     out.finish()
+}
+
+fn encode_stamp(out: &mut Encoder, stamp: &Option<Stamp>) {
+    match stamp {
+        None => out.u32(0),
+        Some(stamp) => {
+            out.u32(1);
+            out.u64((stamp.modified_nanos >> 64) as u64);
+            out.u64(stamp.modified_nanos as u64);
+            out.u64(stamp.size);
+        }
+    }
+}
+
+fn decode_stamp(input: &mut Decoder<'_>) -> Option<Option<Stamp>> {
+    Some(match input.u32()? {
+        0 => None,
+        1 => {
+            let high = input.u64()? as u128;
+            let low = input.u64()? as u128;
+            Some(Stamp {
+                modified_nanos: (high << 64) | low,
+                size: input.u64()?,
+            })
+        }
+        _ => return None,
+    })
 }
 
 fn encode_key(out: &mut Encoder, key: &InputKey) {
@@ -746,10 +823,12 @@ fn decode(bytes: &[u8]) -> Option<LinkCache> {
     }
 
     let mut inputs = Vec::new();
+    let mut stamps = Vec::new();
     for _ in 0..input.u32()? {
         let length = input.u32()? as usize;
         let path = PathBuf::from(std::str::from_utf8(input.bytes_raw(length)?).ok()?);
         inputs.push((path, decode_key(&mut input)?));
+        stamps.push(decode_stamp(&mut input)?);
     }
     let request: [u8; 32] = input.bytes_raw(32)?.try_into().ok()?;
 
@@ -804,6 +883,7 @@ fn decode(bytes: &[u8]) -> Option<LinkCache> {
         addresses,
         sections,
         inputs,
+        stamps,
         request,
         layout,
         page_hashes,
@@ -852,6 +932,10 @@ mod tests {
             addresses: addresses_from([("_main".to_string(), 0x1000)]),
             sections: vec![(1, vec![0xab; 64])],
             inputs: vec![(PathBuf::from("/tmp/a.o"), InputKey::Content([1u8; 32]))],
+            stamps: vec![Some(Stamp {
+                modified_nanos: 1_700_000_000_000_000_000,
+                size: 4096,
+            })],
             request: [2u8; 32],
             page_hashes: vec![[3u8; 32], [4u8; 32]],
             layout: {
@@ -1200,15 +1284,20 @@ mod dep_hash_tests {
     }
 }
 
-/// `replays` reorders the comparison `matches` makes. It must not change it.
+/// What `replays` promises, and the one thing it gives up.
 ///
-/// The reordering exists because a key costs either a `stat` or a read and a
-/// BLAKE3 of the whole file, and probing every input before looking at any
-/// answer paid the expensive price for all of them — 6.6 ms of a 30 ms
-/// ripgrep relink, to establish what the first cheap comparison already ruled
-/// out (finding 232). Cheapening a freshness check is exactly the kind of
-/// change that turns into a stale binary, so the tests below fix the answer
-/// rather than the speed.
+/// It exists because a key costs either a `stat` or a read and a BLAKE3 of the
+/// whole file, and probing every input before looking at any answer paid the
+/// expensive price for all of them — 6.6 ms of a 30 ms ripgrep relink, to
+/// establish what the first cheap comparison already ruled out (finding 232).
+///
+/// The promise is one-directional: **`replays` never claims a replay that
+/// `matches` would not**. It may decline one that `matches` would allow, and
+/// there is exactly one case where it does — a file rewritten with identical
+/// bytes, whose stamp moved and whose hash did not. That costs a full link,
+/// which is correct and reuses almost everything; the opposite error costs a
+/// stale binary. Cheapening a freshness check is exactly the kind of change
+/// that ships one, so the tests below fix the answer rather than the speed.
 #[cfg(test)]
 mod replay_tests {
     use super::*;
@@ -1233,6 +1322,7 @@ mod replay_tests {
                 .iter()
                 .map(|path| (path.clone(), InputKey::probe(path).expect("probeable")))
                 .collect(),
+            stamps: objects.iter().map(|path| Stamp::of(path)).collect(),
             request: [9u8; 32],
             ..LinkCache::default()
         }
@@ -1245,16 +1335,23 @@ mod replay_tests {
         dir
     }
 
-    /// The property that matters: for every input state, the cheap answer is
-    /// the expensive one.
-    fn agree(cache: &LinkCache, objects: &[PathBuf]) -> bool {
+    /// The expensive answer, for comparison.
+    fn matches_exactly(cache: &LinkCache, objects: &[PathBuf]) -> bool {
         let probed: Vec<_> = objects
             .iter()
             .filter_map(|path| InputKey::probe(path).map(|key| (path.clone(), key)))
             .collect();
-        let slow = probed.len() == objects.len() && cache.matches(&probed, &[9u8; 32]);
+        probed.len() == objects.len() && cache.matches(&probed, &[9u8; 32])
+    }
+
+    /// The invariant, asserted on every case: a replay is never claimed that
+    /// the full comparison would refuse.
+    fn replays(cache: &LinkCache, objects: &[PathBuf]) -> bool {
         let fast = cache.replays(objects, &[9u8; 32]);
-        assert_eq!(fast, slow, "replays disagreed with matches");
+        assert!(
+            !fast || matches_exactly(cache, objects),
+            "replays claimed a replay that matches refuses"
+        );
         fast
     }
 
@@ -1263,7 +1360,8 @@ mod replay_tests {
         let dir = scratch("unchanged");
         let (cheap, dear) = two_inputs(&dir);
         let objects = vec![cheap, dear];
-        assert!(agree(&cache_of(&objects), &objects));
+        let cache = cache_of(&objects);
+        assert!(replays(&cache, &objects));
     }
 
     /// The case the reordering makes fast: a cheap input changed, so nothing
@@ -1275,11 +1373,11 @@ mod replay_tests {
         let objects = vec![cheap.clone(), dear];
         let cache = cache_of(&objects);
         std::fs::write(&cheap, b"a different archive").expect("writable");
-        assert!(!agree(&cache, &objects));
+        assert!(!replays(&cache, &objects));
     }
 
-    /// And the case it must not get wrong: only the expensive input changed,
-    /// so the cheap pass agrees throughout and the answer comes from the hash.
+    /// And the case the stamp makes fast: the expensive input changed, and no
+    /// file is read to find that out.
     #[test]
     fn a_changed_object_does_not_replay() {
         let dir = scratch("object");
@@ -1287,18 +1385,35 @@ mod replay_tests {
         let objects = vec![cheap, dear.clone()];
         let cache = cache_of(&objects);
         std::fs::write(&dear, b"a different object").expect("writable");
-        assert!(!agree(&cache, &objects));
+        assert!(!replays(&cache, &objects));
     }
 
-    /// Rewriting an object with the same bytes must still replay.
+    /// A file whose bytes changed while its stamp did not is caught by the
+    /// hash, which is the only reason the hash is still taken.
     ///
-    /// This is the one a cheaper freshness check gets wrong by construction:
-    /// swap the content hash for a timestamp and this file looks changed. It
-    /// is not hypothetical — a build system that rewrites an unchanged output
-    /// is the normal case, and treating that as a change throws away the
-    /// replay every time.
+    /// Constructed by writing the new bytes and then restoring the recorded
+    /// stamp, which is what a same-size write inside one timestamp tick looks
+    /// like. Without the hash this would replay a stale binary.
     #[test]
-    fn rewriting_an_object_with_the_same_bytes_still_replays() {
+    fn a_changed_object_with_an_unchanged_stamp_is_still_caught() {
+        let dir = scratch("silent");
+        let (cheap, dear) = two_inputs(&dir);
+        let objects = vec![cheap, dear.clone()];
+        let mut cache = cache_of(&objects);
+        std::fs::write(&dear, b"AN OBJECT").expect("writable");
+        // Same length by construction; pin the stamp to what was recorded.
+        cache.stamps[1] = Stamp::of(&dear);
+        assert!(!replays(&cache, &objects), "a changed object replayed");
+    }
+
+    /// The one thing the stamp gives up: identical bytes, moved stamp.
+    ///
+    /// `matches` would replay this and `replays` declines. That is the safe
+    /// direction — a full link, which is correct — and it is the price of not
+    /// reading every input on every link. It is written down as a test so the
+    /// trade is a decision rather than a surprise.
+    #[test]
+    fn rewriting_an_object_with_the_same_bytes_declines_the_replay() {
         let dir = scratch("rewritten");
         let (cheap, dear) = two_inputs(&dir);
         let objects = vec![cheap, dear.clone()];
@@ -1306,9 +1421,24 @@ mod replay_tests {
         std::thread::sleep(std::time::Duration::from_millis(10));
         std::fs::write(&dear, b"an object").expect("writable");
         assert!(
-            agree(&cache, &objects),
-            "identical bytes were called a change"
+            matches_exactly(&cache, &objects),
+            "the bytes really are identical, so this case is the trade and not a bug"
         );
+        assert!(!replays(&cache, &objects));
+    }
+
+    /// A cache written before stamps existed has none, and must still work:
+    /// no stamp disqualifies nothing, and the hash decides as it always did.
+    #[test]
+    fn a_cache_without_stamps_falls_back_to_hashing() {
+        let dir = scratch("stampless");
+        let (cheap, dear) = two_inputs(&dir);
+        let objects = vec![cheap, dear.clone()];
+        let mut cache = cache_of(&objects);
+        cache.stamps.clear();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::fs::write(&dear, b"an object").expect("writable");
+        assert!(replays(&cache, &objects), "the hash should have allowed it");
     }
 
     /// An input that vanished is a miss, not a panic.
@@ -1319,7 +1449,7 @@ mod replay_tests {
         let objects = vec![cheap, dear.clone()];
         let cache = cache_of(&objects);
         std::fs::remove_file(&dear).expect("removable");
-        assert!(!agree(&cache, &objects));
+        assert!(!replays(&cache, &objects));
     }
 
     /// The same files in another order are another link.
@@ -1328,6 +1458,6 @@ mod replay_tests {
         let dir = scratch("reordered");
         let (cheap, dear) = two_inputs(&dir);
         let cache = cache_of(&[cheap.clone(), dear.clone()]);
-        assert!(!agree(&cache, &[dear, cheap]));
+        assert!(!replays(&cache, &[dear, cheap]));
     }
 }

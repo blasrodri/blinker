@@ -12316,3 +12316,75 @@ it is proportional to where the change happens to sit in the argument list
 rather than to the change. Making it proportional needs a cheap disqualifier
 for content keys, which means recording a stamp beside the hash, which changes
 the cache format. Worth doing, and worth doing on its own.
+
+## 233. A stamp beside the hash, and the first C workload to show why
+
+Finding 232 left the freshness probe proportional to *where* a change sits in
+the argument list rather than to the change. The cheap pass only helps inputs
+whose name is evidence of their content, and a C or C++ link has none: every
+input is a plain `.o` or `.a`, so every one of them is a read and a BLAKE3 of
+the whole file, on every link.
+
+### Nothing in the corpus could show it
+
+pulsevm was captured expecting the C++ case and is not one:
+
+```
+  312 inputs: 294 stat (720 MB), 18 read+hash (7 MB)
+```
+
+294 rlibs. Same shape as ripgrep, and a change written for the other shape has
+nothing to be true against. Every workload in the corpus is a Rust link, which
+is a blind spot of the same kind finding 231 found in `self`.
+
+So `scripts/c-workload.py` builds one: 201 translation units with debug info,
+3.9 MB of objects, none of them content-addressed. Synthetic, and its comment
+says so — the *shape* is faithful, the code is generated, and what it measures
+honestly is cost proportional to input bytes and count, which is what the probe
+is.
+
+### The change
+
+`Stamp` — modification time and size — recorded beside each input in the cache
+and read in one direction only. A stamp that moved means the file is not
+provably unchanged, so there is nothing to replay and no file is read. A stamp
+that stayed proves nothing, and the hash still decides.
+
+It is deliberately not part of `InputKey`. A timestamp and a size are not
+evidence of content, and keeping them out of the key keeps the key's meaning:
+`InputKey` still answers "are these the same bytes", and is still the only
+thing allowed to answer yes.
+
+### What it costs and what it buys, both measured
+
+201-object C link, alternating arms, a real content edit to one unit per cycle:
+
+```
+              probe median    link min   link median
+  before          3.57 ms      10.89       11.91
+  after           0.16 ms       8.20        8.30
+```
+
+1.4x, and the probe is 22x cheaper. On ripgrep it is a dead heat — 22.4/22.4,
+22.6/22.3, 22.7/22.9 across three alternations — because ripgrep's expensive
+inputs were already a minority the cheap pass reached first.
+
+The price is a false negative, and it has a number too. A file rewritten with
+*identical* bytes has a moved stamp and an unmoved hash, so the whole-image
+replay is declined where it would previously have hit: 7.06 ms becomes 8.34 on
+that path. It buys 3.6 ms on every real edit and costs 1.3 ms when a build
+system rewrites something it did not change. Both directions are tests rather
+than prose, including the one that matters most — a changed object whose stamp
+did not move must still be caught, or this ships a stale binary.
+
+### The harness was measuring the wrong path first
+
+The first version of the C measurement recompiled the same source each cycle
+and reported the change as a 1.2x **loss**. `cc` is deterministic, so
+recompiling unchanged source produces an identical object, and the arm without
+the stamp was replaying the finished image every iteration — 7 ms of which 4.9
+was the probe — while the arm with it did a real relink. Not an edit, and not a
+comparison: the same mistake `scripts/relink.py` documents at length and
+guards against, made again in a fixture written beside it.
+
+Six workloads link byte-identically before and after, now including a C one.
