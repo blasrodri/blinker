@@ -39,6 +39,15 @@
 pub struct UnwindEntry {
     /// Function address, relative to the image base.
     pub function_offset: u32,
+    /// How long the function is.
+    ///
+    /// Read only to compute the sentinel, which is the address *past* the last
+    /// function. Nothing else in the table needs it — an entry's range runs to
+    /// wherever the next entry starts — which is why it was read and thrown
+    /// away, and why the sentinel was the last function's *start* (finding
+    /// 239). That makes the last function's range empty, so the unwinder finds
+    /// no unwind info for any address inside it.
+    pub length: u32,
     /// The compact encoding, without personality bits.
     pub encoding: u32,
     /// Personality routine, as an image-relative offset to its pointer slot.
@@ -158,7 +167,16 @@ pub fn build(mut entries: Vec<UnwindEntry>) -> Vec<u8> {
 
     // The sentinel gives the end of the last function and terminates the
     // search. Its page offset is zero, which is how the unwinder recognises it.
-    let end = entries.last().map(|e| e.function_offset).unwrap_or(0);
+    //
+    // Past the end, not at the start: the unwinder takes the last index entry
+    // whose function offset is `<= pc`, so a sentinel sitting *on* the last
+    // function makes that function's range empty and its unwind info
+    // unreachable. With one function in the table nothing is covered at all,
+    // which is how a C++ `throw` in `main` walked out of the program.
+    let end = entries
+        .last()
+        .map(|e| e.function_offset.saturating_add(e.length))
+        .unwrap_or(0);
     push(end, &mut out);
     push(0, &mut out);
     push(lsda_cursor as u32, &mut out);
@@ -205,6 +223,7 @@ mod tests {
     fn entry(offset: u32) -> UnwindEntry {
         UnwindEntry {
             function_offset: offset,
+            length: 4,
             encoding: 0x0400_0000,
             personality: None,
             lsda: None,
@@ -341,6 +360,45 @@ mod tests {
 }
 
 #[cfg(test)]
+mod sentinel_tests {
+    use super::*;
+
+    /// The sentinel must be *past* the last function, not on it.
+    ///
+    /// The unwinder takes the last index entry whose function offset is at or
+    /// below the pc it is asking about. A sentinel sitting on the last
+    /// function's start makes that function's range empty, so its unwind info
+    /// cannot be found — and with one function in the table, nothing can
+    /// (finding 239).
+    #[test]
+    fn the_sentinel_is_past_the_end_of_the_last_function() {
+        let entries = vec![UnwindEntry {
+            function_offset: 0x1000,
+            length: 0x40,
+            encoding: 0x0400_0000,
+            personality: None,
+            lsda: None,
+        }];
+        let data = build(entries);
+        let read = |i: usize| u32::from_le_bytes(data[i..i + 4].try_into().unwrap());
+        let index_offset = read(20) as usize;
+        let index_count = read(24) as usize;
+        assert_eq!(index_count, 2, "one page and a sentinel");
+        let first = read(index_offset);
+        let sentinel = read(index_offset + INDEX_ENTRY_SIZE);
+        assert_eq!(first, 0x1000);
+        assert_eq!(
+            sentinel, 0x1040,
+            "the sentinel is on the function rather than after it, so its range is empty"
+        );
+        assert!(
+            sentinel > first,
+            "a sentinel at or below the first entry covers nothing at all"
+        );
+    }
+}
+
+#[cfg(test)]
 mod bound_tests {
     use super::*;
 
@@ -348,6 +406,7 @@ mod bound_tests {
         (0..count)
             .map(|i| UnwindEntry {
                 function_offset: i as u32 * 4,
+                length: 4,
                 encoding: 0,
                 personality: Some(0x1000 + (i as u32 % 3)),
                 lsda: with_lsda(i).then_some(0x2000 + i as u32),

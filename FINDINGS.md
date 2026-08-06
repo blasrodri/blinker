@@ -12721,3 +12721,89 @@ The released v0.1.0 fails it, as does every binary in this session. Rust panics
 specific to the C++ personality rather than to unwinding as such. Recorded here
 rather than fixed: it is not what this commit is about, and it is the largest
 thing now known to be broken.
+
+## 239. Two faults, and C++ exceptions never worked
+
+The fixture written in finding 238 to check that a smaller unwind table still
+unwinds does not unwind:
+
+```
+  ld64      caught 42
+  blinker   libc++abi: terminating due to uncaught exception of type int
+```
+
+`int main() { try { throw 42; } catch (int v) { ... } }`. The smallest C++
+program with an exception in it, and every blinker ever built fails it,
+including the released v0.1.0. Rust panics *are* caught, which is what kept it
+hidden — and, it turns out, is also the direct cause of the first fault.
+
+Dumping both tables side by side:
+
+```
+  ld64      personalities 1@28   personality[0] = image+0x4028
+            index[0] function image+0x4e8   index[1] function image+0x5a4
+  blinker   personalities 0@28
+            index[0] function image+0x4d0   index[1] function image+0x4d0
+```
+
+Two independent faults, either of which alone terminates the program.
+
+### One: the personality was dropped because it had no address
+
+`compact_unwind_entries_of` resolved each relocation's target address first and
+skipped the record on failure:
+
+```rust
+let Ok(base) = target_address(object, ids, placed, addresses, relocation.target) else {
+    continue;
+};
+```
+
+An **imported** symbol has no address in this image — that is what importing
+means — so `___gxx_personality_v0`, which lives in libc++abi, took the
+`continue` and its record was never seen. `__unwind_info` was written with zero
+personalities and the unwinder had nothing to call.
+
+`rust_eh_personality` is linked *into* the program and does have an address. So
+the one language whose personality is statically present is the one language
+whose exceptions worked, and the corpus is entirely that language.
+
+The field never needed an address: what reaches the table is the routine's GOT
+slot, looked up by name afterwards. It is now read before any address is.
+
+### Two: the sentinel was on the last function rather than past it
+
+```rust
+let end = entries.last().map(|e| e.function_offset).unwrap_or(0);
+```
+
+The first-level index ends with a sentinel giving the address *past* the last
+function. This gave its *start*. The unwinder takes the last index entry whose
+function offset is `<= pc`, so the last function's range is empty and its
+unwind info unreachable — and in a program with one function, that is the whole
+table covering nothing.
+
+The length was there all along, read out of the record and discarded:
+
+```rust
+let _length = read_u32(CU_LENGTH);
+```
+
+Every binary blinker has produced is missing unwind info for its last function.
+For Rust that is one arbitrary function and nothing noticed. For a small C++
+program it is `main`.
+
+### Tests
+
+Three, behavioural on purpose, all three failing without the fix: a bare
+`throw`/`catch`; an exception through twenty-one frames, checking every
+destructor ran; and one passing through a frame with no landing pad of its own.
+Behavioural because every field of these tables can be inspected and look
+right while the unwinder still finds nothing — which is what was happening.
+
+Plus a unit test on the sentinel, which is a property (`sentinel > first`) that
+no test had ever stated.
+
+ripgrep, pulsevm and the rest link and run unchanged; the tables grow by four
+bytes on pulsevm, which is one more index entry's worth of sentinel being
+correct.

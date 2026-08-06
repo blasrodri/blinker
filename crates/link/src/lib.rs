@@ -1465,6 +1465,29 @@ fn compact_unwind_entries_of(
             // object's own coordinate space, so the offset within that section
             // has to be recovered before rebasing onto the output address.
             for relocation in object.parsed.relocations_for(section.id) {
+                // The personality field is answered before any address is,
+                // because it does not need one: what reaches the table is the
+                // routine's *GOT slot*, looked up by name below.
+                //
+                // It used to be read after `target_address`, which returns
+                // `Err` for a symbol with no address in this image — and an
+                // imported personality is exactly that. So the `continue`
+                // below dropped it, `__unwind_info` was written with zero
+                // personalities, and the unwinder had nothing to call: a C++
+                // `throw` walked out of `main` and terminated. Rust escaped it
+                // only because `rust_eh_personality` is linked *into* the
+                // program and so does have an address (finding 239).
+                if relocation.offset % COMPACT_UNWIND_RECORD == CU_PERSONALITY {
+                    if let RelocationTarget::Symbol(id) = relocation.target {
+                        if let Some(symbol) = object.parsed.symbol(id) {
+                            let scope = symbol_scope(object.parsed.id, symbol);
+                            let record = relocation.offset / COMPACT_UNWIND_RECORD;
+                            personality_names.insert(record, (scope, symbol.name.clone()));
+                        }
+                    }
+                    // Nothing reads this field out of `targets`.
+                    continue;
+                }
                 let Ok(base) = target_address(object, ids, placed, addresses, relocation.target)
                 else {
                     continue;
@@ -1502,14 +1525,6 @@ fn compact_unwind_entries_of(
                 let record = relocation.offset / COMPACT_UNWIND_RECORD;
                 let field = relocation.offset % COMPACT_UNWIND_RECORD;
 
-                if field == CU_PERSONALITY {
-                    if let RelocationTarget::Symbol(id) = relocation.target {
-                        if let Some(symbol) = object.parsed.symbol(id) {
-                            let scope = symbol_scope(object.parsed.id, symbol);
-                            personality_names.insert(record, (scope, symbol.name.clone()));
-                        }
-                    }
-                }
                 targets.insert((record, field), address);
             }
 
@@ -1532,7 +1547,9 @@ fn compact_unwind_entries_of(
                 let Some(encoding) = read_u32(CU_ENCODING) else {
                     continue;
                 };
-                let _length = read_u32(CU_LENGTH);
+                // Needed for the sentinel: the table has to say where the
+                // last function ends, not where it starts.
+                let length = read_u32(CU_LENGTH).unwrap_or(0);
 
                 // A DWARF-mode encoding must carry the offset of this
                 // function's FDE. Without it the unwinder follows a zero and
@@ -1546,6 +1563,7 @@ fn compact_unwind_entries_of(
 
                 entries.push(UnwindEntry {
                     function_offset: (function - image_base) as u32,
+                    length,
                     encoding,
                     personality: personality_names
                         .get(&record)
