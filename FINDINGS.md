@@ -12649,3 +12649,75 @@ liveness half needs no new structure; the address half does.
 Three measurements, three approaches eliminated, and the one that remains is the
 one that was expensive from the start. That is a worse answer than a cheap fix
 and a better one than a cheap fix that recovers a fifth.
+
+## 238. Half of `__unwind_info` was padding, and the comment said kilobytes
+
+`__unwind_info` is 3.10 MB on pulsevm against ld64's 0.49, and the obvious
+explanation is that blinker emits only `UNWIND_SECOND_LEVEL_REGULAR` pages
+where ld64 compresses. Before building compression, measuring what is actually
+in the section:
+
+```
+  pulsevm   table 1554972 bytes, reserved 3102336 bytes
+  ripgrep   table   71696 bytes, reserved  143004 bytes
+```
+
+1.995 and 1.994. The reservation is exactly twice the table on both, and the
+section is padded out to it — so half of `__unwind_info` in every binary
+blinker has ever produced is zeroes.
+
+`upper_bound_size` is computed before any address is known, so it must never
+under-estimate, and it assumed every record carries an LSDA. An LSDA index
+entry is eight bytes and a table entry is eight bytes, so "every record has an
+LSDA" is precisely "double it". Its comment read:
+
+```rust
+// Deliberately generous: ... Over-reserving wastes a few kilobytes;
+// under-reserving is a link failure.
+```
+
+Right about the direction of the risk, wrong about the cost by three orders of
+magnitude.
+
+### The count was already being walked
+
+A record's LSDA is a relocation on its own field, and `live_unwind_records`
+already walks that section's relocations to count which records survive
+stripping. Counting the ones at `CU_LSDA` is the same walk, so the number that
+halves the reservation was free.
+
+```
+                before        after      saved
+  pulsevm    135865292    134355020    1510272
+  ripgrep      7211207      7145543      65664
+  self         2820537      2804121      16416
+  cproj        1991114      1974698      16416
+```
+
+The bound test now tries none, one, every other and all records carrying an
+LSDA — three of those four shapes had never been exercised, because the old
+bound could not tell them apart. A second test fixes tightness rather than
+safety: the reservation must not exceed the table by more than an eighth,
+which is the property that was silently false.
+
+`__unwind_info` is now 1.60 MB against ld64's 0.49. The remaining 3x is the
+compression this went looking for, plus merging adjacent entries that share an
+encoding — and both are harder than they look, because the section is *sized*
+before layout and padded to that size afterwards, so a smaller table only
+becomes a smaller binary if the reservation can predict it.
+
+### Found on the way: C++ exceptions do not unwind
+
+The fixture written to check that a smaller table still unwinds does not
+unwind, and did not before this change either:
+
+```
+  ld64      caught: bottom
+  blinker   libc++abi: terminating due to uncaught exception
+```
+
+The released v0.1.0 fails it, as does every binary in this session. Rust panics
+*are* caught — `catch_unwind` and `#[should_panic]` both work — so this is
+specific to the C++ personality rather than to unwinding as such. Recorded here
+rather than fixed: it is not what this commit is about, and it is the largest
+thing now known to be broken.

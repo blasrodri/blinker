@@ -3413,29 +3413,32 @@ fn unwind_table_size(objects: &[LoadedObject], strip: &Strip) -> u64 {
     // On every core: counting a section's live records reads that object's
     // relocations and the strip map, and writes nothing. It is a reduction, so
     // the chunking cannot reach the answer.
-    let records: usize = crate::parallel::map_chunks(objects, |_, chunk| {
+    let counted = crate::parallel::map_chunks(objects, |_, chunk| {
         chunk
             .iter()
-            .map(|object| {
+            .flat_map(|object| {
                 object
                     .parsed
                     .sections
                     .iter()
                     .filter(|s| s.name == "__compact_unwind")
                     .map(|s| live_unwind_records(object, s, strip))
-                    .sum::<usize>()
             })
-            .sum::<usize>()
-    })
-    .into_iter()
-    .sum();
+            .fold((0usize, 0usize), |(r, l), (dr, dl)| (r + dr, l + dl))
+    });
+    let (records, lsdas) = counted
+        .into_iter()
+        .fold((0usize, 0usize), |(r, l), (dr, dl)| (r + dr, l + dl));
     if records == 0 {
         return 0;
     }
-    // Deliberately generous: the real table is smaller once duplicate function
-    // offsets collapse and only some entries carry an LSDA. Over-reserving
-    // wastes a few kilobytes; under-reserving is a link failure.
-    blinker_output::unwind::upper_bound_size(records) as u64
+    // Still an upper bound — duplicate function offsets have not collapsed yet
+    // — but no longer one that assumes *every* record carries an LSDA. That
+    // assumption doubled it: the LSDA index entry and the table entry are eight
+    // bytes each, so a table of records that mostly have no LSDA was reserved
+    // at twice its size and the difference written out as zeroes. 1.55 MB of
+    // them on pulsevm (finding 238), against a comment claiming kilobytes.
+    blinker_output::unwind::upper_bound_size(records, lsdas) as u64
 }
 
 /// How many of a section's compact unwind records describe a function that
@@ -3445,10 +3448,21 @@ fn unwind_table_size(objects: &[LoadedObject], strip: &Strip) -> u64 {
 /// at 35 KB where 5 KB was used — the largest single thing separating blinker's
 /// stripped output from the system linker's, and invisible because
 /// over-reserving is safe.
-fn live_unwind_records(object: &LoadedObject, section: &InputSection, strip: &Strip) -> usize {
+fn live_unwind_records(
+    object: &LoadedObject,
+    section: &InputSection,
+    strip: &Strip,
+) -> (usize, usize) {
     let total = (section.size / COMPACT_UNWIND_RECORD) as usize;
     let mut live = 0;
+    // Records carrying an LSDA, which is what the index is sized from. A
+    // record's LSDA is a relocation on its own field, in the walk already
+    // happening here — so the count that halves the reservation is free.
+    let mut lsdas = 0;
     for relocation in object.parsed.relocations_for(section.id) {
+        if relocation.offset % COMPACT_UNWIND_RECORD == CU_LSDA {
+            lsdas += 1;
+        }
         if relocation.offset % COMPACT_UNWIND_RECORD != CU_FUNCTION {
             continue;
         }
@@ -3469,9 +3483,9 @@ fn live_unwind_records(object: &LoadedObject, section: &InputSection, strip: &St
     // number — except when there are none at all, where the section is not
     // something this understands and the whole of it is reserved for.
     if live == 0 && object.parsed.relocations_for(section.id).is_empty() {
-        return total;
+        return (total, total);
     }
-    live.min(total)
+    (live.min(total), lsdas.min(total))
 }
 
 /// Build the unwind table and write it into its section.
@@ -3514,6 +3528,14 @@ fn fill_unwind_info(
         &fde_offsets,
     );
     let mut table = blinker_output::unwind::build(entries);
+    #[allow(clippy::print_stderr)]
+    if std::env::var_os("BLINKER_UNWIND_PARTS").is_some() {
+        eprintln!(
+            "  unwind: table {} bytes, reserved {} bytes",
+            table.len(),
+            section.size
+        );
+    }
 
     if table.len() as u64 > section.size {
         return Err(LinkError::UnwindTableTooLarge {

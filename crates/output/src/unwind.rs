@@ -77,14 +77,19 @@ const ENTRIES_PER_PAGE: usize = (4096 - PAGE_HEADER_SIZE) / REGULAR_ENTRY_SIZE;
 /// An upper bound on the size of a table with `records` entries.
 ///
 /// Used to reserve space before any address is known, so it must never
-/// under-estimate: every record is assumed to be distinct and to carry an
-/// LSDA, and the maximum three personalities are assumed present.
-pub fn upper_bound_size(records: usize) -> usize {
+/// under-estimate: every record is assumed to be distinct, and the maximum
+/// three personalities are assumed present.
+///
+/// `lsdas` is how many of those records carry one. It used to be assumed to be
+/// all of them, which is the same eight bytes a table entry costs — so the
+/// reservation was twice the table for input that mostly has no LSDA, and the
+/// section was padded out to it (finding 238).
+pub fn upper_bound_size(records: usize, lsdas: usize) -> usize {
     let pages = records.div_ceil(ENTRIES_PER_PAGE).max(1);
     HEADER_SIZE
         + 3 * 4
         + (pages + 1) * INDEX_ENTRY_SIZE
-        + records * LSDA_ENTRY_SIZE
+        + lsdas.min(records) * LSDA_ENTRY_SIZE
         + pages * PAGE_HEADER_SIZE
         + records * REGULAR_ENTRY_SIZE
 }
@@ -339,25 +344,62 @@ mod tests {
 mod bound_tests {
     use super::*;
 
+    fn table_of(count: usize, with_lsda: impl Fn(usize) -> bool) -> Vec<UnwindEntry> {
+        (0..count)
+            .map(|i| UnwindEntry {
+                function_offset: i as u32 * 4,
+                encoding: 0,
+                personality: Some(0x1000 + (i as u32 % 3)),
+                lsda: with_lsda(i).then_some(0x2000 + i as u32),
+            })
+            .collect()
+    }
+
     /// The reservation must never be smaller than what is built, for any shape
     /// of input — the link fails outright if it is.
+    ///
+    /// Every proportion of LSDA-carrying records is tried, not only all of
+    /// them: the bound is now told how many there are, so "none", "some" and
+    /// "all" are three different sums and only one of them used to be
+    /// exercised.
     #[test]
     fn the_upper_bound_is_never_exceeded() {
-        for count in [1usize, 2, 100, ENTRIES_PER_PAGE, ENTRIES_PER_PAGE + 1, 3000] {
-            let entries: Vec<_> = (0..count)
-                .map(|i| UnwindEntry {
-                    function_offset: i as u32 * 4,
-                    encoding: 0,
-                    personality: Some(0x1000 + (i as u32 % 3)),
-                    lsda: Some(0x2000 + i as u32),
-                })
-                .collect();
-            let built = build(entries).len();
-            let bound = upper_bound_size(count);
-            assert!(
-                built <= bound,
-                "{count} records: built {built} bytes, reserved {bound}"
-            );
+        let counts = [1usize, 2, 100, ENTRIES_PER_PAGE, ENTRIES_PER_PAGE + 1, 3000];
+        type Shape = (&'static str, fn(usize) -> bool);
+        let shapes: [Shape; 4] = [
+            ("none", |_| false),
+            ("all", |_| true),
+            ("every other", |i| i % 2 == 0),
+            ("one", |i| i == 0),
+        ];
+        for count in counts {
+            for (name, has_lsda) in shapes {
+                let entries = table_of(count, has_lsda);
+                let lsdas = entries.iter().filter(|e| e.lsda.is_some()).count();
+                let built = build(entries).len();
+                let bound = upper_bound_size(count, lsdas);
+                assert!(
+                    built <= bound,
+                    "{count} records with {name} LSDA: built {built} bytes, reserved {bound}"
+                );
+            }
         }
+    }
+
+    /// And it must be *tight*, or the difference is written out as zeroes.
+    ///
+    /// It was not: assuming every record carried an LSDA reserved an extra
+    /// eight bytes each, which is exactly what a table entry costs — so a
+    /// table of records without LSDAs was reserved at twice its size, and
+    /// pulsevm carried 1.55 MB of padding (finding 238).
+    #[test]
+    fn the_upper_bound_is_not_twice_the_table() {
+        let entries = table_of(3000, |_| false);
+        let built = build(entries).len();
+        let bound = upper_bound_size(3000, 0);
+        assert!(
+            bound < built + built / 8,
+            "reserved {bound} for a {built}-byte table"
+        );
     }
 }
