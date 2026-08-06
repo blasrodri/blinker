@@ -12119,3 +12119,91 @@ defining `shared_local` must return 11 and 22 — before the fix the link failed
 and a third object exporting a *global* `shared_local` must be a third symbol
 again, which is the direction a scope-keyed table can still get wrong while the
 first case passes.
+
+## 231. The incremental cache reuses 99% of the work and makes the link slower
+
+A friend's review said the mechanisms are real and verified but have not turned
+into wall-clock on medium and large binaries. That is correct, and measuring it
+properly is worse than the review claims: on ripgrep the incremental relocation
+cache is a **1.6x loss** on the workload it exists for.
+
+Resident daemon, 2 of 70 inputs edited, alternating arms:
+
+```
+                   wall min      wall median
+  with the cache     37.0 ms       37.6-39.6
+  --no-cache         23.0 ms       24.4-35.0
+```
+
+And it is not failing to reuse. It reuses everything:
+
+```
+  reused 283/292 objects, 403933/407257 relocations (99%)
+  placement: 1677/1680 contributions kept their address (100%)
+  session: 68 inputs held, 2 read
+```
+
+Every mechanism worked. 99% of relocations were not applied. The link got 60%
+slower.
+
+### Where the 32 ms of link goes
+
+Per-stage minima, resident, ripgrep:
+
+```
+    cache_build       6.95 ms   22.1%   <- recording what the NEXT link may reuse
+    unmeasured        8.67 ms   27.6%
+    read_and_parse    4.45 ms   14.1%
+    layout            1.98 ms    6.3%
+    emit + write      2.63 ms    8.4%
+    symbols           1.16 ms    3.7%
+    dead_strip        1.45 ms    4.6%
+    apply             0.32 ms    1.0%   <- the relocation work itself
+```
+
+`apply` is **0.32 ms of a 41.9 ms wall**: eight tenths of one percent. The
+bookkeeping that lets the linker skip it costs 6.95 ms, twenty-one times what it
+saves, before the 8.67 ms that no stage claims.
+
+The other four fifths are not relocation at all. They are passes proportional to
+the *program* rather than to the *edit* — layout, dead-strip, the symbol table,
+the survey, resolution, the address map: 6.0 ms, 19%, and none of it shrinks when
+one crate of seventy changes. Plus 9.5 ms of sidecar outside the link entirely
+(wall 41.9 against link 32.4): spawn, connect, probe, reply.
+
+### Why `self` did not show it
+
+```
+  self, with the cache    16.0 ms wall
+  self, --no-cache        16.1 ms
+```
+
+A dead heat — so on the workload every measurement in this file was taken
+against, the cache is free and appears harmless. `cache_build` is 0.58 ms there
+against 6.95 on ripgrep: twelve times the cost for 1.2x the objects and 3.9x the
+relocations. Superlinear in something, and finding out in what is the next
+question.
+
+That is the shape of the whole error. `self` is 236 objects and 2.7 MB out;
+ripgrep is 292 objects and 7 MB; the multi-link build numbers (2.0-3.9x) are
+sums over many links each of which is small. Nothing in the corpus was big
+enough to make the per-link overhead visible, and the per-link overhead is the
+product.
+
+### What this does not overturn
+
+The build-level numbers stand — they were measured end to end, and a build of
+sixteen links really does finish in 215 ms against ld64's 822. Amortised across
+many links the fixed costs are paid once against many. The claim that does not
+survive is the single-link one on a medium or large binary, and pulsevm's 0.52x
+was this all along rather than a C++ peculiarity.
+
+### The order of work this implies
+
+1. Attribute `unmeasured` — 28% of the link belongs to no stage, and nothing
+   should be optimised before it is visible.
+2. Make `cache_build` proportional to what changed, or stop paying it: a cache
+   that costs 21x what it saves is not a cache.
+3. The whole-program passes: layout, dead-strip, symbols, survey. Each is
+   correct and each redoes the entire program for a two-input edit.
+4. The sidecar, 23% of wall and not in any stage table.
