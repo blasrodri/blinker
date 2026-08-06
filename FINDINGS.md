@@ -12034,3 +12034,88 @@ and suffix-varying shapes. It fails at six.
 
 83 links byte-identical across the previous binary, this one cold, and this one
 warm twice — a changed name hash reaches no output.
+
+## 230. A name is an identity for a global and not for a local
+
+blinker could not link anything Cranelift produced. Every object failed the same
+way:
+
+```
+blinker: undefined symbols: _.Ldata0
+```
+
+`nm -a` says what that symbol is:
+
+```
+0000000000000000 s _.Ldata0
+```
+
+Lowercase `s`: a **local**. Cranelift names each function's constant pool
+`_.Ldata0` and reaches it through the GOT, so every object in the program
+declares a local of that name, and they are all different data.
+
+### Why nothing had ever caught it
+
+clang refers to its own local data with section-relative relocations and never
+asks for a GOT slot for one, so in a corpus built entirely by LLVM the set of
+names appearing in the GOT and the set of names that are identities are the same
+set. Two coordinate systems that coincide on every input tested — the same shape
+as the bug in `AddressMap`'s first version, which searched only the object
+holding the relocation.
+
+`AddressMap` had already been taught this: it keys locals by object and globals
+by name, and `lookup` shadows one with the other. The GOT and `__thread_ptrs`
+had not. Three layers each assumed a name was enough:
+
+- `survey_chunk` deduplicated candidates by name, so a thousand objects' worth
+  of distinct `_.Ldata0` collapsed into a single slot;
+- `fill_got` resolved that slot with `lookup(SYNTHETIC_OBJECT, …)` — the global
+  scope, where a local by definition is not, which is the message above;
+- `apply_relocations` read `got_slots[name]`, so even a correctly built table
+  would have handed every reference the same slot.
+
+Fixing the first two alone is *worse than the failure*: the link succeeds and
+the program takes `SIGBUS`, because every constant-pool reference in the program
+then reads one object's pool. That version was written, measured, and thrown
+away — a clean link error is a bad outcome and a miscompile is not a lesser one.
+
+### The fix
+
+`TableEntry` carries the resolution scope rather than the referencing object,
+and the slot maps are `SlotTable`: scope, then name, mirroring `AddressMap`.
+`symbol_scope` derives the key from the symbol's visibility, which is the same
+condition `address_map` files definitions under, so the two agree by
+construction.
+
+The scope has to reach the *cache* as well. `dependency_hashes` already recorded
+what an object read under `AddressMap::scope_of`, for every table — but
+`address_table` published GOT and thread-local slots under `GLOBAL`
+unconditionally. A local's slot was therefore advertised under a scope nobody
+would ever look in: a reference that could never be matched, and so an object
+that could never be reused. Nothing had noticed because nothing had a local in
+the GOT.
+
+### What it costs, and what it fixes
+
+Interleaved A/B, arms alternated between the two workloads:
+
+```
+  self       1.002x wall   0.998x link
+  ripgrep    0.978x        0.978x        (arms reversed; sd 1.2/3.8)
+```
+
+Free. Reuse on the resident incremental path is unchanged at 235/236 objects and
+99% of relocations, and the three captured workloads link byte-identically
+before and after.
+
+And it links Cranelift now — smoke crate and ripgrep both, with output identical
+to the same objects linked by ld64. The remaining Cranelift gap is not blinker's:
+`catch_unwind` does not catch a panic in a Cranelift-built binary linked by
+*either* linker.
+
+The regression test is two lines of assembly rather than a Cranelift fixture:
+what matters is a GOT-load relocation against a non-`.globl` label. Two objects
+defining `shared_local` must return 11 and 22 — before the fix the link failed —
+and a third object exporting a *global* `shared_local` must be a third symbol
+again, which is the direction a scope-keyed table can still get wrong while the
+first case passes.

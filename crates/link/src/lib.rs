@@ -1198,6 +1198,11 @@ struct RelocationSurvey {
     personalities: Vec<TableEntry>,
 }
 
+/// Which `(scope, name)` pairs a survey has already answered for.
+///
+/// The names are borrowed from the parsed objects, which outlive the survey.
+type Seen<'a> = HashSet<(u32, &'a str)>;
+
 fn survey_relocations(
     objects: &[LoadedObject],
     imports: &[String],
@@ -1218,25 +1223,23 @@ fn survey_relocations(
     // Borrowed, because these are asked about once per *candidate* and only
     // answered "new" once per *name*. The names live in the parsed objects,
     // which outlive this call.
-    let (mut got_seen, mut tlv_seen, mut stub_seen, mut personality_seen): (
-        HashSet<&str>,
-        HashSet<&str>,
-        HashSet<&str>,
-        HashSet<&str>,
-    ) = (
-        HashSet::default(),
-        HashSet::default(),
-        HashSet::default(),
-        HashSet::default(),
-    );
+    //
+    // The indirection tables dedup by `(scope, name)` rather than by name:
+    // two objects' `_.Ldata0` are two symbols, and one slot cannot hold both.
+    // Stubs dedup by name alone because a stub exists only for an import, and
+    // an import is global by definition.
+    let mut got_seen = Seen::default();
+    let mut tlv_seen = Seen::default();
+    let mut personality_seen = Seen::default();
+    let mut stub_seen: HashSet<&str> = HashSet::default();
     for chunk in &surveyed {
         for entry in &chunk.got {
-            if got_seen.insert(entry.name.as_str()) {
+            if got_seen.insert((entry.scope, entry.name.as_str())) {
                 survey.got.push(entry.clone());
             }
         }
         for entry in &chunk.tlv {
-            if tlv_seen.insert(entry.name.as_str()) {
+            if tlv_seen.insert((entry.scope, entry.name.as_str())) {
                 survey.tlv.push(entry.clone());
             }
         }
@@ -1246,7 +1249,7 @@ fn survey_relocations(
             }
         }
         for entry in &chunk.personalities {
-            if personality_seen.insert(entry.name.as_str()) {
+            if personality_seen.insert((entry.scope, entry.name.as_str())) {
                 survey.personalities.push(entry.clone());
             }
         }
@@ -1267,17 +1270,10 @@ fn survey_chunk(
     strip: &Strip,
 ) -> RelocationSurvey {
     let mut survey = RelocationSurvey::default();
-    let (mut got_seen, mut tlv_seen, mut stub_seen, mut personality_seen): (
-        HashSet<&str>,
-        HashSet<&str>,
-        HashSet<&str>,
-        HashSet<&str>,
-    ) = (
-        HashSet::default(),
-        HashSet::default(),
-        HashSet::default(),
-        HashSet::default(),
-    );
+    let mut got_seen = Seen::default();
+    let mut tlv_seen = Seen::default();
+    let mut personality_seen = Seen::default();
+    let mut stub_seen: HashSet<&str> = HashSet::default();
 
     for object in objects {
         // Which sections are `__compact_unwind`, so personality relocations can
@@ -1310,15 +1306,16 @@ fn survey_chunk(
             let Some(symbol) = object.parsed.symbol(id) else {
                 continue;
             };
+            let scope = symbol_scope(object.parsed.id, symbol);
             let entry = || TableEntry {
-                object: object.parsed.id,
+                scope,
                 name: symbol.name.clone(),
             };
 
-            if needs_got(relocation.kind) && got_seen.insert(symbol.name.as_str()) {
+            if needs_got(relocation.kind) && got_seen.insert((scope, symbol.name.as_str())) {
                 survey.got.push(entry());
             }
-            if needs_tlv(relocation.kind) && tlv_seen.insert(symbol.name.as_str()) {
+            if needs_tlv(relocation.kind) && tlv_seen.insert((scope, symbol.name.as_str())) {
                 survey.tlv.push(entry());
             }
             if relocation.kind == Arm64RelocationKind::Branch26
@@ -1329,7 +1326,7 @@ fn survey_chunk(
             }
             if unwind_sections.contains(&relocation.section)
                 && relocation.offset % COMPACT_UNWIND_RECORD == CU_PERSONALITY
-                && personality_seen.insert(symbol.name.as_str())
+                && personality_seen.insert((scope, symbol.name.as_str()))
             {
                 survey.personalities.push(entry());
             }
@@ -1355,7 +1352,7 @@ fn compact_unwind_entries(
     placed: &Placed,
     addresses: &AddressMap,
     strip: &Strip,
-    got_slots: &HashMap<String, u64>,
+    got_slots: &SlotTable,
     fde_offsets: &HashMap<u64, u32>,
 ) -> Vec<UnwindEntry> {
     let Some(text) = image.layout.segment("__TEXT") else {
@@ -1403,7 +1400,7 @@ fn compact_unwind_entries_of(
     placed: &Placed,
     addresses: &AddressMap,
     strip: &Strip,
-    got_slots: &HashMap<String, u64>,
+    got_slots: &SlotTable,
     fde_offsets: &HashMap<u64, u32>,
 ) -> Vec<UnwindEntry> {
     let mut entries = Vec::new();
@@ -1411,7 +1408,9 @@ fn compact_unwind_entries_of(
     // objects in a debug rust-analyzer link and each was building two maps
     // from empty to hold a few dozen entries.
     let mut targets: HashMap<(u64, u64), u64> = HashMap::default();
-    let mut personality_names: HashMap<u64, String> = HashMap::default();
+    // Scope as well as name: a personality routine's GOT slot is found the
+    // same way every other slot is.
+    let mut personality_names: HashMap<u64, (u32, String)> = HashMap::default();
 
     for (at, object) in objects.iter().enumerate() {
         let ids = &interned[base + at];
@@ -1477,7 +1476,8 @@ fn compact_unwind_entries_of(
                 if field == CU_PERSONALITY {
                     if let RelocationTarget::Symbol(id) = relocation.target {
                         if let Some(symbol) = object.parsed.symbol(id) {
-                            personality_names.insert(record, symbol.name.clone());
+                            let scope = symbol_scope(object.parsed.id, symbol);
+                            personality_names.insert(record, (scope, symbol.name.clone()));
                         }
                     }
                 }
@@ -1520,7 +1520,7 @@ fn compact_unwind_entries_of(
                     encoding,
                     personality: personality_names
                         .get(&record)
-                        .and_then(|name| got_slots.get(name))
+                        .and_then(|(scope, name)| got_slots.get(*scope, name))
                         .map(|slot| (slot - image_base) as u32),
                     lsda: targets
                         .get(&(record, CU_LSDA))
@@ -1535,6 +1535,60 @@ fn compact_unwind_entries_of(
 /// Section id of the synthesised `__thread_ptrs`.
 const TLV_SECTION: SectionId = SectionId(2);
 
+/// The scope a symbol's address — and so its indirection slot — belongs to.
+///
+/// A name is an identity for a global and not for a local: two objects may
+/// each define `_.Ldata0`, and those are two symbols at two addresses. Every
+/// map answering "where is this name" is therefore keyed by scope as well,
+/// and `AddressMap` already is; this is that same key, read from the symbol
+/// rather than from the built map because the indirection tables are surveyed
+/// before any address is known.
+///
+/// It must agree with `AddressMap::scope_of`, which keys locals by object and
+/// everything else globally — so the condition is the same one `address_map`
+/// files definitions under.
+fn symbol_scope(object: ObjectId, symbol: &blinker_macho::InputSymbol) -> u32 {
+    if symbol.visibility == SymbolVisibility::Local {
+        object.0
+    } else {
+        blinker_cache::GLOBAL
+    }
+}
+
+/// Where each slot of a synthesised indirection table landed.
+///
+/// Keyed by scope and then by name, mirroring `AddressMap`: a local's name is
+/// not an identity, so a flat name-keyed map answers the wrong slot for one.
+/// Nested rather than keyed by `(u32, String)` because the alternative would
+/// need an owned tuple — or a `Borrow` impl — at every lookup on the hot
+/// relocation path.
+#[derive(Default, Debug)]
+struct SlotTable {
+    by_scope: HashMap<u32, HashMap<String, u64>>,
+}
+
+impl SlotTable {
+    fn insert(&mut self, scope: u32, name: String, address: u64) {
+        self.by_scope
+            .entry(scope)
+            .or_default()
+            .insert(name, address);
+    }
+
+    fn get(&self, scope: u32, name: &str) -> Option<u64> {
+        self.by_scope.get(&scope)?.get(name).copied()
+    }
+
+    /// Every slot, as (scope, name, address).
+    fn iter(&self) -> impl Iterator<Item = (u32, &str, u64)> + '_ {
+        self.by_scope.iter().flat_map(|(scope, names)| {
+            names
+                .iter()
+                .map(move |(name, address)| (*scope, name.as_str(), *address))
+        })
+    }
+}
+
 /// Relocation kinds that reach their target through a thread-local pointer.
 fn needs_tlv(kind: Arm64RelocationKind) -> bool {
     matches!(
@@ -1545,15 +1599,23 @@ fn needs_tlv(kind: Arm64RelocationKind) -> bool {
 
 /// One slot of a synthesised pointer table.
 ///
-/// The owning object is carried, not just the name. A thread-local or a
-/// GOT target may be a **local** symbol, and locals are keyed per object
-/// because two objects may legitimately define the same local name. Looking
-/// one up under the linker's own synthetic object id finds nothing, and the
-/// slot was then left zero — which is a null descriptor pointer, and a crash
-/// on first use rather than a link error.
+/// The scope is carried, not just the name. A thread-local or a GOT target
+/// may be a **local** symbol, and locals are keyed per object because two
+/// objects may legitimately define the same local name. Looking one up under
+/// the linker's own synthetic object id finds nothing, and the slot was then
+/// left zero — which is a null descriptor pointer, and a crash on first use
+/// rather than a link error.
+///
+/// The scope is what makes an *entry* distinct too, not only what resolves it.
+/// Every Cranelift object names its local constant pool `_.Ldata0`, so a
+/// thousand distinct addresses shared one name; deduplicating this table by
+/// name alone collapsed them into a single slot and the link failed naming
+/// `_.Ldata0` undefined (finding 230).
 #[derive(Debug, Clone)]
 struct TableEntry {
-    object: ObjectId,
+    /// The scope the name resolves in: the defining object for a local,
+    /// `GLOBAL` for everything else. See `symbol_scope`.
+    scope: u32,
     name: String,
 }
 
@@ -2087,14 +2149,21 @@ fn link_inner(
     // value — a rebase for an address we know, a bind for one dyld supplies.
     let mut got = survey.got;
     for entry in survey.personalities {
-        if !got.iter().any(|e| e.name == entry.name) {
+        if !got
+            .iter()
+            .any(|e| e.name == entry.name && e.scope == entry.scope)
+        {
             got.push(entry);
         }
     }
     for name in &imports {
-        if !got.iter().any(|e| &e.name == name) {
+        // An import is global, so `GLOBAL` is the only scope it can occupy.
+        if !got
+            .iter()
+            .any(|e| &e.name == name && e.scope == blinker_cache::GLOBAL)
+        {
             got.push(TableEntry {
-                object: SYNTHETIC_OBJECT,
+                scope: blinker_cache::GLOBAL,
                 name: name.clone(),
             });
         }
@@ -2108,8 +2177,11 @@ fn link_inner(
     // Which names the table already holds. `got.iter().any(...)` compared every
     // entry's text against every personality symbol — a scan of a table that
     // grows, inside a loop over every object, to answer a membership question.
-    let mut in_got: HashSet<&str> = got.iter().map(|entry| entry.name.as_str()).collect();
-    let mut personalities: Vec<(ObjectId, &str)> = Vec::new();
+    let mut in_got: HashSet<(u32, &str)> = got
+        .iter()
+        .map(|entry| (entry.scope, entry.name.as_str()))
+        .collect();
+    let mut personalities: Vec<(u32, &str)> = Vec::new();
     for object in &objects {
         for section in &object.parsed.sections {
             if section.name != "__eh_frame" {
@@ -2126,8 +2198,9 @@ fn link_inner(
                 }
                 if let RelocationTarget::Symbol(id) = relocation.target {
                     if let Some(symbol) = object.parsed.symbol(id) {
-                        if in_got.insert(symbol.name.as_str()) {
-                            personalities.push((object.parsed.id, symbol.name.as_str()));
+                        let scope = symbol_scope(object.parsed.id, symbol);
+                        if in_got.insert((scope, symbol.name.as_str())) {
+                            personalities.push((scope, symbol.name.as_str()));
                         }
                     }
                 }
@@ -2139,8 +2212,8 @@ fn link_inner(
     }
     // Appended after the walk, in the order the walk found them, because the
     // set above borrows the names from the parses and `got` owns copies.
-    got.extend(personalities.into_iter().map(|(object, name)| TableEntry {
-        object,
+    got.extend(personalities.into_iter().map(|(scope, name)| TableEntry {
+        scope,
         name: name.to_string(),
     }));
 
@@ -3056,9 +3129,9 @@ fn object_ranges_index(image: &Image) -> HashMap<u32, Vec<blinker_cache::Range>>
 fn address_table(
     addresses: &AddressMap,
     digests: &[blinker_cache::NameHash],
-    got_slots: &HashMap<String, u64>,
+    got_slots: &SlotTable,
     stub_slots: &HashMap<String, u64>,
-    tlv_slots: &HashMap<String, u64>,
+    tlv_slots: &SlotTable,
 ) -> Vec<(blinker_cache::NameHash, u64)> {
     use blinker_cache::{combine, Table, GLOBAL};
     let digest = |name: SymbolNameId| digests[name.0 as usize];
@@ -3072,9 +3145,9 @@ fn address_table(
                 (combine(digest(*name), *object, Table::Symbol), *address)
             })
         }))
-        .chain(indirect_entries(got_slots, Table::Got))
+        .chain(slot_entries(got_slots, Table::Got))
         .chain(indirect_entries(stub_slots, Table::Stub))
-        .chain(indirect_entries(tlv_slots, Table::ThreadLocal))
+        .chain(slot_entries(tlv_slots, Table::ThreadLocal))
         .collect();
     let collect_ms = _t.elapsed().as_secs_f64() * 1000.0;
     let _s = std::time::Instant::now();
@@ -3103,6 +3176,21 @@ fn indirect_entries(
             *address,
         )
     })
+}
+
+/// The same, for a table whose slots are keyed by scope.
+///
+/// The scope has to reach the hash: `dependency_hashes` records what an object
+/// read under `AddressMap::scope_of`, so a GOT slot for a local was published
+/// here under `GLOBAL` and looked for under its object — a reference that
+/// could never be found, and so an object that could never be reused.
+fn slot_entries(
+    slots: &SlotTable,
+    table: blinker_cache::Table,
+) -> impl Iterator<Item = (blinker_cache::NameHash, u64)> + '_ {
+    slots
+        .iter()
+        .map(move |(scope, name, address)| (blinker_cache::dep_hash(scope, table, name), address))
 }
 
 fn elapsed_ms(start: std::time::Instant) -> f64 {
@@ -3336,7 +3424,7 @@ fn fill_unwind_info(
     placed: &Placed,
     addresses: &AddressMap,
     strip: &Strip,
-    got_slots: &HashMap<String, u64>,
+    got_slots: &SlotTable,
 ) -> Result<(), LinkError> {
     let Some((index, section)) = image
         .layout
@@ -3395,7 +3483,7 @@ fn fill_stubs(
     contents: &mut HashMap<usize, Vec<u8>>,
     image: &Image,
     stubs: &[String],
-    got_slots: &HashMap<String, u64>,
+    got_slots: &SlotTable,
 ) -> Result<(), LinkError> {
     if stubs.is_empty() {
         return Ok(());
@@ -3415,11 +3503,12 @@ fn fill_stubs(
 
     for (slot, name) in stubs.iter().enumerate() {
         let stub_address = section.vm_address + slot as u64 * STUB_SIZE;
-        let got = *got_slots
-            .get(name)
-            .ok_or_else(|| LinkError::UndefinedSymbols {
+        // A stub exists only for an import, and an import is global.
+        let got = got_slots.get(blinker_cache::GLOBAL, name).ok_or_else(|| {
+            LinkError::UndefinedSymbols {
                 names: vec![name.clone()],
-            })?;
+            }
+        })?;
         let start = slot * STUB_SIZE as usize;
         buffer[start..start + STUB_SIZE as usize].copy_from_slice(&stub_code(stub_address, got));
     }
@@ -3462,17 +3551,13 @@ fn got_binds(
 }
 
 /// Address of each GOT slot, in the order the symbols were collected.
-fn got_slot_addresses(got: &[TableEntry], image: &Image) -> HashMap<String, u64> {
+fn got_slot_addresses(got: &[TableEntry], image: &Image) -> SlotTable {
     pointer_slot_addresses(got, image, "__got")
 }
 
 /// Address of each slot in a synthesised pointer table.
-fn pointer_slot_addresses(
-    names: &[TableEntry],
-    image: &Image,
-    section_name: &str,
-) -> HashMap<String, u64> {
-    let mut slots = HashMap::default();
+fn pointer_slot_addresses(names: &[TableEntry], image: &Image, section_name: &str) -> SlotTable {
+    let mut slots = SlotTable::default();
     let Some(section) = image
         .layout
         .sections
@@ -3483,6 +3568,7 @@ fn pointer_slot_addresses(
     };
     for (index, entry) in names.iter().enumerate() {
         slots.insert(
+            entry.scope,
             entry.name.clone(),
             section.vm_address + index as u64 * GOT_ENTRY_SIZE,
         );
@@ -3519,15 +3605,16 @@ fn fill_pointer_table(
         .or_insert_with(|| vec![0u8; names.len() * GOT_ENTRY_SIZE as usize]);
 
     for (slot, entry) in names.iter().enumerate() {
-        // Looked up against the object that *referenced* it, so a local
-        // definition is visible.
+        // Looked up in the entry's own scope, so a local definition is visible
+        // and a global one is not shadowed by an unrelated local of the same
+        // name in some other object.
         // By name, because a table entry is named rather than carried from a
         // symbol — a few thousand of them against the half million that go
         // through `target_address`, so the string hash here is not the one
         // that mattered.
         let Some(address) = interner
             .get(&entry.name)
-            .and_then(|name| addresses.lookup(entry.object, name))
+            .and_then(|name| addresses.lookup(ObjectId(entry.scope), name))
         else {
             continue;
         };
@@ -3568,9 +3655,11 @@ fn fill_got(
             // dyld writes this slot at load time; it starts as zero.
             continue;
         }
+        // In the entry's scope, not the global one: a GOT slot may point at a
+        // local, and a local is by definition not in the global map.
         let address = interner
             .get(name)
-            .and_then(|id| addresses.lookup(SYNTHETIC_OBJECT, id))
+            .and_then(|id| addresses.lookup(ObjectId(entry.scope), id))
             .ok_or_else(|| LinkError::UndefinedSymbols {
                 names: vec![name.clone()],
             })?;
@@ -5525,9 +5614,9 @@ type SectionContents = HashMap<usize, Vec<u8>>;
 /// Grouped because they travel together and are consulted by the same rules:
 /// which one applies is decided by the relocation's kind, not by the caller.
 struct IndirectTables<'a> {
-    got: &'a HashMap<String, u64>,
+    got: &'a SlotTable,
     stubs: &'a HashMap<String, u64>,
-    tlv: &'a HashMap<String, u64>,
+    tlv: &'a SlotTable,
     imports: &'a [String],
     /// Which dynamic library exports each importable name, for bind ordinals.
     exports: Option<&'a libraries::StubExports>,
@@ -5857,7 +5946,7 @@ fn apply_relocations(
                 return None;
             };
             let symbol = object.parsed.symbol(id)?;
-            got_slots.get(&symbol.name).copied()
+            got_slots.get(symbol_scope(object.parsed.id, symbol), &symbol.name)
         };
     // Out of the map and into a vector so the buffers can be borrowed
     // independently of one another; `contents` is rebuilt from it at the end.
@@ -6054,11 +6143,9 @@ fn apply_relocations(
                 // of the symbol; the symbol's address is what the slot contains.
                 let got = if needs_got(relocation.kind) {
                     match relocation.target {
-                        RelocationTarget::Symbol(id) => object
-                            .parsed
-                            .symbol(id)
-                            .and_then(|s| got_slots.get(&s.name))
-                            .copied(),
+                        RelocationTarget::Symbol(id) => object.parsed.symbol(id).and_then(|s| {
+                            got_slots.get(symbol_scope(object.parsed.id, s), &s.name)
+                        }),
                         RelocationTarget::Section(_) => None,
                     }
                 } else {
@@ -6067,11 +6154,9 @@ fn apply_relocations(
 
                 let tlv = if needs_tlv(relocation.kind) {
                     match relocation.target {
-                        RelocationTarget::Symbol(id) => object
-                            .parsed
-                            .symbol(id)
-                            .and_then(|s| tlv_slots.get(&s.name))
-                            .copied(),
+                        RelocationTarget::Symbol(id) => object.parsed.symbol(id).and_then(|s| {
+                            tlv_slots.get(symbol_scope(object.parsed.id, s), &s.name)
+                        }),
                         RelocationTarget::Section(_) => None,
                     }
                 } else {
