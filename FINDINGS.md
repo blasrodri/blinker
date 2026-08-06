@@ -12595,3 +12595,57 @@ in 234 — "its own commit" — was made before knowing which half it was. Writt
 down here so the next attempt starts from the count rather than from the guess.
 
 The diagnostic that says all of the above is committed with it.
+
+## 237. The cheap version of the opacity fix does not work either
+
+Finding 236 ruled out the fix specified in 234. This rules out the one that
+replaced it, before building that either.
+
+The pin exists because `target = symbol_address + addend` and the addend may
+walk off the end of the symbol's own atom onto bytes that moved. But atoms are
+re-placed in order with their alignment congruence preserved, so two kept atoms
+that were adjacent stay adjacent — which means the delta between a symbol and
+something after it survives *as long as nothing between them is stripped*.
+
+So the pin does not need the section. It needs the **span**: the bytes from the
+symbol to what it points at. Pin those, strip the rest, no change to the
+relocation path at all — the arithmetic stays true by construction. A much
+smaller and safer change than resolving every reference to an atom in its
+defining object.
+
+Measured on pulsevm before building it:
+
+```
+  addends: 3734 inside the symbol's atom, 8526 escaping it, 15856 to another object
+  same-object spans reach 187414699 bytes, 35272443 of them distinct
+```
+
+**35 MB of the 45 MB**, from the same-object references alone, before the
+cross-object ones are counted. These addends are not small: 8,526 of them reach
+187 MB between them, 22 KB each on average. They walk across large constant
+tables, and a span that covers half a section is a section.
+
+So span-pinning recovers around a fifth of what it would need to, and it is not
+worth building.
+
+### What that leaves
+
+The three approaches, and what each is now known to be worth:
+
+```
+  edges for section-targeted relocations (234)     0 bytes    — none of the opacity is this
+  skip the pin when the addend stays in the atom   ~0 bytes   — 13% of refs, sections pinned by the rest
+  pin the span rather than the section (237)       ~10 MB     — of 45, and only same-object
+  resolve to the atom in the defining object       the 25 MB  — not yet built
+```
+
+Only the last one gets it, and it needs what 236 said: the target of an
+interior reference resolved to an atom in the object that *defines* the symbol,
+an edge that survives to that atom so liveness follows it, and the address
+recomputed through `Strip::remap` at application time rather than added to a
+symbol's. The owners map already holds the defining atom's index, so the
+liveness half needs no new structure; the address half does.
+
+Three measurements, three approaches eliminated, and the one that remains is the
+one that was expensive from the start. That is a worse answer than a cheap fix
+and a better one than a cheap fix that recovers a fifth.

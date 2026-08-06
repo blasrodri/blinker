@@ -2588,6 +2588,8 @@ fn strip_parts(objects: &[LoadedObject], atoms: &Atoms<'_>, live: &LiveSet) {
     let mut per_object: HashMap<&std::path::Path, u64> = HashMap::default();
     let (mut section_caused, mut symbol_caused) = (0u64, 0u64);
     let (mut contained, mut escaping, mut elsewhere) = (0u64, 0u64, 0u64);
+    let mut span_bytes = 0u64;
+    let mut spans: HashMap<(u32, u32), Vec<(u64, u64)>> = HashMap::default();
     // Atom spans per (object, section), ascending, so a symbol's atom can be
     // found by offset.
     let mut atom_index: HashMap<(u32, u32), Vec<(u64, u64)>> = HashMap::default();
@@ -2642,6 +2644,16 @@ fn strip_parts(objects: &[LoadedObject], atoms: &Atoms<'_>, live: &LiveSet) {
                                     let target = offset as i64 + addend;
                                     if target < start as i64 || target >= end as i64 {
                                         escaping += 1;
+                                        // How far it reaches: the bytes between
+                                        // the symbol and what it points at are
+                                        // all that has to hold still.
+                                        let (lo, hi) = if target < offset as i64 {
+                                            (target.max(0) as u64, offset)
+                                        } else {
+                                            (offset, target as u64)
+                                        };
+                                        span_bytes += hi - lo;
+                                        spans.entry(key).or_default().push((lo, hi));
                                     } else {
                                         contained += 1;
                                     }
@@ -2694,6 +2706,22 @@ fn strip_parts(objects: &[LoadedObject], atoms: &Atoms<'_>, live: &LiveSet) {
         }
         eprintln!("  strip: opacity bytes: section target {section_caused}, symbol+addend {symbol_caused}");
         eprintln!("  strip: addends: {contained} inside the symbol's atom, {escaping} escaping it, {elsewhere} to another object");
+        // The union of the spans, which is what pinning ranges instead of
+        // whole sections would actually hold.
+        let mut union = 0u64;
+        for ranges in spans.values_mut() {
+            ranges.sort_unstable();
+            let (mut at, mut covered) = (0u64, 0u64);
+            for (lo, hi) in ranges.iter().copied() {
+                let start = lo.max(at);
+                if hi > start {
+                    covered += hi - start;
+                    at = hi;
+                }
+            }
+            union += covered;
+        }
+        eprintln!("  strip: same-object spans reach {span_bytes} bytes, {union} of them distinct");
         for (bytes, path) in by_object.into_iter().take(6) {
             eprintln!("  strip: opaque {bytes:>12}  {}", path.display());
         }
