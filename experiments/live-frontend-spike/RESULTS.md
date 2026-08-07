@@ -1775,3 +1775,162 @@ against a crate nobody had to write carefully.
 What is still out of class: trait methods, generics as roots, `const fn`,
 `async fn`, RPIT, anything a vtable reaches, and any constant that is not
 private and read-only. Arena reclamation is still not done.
+
+## 47. Agent Bench (M2), and what it cost to make it measure anything
+
+M1 built the surface. M2 is the instrument that has to decide whether the
+surface is worth anything, and the first thing it had to do was prove it can
+measure — the same rule §31 imposed on the differential, turned on the
+benchmark itself.
+
+### The task set
+
+49 tasks, generated rather than scraped. A benchmark has to know the right
+answer and has to be re-runnable; a task mined from a repository gives neither
+for free. So each is a known-good crate plus a seeded defect, which makes ground
+truth exact — the fix *is* the pristine text — and lets the DIRECT/FALLBACK mix
+be chosen rather than discovered. The cost is external validity, and it is real:
+these are bugs of a realistic *shape* in crates smaller than real ones. Tasks
+from real repositories are the obvious next thing and are not here.
+
+Four domains — a decimal scanner, a run-length decoder, a bracket matcher, a
+rolling checksum — and six families:
+
+| family | n | |
+|---|---:|---|
+| local-bug | 13 | a wrong constant, an inverted guard |
+| multi-function | 13 | two defects, so fixing one function is not enough |
+| fallback | 8 | the defective function is `#[inline]`, so the fix cannot go DIRECT |
+| state-machine | 6 | a missing end-of-input flush, a dropped underflow guard |
+| off-by-one | 5 | a bound, a stride |
+| feature | 4 | the body is a stub and has to be written |
+
+Every task is verified: the suite must **fail on broken and pass on fixed**. The
+first draft dropped 16 of 49 — nine because the *fixed* source failed its own
+suite, since I had written the checksum expectations by hand and my arithmetic
+was wrong, and three because the seeded defect was invisible to the inputs the
+tests happened to use.
+
+Both were generator bugs, and both are now designed out. Expectations are
+**measured off the pristine crate** rather than asserted, which is also the
+right definition for a mutation benchmark: the task is to restore the intended
+behaviour, and pristine is what intended means. The invisible defects got test
+inputs that see them.
+
+That took the rejection rate to zero, which is exactly when a filter stops being
+watched — so two candidates are now injected on every run that must **never**
+survive: a comment reword (invisible), and a real defect checked against a bent
+expectation (so pristine fails its own suite). If either is emitted, generation
+fails.
+
+### The two environments, and the three agents
+
+`cargo` edits the file and runs `cargo test`. `blinker` uses the seven verbs.
+Same tasks, same oracle, same wall clock, both warmed first — a cold `cargo
+build` is dominated by linking a test harness, which is real but is not what an
+agent pays per hypothesis, and timing it would flatter Blinker for reasons that
+have nothing to do with Blinker.
+
+Grading is always a separate `cargo test`, including for the Blinker runs. An
+environment that graded its own work would be reporting its own opinion, and the
+Blinker path publishes into an arena — so "solved" has to mean the *source on
+disk* is right, not that some generation answered well.
+
+| agent | what it is for |
+|---|---|
+| `null` | does nothing. Must score 0, or the oracle is not discriminating |
+| `oracle` | knows the fix. Must score ~100, or a solved task is not reachable |
+| `searcher` | a fixed policy, identical in both environments, that has to find the defect |
+
+`searcher` is where the environments diverge, and holding the policy constant is
+the point: what comes out is the *environment's* difference, which is the one
+thing M2 can honestly measure. What a model adds is M3 and M4, and no model runs
+here.
+
+### What it found in the agent API, twice
+
+**A second `replace_body` on the same function spliced at the wrong offset.**
+The index shifts every span at or after the splice point, and the edited
+function's own `body_end` *is* that point — so it moved with the rest, and was
+then moved again by an explicit adjustment. Five bytes into the following item.
+The M1 gate never saw it because it edits each function once; Agent Bench hit it
+on its second candidate repair, and the only thing that noticed was rustc
+(`the compiler session failed`). There is a regression test now.
+
+**`run_affected` selected against the most recent edit, not all of them.** For a
+revision that changed two functions it ran only the tests reaching the *second*.
+The consequence is worse than under-testing: it reported zero failures while
+tests reaching the first function were still failing, so the agent committed and
+stopped, and the suite on disk disagreed with the API that had just said yes.
+`editing` is a set now, cleared on commit and rollback. That was worth two of
+the three tasks Blinker failed.
+
+### The numbers
+
+Controls, on the full set — 98 attempts of `null`, and `oracle` reaching
+everything it was given:
+
+| agent | env | n | solved | median |
+|---|---|---:|---:|---:|
+| null | cargo | 49 | **0%** | — |
+| null | blinker | 49 | **0%** | — |
+| oracle | cargo | 49 | 100% | 476 ms |
+| oracle | blinker | 30 | 97% | **25 ms** |
+
+`searcher`, the same fixed policy in both environments, all 49 tasks, one run:
+
+| | cargo | blinker | |
+|---|---:|---:|---:|
+| solved | **100%** | 94% | |
+| median | 559 ms | **37 ms** | **15×** |
+| solved within 1 s | 65% | **92%** | |
+| builds | 76 | **17** | 4.5× |
+| bytes across the interface | 1,228,571 | **231,623** | 5.3× |
+| Blinker revisions | 0 | 100 | |
+| FALLBACKs | — | 17 | |
+
+Bytes are the honest stand-in for tokens: no model runs in M2, and a byte count
+is what can be measured without pretending otherwise.
+
+All 17 of Blinker's builds are FALLBACKs — the 8 `#[inline]` tasks, where the
+classifier refuses and the agent has to reach for cargo. That is the escalation
+path working, and it is why the `fallback` family exists.
+
+**Blinker solved fewer.** Both `run_affected` findings above account for two of
+the three, and fixing them took the sweep to **96%**. The two that remain are
+the same defect and its pair: the fix changes `const MODULUS`, and
+`replace_body` replaces *bodies*. An API that structurally cannot change a
+signature also cannot change a constant, and both of those are the same
+deliberate narrowness — but a const is a much more ordinary thing to want to
+edit, and it is the clearest single gap M1 left.
+
+### What the wall clock cost, and why it is not a result
+
+Three contention sources, each found by measuring rather than guessing, and all
+three were mine:
+
+- A candidate repair made `decoded_len` wrong, which turned `decoded_sum` into a
+  non-terminating loop — with a ten-minute subprocess timeout inside a
+  two-minute budget. One hang cost 39 minutes. `cargo test` is now bounded by
+  its own timeout *and* the attempt's remaining budget, the domain caps its own
+  loop, and the run has a `--max-total` ceiling that prints `STOPPED EARLY`
+  rather than presenting a partial sweep as a whole one.
+- The task set was generated **inside the working tree**, so an editor's Rust
+  indexer found 49 new crates and took 327% CPU analysing the benchmark while it
+  ran. Rates fell from 24 attempts a minute to two. Tasks now generate outside
+  the repository; they are build output and `domains.py` reproduces them.
+- Resetting `src/lib.rs` between attempts wrote identical bytes, which still
+  moves the mtime, so cargo rebuilt every time. It writes only on a real
+  difference now.
+
+What remains is XProtect, which scans each freshly written dylib — and the
+Blinker path writes one per session. A warm is 0.65 s in isolation and much more
+under that load. It inflates *Blinker's* wall clock rather than cargo's, so it
+does not favour the result above; it only made the sweep slow to obtain.
+
+### What M2 does not claim
+
+Nothing about models. `searcher`'s absolute success rate is a fact about its
+repair table, not about anything intelligent — it can only fix bugs whose repair
+it already knows. What it measures honestly is the **cost per hypothesis**, and
+that is the quantity M3 and M4 turn into a claim about capability.

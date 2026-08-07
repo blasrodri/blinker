@@ -67,6 +67,7 @@ pub extern "C" fn accumulate(acc: u64, b: u8) -> u64 {
 pub extern "C" fn scan(data: *const u8, len: u64) -> u64 {
     let mut total: u64 = 0;
     let mut acc: u64 = 0;
+    let mut in_number: u64 = 0;
     let mut i: u64 = 0;
     while i < len {
         // SAFETY: the caller passes a pointer to at least `len` bytes.
@@ -74,11 +75,16 @@ pub extern "C" fn scan(data: *const u8, len: u64) -> u64 {
         let class = classify_byte(b);
         if class == CLASS_DIGIT {
             acc = accumulate(acc, b);
+            in_number = 1;
         } else if class == CLASS_SEP {
             total = total.wrapping_add(acc);
             acc = 0;
+            in_number = 0;
         }
         i = i.wrapping_add(1);
+    }
+    if in_number == 1 {
+        total = total.wrapping_add(acc);
     }
     total
 }
@@ -102,6 +108,9 @@ pub extern "C" fn count_numbers(data: *const u8, len: u64) -> u64 {
             in_number = 0;
         }
         i = i.wrapping_add(1);
+    }
+    if in_number == 1 {
+        count = count.wrapping_add(1);
     }
     count
 }

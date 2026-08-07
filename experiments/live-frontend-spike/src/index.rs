@@ -422,6 +422,25 @@ mod tests {
     }
 
     #[test]
+    fn the_spliced_function_moves_exactly_once() {
+        // The regression Agent Bench found. A body at [10, 20) grown by 5 ends
+        // at 25, not 30 — and it is `shift` that moves it, because 20 is at the
+        // splice point rather than before it. Adjusting it again afterwards put
+        // the next edit five bytes into the following item.
+        let mut index = Index {
+            functions: vec![Function {
+                file: "a".into(),
+                body_start: 10,
+                body_end: 20,
+                ..Default::default()
+            }],
+            build_ms: 0.0,
+        };
+        index.shift("a", 20, 5);
+        assert_eq!((index.functions[0].body_start, index.functions[0].body_end), (10, 25));
+    }
+
+    #[test]
     fn shift_moves_only_what_follows_the_splice() {
         let mut index = Index {
             functions: vec![

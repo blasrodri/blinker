@@ -6,3 +6,8 @@
 *.rlib
 *.dylib
 rustc-ice-*.txt
+
+# Agent Bench generates 49 cargo crates; they are build output and live in
+# $TMPDIR, but keep the old in-tree location ignored in case anyone points
+# --out back at it.
+bench/tasks/

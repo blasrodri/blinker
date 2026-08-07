@@ -294,8 +294,15 @@ pub struct Workspace {
     /// The entry table of each committed generation, innermost last, so a
     /// rollback restores addresses as well as the pointer.
     committed: Vec<(u64, Vec<(String, usize)>)>,
-    /// The function the current candidate replaces.
-    editing: Option<String>,
+    /// The functions edited since the last commit or rollback.
+    ///
+    /// A set, not the most recent one. It was `Option<String>`, so a revision
+    /// that changed two functions selected only the tests reaching the
+    /// *second* — and Agent Bench found the consequence, which is worse than
+    /// under-testing: `run_affected` reported zero failures while tests
+    /// reaching the first function were still failing, so the agent committed
+    /// and stopped. The suite on disk disagreed.
+    editing: std::collections::BTreeSet<String>,
     needs_rebase: bool,
     /// The most recent probe's byte buffer, kept alive by the workspace rather
     /// than by the call that made it.
@@ -324,7 +331,7 @@ impl Workspace {
             staged: None,
             staged_entries: Vec::new(),
             committed: Vec::new(),
-            editing: None,
+            editing: std::collections::BTreeSet::new(),
             needs_rebase: false,
             buffer: Vec::new(),
         }
@@ -364,7 +371,7 @@ impl Workspace {
         self.staged_entries.clear();
         self.committed.clear();
         self.contracts.clear();
-        self.editing = None;
+        self.editing.clear();
         self.needs_rebase = false;
 
         let mut observation = self.reindex();
@@ -586,9 +593,18 @@ impl Workspace {
         if let Err(error) = std::fs::write(&self.target_file, &edited) {
             return Observation::error(format!("cannot write the edit: {error}"));
         }
+        // `shift` moves every offset at or after the old body's end, and the
+        // edited function's own `body_end` is exactly that, so it moves with
+        // the rest. It used to be adjusted a second time here, which put it
+        // `delta` bytes too far and made the *next* edit to the same function
+        // splice over whatever followed it.
+        //
+        // Invisible to the M1 gate, which edits each function once. Agent Bench
+        // found it on its second candidate repair, as "the compiler session
+        // failed" — the API had written syntactically broken Rust and the only
+        // thing that noticed was rustc.
         self.index.shift(&function.file, function.body_end, delta);
         if let Some(entry) = self.index.functions.iter_mut().find(|f| f.id == function.id) {
-            entry.body_end = entry.body_end.saturating_add_signed(delta);
             // The splice may have changed what this function calls, and nothing
             // here can know without asking the compiler. Marked rather than
             // guessed; `reindex` is the answer and it says what it cost.
@@ -597,7 +613,7 @@ impl Workspace {
 
         self.staged_entries = staged.entries.clone();
         self.staged = Some(staged);
-        self.editing = Some(function.id.clone());
+        self.editing.insert(function.id.clone());
         Observation {
             status: "staged",
             latency_ms: Some(record.active_ms),
@@ -712,13 +728,16 @@ impl Workspace {
             .functions
             .iter()
             .filter(|f| f.is_test)
-            .filter(|f| match &changed {
+            .filter(|f| {
                 // Selection, and the whole point of having a call graph: a test
-                // that cannot reach the edited function cannot observe it. With
-                // nothing edited yet every test is selected, because there is no
-                // change to be unaffected by.
-                Some(changed) => self.index.reaches(&f.id).contains(changed),
-                None => true,
+                // that cannot reach *any* edited function cannot observe the
+                // change. With nothing edited yet every test is selected,
+                // because there is nothing to be unaffected by.
+                if changed.is_empty() {
+                    return true;
+                }
+                let reaches = self.index.reaches(&f.id);
+                changed.iter().any(|id| reaches.contains(id))
             })
             .cloned()
             .collect();
@@ -765,6 +784,7 @@ impl Workspace {
         let entries = std::mem::take(&mut self.staged_entries);
         let id = staged.commit(&self.runtime);
         self.committed.push((id, entries));
+        self.editing.clear();
         Observation {
             status: "active",
             latency_ms: Some(at.elapsed().as_secs_f64() * 1e3),
@@ -787,6 +807,7 @@ impl Workspace {
         // revision the caller has just abandoned.
         self.staged = None;
         self.staged_entries.clear();
+        self.editing.clear();
         let parent = self.runtime.enter().parent;
         if !self.runtime.rollback_code(parent) {
             return Observation::error("no previous generation");
@@ -809,9 +830,12 @@ impl Workspace {
             needs_rebase: self.needs_rebase,
             symbol: self
                 .editing
-                .as_ref()
-                .and_then(|id| self.index.by_id(id))
-                .map(|f| f.path.clone()),
+                .iter()
+                .filter_map(|id| self.index.by_id(id))
+                .map(|f| f.path.clone())
+                .collect::<Vec<_>>()
+                .first()
+                .cloned(),
             source: Some(if self.staged.is_some() { "candidate" } else { "generation" }),
             ..Observation::ok()
         }
