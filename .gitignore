@@ -9,3 +9,5 @@
 experiments/live-frontend-spike/target/
 experiments/live-frontend-spike/fixtures/*/target/
 experiments/live-frontend-spike/Cargo.lock
+experiments/live-r1/target/
+experiments/live-r1/Cargo.lock
