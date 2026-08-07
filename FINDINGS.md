@@ -12894,3 +12894,140 @@ reuses 283/292 objects and 99% of relocations. And it is the mechanism the
 remaining 15.5 MB needs, so reverting it means building it again.
 
 But 1.07 MB is what it delivered, and the 25 MB is still there.
+
+## 241. Every relink of the largest workload failed, and the corpus had never asked
+
+The one number the specification grades this project on — "p50 relink under
+250 ms on large supported development binaries" — had never been measured on
+the only large binary in the corpus. Measuring it does not produce a number:
+
+```
+  relink: the link failed: rc=1
+  blinker: no input sections to link
+```
+
+pulsevm cold-links fine, and had been cold-linked hundreds of times across
+findings 223–240. It relinks never. Both halves of that sentence had been true
+for as long as the incremental layout has existed, and nothing said so, because
+every workload that gets *relinked* is Rust and the one that isn't only ever
+got linked once.
+
+### The message named the one condition that was not true
+
+`no input sections to link` on a link with 3676 objects and 47 MB of `__text`.
+It came from `carve`, which cuts each output section's buffer into per-object
+slices and refuses when two of them would alias:
+
+```rust
+carve(&mut buffers, image, &slot_of, objects.len()).ok_or(LinkError::NothingToLink)?
+```
+
+`carve`'s own comment said something else again:
+
+> `None` if the contributions of some section overlap or run past its end,
+> which would make the slices unsound — **the caller then keeps the buffers
+> whole and works sequentially**. It has never happened; it is checked because
+> the alternative is trusting the layout to be an invariant it merely is.
+
+There is no such caller. No sequential path was ever written; the `None` became
+`NothingToLink` and the link died. The comment was describing a design, and the
+code was three words of it.
+
+### A member name is not an identity
+
+Two probes, and the first hypothesis was wrong. A zero-length contribution
+shares its offset with whatever comes next, and `sort_by_key` is stable, so
+which of the two lands first depends on the order the layout built them in —
+real, fixed, and not the cause. Skipping empties got 470 KB further into
+`__text` and hit this:
+
+```
+  carve: sec 0 obj=1237 start=28398336 len=1468 consumed=28400204
+```
+
+A genuine overlap: 1868 bytes claimed twice. Counting slot claimants across
+every section says it is not an accident:
+
+```
+  __TEXT,__text     3675 members, 3661 kept,  6 offsets with 12 claimants
+  __TEXT,__const    2816 members, 2813 kept,  9 offsets with 18 claimants
+  __DATA,__data     2344 members, 2344 kept, 19 offsets with 38 claimants
+  ...                                        56 offsets, 112 claimants, all pairs
+```
+
+56 collisions among 22 474 contributions is not a 64-bit hash colliding. The
+key is the archive's path, the member's name, and the section. `ar` has never
+required member names to be unique:
+
+```
+  libllvm_sys-3a1651d8d218ff60.rlib -> COFF.cpp.o x3, MachO.cpp.o x3, Core.cpp.o x2 …
+  libpulsevm_ffi-e7257eb416eb99f6.rlib -> sha256.cpp.o x2
+  48 duplicate members across 312 inputs
+```
+
+A C++ project with `parser/utils.cpp` and `codegen/utils.cpp` archives both as
+`utils.cpp.o`. Three members called `COFF.cpp.o` are one contribution under
+that key, all three ask the previous layout for its single slot, all three are
+told they may stay, and the allocator puts them at one offset.
+
+This is finding 230 again — *a local's name is not its identity* — one level
+up. A name is an identity within the scope that owns it and nowhere else, and
+an archive is a scope.
+
+### Two fixes, because one of them was already promised twice
+
+The cause: a member's identity gains its ordinal among members of that name in
+that archive, the same device `numbered_sections` already used for an object
+with two `__TEXT,__const` sections.
+
+The invariant: **a slot is claimed once.** The allocator is handed a key it
+does not compute and cannot check, so it must not depend on the caller's notion
+of identity being one. Both `layout::reuse` and `link::identity` already
+asserted this protection existed —
+
+> A collision puts two contributions in one slot, which the allocator survives
+> — a slot is claimed once and the second claimant allocates fresh (see
+> `PreviousLayout::take`).
+
+— and `PreviousLayout::take` does not exist and never did. Two modules
+documented a safety net by pointing at each other. With it actually written, a
+future identity bug costs an address rather than the link.
+
+`carve`'s failure also stops being `NothingToLink`.
+
+### Cold linking could not have caught this
+
+A cold link assigns offsets sequentially and cannot overlap whatever the
+identities say. The collision only becomes bytes when a second link reads the
+first one's placement table back. So the regression test links twice with an
+edit between, and fails on the *second* link without the fix — checked by
+reverting each half in turn, because a test that passes either way is not one.
+
+### What the measurement was for, now that it runs
+
+```
+  wall   543 ms      target: p50 under 250 ms
+  link   484 ms      ld64, cold, whole program: 252 ms
+```
+
+and the counters say where it goes:
+
+```
+  placement:    22471/22474 contributions kept their address (100%), 3 moved
+  addresses:    542/298043 changed (0.18%)
+  symbols:      0/3676 objects kept their entries (0%)
+  reachability: 3676/3676 objects' projection moved
+  session:      0 inputs held, 312 read
+  memory:       264 MB of per-target state held of 256 MB budgeted (103%)
+```
+
+The stable layout — the hard part, the thing findings 94 through 106 built —
+works perfectly: 100% of contributions keep their address and 0.18% of
+addresses move. Everything downstream of it reuses nothing. Residency is off
+entirely, not because the inputs are too big but because the *derived* state
+already exceeds the budget before an input is considered, which is finding 226
+unfixed. `read_and_parse` is 126 ms on every relink of a program whose inputs
+did not change.
+
+That is the friend's review, in counters: the mechanisms are real and verified,
+and none of them has been converted into wall-clock on a large binary.

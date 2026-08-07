@@ -648,9 +648,25 @@ fn compute(
 
         if let Some(previous) = retained {
             // Where each member is staying, if it is.
+            //
+            // A slot is claimed once. Two members can ask for the same one —
+            // by a hash collision, or because their identities are genuinely
+            // equal — and handing it to both places both at one offset, which
+            // is an overlapping layout and an unsound carve. The second
+            // claimant is refused and allocates fresh below, which costs it
+            // its address and nothing else.
+            //
+            // Both this module's header and `link::identity` asserted this
+            // protection existed. Neither had it, and pointing at a
+            // `PreviousLayout::take` that was never written is what made a
+            // duplicate archive member name look survivable (finding 241).
+            let mut claimed: BTreeSet<u64> = BTreeSet::new();
             let kept: Vec<Option<u64>> = members
                 .iter()
-                .map(|member| previous.slot(key_of(member), &qualified, member.size))
+                .map(|member| {
+                    let offset = previous.slot(key_of(member), &qualified, member.size)?;
+                    claimed.insert(offset).then_some(offset)
+                })
                 .collect();
 
             let mut occupied: Vec<(u64, u64)> = members

@@ -383,3 +383,55 @@ fn growth_from_liveness_moves_an_input_that_did_not_change() {
         );
     }
 }
+
+/// Two contributions with one identity must not both keep the slot.
+///
+/// The allocator is handed a key it does not compute and cannot check. Two
+/// contributions can carry the same one — by a hash collision, or because the
+/// caller's notion of identity is not one, which is what a repeated archive
+/// member name turned out to be (finding 241). If both are told they stay, the
+/// layout puts them at one offset: overlapping bytes, an unsound carve, and a
+/// link that dies naming a condition that was not true.
+///
+/// This states the property the allocator owns regardless of what the key
+/// means — a slot is claimed once — so that no future identity bug can turn
+/// into an overlapping layout again.
+#[test]
+fn one_slot_is_claimed_once_however_many_contributions_ask_for_it() {
+    let first = compute_layout_with_slop(
+        ImageKind::Executable,
+        &code([1000, 2000, 3000, 4000]),
+        0x1000,
+        Slop::DEFAULT,
+    );
+    let previous = record(&first);
+
+    // Every contribution now answers to object 1's key, which is what a
+    // colliding identity does.
+    let collide = |_: &InputPlacement| ContributionKey(1u64 << 32);
+    let second = compute_layout_reusing(
+        ImageKind::Executable,
+        &code([1000, 2000, 3000, 4000]),
+        0x1000,
+        Slop::DEFAULT,
+        &previous,
+        &collide,
+        &no_extra_room,
+    );
+
+    let section = second
+        .sections
+        .iter()
+        .find(|s| s.name == "__text")
+        .expect("__text exists");
+    let mut ordered: Vec<_> = section.contributions.iter().collect();
+    ordered.sort_by_key(|c| c.offset);
+    for pair in ordered.windows(2) {
+        assert!(
+            pair[0].offset + pair[0].size <= pair[1].offset,
+            "contributions overlap: {:?} then {:?}",
+            pair[0],
+            pair[1]
+        );
+    }
+}

@@ -36,6 +36,23 @@ pub enum LinkError {
     },
     /// No object contributed anything placeable.
     NothingToLink,
+    /// Two contributions to one output section claim the same bytes, or one
+    /// runs past the section's end.
+    ///
+    /// Its own variant because it used to be reported as `NothingToLink`, and
+    /// a layout that overlaps is the opposite of one that placed nothing: the
+    /// message named the one condition that was not true, on a link with 552
+    /// inputs and 47 MB of `__text` (finding 241).
+    OverlappingContributions {
+        section: usize,
+    },
+    /// A buffer was carved for an output section the layout does not have.
+    ///
+    /// The buffers are built from that same layout, so this is the two
+    /// disagreeing with each other rather than anything an input can cause.
+    MissingOutputSection {
+        section: usize,
+    },
     /// The entry symbol was not found in any object.
     NoEntryPoint {
         symbol: String,
@@ -112,6 +129,13 @@ impl std::fmt::Display for LinkError {
                 Ok(())
             }
             LinkError::NothingToLink => write!(f, "no input sections to link"),
+            LinkError::OverlappingContributions { section } => write!(
+                f,
+                "internal: contributions to output section {section} overlap or run past its end"
+            ),
+            LinkError::MissingOutputSection { section } => {
+                write!(f, "internal: the layout has no output section {section}")
+            }
             LinkError::NoEntryPoint { symbol } => {
                 write!(f, "entry symbol {symbol} is not defined in any input")
             }

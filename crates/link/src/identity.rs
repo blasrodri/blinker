@@ -66,6 +66,17 @@ pub struct ContributionKeys {
 impl ContributionKeys {
     pub(crate) fn build(objects: &[LoadedObject]) -> ContributionKeys {
         let mut keys = FastMap::default();
+        // How many members of this name this archive has already produced.
+        //
+        // `ar` does not require member names to be unique, and real archives
+        // are not: `libllvm_sys.rlib` holds three members called `COFF.cpp.o`,
+        // one per source directory that built a file with that name, and
+        // pulsevm's inputs contain 48 such duplicates. Keyed on path and name
+        // alone all three are one contribution, all three claim the previous
+        // link's single slot, and the layout places them at one offset — an
+        // overlap `carve` refuses, which is how every pulsevm relink failed
+        // (finding 241).
+        let mut duplicates: FastMap<(&std::path::Path, &str), u32> = FastMap::default();
         for object in objects {
             // The path this link read it from, not the one baked into a shared
             // parse. Content reuse (finding 145) hands the same parse back
@@ -73,7 +84,18 @@ impl ContributionKeys {
             // a contribution's identity depend on whether the session happened
             // to be holding it — so a warm link and a cold one would disagree
             // about what the same bytes are called.
-            let input = input_identity(object.path.as_ref(), object.member.as_deref());
+            let copy = match object.member.as_deref() {
+                Some(member) => {
+                    let count = duplicates
+                        .entry((object.path.as_ref(), member))
+                        .or_insert(0);
+                    let copy = *count;
+                    *count += 1;
+                    copy
+                }
+                None => 0,
+            };
+            let input = input_identity(object.path.as_ref(), object.member.as_deref(), copy);
             for (ordinal, section) in numbered_sections(&object.parsed) {
                 keys.insert(
                     (object.parsed.id.0, section.id.0),
@@ -131,23 +153,33 @@ fn numbered_sections(
 
 /// The file an object came from, as a number.
 ///
-/// An archive member is its archive's path *and* its member name: the path
-/// alone names an rlib holding two hundred objects, and keying on it would
-/// give every one of them the same identity.
+/// An archive member is its archive's path, its member name, *and* which copy
+/// of that name it is: the path alone names an rlib holding two hundred
+/// objects, and the name is not unique within one archive.
 ///
-/// Both come from the *link*, never from the parse. A held parse can now
+/// `copy` is the member's ordinal among those of the same name in the same
+/// archive, in extraction order — the same device `numbered_sections` uses for
+/// an object with two `__TEXT,__const` sections, and needed for the same
+/// reason. It is stable across a relink as long as the archive's member order
+/// is, which it is for an archive its build system rebuilt. When it is not,
+/// two members trade slots: they keep the addresses of each other's previous
+/// contribution, which costs relocation reuse and nothing else, because a
+/// contribution is always relocated against the address it actually landed at.
+///
+/// All three come from the *link*, never from the parse. A held parse can now
 /// outlive the archive it was read from — rustc renames every codegen unit of
 /// a recompiled crate, and the member cache proves the bytes are unchanged and
 /// serves the old parse under the new name — so taking the member name from
 /// `metadata` would make a warm link and a cold one disagree about what the
 /// same bytes are called.
-fn input_identity(path: &std::path::Path, member: Option<&str>) -> u64 {
+fn input_identity(path: &std::path::Path, member: Option<&str>, copy: u32) -> u64 {
     let mut hasher = FastHasher::default();
     path.hash(&mut hasher);
     match member {
         Some(member) => {
             1u8.hash(&mut hasher);
             member.hash(&mut hasher);
+            copy.hash(&mut hasher);
         }
         None => 0u8.hash(&mut hasher),
     }
@@ -209,9 +241,15 @@ mod tests {
     /// earlier version of this helper recomputed the hash itself, which would
     /// have kept passing had the real one changed underneath it.
     fn key(object: &ParsedObject, section: u32) -> ContributionKey {
+        key_of_copy(object, section, 0)
+    }
+
+    /// The same, for the `copy`th member of its name in its archive.
+    fn key_of_copy(object: &ParsedObject, section: u32, copy: u32) -> ContributionKey {
         let input = input_identity(
             &object.metadata.path.clone(),
             object.metadata.member.as_deref(),
+            copy,
         );
         let (ordinal, section) = numbered_sections(object)
             .find(|(_, s)| s.id.0 == section)
@@ -235,6 +273,34 @@ mod tests {
         let a = object(0, "/lib/libstd.rlib", Some("std.0.o"));
         let b = object(1, "/lib/libstd.rlib", Some("std.1.o"));
         assert_ne!(key(&a, 0), key(&b, 0));
+    }
+
+    /// And two members of one archive that share a *name* are still two.
+    ///
+    /// `ar` does not require member names to be unique. `libllvm_sys.rlib`
+    /// holds three members called `COFF.cpp.o`, and pulsevm's inputs contain
+    /// 48 such duplicates. Keyed on path and name alone all of them are one
+    /// contribution, they all claim one slot in the previous layout, and the
+    /// allocator places them at one offset — an overlapping layout, which is
+    /// exactly what made every pulsevm relink fail (finding 241).
+    #[test]
+    fn two_members_of_one_archive_sharing_a_name_are_distinct() {
+        let first = object(0, "/lib/libllvm_sys.rlib", Some("COFF.cpp.o"));
+        let second = object(1, "/lib/libllvm_sys.rlib", Some("COFF.cpp.o"));
+        assert_ne!(
+            key_of_copy(&first, 0, 0),
+            key_of_copy(&second, 0, 1),
+            "two members of one archive with one name shared a contribution"
+        );
+    }
+
+    /// The copy ordinal is what separates them, and it is what has to be
+    /// stable: the same copy of the same name is the same contribution.
+    #[test]
+    fn the_same_copy_of_a_repeated_member_keeps_its_key() {
+        let before = object(4, "/lib/libllvm_sys.rlib", Some("COFF.cpp.o"));
+        let after = object(91, "/lib/libllvm_sys.rlib", Some("COFF.cpp.o"));
+        assert_eq!(key_of_copy(&before, 0, 2), key_of_copy(&after, 0, 2));
     }
 
     /// A loose object and an archive member of the same name are different.

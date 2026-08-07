@@ -5951,25 +5951,40 @@ impl ObjectBytes<'_> {
 
 /// Cut every output section's buffer into its objects' contributions.
 ///
-/// `None` if the contributions of some section overlap or run past its end,
-/// which would make the slices unsound — the caller then keeps the buffers
-/// whole and works sequentially. It has never happened; it is checked because
-/// the alternative is trusting the layout to be an invariant it merely is.
+/// Fails if the contributions of some section overlap or run past its end,
+/// which would make the slices unsound. There is no fallback: this comment
+/// used to claim the caller "keeps the buffers whole and works sequentially",
+/// and no such path was ever written — the caller turned the `None` into
+/// `NothingToLink` and the link died with a message describing the one thing
+/// that had not gone wrong (finding 241).
 fn carve<'a>(
     buffers: &'a mut [(usize, Vec<u8>)],
     image: &Image,
     slot_of: &HashMap<u32, usize>,
     objects: usize,
-) -> Option<Vec<ObjectBytes<'a>>> {
+) -> Result<Vec<ObjectBytes<'a>>, LinkError> {
     let mut per_object: Vec<ObjectBytes<'a>> = (0..objects)
         .map(|_| ObjectBytes { spans: Vec::new() })
         .collect();
     for (index, buffer) in buffers.iter_mut() {
-        let section = image.layout.section(*index)?;
+        let section = image
+            .layout
+            .section(*index)
+            .ok_or(LinkError::MissingOutputSection { section: *index })?;
+        // Empty contributions are dropped, not ordered. An object that
+        // contributes no bytes to a section still gets an offset — the one the
+        // cursor happens to be at — so it shares that offset with whichever
+        // contribution comes next, and `sort_by_key` is stable, so which of the
+        // two lands first is decided by the order the layout built them in.
+        // Cold and incremental layouts build them in different orders, so on a
+        // pulsevm relink an empty contribution sorted *after* the 14,660-byte
+        // one at its own offset, `start < consumed` fired, and the link failed
+        // with "no input sections to link" (finding 241). There is nothing to
+        // carve for zero bytes and nothing that can overlap them.
         let mut ordered: Vec<&blinker_layout::Contribution> = section
             .contributions
             .iter()
-            .filter(|c| c.object != SYNTHETIC_OBJECT)
+            .filter(|c| c.object != SYNTHETIC_OBJECT && c.size != 0)
             .collect();
         ordered.sort_by_key(|c| c.offset);
 
@@ -5981,19 +5996,23 @@ fn carve<'a>(
             let len = contribution.size as usize;
             // Out of order, overlapping, or off the end.
             if start < consumed || start + len > total {
-                return None;
+                return Err(LinkError::OverlappingContributions { section: *index });
             }
             let (_, tail) = rest.split_at_mut(start - consumed);
             let (mine, tail) = tail.split_at_mut(len);
             rest = tail;
             consumed = start + len;
-            let slot = *slot_of.get(&contribution.object.0)?;
+            let slot = *slot_of
+                .get(&contribution.object.0)
+                .ok_or(LinkError::MissingObject {
+                    object: contribution.object,
+                })?;
             per_object[slot]
                 .spans
                 .push((contribution.section.0, *index, start, mine));
         }
     }
-    Some(per_object)
+    Ok(per_object)
 }
 
 // Eight, and each one is a distinct thing the pass consults. The two already
@@ -6058,8 +6077,7 @@ fn apply_relocations(
         .enumerate()
         .map(|(slot, object)| (object.parsed.id.0, slot))
         .collect();
-    let mut carved =
-        carve(&mut buffers, image, &slot_of, objects.len()).ok_or(LinkError::NothingToLink)?;
+    let mut carved = carve(&mut buffers, image, &slot_of, objects.len())?;
 
     // One chunk of objects, relocated into its own slices and its own
     // accumulators. Everything it produces is chunk-local — including the
