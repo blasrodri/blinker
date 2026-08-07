@@ -168,6 +168,43 @@ struct Measure {
     record: Record,
 }
 
+/// One process, one codegen backend.
+///
+/// rustc loads a codegen backend once per process and caches it, so the first
+/// session decides for every session after it. A later session that asks for a
+/// different backend does not get one — it silently gets the first. §36 found
+/// this the expensive way: the differential's warm session ran first with no
+/// `-Zcodegen-backend`, so the whole suite used LLVM while believing it was
+/// exercising cg_clif, and the live sink was never reached.
+///
+/// Nothing about that failure was visible in its output. It is therefore an
+/// invariant and not a convention: a session that would switch backends aborts.
+static BACKEND: std::sync::Mutex<Option<Option<String>>> = std::sync::Mutex::new(None);
+
+fn hold_the_backend(args: &[String]) {
+    let asked = args
+        .iter()
+        .find_map(|argument| argument.strip_prefix("-Zcodegen-backend="))
+        .map(str::to_string);
+    let mut backend = BACKEND.lock().expect("not poisoned");
+    match backend.as_ref() {
+        None => *backend = Some(asked),
+        Some(held) if *held == asked => {}
+        Some(held) => {
+            let name = |value: &Option<String>| {
+                value.clone().unwrap_or_else(|| "the default (LLVM)".into())
+            };
+            panic!(
+                "this process already loaded {} and rustc caches the backend \
+                 per process, so asking for {} would silently use the first. \
+                 Run one backend per process.",
+                name(held),
+                name(&asked),
+            );
+        }
+    }
+}
+
 /// The hot root's name, for the query override.
 ///
 /// A query provider is a bare `fn` and cannot capture, so the one thing the
@@ -865,6 +902,8 @@ fn run_session_with(
     }
     args.extend(extra.iter().cloned());
 
+    hold_the_backend(&args);
+
     // Cleared, not merely overwritten: if the override never runs — the session
     // failed, or the mode is whole-crate — a stale list from the previous
     // session would be checked against this session's object, and the two would
@@ -917,6 +956,8 @@ struct Options {
     backend: Option<PathBuf>,
     /// Successive revisions in one process (§35).
     sequence: bool,
+    /// The resident-coordinator soak (§38).
+    soak: bool,
 }
 
 fn parse_options() -> Options {
@@ -935,6 +976,7 @@ fn parse_options() -> Options {
     let mut differential = None;
     let mut backend = None;
     let mut sequence = false;
+    let mut soak = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--fixture" => fixture = PathBuf::from(args.next().expect("--fixture takes a path")),
@@ -959,6 +1001,7 @@ fn parse_options() -> Options {
             // between the two is the measurement.
             "--closure-only" => closure_only = true,
             "--sequence" => sequence = true,
+            "--soak" => soak = true,
             "--backend" => backend = Some(PathBuf::from(args.next().expect("--backend takes a path"))),
             // The runtime differential. The argument names the defect to
             // inject: `none` is the suite proper, the rest are its controls.
@@ -1007,6 +1050,7 @@ fn parse_options() -> Options {
         differential,
         backend,
         sequence,
+        soak,
     }
 }
 
@@ -1022,6 +1066,9 @@ fn main() {
             eprintln!("  the live sink is unavailable: {error}");
             std::process::exit(2);
         }
+    }
+    if options.soak {
+        return soak_main(&options);
     }
     if options.sequence {
         return sequence_main(&options);
@@ -1412,6 +1459,325 @@ fn sequence_main(options: &Options) {
     if let Some(path) = &options.out {
         let json = serde_json::to_string_pretty(&records).expect("serialize");
         std::fs::write(path, json).expect("write");
+    }
+    if !failures.is_empty() {
+        std::process::exit(1);
+    }
+}
+
+/// Peak resident set size, in megabytes.
+///
+/// `getrusage`'s `ru_maxrss` is a high-water mark rather than the current
+/// footprint, which is the right shape for the question being asked: a
+/// coordinator that leaks shows a mark that keeps climbing, and one that does
+/// not shows a mark that stops. It is also free, where sampling the current RSS
+/// means a subprocess or a `mach` call on the measured path.
+fn peak_rss_mb() -> f64 {
+    // SAFETY: `getrusage` writes into a struct this function owns.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut usage) } != 0 {
+        return 0.0;
+    }
+    // Darwin reports bytes here; Linux reports kilobytes.
+    if cfg!(target_os = "macos") {
+        usage.ru_maxrss as f64 / 1e6
+    } else {
+        usage.ru_maxrss as f64 / 1e3
+    }
+}
+
+/// The resident coordinator: one process, many revisions, a fresh compiler
+/// session for each.
+///
+/// The process keeps what is genuinely process-scoped — the rustc and cg_clif
+/// dylibs, the sysroot lookup, the captured invocation, the incremental
+/// directory, the arena, the generation table, and the previous revision's
+/// contract. It does *not* try to keep a `TyCtxt`: rustc's `Compiler` is one
+/// session by construction, and pretending otherwise would be a much larger
+/// correctness surface than the few milliseconds it might save.
+///
+/// Sessions are strictly sequential. Overlapping revision N's finalization with
+/// revision N+1's analysis would have them share incremental state, and S0's
+/// `s-…-working` finding is a good enough warning about what that costs to
+/// leave for later.
+fn soak_main(options: &Options) {
+    let arena = arena::Arena::reserve(256 * 1024 * 1024).expect("arena");
+    let runtime = generation::Runtime::new(8);
+    let out_dir = options.incremental.clone();
+    let backend = options
+        .backend
+        .as_ref()
+        .map(|path| format!("-Zcodegen-backend={}", path.display()))
+        .unwrap_or_else(|| "-Zcodegen-backend=cranelift".into());
+
+    // The cycle. Three DIRECT revisions with distinct answers, then one the
+    // classifier must refuse — so the soak exercises recovery as often as it
+    // exercises success, and a refusal that stopped working would show up as a
+    // wrong value rather than as nothing at all.
+    let cycle: [(&str, Option<i64>); 4] = [
+        ("body_arith", Some(167)),
+        ("body_arith2", Some(54)),
+        ("body_arith3", Some(349)),
+        ("fallback_inline", None),
+    ];
+    let sources: Vec<(String, Option<i64>, String)> = cycle
+        .iter()
+        .map(|(name, expected)| {
+            let text = std::fs::read_to_string(options.variants.join(format!("{name}.rs")))
+                .unwrap_or_else(|_| panic!("no variant named {name}"));
+            (name.to_string(), *expected, text)
+        })
+        .collect();
+
+    let pristine = std::fs::read_to_string(options.variants.join("pristine.rs"))
+        .expect("the pristine variant exists");
+    std::fs::write(&options.target_file, &pristine).expect("write pristine");
+    let mut previous = run_session_with(
+        &options.fixture,
+        &options.target_file,
+        &options.incremental,
+        &options.hot,
+        Mode::HotClosure,
+        &[
+            backend.clone(),
+            "--emit=obj".into(),
+            format!("--out-dir={}", out_dir.display()),
+        ],
+        true,
+    )
+    .contract;
+
+    #[derive(serde::Serialize)]
+    struct Soak {
+        revision: usize,
+        edit: String,
+        verdict: String,
+        /// Edit → the published code is callable.
+        edit_to_active_ms: f64,
+        /// Publication → the compiler is ready for the next revision.
+        active_to_ready_ms: f64,
+        edit_to_ready_ms: f64,
+        expand_ms: f64,
+        analysis_ms: f64,
+        classify_ms: f64,
+        closure_ms: f64,
+        mir_to_clif_ms: f64,
+        cranelift_ms: f64,
+        extract_ms: f64,
+        publish_ms: f64,
+        /// Whether the backend actually generated code this revision. A
+        /// revision that changed the source and generated nothing is rustc
+        /// reusing a cached codegen unit, which §36 showed the object path
+        /// could not detect.
+        delivered: bool,
+        peak_rss_mb: f64,
+        returned: Option<i64>,
+        expected: Option<i64>,
+        error: Option<String>,
+    }
+
+    let mut rows: Vec<Soak> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    // What the live program should answer *now*. A refused revision does not
+    // change it: the whole claim about a FALLBACK is that the program is left
+    // exactly as it was.
+    let mut live_value: i64 = 106;
+
+    // Whether the revision before this one was refused, which decides what
+    // this one may be.
+    //
+    // Recovery from an inlinability refusal takes two revisions, not one, and
+    // that is the classifier being right rather than slow: `fallback_inline`
+    // leaves a body that rustc encodes into this crate's rmeta, so a
+    // downstream crate may hold a copy of it. The revision after it has a
+    // clean `#[inline(never)]` body of its own, but its *predecessor* is still
+    // observable downstream, and replacing one copy does not reach the others.
+    // A real coordinator answers a FALLBACK with an ordinary rebuild, which
+    // re-establishes the baseline; this harness has no downstream to rebuild,
+    // so it models the conservative path and checks that the program stays on
+    // its last good generation throughout.
+    let mut recovering = false;
+    for revision in 0..options.iterations {
+        let (edit, expected, source) = &sources[revision % sources.len()];
+        let must_be_direct = expected.is_some() && !recovering;
+        let mut record = live::sink_revision(
+            &arena,
+            &runtime,
+            &options.fixture,
+            &options.target_file,
+            &options.incremental,
+            &options.hot,
+            source,
+            previous.as_ref(),
+            &out_dir,
+            None,
+            &[backend.clone()],
+        );
+        previous = record.contract.clone();
+        let timings = record.timings.unwrap_or_default();
+        let direct = record.verdict == "DIRECT";
+
+        // The value the running program answers with, read *after* the
+        // revision has been accepted or rolled back. For a DIRECT revision
+        // that is the new answer; for a refused one it must still be the old
+        // one, which is the transactional claim exercised every fourth
+        // revision for the length of the soak.
+        let observed = generation::scope(&runtime, |generation| {
+            generation.implementation(0).map(|pointer| {
+                // SAFETY: the fixture's declared signature.
+                let f: extern "C" fn(u64, u32) -> u64 =
+                    unsafe { std::mem::transmute(pointer) };
+                f(3, 5) as i64
+            })
+        });
+        if direct {
+            if let Some(expected) = expected {
+                live_value = *expected;
+            }
+        }
+        let _ = must_be_direct;
+        match observed {
+            Some(value) if value != live_value => failures.push(format!(
+                "revision {revision} ({edit}): the program answers {value}, expected {live_value}"
+            )),
+            None => failures.push(format!("revision {revision}: nothing is published")),
+            _ => {}
+        }
+        if direct != must_be_direct {
+            failures.push(format!(
+                "revision {revision} ({edit}): verdict {} is not the one this variant must get",
+                record.verdict
+            ));
+        }
+        // Set by the *inline* revision, not by any refusal. A revision refused
+        // because its predecessor was observable does not itself leave an
+        // observable body behind, so recovery lasts exactly one revision.
+        recovering = expected.is_none();
+        if direct && record.timings.is_none() {
+            failures.push(format!(
+                "revision {revision} ({edit}): nothing was generated — a cached codegen unit \
+                 was reused for a source that changed"
+            ));
+        }
+        if let Some(error) = &record.error {
+            if direct {
+                failures.push(format!("revision {revision} ({edit}): {error}"));
+            }
+        }
+
+        rows.push(Soak {
+            revision,
+            edit: edit.clone(),
+            verdict: record.verdict.clone(),
+            edit_to_active_ms: record.active_ms,
+            active_to_ready_ms: (record.total_ms - record.active_ms).max(0.0),
+            edit_to_ready_ms: record.total_ms,
+            expand_ms: record.expand_ms,
+            analysis_ms: record.analysis_ms,
+            classify_ms: record.classify_ms,
+            closure_ms: record.closure_ms,
+            mir_to_clif_ms: timings.mir_to_clif_ns as f64 / 1e6,
+            cranelift_ms: timings.cranelift_ns as f64 / 1e6,
+            extract_ms: timings.extract_ns as f64 / 1e6,
+            publish_ms: record.publish_ms,
+            delivered: record.timings.is_some(),
+            peak_rss_mb: peak_rss_mb(),
+            returned: observed,
+            expected: Some(live_value),
+            error: record.error.clone(),
+        });
+        record.edit = edit.clone();
+    }
+    std::fs::write(&options.target_file, &pristine).expect("restore pristine");
+
+    // Reported by decile, because the question is a trend and a hundred rows is
+    // not a way to see one.
+    let bucket = (rows.len() / 10).max(1);
+    println!(
+        "\n  {:>9} {:>10} {:>10} {:>10} {:>9} {:>9} {:>9} {:>9}",
+        "revisions", "active", "ready", "after", "expand", "analysis", "backend", "peak RSS"
+    );
+    let median = |mut values: Vec<f64>| -> f64 {
+        if values.is_empty() {
+            return 0.0;
+        }
+        values.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+        values[values.len() / 2]
+    };
+    for chunk in rows.chunks(bucket) {
+        // Medians over the DIRECT revisions of each bucket, for the same
+        // reason: a refused revision contributes a zero, not a fast one.
+        let direct: Vec<&Soak> = chunk.iter().filter(|r| r.verdict == "DIRECT").collect();
+        let m = |f: fn(&Soak) -> f64| median(direct.iter().map(|r| f(r)).collect());
+        println!(
+            "  {:>4}-{:<4} {:>10.2} {:>10.2} {:>10.2} {:>9.2} {:>9.2} {:>9.3} {:>9.1}",
+            chunk[0].revision,
+            chunk[chunk.len() - 1].revision,
+            m(|r| r.edit_to_active_ms),
+            m(|r| r.edit_to_ready_ms),
+            m(|r| r.active_to_ready_ms),
+            m(|r| r.expand_ms),
+            m(|r| r.analysis_ms),
+            m(|r| r.mir_to_clif_ms + r.cranelift_ms + r.extract_ms),
+            chunk[chunk.len() - 1].peak_rss_mb,
+        );
+    }
+
+    // The acceptance criteria, checked rather than eyeballed.
+    // Over the DIRECT revisions only. A refused one publishes nothing and has
+    // no activation time, and averaging those in made the drift read 0.00x —
+    // a number that looks like perfect stability and means the opposite.
+    let active: Vec<f64> = rows
+        .iter()
+        .filter(|r| r.verdict == "DIRECT")
+        .map(|r| r.edit_to_active_ms)
+        .collect();
+    let quarter = (active.len() / 4).max(1);
+    let first = median(active[..quarter].to_vec());
+    let last = median(active[active.len() - quarter..].to_vec());
+    let drift = last / first.max(f64::MIN_POSITIVE);
+    let rss_first = rows[(rows.len() / 4).min(rows.len() - 1)].peak_rss_mb;
+    let rss_last = rows[rows.len() - 1].peak_rss_mb;
+    println!(
+        "\n  latency drift, last quarter vs first: {drift:.2}x  ({first:.2} → {last:.2} ms)"
+    );
+    println!(
+        "  peak RSS after the first quarter: {rss_first:.1} → {rss_last:.1} MB  \
+         (+{:.1} MB over {} revisions)",
+        rss_last - rss_first,
+        rows.len() - rows.len() / 4
+    );
+    // 1.25 rather than 1.0: the machine is not a clean room, and a threshold
+    // that fires on noise is one that gets ignored.
+    if drift > 1.25 {
+        failures.push(format!("latency drifted upward by {drift:.2}x over the soak"));
+    }
+    if rss_last - rss_first > 64.0 {
+        failures.push(format!(
+            "peak RSS grew {:.1} MB after the first quarter",
+            rss_last - rss_first
+        ));
+    }
+    let refused = rows.iter().filter(|r| r.verdict != "DIRECT").count();
+    println!(
+        "\n  {} revisions, {} DIRECT, {} refused, {} generations retained: {}",
+        rows.len(),
+        rows.len() - refused,
+        refused,
+        runtime.generations(),
+        if failures.is_empty() {
+            "every value exact, every verdict as required".to_string()
+        } else {
+            format!("{} FAILED", failures.len())
+        }
+    );
+    for failure in failures.iter().take(10) {
+        println!("    {failure}");
+    }
+
+    if let Some(path) = &options.out {
+        std::fs::write(path, serde_json::to_string_pretty(&rows).expect("serialize"))
+            .expect("write");
     }
     if !failures.is_empty() {
         std::process::exit(1);

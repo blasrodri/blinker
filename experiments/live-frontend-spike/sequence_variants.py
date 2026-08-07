@@ -13,6 +13,7 @@ make a passing run mean less than it looks like.
 """
 
 import pathlib
+import re
 import sys
 
 HERE = pathlib.Path(__file__).parent
@@ -25,6 +26,26 @@ REVISIONS = [
 ]
 
 FIXTURES = ["small", "rg-lib", "blinker-lib", "medium", "large"]
+
+# A revision the classifier must refuse, so the soak exercises recovery as
+# often as it exercises success.
+#
+# The first attempt introduced a `static` and read it, on the assumption that
+# the base image would have nowhere to put the storage. At `-Copt-level=0` that
+# is refused, and the differential fixture confirms it. At `-Copt-level=3` —
+# which is what the captured cargo invocation for these fixtures uses — rustc
+# folds the read of an immutable static, so the patch closure genuinely never
+# references it and DIRECT is the *correct* verdict. The classifier was right
+# and the fixture was wrong: it reasons about the closure that exists, not
+# about the source text that produced it.
+#
+# `#[inline]` cannot be optimized away, because it is the thing being asked
+# about: an inlinable body may already be embedded in a downstream crate, so
+# replacing this copy would leave the old one running. The arithmetic changes
+# too, so that a refusal which wrongly published would answer 198 rather than
+# whatever the previous revision answered.
+FALLBACK_MULTIPLIER = 13
+FALLBACK_ADDEND = 3
 
 
 def main() -> int:
@@ -45,6 +66,35 @@ def main() -> int:
                 1,
             )
             (variants / f"{name}.rs").write_text(text)
+
+        signature = re.search(r"pub fn (spike_)?hot_root\(", pristine)
+        if signature:
+            # The nearest `#[inline(never)]` above the hot root, not the first
+            # one in the file: other functions carry it too.
+            attribute = pristine.rfind("#[inline(never)]", 0, signature.start())
+            if attribute == -1:
+                print(f"{fixture}: the hot root has no #[inline(never)]", file=sys.stderr)
+                return 1
+            text = (
+                pristine[:attribute]
+                + "#[inline]"
+                + pristine[attribute + len("#[inline(never)]") :]
+            ).replace(
+                anchor,
+                f"reading.total().wrapping_mul({FALLBACK_MULTIPLIER})"
+                f".wrapping_add({FALLBACK_ADDEND})",
+                1,
+            )
+            (variants / "fallback_inline.rs").write_text(text)
+        if False:
+            # Appended, not inserted above the function. Inserting before
+            # `pub fn …` put the static between the hot root's attributes and
+            # the hot root, so `#[inline(never)]` landed on a static and the
+            # crate stopped compiling — which the soak then reported as a
+            # failed session rather than as a refused revision. A top-level
+            # item can go anywhere in the module, so it goes somewhere with no
+            # attributes above it.
+            pass
         print(
             f"  {fixture:12} "
             + " ".join(

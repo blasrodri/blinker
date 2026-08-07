@@ -905,51 +905,66 @@ pub fn sink_revision(
     record.total_ms = whole.elapsed().as_secs_f64() * 1e3;
     record.contract = session.contract.clone();
 
-    if let Some(error) = session.error {
-        record.error = Some(error);
-        return record;
+    // One acceptance point, and one rollback for everything else.
+    //
+    // The sink publishes from inside codegen, before anything has classified
+    // the revision — it has to, because that is where the artifact exists. So
+    // *every* path that does not accept the patch has to undo it, not just the
+    // FALLBACK one. The first version returned early on a missing contract
+    // without rolling back, and the soak caught it on the revision after every
+    // refused one: the program was running new code that nothing had approved,
+    // while the harness believed nothing had been published.
+    if let Some(outcome) = outcome.as_ref() {
+        record.publish_ms = outcome.publish_ms;
+        record.code_bytes = outcome.code_bytes;
+        record.relocations = outcome.relocations;
+        record.active_ms = outcome.active_ms;
+        record.timings = Some(outcome.timings);
+        record.object_defines = outcome.timings.functions as usize;
     }
-    // The verdict is still computed, and still decides. The sink publishes
-    // whatever cg_clif compiled, so a FALLBACK has to be turned into a
-    // rollback rather than prevented — which is why this runs before the
-    // artifact is reported and why a refused revision is rolled back below.
-    let verdict = match (session.contract.as_ref(), before) {
-        (Some(after), Some(before)) => crate::classify::classify(before, after),
-        _ => {
-            record.error = Some("no contract to compare".into());
-            return record;
-        }
-    };
-    record.verdict = verdict.label();
+    let published = outcome
+        .as_ref()
+        .is_some_and(|outcome| outcome.entry != 0 && outcome.error.is_none());
 
-    let Some(outcome) = outcome else {
-        if verdict.is_direct() {
-            record.error = Some("the sink delivered nothing".into());
+    let accept = (|| {
+        if let Some(error) = session.error {
+            return Err(error);
+        }
+        let (Some(after), Some(before)) = (session.contract.as_ref(), before) else {
+            return Err("no previous revision to compare against".into());
+        };
+        let verdict = crate::classify::classify(before, after);
+        record.verdict = verdict.label();
+        if !verdict.is_direct() {
+            // Not an error: a refusal is the classifier working.
+            return Ok(false);
+        }
+        match outcome.as_ref().and_then(|outcome| outcome.error.clone()) {
+            Some(error) => Err(error),
+            None if !published => Err("the sink delivered nothing".into()),
+            None => Ok(true),
+        }
+    })();
+
+    let accepted = match accept {
+        Ok(accepted) => accepted,
+        Err(error) => {
+            record.error = Some(error);
+            false
+        }
+    };
+    if !accepted {
+        if published {
+            // Back to the generation this revision superseded. `parent` is on
+            // the generation itself, which makes a rollback a fact about the
+            // published history rather than a count the caller has to keep.
+            let parent = scope(runtime, |generation| generation.parent);
+            runtime.rollback_code(parent);
         }
         return record;
-    };
-    record.publish_ms = outcome.publish_ms;
-    record.code_bytes = outcome.code_bytes;
-    record.relocations = outcome.relocations;
-    record.active_ms = outcome.active_ms;
-    record.timings = Some(outcome.timings);
-    record.object_defines = outcome.timings.functions as usize;
-    if let Some(error) = outcome.error {
-        record.error = Some(error);
-        return record;
     }
-    if !verdict.is_direct() {
-        // Published, then refused. The generation table's rollback is what
-        // makes this recoverable rather than a hole: the classifier's answer
-        // still governs what the program runs.
-        // Back to the generation this revision superseded. `parent` is on the
-        // generation itself, which is what makes a rollback a fact about the
-        // published history rather than a count the caller has to keep.
-        let parent = scope(runtime, |generation| generation.parent);
-        runtime.rollback_code(parent);
-        return record;
-    }
-    if outcome.entry != 0 {
+
+    if let Some(outcome) = outcome {
         // SAFETY: an address in the arena, of the fixture's declared signature.
         let f: extern "C" fn(u64, u32) -> u64 =
             unsafe { std::mem::transmute(outcome.entry as *const u8) };

@@ -380,9 +380,15 @@ fn trial(
                 "-Cmetadata=diff".to_string(),
                 "-Cdebug-assertions=off".to_string(),
             ];
-            if let Some(backend) = &options.backend {
-                arguments.push(format!("-Zcodegen-backend={}", backend.display()));
-            }
+            // Always, and matching whatever `patch` will ask for. Omitting it
+            // when no `--backend` was given still left this session choosing
+            // LLVM and every session after it stuck with that choice — the
+            // same defect in a smaller form, which is why the invariant checks
+            // the *value* rather than merely that a flag was passed.
+            arguments.push(match &options.backend {
+                Some(backend) => format!("-Zcodegen-backend={}", backend.display()),
+                None => "-Zcodegen-backend=cranelift".into(),
+            });
             arguments
         },
         false,

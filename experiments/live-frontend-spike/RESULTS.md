@@ -1124,3 +1124,115 @@ DIRECT iff
 Subset in (1) and equality in (5), and the difference matters: a closure may
 legitimately contain unchanged functions, but an object may not contain a
 definition nobody predicted.
+
+## 38. The resident coordinator, and a 100-revision soak
+
+One process, a fresh compiler session per revision. The process keeps what is
+genuinely process-scoped — the rustc and cg_clif dylibs, the sysroot lookup,
+the captured invocation, the incremental directory, the arena, the generation
+table, and the previous revision's contract. It does not try to keep a
+`TyCtxt`: rustc's `Compiler` is one session by construction.
+
+Sessions are strictly sequential. Overlapping revision N's finalization with
+N+1's analysis would have them share incremental state, and S0's `s-…-working`
+finding is warning enough about what that costs, for a few milliseconds of
+throughput.
+
+### One process, one backend — as an invariant
+
+rustc loads a codegen backend once per process and caches it, so the first
+session decides for every session after it. §36 found this by accident. It is
+now checked: a session that would switch backends aborts with the reason.
+
+It fired immediately, on the object-path differential, which passed no backend
+flag on its warm session and `-Zcodegen-backend=cranelift` afterwards — so it
+had been running LLVM throughout. Fixed, and with cranelift actually selected
+that suite now refuses `new_local_helper` exactly as the sink path does. The
+two paths agree because they are finally compiling with the same compiler.
+
+### 100 revisions per fixture, deterministic cycle
+
+`body_arith` → `body_arith2` → `body_arith3` → `fallback_inline`, repeating.
+Three DIRECT revisions with distinct answers and one the classifier must
+refuse, so recovery is exercised as often as success. The value the *running
+program* answers is read after every revision, including refused ones — where
+it must be unchanged.
+
+| fixture | revisions 0–9 | 40–49 | 90–99 | drift | peak RSS |
+|---|---:|---:|---:|---:|---|
+| small | 14.4 | 17.6 | 15.0 | **1.08×** | 108 → 114 MB |
+| rg-lib | 29.7 | 27.7 | 20.8 | **0.77×** | 140 → 143 MB |
+| blinker-lib | 29.3 | 24.7 | 24.5 | **0.92×** | 135 → 136 MB |
+
+`edit → active`, p50 per bucket, milliseconds. `blinker-lib` is flat to within
+0.5 ms from revision 10 onward.
+
+**300 revisions across three fixtures: every value exact, every verdict as
+required, no latency drift, peak RSS growth of 1.2–6.0 MB over the last 75
+revisions.** 101 generations retained per run, none reclaimed — R1 deferred
+reclamation and at this scale it is not what limits anything.
+
+### The two latencies
+
+| fixture | edit → active | active → ready | edit → ready |
+|---|---:|---:|---:|
+| small | 14.4 | 3.2 | 17.6 |
+| rg-lib | 21.8 | 4.3 | 26.2 |
+| blinker-lib | 24.5 | 4.1 | 28.6 |
+
+Steady-state medians. The first is what a developer waits for. The second is
+when the compiler is ready for the next revision, and it is the cost of a
+coordinator that accepts edits faster than it can finalize them.
+
+### Residency did not remove expansion, as predicted
+
+| blinker-lib, 24.5 ms | |
+|---|---:|
+| expand | 14.2 |
+| analysis | 6.8 |
+| everything Blinker Live | **0.5** |
+| — of which the backend | 0.18 |
+
+Process residency removed startup and dylib loading. It did not remove
+parsing and expansion, and it was never going to: each revision is a new
+compiler session, and `TyCtxt`, HIR arenas and query state are session-scoped.
+An earlier note in this file suggested a resident compiler "would not repeat"
+whole-crate parsing. That was wrong, and the soak is what would have caught it
+had it been acted on.
+
+**Expansion is now the largest single component of the product's latency, and
+it is a compiler-persistence problem rather than a Blinker Live one.**
+
+## 39. Three more the soak found
+
+**A published revision that nothing had classified.** The sink publishes from
+inside codegen, before any verdict exists — it has to, because that is where
+the artifact is. Every path that does not accept the patch must therefore undo
+it, and the first version only undid the FALLBACK one. On the revision after
+every refusal, the contract comparison had no baseline, the code returned
+early, and the program went on running a patch that nothing had approved while
+the harness recorded that nothing was published. There is now one acceptance
+point and one rollback for everything else.
+
+**A refusal that could be optimized away.** The soak's refusable revision
+introduced a `static` and read it, on the theory that the base image has
+nowhere to put the storage. At `-Copt-level=0` that is refused, and the
+differential fixture confirms it. At `-Copt-level=3` — which the captured cargo
+invocation for these fixtures uses — rustc folds the read of an immutable
+static, the patch closure genuinely never references it, and DIRECT is the
+*correct* verdict. The classifier was right and the fixture was wrong: it
+reasons about the closure that exists, not the source text that produced it.
+The refusable revision is now an `#[inline]` one, which cannot be folded
+because inlinability is the thing being asked about.
+
+**Recovery from an inlinability refusal takes two revisions.** `fallback_inline`
+leaves a body rustc encodes into the crate's rmeta, so a downstream crate may
+hold a copy. The revision after it has a clean `#[inline(never)]` body of its
+own — but its *predecessor* is still observable downstream, and replacing one
+copy does not reach the others. `classify` refuses on `before.mir_observable`
+as well as `after.mir_observable`, which is correct and which no earlier test
+had exercised, because no earlier test ran two revisions in a row. A real
+coordinator answers a FALLBACK with an ordinary rebuild, which re-establishes
+the baseline; this harness has none to rebuild, so it models the conservative
+path and checks that the program stays on its last good generation throughout.
+Across 300 revisions it did.
