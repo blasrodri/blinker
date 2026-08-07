@@ -297,6 +297,63 @@ last.
 
 ---
 
+## Blinker Live — an experiment, not a product
+
+Linking is not the only thing a build repeats. Cargo rebuilds every crate
+downstream of an edit because an rlib changed, and for a change to one function
+body that work is almost entirely unnecessary. **Blinker Live** asks what it
+costs to skip it: validate the edit with a real compiler, prove it is safe to
+replace in place, generate only the code that actually changed, and publish it
+into a running process.
+
+It is in [`experiments/`](experiments/), it is not installed by anything above,
+and it is not on the path of any `cargo build`. It uses a pinned nightly and
+`rustc_private`; a failure to build it cannot affect the linker. It does share
+one thing with the linker — `blinker-macho`, whose symbol and relocation model
+turned out to be exactly what lifting a function out of a compiler's output
+needs.
+
+**Measured, on real crates** (`grep_matcher` from ripgrep, and this
+workspace's own `blinker_diagnostics`):
+
+| | Cargo debug rebuild | Blinker Live | |
+|---|---:|---:|---:|
+| edit `grep_matcher` | 762 ms | **23 ms** | **33×** |
+| edit `blinker_diagnostics` | 434 ms | **29 ms** | **15×** |
+
+Of that 29 ms, everything Blinker Live does is **0.5 ms**: the changed Rust
+closure compiles through Cranelift in 0.13–0.27 ms and the new machine code
+becomes callable in about 2 µs. The rest is rustc validating the edit, which is
+work a correct system has to do.
+
+The interesting result is not the speed. It is that **Cargo's downstream
+rebuild graph is not the execution dependency graph** for a body-only edit —
+and that this can be decided rather than hoped:
+
+- a classifier that must *prove* an edit is safe, refusing anything it cannot
+  (14 adversarial cases; a compile-time oracle rebuilds 50 and 32 downstream
+  crates and checks their code is byte-identical);
+- the exact set of functions an edit changed, discovered from the edited
+  function outward rather than by compiling the crate;
+- a runtime differential that runs the patched program against an
+  independently rebuilt one — ordinary rustc, LLVM, a real linker, the system
+  dynamic loader — across a mutation suite, with three negative controls that
+  break it deliberately to show it can fail;
+- immutable generations with one atomic commit, checked under concurrency and
+  rollback against those same clean rebuilds;
+- 300 revisions in one resident process with flat latency and bounded memory.
+
+What it does not do: trait methods, generics, `const fn`, `async fn`, or any
+edit whose generated code needs constant data — string literals, panics, vtables
+— are all refused rather than attempted. Nothing is reclaimed from the code
+arena. It replaces code, not state.
+
+The record is [`experiments/live-frontend-spike/RESULTS.md`](experiments/live-frontend-spike/RESULTS.md),
+which is written the same way as FINDINGS: every number with the harness that
+produced it, and every wrong turn that produced a convincing number first.
+
+---
+
 ## Reference
 
 ### Options
@@ -478,5 +535,9 @@ what `install.sh` downloads.
 
 - [PRODUCT_SPEC.md](PRODUCT_SPEC.md) — what the product is
 - [IMPLEMENTATION_PLAN.md](IMPLEMENTATION_PLAN.md) — the milestone sequence
-- **[FINDINGS.md](FINDINGS.md)** — the 208 places reality contradicted the plan,
+- **[FINDINGS.md](FINDINGS.md)** — the 241 places reality contradicted the plan,
   several of them contradicting earlier entries in the same file
+- [experiments/live-frontend-spike/RESULTS.md](experiments/live-frontend-spike/RESULTS.md)
+  — Blinker Live, measured
+- [experiments/live-sink/](experiments/live-sink/) — the 356-line cg_clif patch
+  that lets a backend hand out machine code instead of an object file
