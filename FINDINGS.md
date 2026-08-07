@@ -13031,3 +13031,78 @@ did not change.
 
 That is the friend's review, in counters: the mechanisms are real and verified,
 and none of them has been converted into wall-clock on a large binary.
+
+## 242. A layout probe was still a whole discarded image
+
+Relocations need addresses before the final image can be emitted. The first
+pass asked `ImageBuilder::build` for them, then threw away everything except
+`Image::layout`. Calling that pass unsigned had removed code signing, but it
+still allocated an output-sized zero buffer, assembled the load commands and
+`__LINKEDIT`, and hashed the buffer for its UUID.
+
+On the captured Pronvo debug link that pass was **4.9 ms**. It is now a real
+planning operation: `ImageBuilder::layout` computes only the command
+reservation and layout, and `build` calls that same method before emission.
+The linker passes `&Layout` to every address consumer rather than manufacturing
+an `Image` with bytes nobody is allowed to read. One shared builder
+configuration owns every layout-affecting input so planning and emission cannot
+drift.
+
+Interleaved against the untouched `e5a8850` binary:
+
+```
+  link   97.7 ms -> 93.1 ms   -4.6 ms   0.953x
+  layout  4.9 ms ->  0.6 ms
+  output 27545 KB -> 27545 KB
+```
+
+The regression test compares a planned stable layout — including dylibs,
+rpaths and slop — with the layout `build` actually emits. The full workspace
+suite, including cold/resident byte-identity tests, passes.
+
+## 243. Format detection was opening every input twice
+
+The driver opened every loose object and read four bytes to find LLVM bitcode,
+then the parallel loader opened and read it again. The comment called this
+sub-millisecond; Pronvo measured **4.9 ms** across 439 inputs, serially, before
+the link began.
+
+The Mach-O parser already identifies bitcode precisely. The link layer now
+preserves only that parse outcome as `UnsupportedInputFormat`, and the driver
+delegates only that typed result. Malformed objects, wrong architectures,
+unsupported relocations, and internal errors remain hard failures. Detection
+there also fixes the old blind spot: a bitcode member extracted from a static
+archive now delegates with the archive and member named, and an end-to-end
+fixture proves the delegated binary runs.
+
+The input precheck is now 0.0003 ms in the diagnostic record. With finding 242
+included, an interleaved 20-run comparison against untouched `e5a8850` is:
+
+```
+  wall   110.1 ms -> 102.0 ms   -8.1 ms   0.926x
+  link    93.0 ms ->  85.2 ms   -7.8 ms   0.916x
+  output 27545 KB -> 27545 KB
+```
+
+## 244. Liveness-aware archive extraction has no Pronvo prize
+
+The attractive next idea was to stop extracting archive members requested only
+by code dead-stripping later removes. Before changing the extraction frontier,
+the linker now counts extracted members whose non-debug, non-linker-internal
+output contributions total zero after stripping, plus their input bytes. The
+counter is built in the placement pass already walking those sections, and a
+positive/negative fixture proves its meaning.
+
+Pronvo's answer:
+
+```
+  extracted archive members       497
+  wholly dead after stripping       1
+  bytes in that member           2440
+```
+
+So the idea is rejected for this workload: coordinating reachability with
+archive extraction would add a new dependency between two stages to avoid
+parsing 0.0007% of the 346 MB input set. The next cold-link experiment should
+target work the profile actually contains — particularly the 13 ms symbol
+plan and 19 ms relocation branch — rather than make extraction more clever.

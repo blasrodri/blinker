@@ -160,10 +160,9 @@ pub fn parse_object(
     member: Option<&str>,
     id: ObjectId,
 ) -> Result<ParsedObject, ParseError> {
-    // Named before it is rejected. The driver catches bitcode inputs up front
-    // and delegates the whole link, so reaching here means one arrived inside an
-    // archive — where delegating is no longer on the table and a clear sentence
-    // is all that is left to give.
+    // Named before it is rejected. The link layer preserves this exact outcome
+    // so the driver can delegate the whole invocation; all other parse errors
+    // remain hard failures.
     if crate::is_bitcode(data) {
         return Err(ParseError::UnsupportedFormat {
             path: path.to_path_buf(),

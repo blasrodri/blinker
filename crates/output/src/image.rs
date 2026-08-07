@@ -6,12 +6,11 @@
 //! the header and load commands. But the load commands describe the segments,
 //! so their size is not known until layout has run. Each needs the other.
 //!
-//! [`commands::command_size_for`] breaks it by computing the command size from
-//! the layout's *shape* — how many segments, how many sections, how many
-//! dylibs — rather than by emitting and measuring. The caller lays out once to
-//! discover the shape, sizes the commands, then lays out again with the real
-//! reservation. [`ImageBuilder::build`] does both passes internally so callers
-//! cannot get the order wrong.
+//! [`commands::command_size_for_shape`] breaks it by computing the command size
+//! from the inputs' *shape* — how many segments, how many sections, how many
+//! dylibs — rather than by emitting and measuring. [`ImageBuilder::layout`]
+//! owns that calculation so a caller that needs addresses before it can supply
+//! content gets exactly the same layout [`ImageBuilder::build`] will emit.
 //!
 //! # `__LINKEDIT`
 //!
@@ -343,16 +342,13 @@ impl<'a> ImageBuilder<'a> {
 
     /// Skip the ad-hoc signature.
     ///
-    /// The linker assembles the image twice: once to discover where everything
-    /// lands, and once with real content. The first pass reads only
-    /// `Image::layout` — and signing it means SHA-256 over every page of a
-    /// megabytes-large buffer that is then dropped. On blinker's own binary
-    /// that was **6.2 ms per link**, cold and warm alike, hashing bytes nobody
-    /// looks at.
+    /// Useful for inspection images whose bytes will never be executed. A
+    /// caller that only needs addresses should use [`Self::layout`] instead,
+    /// which avoids allocating and hashing the image altogether.
     ///
     /// The reservation is unaffected: `signature_size` is derived from the
-    /// image's length, not from the hashes, so the layout the probe reports is
-    /// the same either way.
+    /// image's length, not from the hashes, so the layout is the same either
+    /// way.
     pub fn unsigned(&mut self) -> &mut Self {
         self.sign = false;
         self
@@ -405,9 +401,14 @@ impl<'a> ImageBuilder<'a> {
         self
     }
 
-    /// Lay out and emit the image.
-    pub fn build(mut self) -> Result<Image, ImageError> {
-        // Pass one: discover the shape with a nominal reservation.
+    /// Compute the layout this builder will emit, without allocating or
+    /// hashing an image.
+    ///
+    /// Linkers need section addresses before they can apply relocations. This
+    /// is that planning operation: it deliberately depends only on the fields
+    /// that affect layout, and [`ImageBuilder::build`] calls the same method so
+    /// the planned and emitted addresses cannot drift apart.
+    pub fn layout(&self) -> Layout {
         let lay_out = |reservation: u64| match &self.previous {
             Some((previous, keys)) => compute_layout_reusing(
                 self.kind,
@@ -430,8 +431,6 @@ impl<'a> ImageBuilder<'a> {
             None => compute_layout_with_slop(self.kind, &self.inputs, reservation, self.slop),
         };
 
-        let mut timings = EmitTimings::default();
-        let started = std::time::Instant::now();
         let mut dylib_bytes: usize = self
             .dylibs
             .iter()
@@ -472,8 +471,16 @@ impl<'a> ImageBuilder<'a> {
 
         // Lay out for real, with room for the header and commands.
         let reservation = align_up((MachHeader::SIZE + command_size) as u64, 16);
-        let layout = lay_out(reservation);
+        lay_out(reservation)
+    }
+
+    /// Lay out and emit the image.
+    pub fn build(mut self) -> Result<Image, ImageError> {
+        let mut timings = EmitTimings::default();
+        let started = std::time::Instant::now();
+        let layout = self.layout();
         timings.layout_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let reservation = layout.header_reservation;
 
         for content in &self.contents {
             let Some(section) = layout.section(content.section) else {
@@ -1184,5 +1191,24 @@ mod tests {
     fn building_the_same_inputs_twice_produces_identical_bytes() {
         // Reproducibility is a spec requirement.
         assert_eq!(minimal().bytes, minimal().bytes);
+    }
+
+    #[test]
+    fn planned_layout_is_the_layout_build_emits() {
+        fn configured() -> ImageBuilder<'static> {
+            let mut builder = ImageBuilder::new();
+            builder.input(code(16));
+            // Stable-layout slop extends the output section beyond the input
+            // contribution; callers supply the whole output-section buffer.
+            builder.content(0, vec![0xA5; 256]);
+            builder.dylib(Dylib::lib_system());
+            builder.rpath("@loader_path/../Frameworks".into());
+            builder.slop(Slop::DEFAULT);
+            builder
+        }
+
+        let planned = configured().layout();
+        let emitted = configured().build().expect("builds");
+        assert_eq!(planned, emitted.layout);
     }
 }

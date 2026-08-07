@@ -198,32 +198,49 @@ pub fn run_in(
             eprintln!("blinker: {flag} is not an output kind blinker produces; delegating");
         }
     }
-    // The same decision, about an input rather than a flag. Asked here and not
-    // discovered during the link, because a link that fails and then quietly
-    // retries with the system linker is indistinguishable from one that worked
-    // — and that difference is the whole project.
-    let foreign = match options.internal_link && unsupported.is_none() {
-        true => unsupported_input_format(&parsed),
-        false => None,
-    };
-    if let Some((path, format)) = &foreign {
-        if options.verbosity != Verbosity::Quiet {
-            eprintln!(
-                "blinker: {} is {format}; delegating this link to the system linker",
-                path.display()
-            );
-        }
-    }
-    let precheck_elapsed = exec_started.elapsed();
-    let exit_code = if options.internal_link && unsupported.is_none() && foreign.is_none() {
+    let dispatch_elapsed = exec_started.elapsed();
+    let internal = if options.internal_link && unsupported.is_none() {
         if options.verbosity == Verbosity::Verbose {
             eprintln!("blinker: linking internally");
         }
-        let (phases, request_elapsed) =
-            internal_link(&parsed, &options, session).map_err(|e| DriverError::Link {
-                detail: e.to_string(),
-            })?;
-        record.set_timing_setup(precheck_elapsed, request_elapsed);
+        Some(internal_link(&parsed, &options, session))
+    } else {
+        None
+    };
+
+    // One typed linker outcome delegates: a well-formed input format whose
+    // implementation belongs to another linker. Detection happens in the
+    // normal parallel loader, using bytes it already read. Everything else —
+    // malformed objects, unsupported relocations, or an internal failure — is
+    // still reported rather than silently retried.
+    let foreign = match internal.as_ref() {
+        Some(Err(blinker_link::LinkError::UnsupportedInputFormat {
+            path,
+            member,
+            format,
+            ..
+        })) => Some((path.clone(), member.clone(), *format)),
+        Some(Err(error)) => {
+            return Err(DriverError::Link {
+                detail: error.to_string(),
+            })
+        }
+        _ => None,
+    };
+    if let Some((path, member, format)) = &foreign {
+        if options.verbosity != Verbosity::Quiet {
+            let member = member
+                .as_ref()
+                .map(|member| format!("({member})"))
+                .unwrap_or_default();
+            eprintln!(
+                "blinker: {}{member} is {format}; delegating this link to the system linker",
+                path.display(),
+            );
+        }
+    }
+    let exit_code = if let Some(Ok((phases, request_elapsed))) = internal {
+        record.set_timing_setup(dispatch_elapsed, request_elapsed);
         record.set_timing_internal_link(
             exec_started.elapsed(),
             blinker_diagnostics::LinkStages {
@@ -310,6 +327,11 @@ pub fn run_in(
         if wants_dead_strip(&parsed) {
             record.set_dead_strip(phases.stripped_bytes, phases.revived_atoms);
         }
+        record.set_archive_members(
+            phases.extracted_archive_members,
+            phases.fully_dead_archive_members,
+            phases.fully_dead_archive_member_bytes,
+        );
         if options.incremental_cache {
             record.set_reuse(
                 phases.reused_objects,
@@ -372,36 +394,6 @@ pub fn run_in(
 /// Delegating is the correct answer rather than a stopgap: a shim linker that
 /// refuses what it cannot do, loudly and by name, is usable today on projects
 /// whose every crate it cannot yet link. One that fails is not.
-/// An input in a format blinker does not link, if the command line has one.
-///
-/// # Why this reads the files
-///
-/// The answer is not in the arguments. `-flto` is given to the *compiler*, and
-/// what reaches the linker is an ordinary-looking `.o` that happens to hold
-/// bitcode — so the only way to know is to look at the first four bytes.
-///
-/// That costs an open and a four-byte read per input. Measured on the workload
-/// where it is worst, a 580-input C++ link, it is under a millisecond against a
-/// 500 ms link; on a 23-input Rust link it is not measurable. Cheap enough to
-/// pay on every link to avoid failing on some of them.
-///
-/// Only loose inputs. A bitcode member inside a static archive is not found
-/// here — reading every member's header would mean parsing every archive before
-/// deciding whether to link at all — and is reported by the parser instead,
-/// which by then can only explain rather than delegate.
-fn unsupported_input_format(parsed: &ParsedInvocation) -> Option<(PathBuf, &'static str)> {
-    use std::io::Read;
-    parsed.input_paths().into_iter().find_map(|path| {
-        let mut head = [0u8; 4];
-        let read = std::fs::File::open(path)
-            .and_then(|mut file| file.read_exact(&mut head))
-            .is_ok();
-        // A file that cannot be read is not this function's problem to report:
-        // the link will reach it and say so with the path and the OS error.
-        (read && blinker_macho::is_bitcode(&head)).then(|| (path.to_path_buf(), "LLVM bitcode"))
-    })
-}
-
 fn unsupported_output_kind(parsed: &ParsedInvocation) -> Option<&'static str> {
     const KINDS: &[&str] = &[
         // `-dynamiclib` is *not* here: a dylib is an output kind blinker

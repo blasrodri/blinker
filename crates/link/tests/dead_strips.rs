@@ -9,7 +9,7 @@
 //! output is correct" are both satisfied by a linker that removed the wrong
 //! thing, and only the pair distinguishes them.
 
-use blinker_link::{link_to_file, LinkRequest};
+use blinker_link::{link_to_file, link_to_file_timed, LinkRequest};
 use blinker_test_support::Scratch;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -231,6 +231,52 @@ fn nothing_is_stripped_without_the_flag() {
     assert!(contains(&both.whole, "this-string-belongs-to-dead-code"));
     let names = Command::new("nm").arg(&both.whole).output().expect("nm");
     assert!(String::from_utf8_lossy(&names.stdout).contains("_never_called"));
+}
+
+/// Archive extraction runs before reachability, so a reference from dead code
+/// can pull in a member whose every output byte is then discarded. The counter
+/// makes that avoidable loader work measurable.
+#[test]
+fn a_member_extracted_only_for_dead_code_is_reported() {
+    let scratch = Scratch::dir("strip-dead-archive-member").expect("scratch");
+    let objects = compile(
+        &scratch,
+        &[
+            (
+                "main.c",
+                r#"
+extern int archive_answer(void);
+__attribute__((noinline)) int never_called(void) { return archive_answer(); }
+int main(void) { return 0; }
+"#,
+            ),
+            ("answer.c", "int archive_answer(void) { return 42; }\n"),
+        ],
+    );
+    let archive = scratch.join("libanswer.a");
+    let status = Command::new("ar")
+        .arg("rcs")
+        .arg(&archive)
+        .arg(&objects[1])
+        .status()
+        .expect("ar runs");
+    assert!(status.success(), "ar failed to build the fixture");
+
+    let stripped = scratch.join("stripped-archive");
+    let timings = link_to_file_timed(
+        &LinkRequest::new(vec![objects[0].clone(), archive.clone()]).dead_stripped(true),
+        &stripped,
+    )
+    .expect("the stripped archive link succeeds");
+    assert_eq!(timings.extracted_archive_members, 1);
+    assert_eq!(timings.fully_dead_archive_members, 1);
+    assert!(timings.fully_dead_archive_member_bytes > 0);
+
+    let whole = scratch.join("whole-archive");
+    let control = link_to_file_timed(&LinkRequest::new(vec![objects[0].clone(), archive]), &whole)
+        .expect("the unstripped archive link succeeds");
+    assert_eq!(control.extracted_archive_members, 1);
+    assert_eq!(control.fully_dead_archive_members, 0);
 }
 
 /// And the result must match the linker that already does this.
