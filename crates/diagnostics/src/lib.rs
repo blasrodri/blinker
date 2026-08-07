@@ -318,6 +318,11 @@ pub struct Counters {
     pub cache_bytes_written: Option<u64>,
     /// `__text` bytes dead-stripping removed. `None` when it did not run.
     pub stripped_bytes: Option<u64>,
+    /// Archive members selected by symbol resolution, and the subset whose
+    /// placeable bytes were all removed by dead-stripping.
+    pub extracted_archive_members: Option<u64>,
+    pub fully_dead_archive_members: Option<u64>,
+    pub fully_dead_archive_member_bytes: Option<u64>,
     /// Atoms the reachability propagation left dead that something live then
     /// referred to.
     ///
@@ -679,6 +684,16 @@ impl LinkRecord {
         self.counters.revived_atoms = Some(revived);
     }
 
+    /// Record how much archive extraction turned into no output at all.
+    pub fn set_archive_members(&mut self, extracted: u64, fully_dead: u64, dead_bytes: u64) {
+        if extracted == 0 {
+            return;
+        }
+        self.counters.extracted_archive_members = Some(extracted);
+        self.counters.fully_dead_archive_members = Some(fully_dead);
+        self.counters.fully_dead_archive_member_bytes = Some(dead_bytes);
+    }
+
     /// The concise human-readable summary shown on a normal successful link.
     pub fn to_summary(&self) -> String {
         let mode = match self.mode {
@@ -739,6 +754,14 @@ impl LinkRecord {
                     self.counters.revived_atoms.unwrap_or(0)
                 ));
             }
+        }
+        if let Some(extracted) = self.counters.extracted_archive_members {
+            let dead = self.counters.fully_dead_archive_members.unwrap_or(0);
+            let bytes = self.counters.fully_dead_archive_member_bytes.unwrap_or(0);
+            s.push_str(&format!(
+                "\n  archive extraction: {dead}/{extracted} members wholly dead ({} KB read)",
+                bytes / 1024
+            ));
         }
         if !self.unrecognized_arguments.is_empty() {
             s.push_str(&format!(
@@ -818,6 +841,18 @@ mod tests {
         let mut record = LinkRecord::delegated();
         record.set_timing_total(Duration::from_millis(1500));
         assert_eq!(record.timings.total_ms, Some(1500.0));
+    }
+
+    #[test]
+    fn wholly_dead_archive_members_are_visible_in_json_and_the_summary() {
+        let mut record = LinkRecord::delegated();
+        record.set_archive_members(12, 5, 48 * 1024);
+        let json = parse(&record);
+        assert_eq!(json["counters"]["extracted_archive_members"], 12);
+        assert_eq!(json["counters"]["fully_dead_archive_members"], 5);
+        assert!(record
+            .to_summary()
+            .contains("archive extraction: 5/12 members wholly dead (48 KB read)"));
     }
 
     #[test]

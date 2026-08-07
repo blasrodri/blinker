@@ -16,15 +16,13 @@
 //!   → emit and sign      blinker-output
 //! ```
 //!
-//! # Why the layout is computed twice
+//! # Why layout is planned before the image is emitted
 //!
-//! Relocations need the addresses that layout assigns, and layout runs inside
-//! `ImageBuilder::build`. Rather than duplicate the layout computation — where
-//! a divergence would put relocations at addresses the emitted image does not
-//! use — the image is built once to *learn* the layout, the relocations are
-//! applied against it, and it is built again with the patched bytes. Layout
-//! depends only on section sizes and alignments, which the patching does not
-//! change, so the two passes agree by construction.
+//! Relocations need the addresses that layout assigns before the image bytes
+//! can be built. `ImageBuilder::layout` exposes that plan without allocating a
+//! disposable image, and `ImageBuilder::build` calls the same operation before
+//! emitting the patched bytes. Layout depends only on section sizes and
+//! alignments, which patching does not change, so the two agree by construction.
 
 // This crate is a library: everything it has to say travels through
 // `LinkError`, `LinkTimings` or a return value. Printing is the CLI's job.
@@ -41,7 +39,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use blinker_layout::{ImageKind, InputPlacement};
+use blinker_layout::{ImageKind, InputPlacement, Layout};
 use blinker_macho::{
     parse_object, Arm64RelocationKind, InputRelocation, InputSection, ObjectId, ParsedObject,
     RelocationLength, RelocationTarget, SectionId, SectionKind, SymbolStrength, SymbolVisibility,
@@ -149,6 +147,15 @@ pub struct LinkTimings {
     pub accounting_ms: f64,
     /// `__text` bytes the strip removed, as the analysis counts them.
     pub stripped_bytes: u64,
+    /// Archive members pulled in during symbol resolution, and the subset that
+    /// contributes no output bytes after dead-stripping.
+    ///
+    /// The latter is extraction work that could have been avoided by a
+    /// liveness-aware archive frontier. Its input bytes quantify the parse and
+    /// indexing work behind the member count.
+    pub extracted_archive_members: u64,
+    pub fully_dead_archive_members: u64,
+    pub fully_dead_archive_member_bytes: u64,
     /// Atoms the propagation left dead that something live then referred to.
     ///
     /// Reported because it must be zero: a non-zero count is the model failing
@@ -1067,19 +1074,14 @@ fn contribution_offsets(output: &blinker_layout::OutputSection) -> HashMap<(u32,
 fn eh_frame_fde_offsets(
     objects: &[LoadedObject],
     interned: &[Arc<Vec<SymbolNameId>>],
-    image: &Image,
+    layout: &Layout,
     placed: &Placed,
     addresses: &AddressMap,
     strip: &Strip,
 ) -> HashMap<u64, u32> {
     let mut offsets = HashMap::default();
 
-    let Some(output) = image
-        .layout
-        .sections
-        .iter()
-        .find(|s| s.name == "__eh_frame")
-    else {
+    let Some(output) = layout.sections.iter().find(|s| s.name == "__eh_frame") else {
         return offsets;
     };
     let offsets_of = contribution_offsets(output);
@@ -1377,14 +1379,14 @@ fn survey_chunk(
 fn compact_unwind_entries(
     objects: &[LoadedObject],
     interned: &[Arc<Vec<SymbolNameId>>],
-    image: &Image,
+    layout: &Layout,
     placed: &Placed,
     addresses: &AddressMap,
     strip: &Strip,
     got_slots: &SlotTable,
     fde_offsets: &HashMap<u64, u32>,
 ) -> Vec<UnwindEntry> {
-    let Some(text) = image.layout.segment("__TEXT") else {
+    let Some(text) = layout.segment("__TEXT") else {
         return Vec::new();
     };
     let image_base = text.vm_address;
@@ -1808,8 +1810,8 @@ fn natural_alignment(size: u64) -> u32 {
 }
 
 /// Where each common symbol landed, once `__common` has an address.
-fn common_addresses<'a>(commons: &'a [Common], image: &Image) -> Vec<(&'a str, u64)> {
-    let Some(section) = image.layout.sections.iter().find(|s| s.name == "__common") else {
+fn common_addresses<'a>(commons: &'a [Common], layout: &Layout) -> Vec<(&'a str, u64)> {
+    let Some(section) = layout.sections.iter().find(|s| s.name == "__common") else {
         return Vec::new();
     };
     let mut at = section.vm_address;
@@ -2135,7 +2137,10 @@ fn link_inner(
     timings.strip_stats_ms = elapsed_ms(strip_stats);
 
     let prep = std::time::Instant::now();
-    let mut placements = placements_for(&objects, &strip);
+    let (mut placements, archive_members) = placements_for(&objects, &strip);
+    timings.extracted_archive_members = archive_members.extracted;
+    timings.fully_dead_archive_members = archive_members.fully_dead;
+    timings.fully_dead_archive_member_bytes = archive_members.fully_dead_bytes;
     timings.prepare_ms = elapsed_ms(prep);
     gap!(_gap, "after prepare");
     timings.placements_ms = timings.prepare_ms;
@@ -2415,7 +2420,7 @@ fn link_inner(
         .filter(|cache| !cache.layout.slots.is_empty())
         .map(|cache| (cache.layout.clone(), contribution_keys.as_map()));
 
-    let probe = assemble(
+    let layout = plan_layout(
         request,
         &Assembly {
             placements: &placements,
@@ -2424,9 +2429,7 @@ fn link_inner(
             dylibs: &dylibs,
             ..Assembly::default()
         },
-        [Vec::new(), Vec::new(), Vec::new()],
-        blinker_output::symtab::StringTable::default(),
-    )?;
+    );
 
     timings.layout_probe_ms = elapsed_ms(step);
 
@@ -2435,12 +2438,12 @@ fn link_inner(
     let step = std::time::Instant::now();
     // Built once from the layout, and consulted a few hundred thousand times.
     let sub = std::time::Instant::now();
-    let placed = Placed::index(&probe);
+    let placed = Placed::index(&layout);
     let mut addresses = address_map(&objects, &interned, &placed, &strip);
     // Commons have no section of their own in any input, so `address_map` —
     // which walks each symbol's defining section — cannot see them. They are
     // definitions all the same, and every reference resolves here.
-    for (name, value) in common_addresses(&commons, &probe) {
+    for (name, value) in common_addresses(&commons, &layout) {
         // Interned rather than looked up: a common has no defining section, so
         // `address_map` never saw it, and every consumer asks by id.
         let id = session.names_mut().intern(name);
@@ -2450,7 +2453,7 @@ fn link_inner(
     // reach here with no address. Inserted after the probe because their value
     // *is* the layout: `___dso_handle` is where the mach header ended up.
     for name in ["___dso_handle"] {
-        let Some(value) = linker_defined_address(name, &probe) else {
+        let Some(value) = linker_defined_address(name, &layout) else {
             continue;
         };
         let id = session.names_mut().intern(name);
@@ -2458,13 +2461,13 @@ fn link_inner(
     }
     // Taken after the last name is interned, so it covers every id above.
     let name_digests = session.digests();
-    let got_slots = got_slot_addresses(&got, &probe);
-    let stub_slots = stub_addresses(&stubs, &probe);
-    let tlv_slots = pointer_slot_addresses(&tlv, &probe, "__thread_ptrs");
+    let got_slots = got_slot_addresses(&got, &layout);
+    let stub_slots = stub_addresses(&stubs, &layout);
+    let tlv_slots = pointer_slot_addresses(&tlv, &layout, "__thread_ptrs");
     timings.address_map_ms = elapsed_ms(sub);
 
     let sub = std::time::Instant::now();
-    let mut contents = build_contents(&objects, &probe, &strip)?;
+    let mut contents = build_contents(&objects, &layout, &strip)?;
     timings.contents_ms = elapsed_ms(sub);
 
     let sub = std::time::Instant::now();
@@ -2475,22 +2478,22 @@ fn link_inner(
     // rid of. Which of those the 1.44 ms is decides whether there is anything
     // here worth doing.
     let part = std::time::Instant::now();
-    repair_eh_frame(&mut contents, &probe, &objects, &strip);
+    repair_eh_frame(&mut contents, &layout, &objects, &strip);
     timings.eh_frame_ms = elapsed_ms(part);
 
     let part = std::time::Instant::now();
     fill_got(
         &mut contents,
-        &probe,
+        &layout,
         &got,
         &addresses,
         session.names(),
         &imports,
     )?;
-    fill_stubs(&mut contents, &probe, &stubs, &got_slots)?;
+    fill_stubs(&mut contents, &layout, &stubs, &got_slots)?;
     fill_pointer_table(
         &mut contents,
-        &probe,
+        &layout,
         &tlv,
         &addresses,
         session.names(),
@@ -2501,7 +2504,7 @@ fn link_inner(
     let part = std::time::Instant::now();
     fill_unwind_info(
         &mut contents,
-        &probe,
+        &layout,
         &objects,
         &interned,
         &placed,
@@ -2568,7 +2571,7 @@ fn link_inner(
 
     let cache_step = std::time::Instant::now();
     // One pass over the layout, shared by the reuse plan and the cache builder.
-    let ranges_of = object_ranges_index(&probe);
+    let ranges_of = object_ranges_index(&layout);
     let plan = match (&previous, &current_addresses) {
         (Some(previous), Some(current)) => {
             Some(plan_reuse(&objects, previous, current, session, &ranges_of))
@@ -2585,7 +2588,7 @@ fn link_inner(
             interned: &interned,
             digests: &name_digests,
         },
-        &probe,
+        &layout,
         &Placement {
             addresses: &addresses,
             strip: &strip,
@@ -2613,7 +2616,7 @@ fn link_inner(
         (Some(_), Some(addresses)) => Some(build_cache(
             request,
             &objects,
-            &probe,
+            &layout,
             addresses,
             reuse_relocations.then_some(&patched.contents),
             &patched,
@@ -2633,7 +2636,7 @@ fn link_inner(
     // A dylib names no entry point, so there is nothing to find and no error
     // if it is missing — `_main` is exactly the symbol a library does not have.
     let entry_offset = match request.kind {
-        ImageKind::Executable => entry_offset(request, &objects, &probe, &strip)?,
+        ImageKind::Executable => entry_offset(request, &objects, &layout, &strip)?,
         ImageKind::Dylib => 0,
     };
     timings.relocate_ms = elapsed_ms(step);
@@ -2669,10 +2672,10 @@ fn link_inner(
     // Each GOT slot holds an absolute address, and the image is position
     // independent, so dyld must relocate every one of them at load time.
     // A slot whose value we know is rebased; a slot dyld fills is bound.
-    let mut rebases = got_rebases(&probe, &got, &imports);
-    let mut binds = got_binds(&probe, &got, &imports, exported.as_deref());
+    let mut rebases = got_rebases(&layout, &got, &imports);
+    let mut binds = got_binds(&layout, &got, &imports, exported.as_deref());
     binds.extend(patched.binds);
-    rebases.extend(pointer_table_rebases(&probe, "__thread_ptrs", tlv.len()));
+    rebases.extend(pointer_table_rebases(&layout, "__thread_ptrs", tlv.len()));
     rebases.extend(patched.rebases);
 
     timings.symbols_ms = elapsed_ms(sub);
@@ -2687,7 +2690,6 @@ fn link_inner(
             rebases: &rebases,
             binds: &binds,
             entry_offset,
-            final_pass: true,
             previous: previous_layout.as_ref(),
             reservations: reservations.as_ref(),
             previous_signature: previous_signature.as_ref(),
@@ -3039,7 +3041,7 @@ fn plan_reuse<'a>(
 fn build_cache(
     request: &LinkRequest,
     objects: &[LoadedObject],
-    image: &Image,
+    layout: &Layout,
     addresses: Vec<(blinker_cache::NameHash, u64)>,
     // The patched section bytes, when a later link may reuse them per object.
     // `None` stores the finished image alone — every byte here is a second copy
@@ -3154,7 +3156,7 @@ fn build_cache(
         // that survives the next one. This is what the retained-placement
         // allocator consumes; recording it costs a walk over the contributions
         // that already exist.
-        layout: blinker_layout::PreviousLayout::record(&image.layout, |object, section| {
+        layout: blinker_layout::PreviousLayout::record(layout, |object, section| {
             identities.key_or_fresh(object, section)
         }),
         // Filled in once the image exists; a cache written without it simply
@@ -3171,9 +3173,9 @@ fn build_cache(
 /// reuse plan and the cache builder did — makes that quadratic: 237 objects
 /// against 1,063 contributions is a quarter of a million iterations, twice a
 /// link, to produce a partition of the very list being scanned.
-fn object_ranges_index(image: &Image) -> HashMap<u32, Vec<blinker_cache::Range>> {
+fn object_ranges_index(layout: &Layout) -> HashMap<u32, Vec<blinker_cache::Range>> {
     let mut index: HashMap<u32, Vec<blinker_cache::Range>> = HashMap::default();
-    for (section_index, section) in image.layout.sections.iter().enumerate() {
+    for (section_index, section) in layout.sections.iter().enumerate() {
         for contribution in &section.contributions {
             index
                 .entry(contribution.object.0)
@@ -3312,14 +3314,9 @@ fn is_linker_defined(name: &str) -> bool {
 ///
 /// The mach header's address, which is where `__TEXT` begins because the
 /// header lives inside it. Zero for a dylib, which is laid out from zero.
-fn linker_defined_address(name: &str, image: &blinker_output::Image) -> Option<u64> {
+fn linker_defined_address(name: &str, layout: &Layout) -> Option<u64> {
     match name {
-        "___dso_handle" => Some(
-            image
-                .layout
-                .segment("__TEXT")
-                .map_or(0, |text| text.vm_address),
-        ),
+        "___dso_handle" => Some(layout.segment("__TEXT").map_or(0, |text| text.vm_address)),
         _ => None,
     }
 }
@@ -3511,7 +3508,7 @@ fn live_unwind_records(
 #[allow(clippy::too_many_arguments)]
 fn fill_unwind_info(
     contents: &mut SectionContents,
-    image: &Image,
+    layout: &Layout,
     objects: &[LoadedObject],
     interned: &[Arc<Vec<SymbolNameId>>],
     placed: &Placed,
@@ -3519,8 +3516,7 @@ fn fill_unwind_info(
     strip: &Strip,
     got_slots: &SlotTable,
 ) -> Result<(), LinkError> {
-    let Some((index, section)) = image
-        .layout
+    let Some((index, section)) = layout
         .sections
         .iter()
         .enumerate()
@@ -3534,11 +3530,11 @@ fn fill_unwind_info(
     // cost is finding where each function's FDE landed, not building the table
     // — which is the opposite of what the name suggests, and is where any work
     // on this should go.
-    let fde_offsets = eh_frame_fde_offsets(objects, interned, image, placed, addresses, strip);
+    let fde_offsets = eh_frame_fde_offsets(objects, interned, layout, placed, addresses, strip);
     let entries = compact_unwind_entries(
         objects,
         interned,
-        image,
+        layout,
         placed,
         addresses,
         strip,
@@ -3568,9 +3564,9 @@ fn fill_unwind_info(
 }
 
 /// Address of each stub.
-fn stub_addresses(stubs: &[String], image: &Image) -> HashMap<String, u64> {
+fn stub_addresses(stubs: &[String], layout: &Layout) -> HashMap<String, u64> {
     let mut slots = HashMap::default();
-    let Some(section) = image.layout.sections.iter().find(|s| s.name == "__stubs") else {
+    let Some(section) = layout.sections.iter().find(|s| s.name == "__stubs") else {
         return slots;
     };
     for (index, name) in stubs.iter().enumerate() {
@@ -3582,15 +3578,14 @@ fn stub_addresses(stubs: &[String], image: &Image) -> HashMap<String, u64> {
 /// Write each stub's three instructions.
 fn fill_stubs(
     contents: &mut HashMap<usize, Vec<u8>>,
-    image: &Image,
+    layout: &Layout,
     stubs: &[String],
     got_slots: &SlotTable,
 ) -> Result<(), LinkError> {
     if stubs.is_empty() {
         return Ok(());
     }
-    let Some((index, section)) = image
-        .layout
+    let Some((index, section)) = layout
         .sections
         .iter()
         .enumerate()
@@ -3618,16 +3613,15 @@ fn fill_stubs(
 
 /// Bind entries: one per GOT slot dyld has to fill.
 fn got_binds(
-    image: &Image,
+    layout: &Layout,
     got: &[TableEntry],
     imports: &[String],
     exports: Option<&libraries::StubExports>,
 ) -> Vec<Bind> {
-    let Some(section) = image.layout.sections.iter().find(|s| s.name == "__got") else {
+    let Some(section) = layout.sections.iter().find(|s| s.name == "__got") else {
         return Vec::new();
     };
-    let Some((segment_index, segment)) = image
-        .layout
+    let Some((segment_index, segment)) = layout
         .segments
         .iter()
         .enumerate()
@@ -3652,19 +3646,14 @@ fn got_binds(
 }
 
 /// Address of each GOT slot, in the order the symbols were collected.
-fn got_slot_addresses(got: &[TableEntry], image: &Image) -> SlotTable {
-    pointer_slot_addresses(got, image, "__got")
+fn got_slot_addresses(got: &[TableEntry], layout: &Layout) -> SlotTable {
+    pointer_slot_addresses(got, layout, "__got")
 }
 
 /// Address of each slot in a synthesised pointer table.
-fn pointer_slot_addresses(names: &[TableEntry], image: &Image, section_name: &str) -> SlotTable {
+fn pointer_slot_addresses(names: &[TableEntry], layout: &Layout, section_name: &str) -> SlotTable {
     let mut slots = SlotTable::default();
-    let Some(section) = image
-        .layout
-        .sections
-        .iter()
-        .find(|s| s.name == section_name)
-    else {
+    let Some(section) = layout.sections.iter().find(|s| s.name == section_name) else {
         return slots;
     };
     for (index, entry) in names.iter().enumerate() {
@@ -3683,7 +3672,7 @@ fn pointer_slot_addresses(names: &[TableEntry], image: &Image, section_name: &st
 /// it, and writing a wrong value would be worse than writing none.
 fn fill_pointer_table(
     contents: &mut HashMap<usize, Vec<u8>>,
-    image: &Image,
+    layout: &Layout,
     names: &[TableEntry],
     addresses: &AddressMap,
     interner: &SymbolNames,
@@ -3692,8 +3681,7 @@ fn fill_pointer_table(
     if names.is_empty() {
         return Ok(());
     }
-    let Some((index, _)) = image
-        .layout
+    let Some((index, _)) = layout
         .sections
         .iter()
         .enumerate()
@@ -3728,7 +3716,7 @@ fn fill_pointer_table(
 /// Write each GOT slot's initial value: the address of the symbol it points at.
 fn fill_got(
     contents: &mut HashMap<usize, Vec<u8>>,
-    image: &Image,
+    layout: &Layout,
     got: &[TableEntry],
     addresses: &AddressMap,
     interner: &SymbolNames,
@@ -3737,8 +3725,7 @@ fn fill_got(
     if got.is_empty() {
         return Ok(());
     }
-    let Some((index, _)) = image
-        .layout
+    let Some((index, _)) = layout
         .sections
         .iter()
         .enumerate()
@@ -3777,17 +3764,11 @@ fn fill_got(
 /// Missing these produced a `SIGSEGV` in `lang_start_internal`, the first code
 /// to walk a thread-local pointer, with a fault address in the *unslid*
 /// address space — the signature of a pointer dyld was never told about.
-fn pointer_table_rebases(image: &Image, section_name: &str, count: usize) -> Vec<Rebase> {
-    let Some(section) = image
-        .layout
-        .sections
-        .iter()
-        .find(|s| s.name == section_name)
-    else {
+fn pointer_table_rebases(layout: &Layout, section_name: &str, count: usize) -> Vec<Rebase> {
+    let Some(section) = layout.sections.iter().find(|s| s.name == section_name) else {
         return Vec::new();
     };
-    let Some((segment_index, segment)) = image
-        .layout
+    let Some((segment_index, segment)) = layout
         .segments
         .iter()
         .enumerate()
@@ -3805,12 +3786,11 @@ fn pointer_table_rebases(image: &Image, section_name: &str, count: usize) -> Vec
 }
 
 /// One rebase entry per GOT slot.
-fn got_rebases(image: &Image, got: &[TableEntry], imports: &[String]) -> Vec<Rebase> {
-    let Some(section) = image.layout.sections.iter().find(|s| s.name == "__got") else {
+fn got_rebases(layout: &Layout, got: &[TableEntry], imports: &[String]) -> Vec<Rebase> {
+    let Some(section) = layout.sections.iter().find(|s| s.name == "__got") else {
         return Vec::new();
     };
-    let Some((segment_index, segment)) = image
-        .layout
+    let Some((segment_index, segment)) = layout
         .segments
         .iter()
         .enumerate()
@@ -3872,6 +3852,36 @@ enum Loaded {
     ),
 }
 
+/// Parse one object, preserving the one parse outcome the driver can safely
+/// delegate.
+///
+/// Detection lives here, after the loader has read the input for its real
+/// purpose. A separate driver preflight opened every file just to read four
+/// bytes and then opened it again here; on Pronvo that serial duplicate pass
+/// cost 4.9 ms. Only `UnsupportedFormat` is promoted. A malformed object,
+/// unsupported relocation, or wrong architecture is still a hard link error.
+fn parse_link_object(
+    data: &[u8],
+    path: &Path,
+    member: Option<&str>,
+    id: ObjectId,
+) -> Result<ParsedObject, LinkError> {
+    match parse_object(data, path, member, id) {
+        Ok(object) => Ok(object),
+        Err(blinker_macho::ParseError::UnsupportedFormat {
+            path,
+            format,
+            remedy,
+        }) => Err(LinkError::UnsupportedInputFormat {
+            path,
+            member: member.map(str::to_string),
+            format,
+            remedy,
+        }),
+        Err(source) => Err(LinkError::Parse(Box::new(source))),
+    }
+}
+
 /// Read and parse one input. Pure with respect to the others, which is what
 /// lets [`load_objects`] run them concurrently.
 fn load_one(path: &Path, id: Option<ObjectId>) -> Result<Loaded, LinkError> {
@@ -3892,8 +3902,7 @@ fn load_one(path: &Path, id: Option<ObjectId>) -> Result<Loaded, LinkError> {
             ))
         }
         Some(id) => {
-            let parsed = parse_object(&data, path, None, id)
-                .map_err(|source| LinkError::Parse(Box::new(source)))?;
+            let parsed = parse_link_object(&data, path, None, id)?;
             Ok(Loaded::Object(LoadedObject {
                 parsed: std::sync::Arc::new(parsed),
                 data: SourceBytes::whole(data),
@@ -4521,8 +4530,7 @@ fn parse_member(
         .ok_or(LinkError::MissingObject { object: id })?;
     let bytes = blinker_archive::member_data(data, member, path)
         .map_err(|source| LinkError::Archive(Box::new(source)))?;
-    let parsed = parse_object(bytes, path, Some(&member.name), id)
-        .map_err(|source| LinkError::Parse(Box::new(source)))?;
+    let parsed = parse_link_object(bytes, path, Some(&member.name), id)?;
     let start = member.offset as usize;
     Ok(LoadedObject {
         parsed: std::sync::Arc::new(parsed),
@@ -4675,38 +4683,55 @@ impl<'a> DefiningIndex<'a> {
 /// A section contributes its *stripped* size. Nothing else in layout changes:
 /// the survivors keep their order inside the contribution, so the section is
 /// still one run of bytes — just a shorter one.
-fn placements_for(objects: &[LoadedObject], strip: &Strip) -> Vec<InputPlacement> {
+#[derive(Default)]
+struct ArchiveMemberStats {
+    extracted: u64,
+    fully_dead: u64,
+    fully_dead_bytes: u64,
+}
+
+fn placements_for(
+    objects: &[LoadedObject],
+    strip: &Strip,
+) -> (Vec<InputPlacement>, ArchiveMemberStats) {
     let mut placements = Vec::new();
+    let mut members = ArchiveMemberStats::default();
     for object in objects {
+        let mut output_bytes = 0u64;
         for section in &object.parsed.sections {
             if is_linker_internal(section) {
                 continue;
             }
+            let size = strip.size_of(object.parsed.id, section.id, section.size);
+            output_bytes += size;
             placements.push(InputPlacement {
                 object: object.parsed.id,
                 section: section.id,
                 segment: section.segment.clone(),
                 name: section.name.clone(),
                 kind: section.kind,
-                size: strip.size_of(object.parsed.id, section.id, section.size),
+                size,
                 alignment: section.alignment,
             });
         }
+        if object.member.is_some() {
+            members.extracted += 1;
+            if output_bytes == 0 {
+                members.fully_dead += 1;
+                members.fully_dead_bytes += object.data.len() as u64;
+            }
+        }
     }
-    placements
+    (placements, members)
 }
 
 /// Assemble an image from the current knowledge.
 ///
-/// `contents` is keyed by output-section index; an empty map produces an image
-/// whose sections are zero-filled, which is what the first pass wants.
+/// `contents` is keyed by output-section index.
 /// Everything the emitter needs, gathered so the parameter list stays a list
 /// of *decisions* rather than of accumulated arguments.
 #[derive(Default)]
 struct Assembly<'a> {
-    /// Whether this pass produces the real image. The layout probe does not,
-    /// and signing what it produces hashes megabytes that are then dropped.
-    final_pass: bool,
     placements: &'a [InputPlacement],
     contents: Option<&'a HashMap<usize, Vec<u8>>>,
     rebases: &'a [Rebase],
@@ -4714,9 +4739,8 @@ struct Assembly<'a> {
     entry_offset: u64,
     /// The previous link's placements, when there are any to build on.
     ///
-    /// Both passes get the same one. The probe exists to size the load
-    /// commands, and sizing them against a layout the real pass will not
-    /// produce is how a reservation comes to be wrong.
+    /// Planning and emission both get the same one. Planning addresses against
+    /// a layout the real pass will not produce is how relocations become wrong.
     previous: Option<&'a (blinker_layout::PreviousLayout, PlacementKeys)>,
     /// Room to reserve per contribution. See [`full_sizes`].
     reservations: Option<&'a blinker_output::PlacementReservations>,
@@ -4756,12 +4780,47 @@ fn full_sizes(objects: &[LoadedObject]) -> blinker_output::PlacementReservations
     sizes
 }
 
+/// Configure the part of an image builder that determines addresses.
+///
+/// Both layout planning and final emission go through here. Keeping those
+/// fields in one place is the correctness property: a relocation must never be
+/// applied against a plan produced with different inputs, dylibs, rpaths, or
+/// stable-layout policy than the emitted image.
+fn layout_builder(request: &LinkRequest, assembly: &Assembly<'_>) -> ImageBuilder<'static> {
+    let mut builder = ImageBuilder::new();
+    if let Some((previous, keys)) = assembly.previous {
+        builder.reusing_layout(previous.clone(), keys.clone());
+        if let Some(reservations) = assembly.reservations {
+            builder.reserving(reservations.clone());
+        }
+    }
+    if request.stable_layout {
+        builder.slop(blinker_layout::Slop::DEFAULT);
+    }
+    for placement in assembly.placements {
+        builder.input(placement.clone());
+    }
+    for dylib in assembly.dylibs {
+        builder.dylib(dylib.clone());
+    }
+    for path in &request.rpaths {
+        builder.rpath(path.clone());
+    }
+    if request.kind == ImageKind::Dylib {
+        builder.dylib_output(&request.install_name);
+    }
+    builder
+}
+
+/// Plan addresses without allocating, hashing, or signing an output image.
+fn plan_layout(request: &LinkRequest, assembly: &Assembly<'_>) -> Layout {
+    layout_builder(request, assembly).layout()
+}
+
 /// Assemble the image.
 ///
 /// `strings` is the `__LINKEDIT` string table to place the names in, and is
-/// handed back on the [`Image`] so the next link can reuse the offsets. The
-/// layout probe passes an empty one: it emits no symbols, so it has nothing to
-/// place and nothing to hand on.
+/// handed back on the [`Image`] so the next link can reuse the offsets.
 ///
 /// `output_symbols` is *moved* rather than borrowed, and that is not tidiness.
 /// It was a slice, and the loop below cloned every element into the builder:
@@ -4780,17 +4839,13 @@ fn assemble(
         rebases,
         binds,
         entry_offset,
-        final_pass: _,
         previous: _,
         reservations: _,
         previous_signature: _,
         dylibs: _,
     } = *assembly;
-    let mut builder = ImageBuilder::new();
+    let mut builder = layout_builder(request, assembly);
     builder.reusing_strings(strings);
-    if !assembly.final_pass {
-        builder.unsigned();
-    }
     // Padding is for the next link, not this one: it costs image size and buys
     // the property that an edit which grows one contribution does not move
     // every contribution after it — which is what keeps the cache's placement
@@ -4799,36 +4854,13 @@ fn assemble(
     if let Some((image, hashes)) = assembly.previous_signature {
         builder.reusing_signature(image.clone(), hashes.clone());
     }
-    if let Some((previous, keys)) = assembly.previous {
-        builder.reusing_layout(previous.clone(), keys.clone());
-        if let Some(reservations) = assembly.reservations {
-            builder.reserving(reservations.clone());
-        }
-    }
-    if request.stable_layout {
-        builder.slop(blinker_layout::Slop::DEFAULT);
-    }
-    for placement in placements {
-        builder.input(placement.clone());
-    }
-    for dylib in assembly.dylibs {
-        builder.dylib(dylib.clone());
-    }
-    for path in &request.rpaths {
-        builder.rpath(path.clone());
-    }
     builder.identifier(&request.identifier);
-    match request.kind {
-        ImageKind::Executable => {
-            builder.entry_offset(entry_offset);
-        }
-        ImageKind::Dylib => {
-            builder.dylib_output(&request.install_name);
-        }
+    if request.kind == ImageKind::Executable {
+        builder.entry_offset(entry_offset);
     }
 
     // Sections with no supplied content are emitted as zeroes of the right
-    // size, so the first pass produces a valid image to read the layout from.
+    // size. The linker supplies every non-zero-filled section here.
     if let Some(contents) = contents {
         for index in 0..placements.len() {
             if let Some(bytes) = contents.get(&index) {
@@ -5531,13 +5563,13 @@ impl<'a> ObjectIndex<'a> {
 /// the gaps between them are simply not copied.
 fn build_contents(
     objects: &[LoadedObject],
-    image: &Image,
+    layout: &Layout,
     strip: &Strip,
 ) -> Result<HashMap<usize, Vec<u8>>, LinkError> {
     let mut contents: HashMap<usize, Vec<u8>> = HashMap::default();
     let index_of = ObjectIndex::build(objects);
 
-    for (index, section) in image.layout.sections.iter().enumerate() {
+    for (index, section) in layout.sections.iter().enumerate() {
         if section.is_zero_filled() {
             continue;
         }
@@ -5612,12 +5644,11 @@ fn build_contents(
 /// every other section can.
 fn repair_eh_frame(
     contents: &mut SectionContents,
-    image: &Image,
+    layout: &Layout,
     objects: &[LoadedObject],
     strip: &Strip,
 ) {
-    let Some((index, output)) = image
-        .layout
+    let Some((index, output)) = layout
         .sections
         .iter()
         .enumerate()
@@ -5687,9 +5718,8 @@ fn repair_eh_frame(
 /// block**, not its address. dyld copies the block per thread, so an absolute
 /// address there is meaningless — it rejects the image with "malformed
 /// thread-local, offset=… is larger than total size".
-fn thread_local_base(image: &Image) -> Option<u64> {
-    image
-        .layout
+fn thread_local_base(layout: &Layout) -> Option<u64> {
+    layout
         .sections
         .iter()
         .filter(|s| s.name == "__thread_data" || s.name == "__thread_bss")
@@ -5698,9 +5728,8 @@ fn thread_local_base(image: &Image) -> Option<u64> {
 }
 
 /// Whether an address falls inside the per-thread block.
-fn in_thread_local_block(image: &Image, address: u64) -> bool {
-    image
-        .layout
+fn in_thread_local_block(layout: &Layout, address: u64) -> bool {
+    layout
         .sections
         .iter()
         .filter(|s| s.name == "__thread_data" || s.name == "__thread_bss")
@@ -5868,9 +5897,9 @@ struct Placed {
 }
 
 impl Placed {
-    fn index(image: &Image) -> Placed {
+    fn index(layout: &Layout) -> Placed {
         let mut chunks = FastMap::default();
-        for (index, section) in image.layout.sections.iter().enumerate() {
+        for (index, section) in layout.sections.iter().enumerate() {
             for contribution in &section.contributions {
                 chunks.insert(
                     (contribution.object.0, contribution.section.0),
@@ -5959,7 +5988,7 @@ impl ObjectBytes<'_> {
 /// that had not gone wrong (finding 241).
 fn carve<'a>(
     buffers: &'a mut [(usize, Vec<u8>)],
-    image: &Image,
+    layout: &Layout,
     slot_of: &HashMap<u32, usize>,
     objects: usize,
 ) -> Result<Vec<ObjectBytes<'a>>, LinkError> {
@@ -5967,8 +5996,7 @@ fn carve<'a>(
         .map(|_| ObjectBytes { spans: Vec::new() })
         .collect();
     for (index, buffer) in buffers.iter_mut() {
-        let section = image
-            .layout
+        let section = layout
             .section(*index)
             .ok_or(LinkError::MissingOutputSection { section: *index })?;
         // Empty contributions are dropped, not ordered. An object that
@@ -6022,7 +6050,7 @@ fn carve<'a>(
 fn apply_relocations(
     objects: &[LoadedObject],
     names: &Names<'_>,
-    image: &Image,
+    layout: &Layout,
     placement: &Placement<'_>,
     tables: &IndirectTables<'_>,
     mut contents: SectionContents,
@@ -6077,7 +6105,7 @@ fn apply_relocations(
         .enumerate()
         .map(|(slot, object)| (object.parsed.id.0, slot))
         .collect();
-    let mut carved = carve(&mut buffers, image, &slot_of, objects.len())?;
+    let mut carved = carve(&mut buffers, layout, &slot_of, objects.len())?;
 
     // One chunk of objects, relocated into its own slices and its own
     // accumulators. Everything it produces is chunk-local — including the
@@ -6150,10 +6178,9 @@ fn apply_relocations(
                 index += 1;
 
                 // Where the patched field lives in the output.
-                let Some((section_index, chunk_address)) =
-                    placed.chunk(object.parsed.id, relocation.section).and_then(
-                        |(index, address)| image.layout.section(index).map(|_| (index, address)),
-                    )
+                let Some((section_index, chunk_address)) = placed
+                    .chunk(object.parsed.id, relocation.section)
+                    .and_then(|(index, address)| layout.section(index).map(|_| (index, address)))
                 else {
                     // The relocation patches a section that was dropped as
                     // linker-internal; nothing in the output refers to it.
@@ -6168,7 +6195,7 @@ fn apply_relocations(
                     note_reference(&mut referenced, relocation);
                 }
 
-                let output_section = image.layout.section(section_index).expect("just matched");
+                let output_section = layout.section(section_index).expect("just matched");
                 // Where the field moved to. `None` means the bytes holding it were
                 // stripped, so there is nothing to patch — and, for a `SUBTRACTOR`,
                 // its partner must be stepped over with it.
@@ -6307,8 +6334,7 @@ fn apply_relocations(
                     if let RelocationTarget::Symbol(id) = relocation.target {
                         if let Some(symbol) = object.parsed.symbol(id) {
                             if imports.contains(&symbol.name) {
-                                if let Some((segment_index, segment)) = image
-                                    .layout
+                                if let Some((segment_index, segment)) = layout
                                     .segments
                                     .iter()
                                     .enumerate()
@@ -6338,7 +6364,7 @@ fn apply_relocations(
                 let thread_local_offset = if relocation.kind == Arm64RelocationKind::Unsigned
                     && output_section.name == "__thread_vars"
                 {
-                    thread_local_base(image)
+                    thread_local_base(layout)
                 } else {
                     None
                 };
@@ -6433,7 +6459,7 @@ fn apply_relocations(
                 // block are converted: a descriptor also holds a bound thunk
                 // pointer and a key, and those are not offsets.
                 let target = match thread_local_offset {
-                    Some(base) if in_thread_local_block(image, target) => target - base,
+                    Some(base) if in_thread_local_block(layout, target) => target - base,
                     _ => target,
                 };
 
@@ -6446,8 +6472,7 @@ fn apply_relocations(
                     && thread_local_offset.is_none()
                     && output_section.segment != "__TEXT"
                 {
-                    if let Some((segment_index, segment)) = image
-                        .layout
+                    if let Some((segment_index, segment)) = layout
                         .segments
                         .iter()
                         .enumerate()
@@ -6855,7 +6880,7 @@ fn address_map_of(
 fn entry_offset(
     request: &LinkRequest,
     objects: &[LoadedObject],
-    image: &Image,
+    layout: &Layout,
     strip: &Strip,
 ) -> Result<u64, LinkError> {
     for object in objects {
@@ -6887,7 +6912,7 @@ fn entry_offset(
             continue;
         };
 
-        for section in &image.layout.sections {
+        for section in &layout.sections {
             if let Some(address) = section.address_of(object.parsed.id, section_id) {
                 let Some(file_offset) = section.file_offset else {
                     continue;

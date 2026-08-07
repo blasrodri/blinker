@@ -183,6 +183,63 @@ fn a_bitcode_input_delegates_and_still_produces_a_program() {
     assert_eq!(status.code(), Some(9), "the delegated link did not work");
 }
 
+/// Detection belongs at the parse boundary, not in a loose-file preflight: an
+/// archive member is just as capable of being bitcode as a top-level object.
+#[test]
+fn a_bitcode_archive_member_delegates_too() {
+    let scratch = Scratch::dir("delegate-bitcode-archive").expect("scratch");
+    let main = compile(
+        &scratch,
+        "main.c",
+        "extern int answer(void); int main(void) { return answer(); }\n",
+    );
+    let source = scratch
+        .write("answer.c", "int answer(void) { return 11; }\n")
+        .expect("writable");
+    let bitcode = scratch.join("answer.o");
+    let compiled = Command::new("cc")
+        .args(["-arch", "arm64", DEPLOYMENT_TARGET, "-flto", "-c"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&bitcode)
+        .status()
+        .expect("cc runs");
+    if !compiled.success() {
+        return;
+    }
+
+    let archive = scratch.join("libanswer.a");
+    let archived = Command::new("ar")
+        .arg("rcs")
+        .arg(&archive)
+        .arg(&bitcode)
+        .status()
+        .expect("ar runs");
+    assert!(archived.success(), "ar failed to build the fixture");
+
+    let out = scratch.join("program");
+    let record = scratch.join("bitcode-archive.json");
+    let status = blinker()
+        .arg("--blinker-internal")
+        .arg("--blinker-json-diagnostics")
+        .arg(&record)
+        .arg("-o")
+        .arg(&out)
+        .arg(&main)
+        .arg(&archive)
+        .arg("-lSystem")
+        .status()
+        .expect("blinker runs");
+    assert!(status.success(), "the archive link did not delegate");
+    let json = std::fs::read_to_string(&record).expect("record written");
+    assert!(
+        json.contains("unsupported_input_format"),
+        "a bitcode archive member was not delegated for that reason:\n{json}"
+    );
+    let status = Command::new(&out).status().expect("the program runs");
+    assert_eq!(status.code(), Some(11), "the delegated link did not work");
+}
+
 /// And the control: an ordinary executable must **not** delegate, or the rule
 /// above would be satisfied by a linker that delegates everything.
 #[test]

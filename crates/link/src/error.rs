@@ -20,6 +20,15 @@ pub enum LinkError {
     /// Boxed because `ParseError` carries a path and detail string, and an
     /// unboxed variant would make every `LinkError` that large.
     Parse(Box<blinker_macho::ParseError>),
+    /// A well-formed input that requires a linker feature blinker does not
+    /// implement. The driver may delegate this exact outcome; malformed input
+    /// and every other link error remain failures.
+    UnsupportedInputFormat {
+        path: PathBuf,
+        member: Option<String>,
+        format: &'static str,
+        remedy: &'static str,
+    },
     /// An archive could not be read or indexed.
     Archive(Box<blinker_archive::ArchiveError>),
     /// Symbols referenced but never defined.
@@ -113,6 +122,18 @@ impl std::fmt::Display for LinkError {
                 write!(f, "cannot write {}: {source}", path.display())
             }
             LinkError::Parse(source) => write!(f, "{source}"),
+            LinkError::UnsupportedInputFormat {
+                path,
+                member,
+                format,
+                remedy,
+            } => {
+                write!(f, "{}", path.display())?;
+                if let Some(member) = member {
+                    write!(f, "({member})")?;
+                }
+                write!(f, " is {format}; {remedy}")
+            }
             LinkError::Archive(source) => write!(f, "{source}"),
             LinkError::UndefinedSymbols { names } => {
                 write!(f, "undefined symbols:")?;
