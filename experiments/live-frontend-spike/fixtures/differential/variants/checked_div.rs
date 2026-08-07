@@ -27,6 +27,15 @@
 #[no_mangle]
 pub static DIFF_BASE: u64 = 1_000;
 
+/// A `const`, read in two places: inside the patch closure and outside it.
+///
+/// It is `1` so that it changes nothing here. It exists to be *changed*, in
+/// §48's mutation, because a `const` is folded into every use site at compile
+/// time — so editing one edits the machine code of every function that reads
+/// it, including the ones a patch does not replace. Nothing in this crate had a
+/// `const` before, which is why that had never been tested.
+pub const DIFF_SCALE: u64 = 1;
+
 #[derive(Clone, Copy)]
 pub struct Reading {
     pub value: u64,
@@ -67,7 +76,7 @@ fn blend(x: u64) -> u64 {
 pub extern "C" fn diff_root(value: u64, scale: u32, out: *mut u64) -> u64 {
     let reading = Reading { value, scale };
     let total = reading.total();
-    let mixed = blend(total).wrapping_div((scale as u64) | 1).wrapping_add(1);
+    let mixed = blend(total).wrapping_div((scale as u64) | 1).wrapping_add(1).wrapping_mul(DIFF_SCALE);
     // The memory output: a differential that compared return values alone
     // would miss a patch that got the write wrong.
     unsafe { *out = mixed ^ 0xAAAA };
@@ -85,5 +94,7 @@ pub static mut DIFF_GATE: Option<Root> = None;
 #[no_mangle]
 pub extern "C" fn diff_entry(value: u64, scale: u32, out: *mut u64) -> u64 {
     let through = unsafe { DIFF_GATE }.unwrap_or(diff_root);
-    through(value, scale, out)
+    // Reads `DIFF_SCALE` too, and lives in the base image where no patch
+    // reaches it.
+    through(value, scale, out).wrapping_mul(DIFF_SCALE)
 }

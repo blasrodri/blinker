@@ -108,6 +108,15 @@
     "error": null
   },
   {
+    "mutation": "const_changed",
+    "verdict": "FALLBACK(const_changed)",
+    "agreed": null,
+    "difference": null,
+    "base_intact": true,
+    "closure_size": 6,
+    "error": "the classifier refused: Fallback { reason: ConstChanged { consts: [\"::DIFF_SCALE\"] } }"
+  },
+  {
     "mutation": "new_static",
     "verdict": "FALLBACK(new_static_required)",
     "agreed": null,

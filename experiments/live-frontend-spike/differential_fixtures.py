@@ -27,7 +27,7 @@ VARIANTS = HERE / "fixtures" / "differential" / "variants"
 
 PRISTINE_BODY = """    let reading = Reading { value, scale };
     let total = reading.total();
-    let mixed = blend(total);"""
+    let mixed = blend(total).wrapping_mul(DIFF_SCALE);"""
 
 PRISTINE_BLEND = """#[inline(never)]
 fn blend(x: u64) -> u64 {
@@ -41,7 +41,7 @@ MUTATIONS = [
         "arithmetic in the root body",
         [(PRISTINE_BODY, """    let reading = Reading { value, scale };
     let total = reading.total();
-    let mixed = blend(total).wrapping_mul(11).wrapping_add(2);""")],
+    let mixed = blend(total).wrapping_mul(11).wrapping_add(2).wrapping_mul(DIFF_SCALE);""")],
     ),
     (
         "call_existing",
@@ -49,7 +49,7 @@ MUTATIONS = [
         [(PRISTINE_BODY, """    let reading = Reading { value, scale };
     let other = Reading { value: scale as u64, scale: 3 };
     let total = reading.total().wrapping_add(other.total());
-    let mixed = blend(total);""")],
+    let mixed = blend(total).wrapping_mul(DIFF_SCALE);""")],
     ),
     (
         "new_local_helper",
@@ -63,7 +63,7 @@ fn skew(x: u64) -> u64 {
 }"""),
             (PRISTINE_BODY, """    let reading = Reading { value, scale };
     let total = reading.total();
-    let mixed = skew(blend(total));"""),
+    let mixed = skew(blend(total)).wrapping_mul(DIFF_SCALE);"""),
         ],
     ),
     (
@@ -78,7 +78,7 @@ fn fold<T: Copy + core::ops::BitXor<Output = T>>(a: T, b: T) -> T {
 }"""),
             (PRISTINE_BODY, """    let reading = Reading { value, scale };
     let total = reading.total();
-    let mixed = blend(fold(total, 0x5555u64));"""),
+    let mixed = blend(fold(total, 0x5555u64)).wrapping_mul(DIFF_SCALE);"""),
         ],
     ),
     (
@@ -156,9 +156,8 @@ fn blend(x: u64) -> u64 {
     (
         "edit_outside_closure",
         "a function outside the patch closure changed in the same revision",
-        [("""    let through = unsafe { DIFF_GATE }.unwrap_or(diff_root);
-    through(value, scale, out)""", """    let through = unsafe { DIFF_GATE }.unwrap_or(diff_root);
-    through(value, scale, out).wrapping_add(1)""")],
+        [("""    through(value, scale, out).wrapping_mul(DIFF_SCALE)""",
+          """    through(value, scale, out).wrapping_mul(DIFF_SCALE).wrapping_add(1)""")],
     ),
     # Not a DIRECT edit. Included so the suite exercises a refusal as well as
     # an acceptance: a run in which nothing is ever refused cannot distinguish
@@ -173,7 +172,7 @@ fn blend(x: u64) -> u64 {
         # guarantee rather than a debug assertion.
         [(PRISTINE_BODY, """    let reading = Reading { value, scale };
     let total = reading.total();
-    let mixed = blend(total).wrapping_div((scale as u64) | 1).wrapping_add(1);""")],
+    let mixed = blend(total).wrapping_div((scale as u64) | 1).wrapping_add(1).wrapping_mul(DIFF_SCALE);""")],
     ),
     (
         "const_table",
@@ -188,8 +187,13 @@ fn blend(x: u64) -> u64 {
 const SKEW: [u64; 8] = [3, 5, 7, 11, 13, 17, 19, 23];"""),
             (PRISTINE_BODY, """    let reading = Reading { value, scale };
     let total = reading.total();
-    let mixed = blend(total).wrapping_mul(SKEW[(total & 7) as usize]);"""),
+    let mixed = blend(total).wrapping_mul(SKEW[(total & 7) as usize]).wrapping_mul(DIFF_SCALE);"""),
         ],
+    ),
+    (
+        "const_changed",
+        "a `const` read by a function outside the patch closure (§48)",
+        [("pub const DIFF_SCALE: u64 = 1;", "pub const DIFF_SCALE: u64 = 7;")],
     ),
     (
         "new_static",

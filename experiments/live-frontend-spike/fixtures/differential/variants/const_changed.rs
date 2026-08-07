@@ -34,7 +34,7 @@ pub static DIFF_BASE: u64 = 1_000;
 /// time — so editing one edits the machine code of every function that reads
 /// it, including the ones a patch does not replace. Nothing in this crate had a
 /// `const` before, which is why that had never been tested.
-pub const DIFF_SCALE: u64 = 1;
+pub const DIFF_SCALE: u64 = 7;
 
 #[derive(Clone, Copy)]
 pub struct Reading {

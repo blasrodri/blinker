@@ -93,6 +93,8 @@ pub struct Contract {
     /// Every function the crate defines, keyed by `DefPathHash`, holding a
     /// fingerprint of its body and a readable path (§32).
     pub bodies: std::collections::BTreeMap<String, (String, String)>,
+    /// Every `const` the crate defines, by `DefPathHash` (§48).
+    pub consts: std::collections::BTreeMap<String, (String, String)>,
     pub closure_is_local: bool,
     /// Statics the closure reads. A body that introduces a new one needs
     /// storage the base image does not have, and no signature or ABI
@@ -113,6 +115,10 @@ pub enum Reason {
     /// A function outside the patch closure changed in the same revision, so
     /// the base image would keep its old compiled code (§32).
     ChangedOutsideClosure { functions: Vec<String> },
+    /// A `const` changed (§48). It is folded into every use site, so the base
+    /// image's copy of every function that reads it is now wrong — and unlike a
+    /// changed function body, nothing in the closure names it.
+    ConstChanged { consts: Vec<String> },
     /// The crate's body fingerprints could not be read, so the check above
     /// cannot be performed and the edit is refused rather than assumed safe.
     BodiesUnavailable,
@@ -244,6 +250,7 @@ pub fn contract_of(
     crate_statics: &std::collections::BTreeSet<String>,
     closure_paths: &std::collections::BTreeSet<String>,
     bodies: std::collections::BTreeMap<String, (String, String)>,
+    consts: std::collections::BTreeMap<String, (String, String)>,
 ) -> Contract {
     let global = def_id.to_def_id();
     let def_kind = tcx.def_kind(def_id);
@@ -339,6 +346,7 @@ pub fn contract_of(
         closure_size,
         closure_paths: closure_paths.clone(),
         bodies,
+        consts,
         closure_is_local,
         statics: statics.iter().cloned().collect(),
         crate_statics: crate_statics.iter().cloned().collect(),
@@ -524,6 +532,35 @@ pub fn classify(before: &Contract, after: &Contract) -> Verdict {
         // by being unable to run.
         return fallback(Reason::BodiesUnavailable);
     }
+    // §48, before the body check because it is the stricter rule and its
+    // failure mode is the one nothing else can see.
+    // Only consts that existed before and have a different definition now.
+    //
+    // Not additions: a `const` the previous revision did not have cannot have
+    // been folded into anything in the base image, so a patch that introduces
+    // one and reads it is exactly as safe as a patch that introduces a helper.
+    // The first version refused those too and turned §46's `const_table` — a
+    // mutation whose whole purpose is to add a constant and read it — into a
+    // FALLBACK, which took the corrupted-constant control with it.
+    //
+    // Not removals either. A base-image function that folded the old value
+    // keeps a value that was correct when it was compiled; if anything still
+    // *refers* to the const, the crate does not compile and no verdict is
+    // reached at all.
+    let mut changed_consts: Vec<String> = Vec::new();
+    for (id, (hash, name)) in &after.consts {
+        if let Some((was, _)) = before.consts.get(id) {
+            if was != hash {
+                changed_consts.push(name.clone());
+            }
+        }
+    }
+    if !changed_consts.is_empty() {
+        changed_consts.sort();
+        changed_consts.dedup();
+        return fallback(Reason::ConstChanged { consts: changed_consts });
+    }
+
     let mut outside: Vec<String> = Vec::new();
     let trace = std::env::var_os("SPIKE_TRACE_BODIES").is_some();
     for (id, (hash, name)) in &after.bodies {

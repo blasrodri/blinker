@@ -356,9 +356,19 @@ pub fn run(options: &crate::Options, sabotage: Sabotage) -> Vec<Trial> {
                     verdict: String::new(),
                     agreed: None,
                     difference: None,
-                    base_intact: true,
+                    base_intact: false,
                     closure_size: 0,
-                    error: Some(format!("no variant named {mutation}")),
+                    // Marked as *not* base-intact so the report fails.
+                    //
+                    // It used to read as an ordinary refusal, so a mutation
+                    // whose file the generator had never written counted as a
+                    // pass — and §48's mutation did exactly that for one run,
+                    // reporting "as expected" for an experiment that had not
+                    // happened. A suite that cannot tell "refused" from "never
+                    // ran" is a suite that can be silently emptied.
+                    error: Some(format!(
+                        "no variant named {mutation} — run differential_fixtures.py"
+                    )),
                 });
                 continue;
             }

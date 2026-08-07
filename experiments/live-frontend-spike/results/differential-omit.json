@@ -6,7 +6,7 @@
     "difference": null,
     "base_intact": true,
     "closure_size": 6,
-    "error": "_RNvMCsfCWnWJ9PaRW_12diff_fixtureNtB2_7Reading5total is -195147544 bytes away, out of range for a bl"
+    "error": "the patch object defines 5 symbols against 6 expected: 0 unexpected [], 1 missing [\"RNvMCsfCWnWJ9PaRW_12diff_fixtureNtB2_7Reading5total\"]"
   },
   {
     "mutation": "call_existing",
@@ -106,6 +106,15 @@
     "base_intact": true,
     "closure_size": 6,
     "error": "the patch object defines 5 symbols against 6 expected: 0 unexpected [], 1 missing [\"RNvMCsfCWnWJ9PaRW_12diff_fixtureNtB2_7Reading5total\"]"
+  },
+  {
+    "mutation": "const_changed",
+    "verdict": "FALLBACK(const_changed)",
+    "agreed": null,
+    "difference": null,
+    "base_intact": true,
+    "closure_size": 6,
+    "error": "the classifier refused: Fallback { reason: ConstChanged { consts: [\"::DIFF_SCALE\"] } }"
   },
   {
     "mutation": "new_static",

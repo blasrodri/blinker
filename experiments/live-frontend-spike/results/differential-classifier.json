@@ -108,6 +108,15 @@
     "error": null
   },
   {
+    "mutation": "const_changed",
+    "verdict": "FALLBACK(const_changed)",
+    "agreed": false,
+    "difference": "probe 0 (0, 0): live returned 56 wrote 43666, clean returned 392 wrote 43666",
+    "base_intact": true,
+    "closure_size": 6,
+    "error": null
+  },
+  {
     "mutation": "new_static",
     "verdict": "FALLBACK(new_static_required)",
     "agreed": null,

@@ -426,6 +426,7 @@ impl Callbacks for Measure {
             &defined,
             &self.closure_paths,
             body_fingerprints(tcx),
+            const_fingerprints(tcx),
         ));
         self.record.classify_ms = at.elapsed().as_secs_f64() * 1e3;
 
@@ -510,6 +511,41 @@ fn find_hot_root(tcx: TyCtxt<'_>, name: &str) -> Option<LocalDefId> {
                 // `optimized_mir`.
                 && tcx.is_mir_available(def_id.to_def_id())
         })
+}
+
+/// Every `const` this crate defines, and a fingerprint of its definition.
+///
+/// §48. A `const` is folded into every use site at compile time, so changing
+/// one changes the machine code of every function that reads it — including
+/// functions a patch does not replace. §32's check cannot see this: it compares
+/// *function* HIR hashes, and a caller's HIR does not change when the constant
+/// it reads does. The differential found the consequence directly, with the
+/// live program answering 56 where a clean rebuild answered 392.
+///
+/// The rule is deliberately blunt: any change to any `const` refuses the
+/// revision. A narrower rule would need the set of functions that read it, and
+/// there is no cheap reliable way to get that — the reference is folded away
+/// before MIR, which is the whole reason this is dangerous.
+fn const_fingerprints(
+    tcx: TyCtxt<'_>,
+) -> std::collections::BTreeMap<String, (String, String)> {
+    use rustc_hir::def::DefKind;
+    tcx.hir_crate_items(())
+        .definitions()
+        .filter(|def_id| matches!(tcx.def_kind(*def_id), DefKind::Const { .. } | DefKind::AssocConst { .. }))
+        .map(|def_id| {
+            let owner = rustc_hir::OwnerId { def_id };
+            let hash = tcx.hir_owner_nodes(owner).opt_hash;
+            let display = tcx.def_path(def_id.to_def_id()).to_string_no_crate_verbose();
+            (
+                format!("{:?}", tcx.def_path_hash(def_id.to_def_id())),
+                match hash {
+                    Some(hash) => (format!("{hash:?}"), display),
+                    None => (String::new(), display),
+                },
+            )
+        })
+        .collect()
 }
 
 /// Every function this crate defines, and a fingerprint of its body.

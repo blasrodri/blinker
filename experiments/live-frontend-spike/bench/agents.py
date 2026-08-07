@@ -136,6 +136,18 @@ def _searcher_blinker(environment, attempt, task, deadline):
     for repair in _repairs(source, task):
         _tick(deadline)
         bodies = _bodies(repair)
+        # A repair the API cannot express has to escalate, not be skipped.
+        #
+        # `replace_body` replaces bodies, so a repair that changes a `const` —
+        # or anything else that is not a function body — leaves the source
+        # untouched and the loop moved on to the next candidate. Two of the
+        # three tasks Blinker failed were that: the right repair was tried, did
+        # nothing, and was never noticed. Falling back is what a person would
+        # do, and it is what the FALLBACK path is for.
+        if _differs_outside_bodies(repair, source, task["targets"]):
+            if _fall_back(environment, attempt, task, repair):
+                return
+            continue
         staged = []
         for name in task["targets"]:
             if name not in bodies:
@@ -177,6 +189,23 @@ def _fall_back(environment, attempt, task, source):
     attempt.bytes_out += len(source)
     (task["_dir"] / "src" / "lib.rs").write_text(source)
     return harness.cargo_test(task["_dir"], environment.deadline)[0]
+
+
+def _differs_outside_bodies(repair, source, targets):
+    """Whether `repair` changes anything the body verbs cannot reach.
+
+    Compares the two sources with every target's body blanked out. What is left
+    is everything `replace_body` cannot touch — item signatures, attributes, and
+    `const` definitions — so a difference there means the API is not enough.
+    """
+    def blanked(text):
+        bodies = _bodies(text)
+        for name in targets:
+            if name in bodies:
+                text = text.replace(bodies[name], "{}", 1)
+        return text
+
+    return blanked(repair) != blanked(source)
 
 
 BODY = re.compile(r'pub extern "C" fn (\w+)\s*\(')

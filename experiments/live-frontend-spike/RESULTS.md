@@ -1897,12 +1897,9 @@ classifier refuses and the agent has to reach for cargo. That is the escalation
 path working, and it is why the `fallback` family exists.
 
 **Blinker solved fewer.** Both `run_affected` findings above account for two of
-the three, and fixing them took the sweep to **96%**. The two that remain are
-the same defect and its pair: the fix changes `const MODULUS`, and
-`replace_body` replaces *bodies*. An API that structurally cannot change a
-signature also cannot change a constant, and both of those are the same
-deliberate narrowness — but a const is a much more ordinary thing to want to
-edit, and it is the clearest single gap M1 left.
+the three, and fixing them took the sweep to 96%. The last one was the fix
+changing `const MODULUS`, which `replace_body` cannot express — and chasing
+that turned out to be worth much more than one task. §48.
 
 ### What the wall clock cost, and why it is not a result
 
@@ -1934,3 +1931,94 @@ Nothing about models. `searcher`'s absolute success rate is a fact about its
 repair table, not about anything intelligent — it can only fix bugs whose repair
 it already knows. What it measures honestly is the **cost per hypothesis**, and
 that is the quantity M3 and M4 turn into a claim about capability.
+
+
+## 48. What the const gap actually was
+
+M2 ended with two tasks Blinker could not solve, both wanting to change
+`const MODULUS`. That looks like a missing verb. Before adding one, the
+question worth asking is whether changing a `const` is *safe to publish at
+all* — and it is not, and the classifier was letting it through.
+
+### The hole
+
+A `const` is folded into every use site at compile time. Changing one changes
+the machine code of every function that reads it. §32's check compares the HIR
+hashes of *functions*, and a caller's HIR does not change when a constant it
+reads does — so nothing saw it.
+
+The differential fixture had no `const` in it, which is why this had never been
+tested. Adding one read in two places — inside the patch closure and by
+`diff_entry`, which lives in the base image where no patch reaches it — and
+changing its value:
+
+```
+  const_changed   DIRECT   6   NO   intact   FAIL
+      probe 0 (0, 0): live returned 56 wrote 43666, clean returned 392 wrote 43666
+```
+
+DIRECT, published, and a factor of seven wrong. The patched `diff_root` uses the
+new constant; the base image's `diff_entry` still uses the old one. Exactly
+§32's failure — a change outside the closure — in the one shape §32's check
+cannot see.
+
+### The rule
+
+Every `const` the crate defines is now fingerprinted into the contract, by
+`DefPathHash` and its HIR owner hash, and a revision in which one **changed**
+is refused: `FALLBACK(const_changed)`, naming it.
+
+Deliberately blunt. A narrower rule would need the set of functions that read
+the constant, and there is no cheap reliable way to get one — the reference is
+folded away before MIR, which is the whole reason this is dangerous.
+
+But only *changes*. The first version also refused additions and removals, and
+that was wrong in a way §46's own suite caught within minutes: `const_table`
+adds a constant and reads it, which is exactly as safe as adding a helper —
+nothing in the base image can have folded a constant that did not exist. It
+turned that mutation into a FALLBACK and took the corrupted-constant control
+down with it, because a refused patch carries no constants to corrupt. A removal
+is likewise safe: a base-image function that folded the old value holds one that
+was correct when it was compiled, and anything still *referring* to the constant
+fails to compile, so no verdict is reached.
+
+### Two more things the same afternoon found
+
+**A missing variant counted as a pass.** The differential reported `as expected`
+for `const_changed` on a run where the generator had never written the file —
+the trial was recorded as an ordinary refusal. A suite that cannot tell
+"refused" from "never ran" can be silently emptied. A missing variant now fails
+the run and says which script to run.
+
+**The `edit_outside_closure` mutation had stopped applying.** Its anchor was
+`diff_entry`'s body, which this section changed, and the generator halted there
+— so every mutation after it silently stopped being regenerated. Found because
+`const_changed` was one of them.
+
+### And then the verb was not needed
+
+With the classifier correct, `replace_body` still cannot change a constant — and
+should not. What was missing was the *agent* noticing. The searcher tried the
+right repair, `replace_body` left the source untouched because the change was
+not in any body, and the loop moved on. Two of the three failures were that.
+
+The policy now compares the candidate against the current source with every
+target's body blanked out. A difference in what is left is a change the body
+verbs cannot reach, and it escalates — which is what a person would do, and what
+the FALLBACK path is for.
+
+| `searcher`, 49 tasks | cargo | blinker |
+|---|---:|---:|
+| solved | 100% | **100%** |
+| median | 559 ms | **40 ms** |
+| within 1 s | 65% | **92%** |
+| builds | 76 | **19** |
+| bytes across the interface | 1,228,571 | **235,760** |
+
+All six families, 49 of 49, in both. Blinker's 19 builds are its escalations: 17
+for the `#[inline]` family, 2 for the constant changes. That is the shape the
+whole design wants — the fast path takes what it can prove, and the slow path
+takes the rest, with the classifier deciding rather than the agent guessing.
+
+Every M0 suite re-run: 6 differential modes over 14 mutations, generations 10/10
+exact, 22 unit tests, the M1 gate, the linker gate.
