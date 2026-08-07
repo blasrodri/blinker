@@ -525,8 +525,20 @@ pub fn classify(before: &Contract, after: &Contract) -> Verdict {
         return fallback(Reason::BodiesUnavailable);
     }
     let mut outside: Vec<String> = Vec::new();
+    let trace = std::env::var_os("SPIKE_TRACE_BODIES").is_some();
     for (id, (hash, name)) in &after.bodies {
         let unchanged = before.bodies.get(id).map(|(hash, _)| hash) == Some(hash);
+        if trace && !unchanged {
+            // Kept, rather than deleted once §45 was understood. The question
+            // "which body does the compiler think changed, and to what" has now
+            // had to be asked twice, and both times the answer overturned an
+            // assumption; an instrument that has done that is worth its four
+            // lines.
+            eprintln!(
+                "  trace {name}\n    before {}\n    after  {hash}",
+                before.bodies.get(id).map(|(h, _)| h.as_str()).unwrap_or("<absent>")
+            );
+        }
         if !unchanged && !after.closure_paths.contains(id) {
             outside.push(name.clone());
         }

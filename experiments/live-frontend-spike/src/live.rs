@@ -64,6 +64,13 @@ pub struct LiveRecord {
     pub publish_ms: f64,
     pub total_ms: f64,
     pub verdict: String,
+    /// The verdict with its reason still attached.
+    ///
+    /// `verdict` above is a label, and a label is enough to decide with and not
+    /// enough to *act* on: `changed_outside_closure` without the list of
+    /// functions tells an agent that something moved and not what, which is the
+    /// compiler-prose problem the agent API exists to remove.
+    pub reason: Option<crate::classify::Verdict>,
     pub closure_size: usize,
     /// External definitions in the patch object, which must equal the codegen
     /// universe exactly (§29).
@@ -89,6 +96,11 @@ pub struct LiveRecord {
     /// What the published function returned. The point of the exercise.
     pub returned: Option<i64>,
     pub error: Option<String>,
+    /// Every closure member's arena address, by symbol, when a candidate was
+    /// accepted. This is how a probe finds a function other than the root, and
+    /// how `run_affected` finds a test's freshly generated copy.
+    #[serde(skip)]
+    pub entries: Vec<(String, usize)>,
 }
 
 /// Symbols a patch object may define beyond Path D's closure.
@@ -352,8 +364,18 @@ pub fn stage(
         let address = match lifted.iter().position(|f| f.name == *target) {
             // SAFETY: an offset inside the slab.
             Some(member) => (unsafe { slab.ptr.add(offsets[member]) }) as u64,
-            None => resolve(target, image)
-                .ok_or_else(|| format!("cannot resolve {target} for the GOT"))?,
+            // Named with the function that wants it, because "cannot resolve
+            // .Ldata0" is a fact about a symbol nobody wrote and the actionable
+            // question is which body needed constant data. Working that out by
+            // bisecting the fixture took longer than this line.
+            None => resolve(target, image).ok_or_else(|| {
+                let wants: Vec<&str> = lifted
+                    .iter()
+                    .filter(|f| f.relocations.iter().any(|(_, t, _, _, _)| t == target))
+                    .map(|f| f.name.as_str())
+                    .collect();
+                format!("cannot resolve {target} for the GOT, wanted by {}", wants.join(", "))
+            })?,
         };
         // SAFETY: a slot this function just reserved.
         unsafe { arena.write(&slab, got_base + index * 8, &address.to_le_bytes()) };
@@ -922,6 +944,57 @@ pub fn sink_revision(
     image: Option<*mut libc::c_void>,
     extra: &[String],
 ) -> LiveRecord {
+    let (mut record, staged) = sink_candidate(
+        arena,
+        runtime,
+        fixture,
+        target_file,
+        incremental,
+        hot,
+        edited,
+        before,
+        out_dir,
+        image,
+        extra,
+        &crate::Extras::default(),
+    );
+    let Some(staged) = staged else {
+        return record;
+    };
+    let entry = staged.entry();
+    staged.commit(runtime);
+    // SAFETY: an address in the arena, of the fixture's declared signature.
+    let f: extern "C" fn(u64, u32) -> u64 = unsafe { std::mem::transmute(entry as *const u8) };
+    record.returned = Some(f(3, 5) as i64);
+    record
+}
+
+/// The same revision, stopping one step short of publication.
+///
+/// This is the split §40 argued for, made available to a caller: everything up
+/// to and including the acceptance decision happens here, and the caller is
+/// handed a `Staged` that nothing can reach yet. `sink_revision` above is the
+/// thin wrapper that commits immediately, so the measured paths run exactly the
+/// sequence they were measured running.
+///
+/// The agent protocol needs the halves apart, because the useful thing an agent
+/// does between them is *probe the candidate*. A patch that has to be published
+/// before it can be observed forces every experiment to be a deployment.
+#[allow(clippy::too_many_arguments)]
+pub fn sink_candidate(
+    arena: &Arena,
+    runtime: &Runtime,
+    fixture: &crate::Fixture,
+    target_file: &Path,
+    incremental: &Path,
+    hot: &str,
+    edited: &str,
+    before: Option<&crate::classify::Contract>,
+    out_dir: &Path,
+    image: Option<*mut libc::c_void>,
+    extra: &[String],
+    extras: &crate::Extras,
+) -> (LiveRecord, Option<Staged>) {
     let mut record = LiveRecord {
         fixture: fixture.name.clone(),
         ..Default::default()
@@ -936,7 +1009,7 @@ pub fn sink_revision(
         format!("--out-dir={}", out_dir.display()),
     ];
     arguments.extend(extra.iter().cloned());
-    let session = crate::run_session_with(
+    let session = crate::run_session_full(
         fixture,
         target_file,
         incremental,
@@ -944,6 +1017,7 @@ pub fn sink_revision(
         crate::Mode::HotClosure,
         &arguments,
         true,
+        extras,
     );
     let outcome = crate::sink::finish();
 
@@ -990,6 +1064,7 @@ pub fn sink_revision(
         };
         let verdict = crate::classify::classify(before, after);
         record.verdict = verdict.label();
+        record.reason = Some(verdict.clone());
         if !verdict.is_direct() {
             // Not an error: a refusal is the classifier working.
             return Ok(false);
@@ -1011,16 +1086,39 @@ pub fn sink_revision(
     // A refused candidate is *discarded*, not rolled back. Its arena slab stays
     // allocated until reclamation exists — R1 deferred that — but nothing ever
     // pointed at it, so there is no window in which it could have run.
-    let Some(outcome) = outcome.filter(|_| accepted) else {
-        return record;
-    };
-    let Some(staged) = outcome.staged else {
-        return record;
-    };
-    let entry = staged.entry();
-    staged.commit(runtime);
-    // SAFETY: an address in the arena, of the fixture's declared signature.
-    let f: extern "C" fn(u64, u32) -> u64 = unsafe { std::mem::transmute(entry as *const u8) };
-    record.returned = Some(f(3, 5) as i64);
-    record
+    let staged = outcome.filter(|_| accepted).and_then(|outcome| outcome.staged);
+    if let Some(staged) = &staged {
+        record.entries = staged.entries.clone();
+    }
+    (record, staged)
+}
+
+/// The session's own index, when one was asked for.
+///
+/// Returned beside the record rather than inside it: an `Index` is the agent
+/// protocol's data and every measured path serializes `LiveRecord` to JSON.
+pub fn index_session(
+    fixture: &crate::Fixture,
+    target_file: &Path,
+    incremental: &Path,
+    hot: &str,
+    extra: &[String],
+) -> (Option<crate::index::Index>, Option<crate::classify::Contract>, f64, Option<String>) {
+    let at = Instant::now();
+    let session = crate::run_session_full(
+        fixture,
+        target_file,
+        incremental,
+        hot,
+        crate::Mode::HotClosure,
+        extra,
+        true,
+        &crate::Extras { roots: Vec::new(), index: true },
+    );
+    (
+        session.index,
+        session.contract,
+        at.elapsed().as_secs_f64() * 1e3,
+        session.error,
+    )
 }

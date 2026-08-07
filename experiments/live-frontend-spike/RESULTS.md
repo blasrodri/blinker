@@ -1373,3 +1373,243 @@ The defensible claim:
 > in well under a millisecond and publishes in about 2 µs; the remaining
 > latency is rustc's own semantic validation, of which expansion is the largest
 > part and is a compiler-persistence problem rather than a Blinker Live one.
+
+## 44. The agent API (M1)
+
+M0 is the runtime. This is the surface, and the surface is the product decision.
+
+An agent fixing a Rust bug with conventional tools spends its wall clock on
+three things: reading files to find out what the program *is*, running cargo to
+find out whether a change compiles, and running tests to find out what the
+program *does*. The first is textual archaeology over a language whose structure
+the resident compiler already knows exactly. The second and third are the same
+434–762 ms rebuild, paid once per hypothesis.
+
+So the API is not a shell. It is seven verbs:
+
+| verb | question |
+|---|---|
+| `inspect` | what is this function — signature, body, callees, where it lives |
+| `callers` | who calls it |
+| `replace_body` | make this the new body; is that publishable |
+| `probe` | what does this function *actually* return for these arguments |
+| `run_affected` | which tests reach the change, and do they pass |
+| `commit` | make the candidate the program |
+| `rollback` | put the previous generation back |
+
+JSON lines in, one flat observation out:
+
+```
+{"op":"probe","symbol":"scan","args":[0,5],"bytes":"12,18"}
+{"status":"ok","latency_ms":0.009,"symbol":"::scan","returned":12,"source":"image"}
+```
+
+Three decisions inside that are worth naming.
+
+**`replace_body` never publishes.** It compiles, classifies, and stages — §40's
+candidate, exposed rather than hidden. `probe` and `run_affected` then call
+*into the candidate* by address. An agent can therefore find out what a change
+does before any of it becomes the program, which is what makes this an
+experimentation surface rather than a fast deploy button, and is the thing M5's
+speculative branching needs in order to exist at all.
+
+**`source` is never omitted.** Every probe says whether it was answered by the
+`candidate`, the current `generation`, or the base `image`. A probe that hits
+the image after a patch is staged reports the *old* behaviour — which is true,
+and is what every unpatched caller still sees — but an agent that mistook it for
+the new one would conclude its edit had done nothing.
+
+**A test reports two numbers, not a boolean.** `extern "C" fn(*mut u64) -> u64`:
+write what you expected, return what you got. `{"expected":30,"actual":12}` is
+actionable; `false` sends the agent looking for the difference somewhere this
+API cannot answer.
+
+### The semantic graph
+
+`inspect` and `callers` come from `optimized_mir`'s call terminators and HIR
+spans, keyed by `DefPathHash` throughout — §37's identity, because this index
+has to survive exactly the session boundary that identity was designed for.
+
+It is **not** built on the edit → active path. Building it forces `optimized_mir`
+for every function in the crate, which the revision path does not otherwise do,
+and in `after_analysis` it would land in front of the sink. So `replace_body`
+does not ask for one: the workspace knows the byte delta of the splice it just
+made and shifts every span in the same file arithmetically, which is exact.
+What it cannot know is whether the edit changed the call graph, so it marks the
+edited function's edges stale and the next question that needs them pays for a
+refresh and says so.
+
+| fixture | session | graph | functions |
+|---|---:|---:|---:|
+| agent | 15.0 ms | **0.05 ms** | 12 |
+| small | 73.9 | **1.39** | 307 |
+| rg-lib | 26.4 | **4.29** | 129 |
+| blinker-lib | 28.9 | **4.19** | 63 |
+
+The graph is 0.05–4.3 ms. The compiler session around it is 15–74. Which is the
+same shape as every other number here: the part this project wrote is not the
+expensive part.
+
+### Affected-test selection, and the root that is not the patch
+
+A test lives in the base image and calls the function it tests with an ordinary
+`bl`. Publishing a patch does not change that call — the base image's test would
+keep exercising the base image's code, and a suite that passes against the old
+body while reporting on the new one is worse than no suite.
+
+So the tests become **additional codegen roots**. The union of their Path D
+closures is the codegen universe, and the arena gets a copy of each test whose
+call to the patched function is an intra-closure relocation. `EXTRA_ROOTS` is
+empty unless an agent session asks, so every measurement above compiles the
+universe it always did.
+
+Two things that had to be got right:
+
+- `hot_root_closure` grew a shared `seen` set. Per-call dedup emitted each
+  shared member once per root — a test reaches the function it tests — and §29's
+  equality check expects a set, not a multiset.
+- The contract, and therefore the classifier, still sees **the hot root's own
+  closure**. Widening the universe widens what is generated; it must not widen
+  what a DIRECT verdict is a claim about.
+
+Selection is over the `DefId` graph, which over-approximates Path D: one generic
+function stands for all its instantiations. That is the safe direction — a
+superset runs tests that did not need to run, a subset silently skips the one
+that would have failed. Generation, by contrast, is *complete*: every test is a
+root, not only the ones the pre-edit graph calls affected, because an edit whose
+purpose is to change what a function calls is exactly the case where the
+pre-edit graph is wrong. It costs codegen proportional to the suite's reachable
+set, and that is the honest limit to carry into M2.
+
+### The gate
+
+`agent_gate.py` is a transcript, not a unit test: every step is a question
+somebody debugging would actually ask, and each is checked for the answer that
+lets them take the next step.
+
+```
+  the program, as it is
+  ok    the suite reports three failures, with both numbers
+  what the failing path is made of
+  ok    callers of `scan` come from the call graph, not from a search
+  the hypothesis, asked of the running program
+  ok    probe scan('12,18')  = 12   [image]
+  ok    probe scan('12,18,') = 30   [image]
+  ok    probe scan('7')      = 0    [image]
+  ok    probe scan('7,')     = 7    [image]
+  the fix, compiled and classified, published to nothing
+  ok    the edit is DIRECT and staged            (9.5 ms)
+  ok    the candidate answers 30 where the image answered 12
+  ok    and nothing has been published: the generation is still 0
+  the tests that reach the change, and only those
+  ok    four of six selected — `test_count` and `test_classify_only`
+        cannot reach `scan`
+  ok    and every selected test passes
+  commit / rollback
+  ok    the retired implementation is the one running again
+
+  21 calls, 3 compiler sessions, 339 ms total
+  cargo, invoked: 0
+```
+
+The four probes are the whole argument. Two of them *are* the diagnosis —
+`12,18` gives 12 and `12,18,` gives 30, so the machine loses whatever follows
+the last separator — and none of them needed a rebuild, a print statement or a
+debugger. Three compiler sessions in the entire session, one of them the open.
+
+`test_classify_only` exists to be the discriminating control for selection:
+without a test that cannot reach the change, "the affected tests were selected"
+is a claim a selector returning everything would also satisfy.
+
+## 45. What the agent workload found that nothing else could
+
+Two findings, and both were invisible to every suite before it for the same
+reason: the existing mutations are generated by *substitution*. `body_arith`
+replaces `wrapping_mul(7)` with `wrapping_mul(11)`. An agent rewrites a body.
+
+### The body fingerprint moved when the source moved
+
+The first real `replace_body` was refused: `FALLBACK(changed_outside_closure)`,
+naming `::count_numbers` — a function the edit did not touch.
+
+The discriminator took three runs to build and one line to state:
+
+| edit to `scan`'s body | verdict |
+|---|---|
+| byte-identical replacement | DIRECT |
+| `let mut acc = 0` → `= 1` (same length) | DIRECT |
+| three extra **spaces** before the closing brace | DIRECT |
+| three extra **newlines** before the closing brace | **FALLBACK, `::count_numbers`** |
+
+§32's fingerprints are `tcx.hir_owner_nodes(owner).opt_hash`, and rustc hashes
+source *positions* into them along with content. An edit that changes the number
+of lines in one body changes the hash of an unrelated body further down the
+file. Nothing about the second function's meaning changed; only where it is.
+
+It fails **closed** — it refused a safe edit rather than accepting an unsafe
+one, so nothing published was ever wrong. But it makes `replace_body` nearly
+useless, because almost every real edit changes a line count.
+
+rustc names the fix itself. Its hashing context reads
+`hash_spans = !incremental_ignore_spans`, so `-Zincremental-ignore-spans` turns
+exactly this off, and the fingerprint stays the compiler's answer rather than
+becoming one this harness invented.
+
+Sound for what a live patch claims, and the claim is narrow enough to write
+down: **a patch replaces `__text` and ships no debug information at all**, so a
+function whose only difference between two revisions is its line number has
+byte-identical machine code and the base image's copy of it is correct. What is
+not fixed up either way is DWARF — after a live patch the base image still
+describes the source positions it was built from, so a debugger reads stale line
+numbers for patched and unpatched code alike. That was already true and this
+does not make it worse.
+
+Two controls:
+
+- `SPIKE_HASH_SPANS=1` puts the flag back. The gate then fails at the fix and
+  names `::count_numbers`. A fix whose absence cannot be demonstrated is a fix
+  nobody can check.
+- It costs nothing. Three **interleaved** 60-revision `rg-lib` soaks gave
+  19.84/19.83, 19.29/19.92 and 26.36/19.78 ms with the flag off and on. No
+  consistent difference, and the outlier is on the faster side of its pair.
+  Worth recording because a single first pair read as a 13% win and it was
+  noise — the same mistake as §33, caught the same way.
+
+Every M0 suite re-run after the change: differential 4 modes × 11 mutations
+(8 agreed, 1 refused as out of artifact class, the classifier control still
+answering live 8 / clean 9), generations 10 observations across 3 scenarios and
+a control, soaks of `small`, `rg-lib` and `blinker-lib` at 100 revisions each —
+drift 0.88×, 1.04×, 0.96×, every value exact, every verdict as required.
+
+### `ptr::add` is constant data at `-Copt-level=0`
+
+The fixture then refused to publish: `cannot resolve .Ldata0 for the GOT`.
+
+The error named a symbol nobody wrote, so the first thing built was an error
+that names the *function* wanting it. Working it out by bisecting the fixture
+took longer than the line that reports it.
+
+Compiling five shapes and reading `__text`'s relocations:
+
+| shape | needs constant data |
+|---|---|
+| `unsafe { *out = 7 }` | no |
+| `unsafe { *p.add(i) }` | **yes** |
+| `unsafe { *((p as usize + i) as *const u8) }` | no |
+| `(packed >> (i * 8)) & 0xff` | no |
+| `b - b'0'` | **yes** (overflow check) |
+| `b.wrapping_sub(b'0')` | no |
+
+`ptr::add` carries a UB precondition check whose call takes a
+`core::panic::Location`. At `-Copt-level=0` nothing folds it away — not
+`-Cdebug-assertions=off`, not `-Zub-checks=no` — so the call survives and the
+patch references a `Location` it cannot carry. Integer offset arithmetic
+compiles to a single `ldrb` and carries nothing.
+
+The refusal was right and the fixture was wrong, for the third time in this
+document (§31, §35, here). But the finding is bigger than the fixture: the
+constant-data artifact class is not an exotic corner, it is `ptr::add`,
+arithmetic overflow checks, array literals, bounds checks, `panic!`, and every
+string in the program. It is **the** limiting factor on what fraction of real
+Rust edits can go DIRECT, and M2's task set has to be built knowing that rather
+than around it.

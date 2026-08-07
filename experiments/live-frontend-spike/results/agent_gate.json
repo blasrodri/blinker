@@ -1,0 +1,334 @@
+[
+  {
+    "request": {
+      "op": "open"
+    },
+    "observation": {
+      "status": "ok",
+      "latency_ms": 404.310167,
+      "tests": 6,
+      "closure": 12
+    }
+  },
+  {
+    "request": {
+      "op": "run_affected"
+    },
+    "observation": {
+      "status": "ok",
+      "latency_ms": 0.010834,
+      "source": "generation",
+      "tests": 6,
+      "failed": 3,
+      "failures": [
+        {
+          "test": "::test_count",
+          "expected": 2,
+          "actual": 1
+        },
+        {
+          "test": "::test_scaled",
+          "expected": 30,
+          "actual": 21
+        },
+        {
+          "test": "::test_trailing_number",
+          "expected": 30,
+          "actual": 12
+        }
+      ]
+    }
+  },
+  {
+    "request": {
+      "op": "inspect",
+      "symbol": "test_trailing_number"
+    },
+    "observation": {
+      "status": "ok",
+      "latency_ms": 0.049499999999999995,
+      "symbol": "::test_trailing_number",
+      "signature": "fn(*mut u64) -> u64",
+      "file": "/Users/blas/projects/blinker/experiments/live-frontend-spike/fixtures/agent/src/lib.rs",
+      "line": 149,
+      "body": "{\n    let mut buf: u64 = 0;\n    let p = (&mut buf) as *mut u64 as *mut u8;\n    // SAFETY: `buf` is eight bytes of this frame and the writes stay inside it;\n    // `expected` is a writable `u64` the caller owns.\n    unsafe {\n        *p = b'1';\n        *((p as usize + 1) as *mut u8) = b'2';\n        *((p as usize + 2) as *mut u8) = b',';\n        *((p as usize + 3) as *mut u8) = b'1';\n        *((p as usize + 4) as *mut u8) = b'8';\n        *expected = 30;\n    }\n    scan(p as *const u8, 5)\n}",
+      "calls": [
+        "::scan"
+      ]
+    }
+  },
+  {
+    "request": {
+      "op": "inspect",
+      "symbol": "scan"
+    },
+    "observation": {
+      "status": "ok",
+      "latency_ms": 0.031542,
+      "symbol": "::scan",
+      "signature": "fn(*const u8, u64) -> u64",
+      "file": "/Users/blas/projects/blinker/experiments/live-frontend-spike/fixtures/agent/src/lib.rs",
+      "line": 82,
+      "body": "{\n    let mut total: u64 = 0;\n    let mut acc: u64 = 0;\n    let mut i: u64 = 0;\n    while i < len {\n        // SAFETY: the caller passes a pointer to at least `len` bytes.\n        let b = unsafe { byte_at(data, i) };\n        let class = classify_byte(b);\n        if class == CLASS_DIGIT {\n            acc = accumulate(acc, b);\n        } else if class == CLASS_SEP {\n            total = total.wrapping_add(acc);\n            acc = 0;\n        }\n        i = i.wrapping_add(1);\n    }\n    total\n}",
+      "calls": [
+        "::classify_byte",
+        "::accumulate",
+        "::byte_at"
+      ]
+    }
+  },
+  {
+    "request": {
+      "op": "callers",
+      "symbol": "scan"
+    },
+    "observation": {
+      "status": "ok",
+      "latency_ms": 0.000833,
+      "symbol": "::scan",
+      "callers": [
+        "::test_empty",
+        "::test_trailing_number",
+        "::test_trailing_separator",
+        "::total_scaled"
+      ]
+    }
+  },
+  {
+    "request": {
+      "op": "probe",
+      "symbol": "scan",
+      "args": [
+        0,
+        5
+      ],
+      "bytes": "12,18"
+    },
+    "observation": {
+      "status": "ok",
+      "latency_ms": 0.002084,
+      "symbol": "::scan",
+      "returned": 12,
+      "source": "image"
+    }
+  },
+  {
+    "request": {
+      "op": "probe",
+      "symbol": "scan",
+      "args": [
+        0,
+        6
+      ],
+      "bytes": "12,18,"
+    },
+    "observation": {
+      "status": "ok",
+      "latency_ms": 0.0006670000000000001,
+      "symbol": "::scan",
+      "returned": 30,
+      "source": "image"
+    }
+  },
+  {
+    "request": {
+      "op": "probe",
+      "symbol": "scan",
+      "args": [
+        0,
+        1
+      ],
+      "bytes": "7"
+    },
+    "observation": {
+      "status": "ok",
+      "latency_ms": 0.009833999999999999,
+      "symbol": "::scan",
+      "returned": 0,
+      "source": "image"
+    }
+  },
+  {
+    "request": {
+      "op": "probe",
+      "symbol": "scan",
+      "args": [
+        0,
+        2
+      ],
+      "bytes": "7,"
+    },
+    "observation": {
+      "status": "ok",
+      "latency_ms": 0.000833,
+      "symbol": "::scan",
+      "returned": 7,
+      "source": "image"
+    }
+  },
+  {
+    "request": {
+      "op": "replace_body",
+      "symbol": "scan",
+      "body": "{\n    let mut total: u64 = 0;\n    let mut acc: u64 = 0;\n    let mut in_number: u64 = 0;\n    let mut i: u64 = 0;\n    while i < len {\n        // SAFETY: the caller passes a pointer to at least `len` bytes.\n        let b = unsafe { byte_at(data, i) };\n        let class = classify_byte(b);\n        if class == CLASS_DIGIT {\n            acc = accumulate(acc, b);\n            in_number = 1;\n        } else if class == CLASS_SEP {\n            total = total.wrapping_add(acc);\n            acc = 0;\n            in_number = 0;\n        }\n        i = i.wrapping_add(1);\n    }\n    if in_number == 1 {\n        total = total.wrapping_add(acc);\n    }\n    total\n}"
+    },
+    "observation": {
+      "status": "staged",
+      "latency_ms": 10.415958,
+      "verdict": "DIRECT",
+      "symbol": "::scan",
+      "generation": 0,
+      "closure": 8,
+      "setup_ms": 14.114958
+    }
+  },
+  {
+    "request": {
+      "op": "probe",
+      "symbol": "scan",
+      "args": [
+        0,
+        5
+      ],
+      "bytes": "12,18"
+    },
+    "observation": {
+      "status": "ok",
+      "latency_ms": 0.0012920000000000002,
+      "symbol": "::scan",
+      "returned": 30,
+      "source": "candidate"
+    }
+  },
+  {
+    "request": {
+      "op": "status"
+    },
+    "observation": {
+      "status": "ok",
+      "symbol": "::scan",
+      "source": "candidate",
+      "tests": 6,
+      "generation": 0,
+      "closure": 12
+    }
+  },
+  {
+    "request": {
+      "op": "run_affected"
+    },
+    "observation": {
+      "status": "ok",
+      "latency_ms": 0.0065,
+      "source": "candidate",
+      "tests": 4,
+      "failed": 0
+    }
+  },
+  {
+    "request": {
+      "op": "commit"
+    },
+    "observation": {
+      "status": "active",
+      "latency_ms": 0.000959,
+      "generation": 1
+    }
+  },
+  {
+    "request": {
+      "op": "probe",
+      "symbol": "scan",
+      "args": [
+        0,
+        5
+      ],
+      "bytes": "12,18"
+    },
+    "observation": {
+      "status": "ok",
+      "latency_ms": 0.00020800000000000001,
+      "symbol": "::scan",
+      "returned": 30,
+      "source": "generation"
+    }
+  },
+  {
+    "request": {
+      "op": "run_affected"
+    },
+    "observation": {
+      "status": "ok",
+      "latency_ms": 0.003875,
+      "source": "generation",
+      "tests": 4,
+      "failed": 0
+    }
+  },
+  {
+    "request": {
+      "op": "replace_body",
+      "symbol": "count_numbers",
+      "body": "{\n    let mut count: u64 = 0;\n    let mut in_number: u64 = 0;\n    let mut i: u64 = 0;\n    while i < len {\n        // SAFETY: as above.\n        let b = unsafe { byte_at(data, i) };\n        if classify_byte(b) == CLASS_DIGIT {\n            in_number = 1;\n        } else if in_number == 1 {\n            count = count.wrapping_add(1);\n            in_number = 0;\n        }\n        i = i.wrapping_add(1);\n    }\n    if in_number == 1 {\n        count = count.wrapping_add(1);\n    }\n    count\n}"
+    },
+    "observation": {
+      "status": "staged",
+      "latency_ms": 9.810416,
+      "verdict": "DIRECT",
+      "symbol": "::count_numbers",
+      "generation": 1,
+      "closure": 5,
+      "setup_ms": 11.957834
+    }
+  },
+  {
+    "request": {
+      "op": "commit"
+    },
+    "observation": {
+      "status": "active",
+      "latency_ms": 0.000875,
+      "generation": 2
+    }
+  },
+  {
+    "request": {
+      "op": "run_affected"
+    },
+    "observation": {
+      "status": "ok",
+      "latency_ms": 0.005875,
+      "source": "generation",
+      "tests": 1,
+      "failed": 0
+    }
+  },
+  {
+    "request": {
+      "op": "rollback"
+    },
+    "observation": {
+      "status": "rolled_back",
+      "latency_ms": 0.000583,
+      "generation": 1
+    }
+  },
+  {
+    "request": {
+      "op": "probe",
+      "symbol": "count_numbers",
+      "args": [
+        0,
+        5
+      ],
+      "bytes": "12,18"
+    },
+    "observation": {
+      "status": "ok",
+      "latency_ms": 0.001042,
+      "symbol": "::count_numbers",
+      "returned": 1,
+      "source": "generation"
+    }
+  }
+]

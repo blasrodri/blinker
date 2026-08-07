@@ -58,8 +58,10 @@ use rustc_middle::mono::{
 use rustc_middle::mir::TerminatorKind;
 use rustc_middle::ty::{self, TyCtxt, TypingEnv};
 
+mod agent;
 mod classify;
 mod differential;
+mod index;
 mod live;
 mod sink;
 
@@ -112,6 +114,10 @@ struct Record {
     /// The comparison against the previous revision, filled in by the caller
     /// once both contracts exist.
     verdict: Option<Verdict>,
+    /// The semantic code graph, when this session was asked to build one. Not
+    /// built on the revision path: see the module docs of `index`.
+    #[serde(skip)]
+    index: Option<index::Index>,
     /// Non-empty when the session failed; the record is kept either way.
     error: Option<String>,
 }
@@ -155,6 +161,10 @@ struct Measure {
     mode: Mode,
     /// Replace the crate's codegen universe with Path D's closure (§27).
     closure_only: bool,
+    /// Build the agent's semantic code graph in this session (§44). Off on the
+    /// revision path, because it forces `optimized_mir` for the whole crate and
+    /// would land in front of the sink.
+    wants_index: bool,
     /// Whether an empty whole-crate collection is a bug or the truth.
     expects_mono_roots: bool,
     /// Set by Path D: whether every instance it reached resolved in this crate.
@@ -212,6 +222,20 @@ fn hold_the_backend(args: &[String]) {
 /// are sequential, and a mutex rather than a `static mut` says so honestly.
 static PATCH_ROOT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
+/// Codegen roots beyond the patched one (§44).
+///
+/// A test lives in the base image and calls the function it tests with an
+/// ordinary `bl`. Publishing a patch does not change that call: the base
+/// image's test would keep exercising the base image's code, and a suite that
+/// passes against the old body while reporting on the new one is worse than no
+/// suite. So the agent asks for the affected tests as *additional roots*, their
+/// closures join the universe, and the arena gets a copy of each test whose
+/// call to the patched function is an intra-closure relocation.
+///
+/// Empty unless an agent session asked, so every existing measurement compiles
+/// the same universe it always did.
+static EXTRA_ROOTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 /// The discriminating control for the closure-only measurement.
 ///
 /// The residual this harness calls `codegen` is *everything after analysis* —
@@ -267,14 +291,29 @@ fn patch_universe<'tcx>(tcx: TyCtxt<'tcx>, (): ()) -> MonoItemPartitions<'tcx> {
     let mut instances: Vec<ty::Instance<'tcx>> = Vec::new();
     let mut defined = DefIdSet::default();
     let empty = EMPTY_UNIVERSE.load(std::sync::atomic::Ordering::Relaxed);
-    if let Some(root) = find_hot_root(tcx, &name).filter(|_| !empty) {
+    if !empty {
         // Recomputed rather than carried over from `after_analysis`, because an
         // `Instance<'tcx>` cannot outlive the `TyCtxt` it names and so cannot be
         // parked in a static. S0 measured this walk at 0.05 ms and the queries
         // underneath it are already cached by now, so the duplicate lands in
         // the codegen column and is smaller than the column's own noise.
+        //
+        // The hot root goes first and stays first: the sink publishes slot 0 as
+        // the entry point, and §36 is the record of what it costs when the
+        // function in slot 0 is not the one the caller thinks it is.
         let mut walk = Closure::default();
-        hot_root_closure(tcx, root.to_def_id(), &mut walk);
+        let extra = EXTRA_ROOTS.lock().expect("not poisoned").clone();
+        //
+        // A root that does not resolve emits nothing rather than guessing. The
+        // hot one is already refused in `after_analysis`, and an extra one the
+        // agent named wrongly shows up as a test that never ran — which
+        // `run_affected` reports, because it compares what it asked to run
+        // against what it got back.
+        for name in std::iter::once(&name).chain(extra.iter()) {
+            if let Some(root) = find_hot_root(tcx, name) {
+                hot_root_closure(tcx, root.to_def_id(), &mut walk);
+            }
+        }
         instances = walk.instances;
     }
 
@@ -423,6 +462,13 @@ impl Callbacks for Measure {
             + self.record.hot_closure_ms
             + self.record.abi_layout_ms;
 
+        // Last, and only when asked: the whole-crate call graph is the most
+        // expensive thing in this callback and everything above it is on the
+        // edit → active path.
+        if self.wants_index {
+            self.record.index = Some(index::build(tcx));
+        }
+
         // Continue, even though everything this spike measures is already
         // recorded above.
         //
@@ -544,6 +590,16 @@ struct Closure<'tcx> {
     /// The members as instances, when the caller is `patch_universe` and is
     /// about to hand them to the backend as the codegen universe.
     instances: Vec<ty::Instance<'tcx>>,
+    /// Every instance already walked, across *all* roots this closure was
+    /// grown from.
+    ///
+    /// It lives here rather than inside `hot_root_closure` because §44's extra
+    /// roots call that function more than once into the same `Closure`, and
+    /// their closures overlap heavily — a test reaches the function it tests.
+    /// A per-call set would emit each shared member once per root, and the
+    /// object's external definitions would then be a multiset where §29's
+    /// equality check expects a set.
+    seen: FxHashSet<ty::Instance<'tcx>>,
 }
 
 /// Walk what the hot root reaches, and only that.
@@ -571,7 +627,6 @@ fn hot_root_closure<'tcx>(
         return (0, false);
     };
 
-    let mut seen: FxHashSet<ty::Instance<'_>> = FxHashSet::default();
     // Whether every instance reached is one this crate can generate code for.
     // An instance whose MIR lives in another crate is one a direct
     // replacement cannot produce, so the closure is not local and the edit
@@ -609,7 +664,7 @@ fn hot_root_closure<'tcx>(
             ty::InstanceKind::Virtual(_, _) => continue,
             _ => instance,
         };
-        if !seen.insert(instance) {
+        if !out.seen.insert(instance) {
             continue;
         }
         // The root first, then everything it reaches: the caller publishes
@@ -685,7 +740,7 @@ fn hot_root_closure<'tcx>(
             }
         }
     }
-    (seen.len(), local)
+    (out.seen.len(), local)
 }
 
 /// Visits every constant in a body, looking for statics.
@@ -835,6 +890,12 @@ struct Fixture {
     crate_type: String,
     #[serde(default)]
     args: Vec<String>,
+    /// Appended to whichever invocation is used. `-Cmetadata` lives here: the
+    /// agent fixture's base image is a separate `rustc` run, and the crate
+    /// disambiguator feeds every mangled symbol, so the two compilations have
+    /// to be told to agree about it.
+    #[serde(default)]
+    extra_args: Vec<String>,
 }
 
 fn default_crate_name() -> String {
@@ -871,6 +932,49 @@ fn run_session_with(
     extra: &[String],
     closure_only: bool,
 ) -> Record {
+    run_session_full(
+        fixture,
+        file,
+        incremental,
+        hot,
+        mode,
+        extra,
+        closure_only,
+        &Extras::default(),
+    )
+}
+
+/// What the agent session needs and no measurement does.
+///
+/// A separate struct rather than two more positional parameters, so that every
+/// existing call site — and therefore every number in this document — keeps
+/// running the code it was measured on.
+#[derive(Debug, Default, Clone)]
+struct Extras {
+    /// Additional codegen roots beyond the hot one. The union of their Path D
+    /// closures becomes the codegen universe, which is how a probe or a test
+    /// gets a copy of itself that calls the *patched* function rather than the
+    /// base image's.
+    ///
+    /// The contract, and therefore the classifier, still sees the hot root's
+    /// own closure. Widening the universe widens what is generated; it must not
+    /// widen what a DIRECT verdict is a claim about.
+    roots: Vec<String>,
+    /// Build the semantic code graph (§44).
+    index: bool,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_session_full(
+    fixture: &Fixture,
+    file: &Path,
+    incremental: &Path,
+    hot: &str,
+    mode: Mode,
+    extra: &[String],
+    closure_only: bool,
+    extras: &Extras,
+) -> Record {
     let mut args: Vec<String> = if fixture.args.is_empty() {
         vec![
             "rustc".into(),
@@ -886,11 +990,47 @@ fn run_session_with(
     } else {
         fixture.args.clone()
     };
+    args.extend(fixture.extra_args.iter().cloned());
     args.push(format!("--sysroot={}", sysroot()));
     args.push(format!("-Cincremental={}", incremental.display()));
     // Deny nothing and render nothing: a diagnostic that is printed is a
     // diagnostic that is timed, and lint output is not what this measures.
     args.push("--cap-lints=allow".into());
+    // §45. The body fingerprints §32 compares are rustc's HIR owner hashes, and
+    // those hash source *positions* as well as content. An edit that changes the
+    // number of lines in one body therefore changes the hash of an unrelated
+    // body further down the file, and the classifier refuses a safe edit while
+    // naming a function nobody touched.
+    //
+    // This is rustc's own switch for the question — the hashing context reads
+    // it directly as `hash_spans = !incremental_ignore_spans` — so the
+    // fingerprint stays the compiler's answer rather than becoming one this
+    // harness invented.
+    //
+    // Sound for what a live patch claims, and the claim is narrow enough to
+    // state: a patch replaces `__text` and ships no debug information at all. A
+    // function whose only difference between two revisions is its line number
+    // has byte-identical machine code, so the base image's copy of it is
+    // correct and keeping it is right. What is *not* fixed up either way is
+    // DWARF: after a live patch the base image still describes the source
+    // positions it was built from, so a debugger reads stale line numbers for
+    // patched and unpatched code alike. That was already true — the patch has
+    // no debug information to install — and this does not make it worse.
+    //
+    // `SPIKE_HASH_SPANS=1` puts the flag back and is §45's control. With it set,
+    // the agent gate refuses its first edit and names `::count_numbers` — a
+    // function the edit did not touch. A fix whose absence cannot be
+    // demonstrated is a fix nobody can check.
+    //
+    // It is also the control for the claim that this costs nothing: three
+    // interleaved 60-revision soaks of `rg-lib` gave 19.84/19.83, 19.29/19.92
+    // and 26.36/19.78 ms with the flag off and on. No consistent difference,
+    // and the one outlier is on the *faster* side of the pair — so this is a
+    // correctness change and not a performance one, which is worth saying
+    // because the first single pair suggested a 13% win and it was noise.
+    if std::env::var_os("SPIKE_HASH_SPANS").is_none() {
+        args.push("-Zincremental-ignore-spans".into());
+    }
     if !extra.is_empty() {
         // `--emit`, `--out-dir` and `-o` are two-token flags in the captured
         // cargo invocation, and adding a second `--emit` does not override the
@@ -909,11 +1049,16 @@ fn run_session_with(
     // session would be checked against this session's object, and the two would
     // agree often enough to be worse than no check.
     UNIVERSE_SYMBOLS.lock().expect("not poisoned").clear();
+    // Same reasoning: a stale extra root from the previous session would widen
+    // this session's universe by a function nobody asked for, and the object
+    // would then contain a definition the equality check cannot explain.
+    *EXTRA_ROOTS.lock().expect("not poisoned") = extras.roots.clone();
 
     let mut measure = Measure {
         hot: hot.to_string(),
         mode,
         closure_only,
+        wants_index: extras.index,
         expects_mono_roots: fixture.crate_type == "bin",
         closure_is_local: true,
         statics: std::collections::BTreeSet::new(),
@@ -960,6 +1105,8 @@ struct Options {
     soak: bool,
     /// Concurrency and rollback against clean rebuilds (§40).
     generations: bool,
+    /// The agent protocol on stdin/stdout (§44).
+    serve: bool,
 }
 
 fn parse_options() -> Options {
@@ -980,6 +1127,7 @@ fn parse_options() -> Options {
     let mut sequence = false;
     let mut soak = false;
     let mut generations = false;
+    let mut serve = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--fixture" => fixture = PathBuf::from(args.next().expect("--fixture takes a path")),
@@ -1006,6 +1154,9 @@ fn parse_options() -> Options {
             "--sequence" => sequence = true,
             "--soak" => soak = true,
             "--generations" => generations = true,
+            // The agent protocol: JSON requests in, observations out, one per
+            // line, against a workspace that stays resident for the run.
+            "--serve" => serve = true,
             "--backend" => backend = Some(PathBuf::from(args.next().expect("--backend takes a path"))),
             // The runtime differential. The argument names the defect to
             // inject: `none` is the suite proper, the rest are its controls.
@@ -1056,6 +1207,7 @@ fn parse_options() -> Options {
         sequence,
         soak,
         generations,
+        serve,
     }
 }
 
@@ -1071,6 +1223,9 @@ fn main() {
             eprintln!("  the live sink is unavailable: {error}");
             std::process::exit(2);
         }
+    }
+    if options.serve {
+        std::process::exit(if agent::serve(&options) { 0 } else { 1 });
     }
     if options.soak {
         return soak_main(&options);

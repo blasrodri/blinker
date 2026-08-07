@@ -1,0 +1,10 @@
+{
+  "name": "agent",
+  "crate": "/Users/blas/projects/blinker/experiments/live-frontend-spike/fixtures/agent",
+  "file": "src/lib.rs",
+  "crate_name": "agent_fixture",
+  "crate_type": "lib",
+  "hot": "scan",
+  "args": [],
+  "extra_args": ["-Cmetadata=agent", "-Cdebug-assertions=off"]
+}
