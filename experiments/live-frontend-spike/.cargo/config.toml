@@ -1,0 +1,7 @@
+# `rustc_private` crates are dylibs living in the toolchain sysroot, so the
+# binary needs an rpath to them. Written out rather than set through
+# DYLD_FALLBACK_LIBRARY_PATH at run time: an environment variable that has to
+# be right at every invocation is one that will eventually be wrong at one, and
+# a spike whose numbers depend on how it was launched is not measuring rustc.
+[build]
+rustflags = ["-Zunstable-options", "-C", "link-args=-Wl,-rpath,/Users/blas/.rustup/toolchains/nightly-2026-07-27-aarch64-apple-darwin/lib"]

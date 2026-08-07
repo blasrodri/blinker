@@ -1,0 +1,11 @@
+{
+  "chip": "Apple M5 Pro",
+  "cores": "15",
+  "memory_gb": 25.8,
+  "macos": "26.5.2",
+  "rustc": "rustc 1.99.0-nightly (dc3f85158 2026-07-26) | binary: rustc | commit-hash: dc3f85158a955a87a6e4363af1fbe9cf2d063cce | commit-date: 2026-07-26 | host: aarch64-apple-darwin | release: 1.99.0-nightly | LLVM version: 22.1.8",
+  "filesystem": [
+    "/dev/disk3s5   926Gi   298Gi   601Gi    34%    2.2M  6.3G    0%   /System/Volumes/Data"
+  ],
+  "captured_at": "2026-08-07T14:06:42"
+}

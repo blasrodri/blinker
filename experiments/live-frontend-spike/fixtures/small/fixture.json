@@ -1,0 +1,16 @@
+{
+  "name": "small",
+  "crate": "/Users/blas/projects/blinker/experiments/live-frontend-spike/fixtures/small",
+  "file": "src/main.rs",
+  "crate_name": "spike_small",
+  "crate_type": "bin",
+  "hot": "hot_root",
+  "variants": [
+    "body_arith",
+    "body_existing_call",
+    "body_new_generic",
+    "pristine",
+    "signature",
+    "type_layout"
+  ]
+}

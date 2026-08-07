@@ -1,0 +1,543 @@
+//! Spike S0: what does a Rust frontend cost before a hot function can be
+//! replaced?
+//!
+//! This measures one thing and deliberately not the next thing. It generates
+//! no machine code, links nothing, and executes nothing it compiled. The
+//! question is the one BLINKER_LIVE_SPEC_V2 §2.1 asks: after a small edit, how
+//! long until we hold validated codegen MIR for the changed function, the set
+//! of monomorphized items that changed with it, and enough ABI and layout
+//! facts to decide whether replacing it is safe.
+//!
+//! Four paths, because one number would not be a result
+//! ----------------------------------------------------
+//!
+//! - **A** — an ordinary compiler process per revision. Run by re-executing
+//!   this binary, so that A and B stop at exactly the same point and their
+//!   difference is process startup and nothing else. Comparing a `cargo check`
+//!   against an in-process session would measure the stopping point, not the
+//!   residency.
+//! - **B** — the same sessions inside one process. `TyCtxt` does not survive
+//!   between them and this does not pretend otherwise; what survives is the
+//!   process, its loaded dylibs, and the incremental directory's page cache.
+//! - **C** — whole-crate `collect_and_partition_mono_items`, the route
+//!   ordinary compilation takes. A control, not a proposal.
+//! - **D** — discovery from the hot root outward: start at the concrete
+//!   instance the previous build already knew about, take its new MIR, and
+//!   walk only what it reaches. This is the one the product depends on.
+//!
+//! What "validated MIR" means here
+//! -------------------------------
+//!
+//! §6 is explicit that an early compiler point is not the answer. Every path
+//! runs the full analysis phase — resolution, type checking, trait selection,
+//! borrow check — and then forces `optimized_mir`, which is the MIR a codegen
+//! backend consumes. Nothing is reported as "MIR ready" that a backend could
+//! not compile.
+
+#![feature(rustc_private)]
+
+extern crate rustc_abi;
+extern crate rustc_data_structures;
+extern crate rustc_driver;
+extern crate rustc_hir;
+extern crate rustc_interface;
+extern crate rustc_middle;
+extern crate rustc_session;
+extern crate rustc_span;
+
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
+use rustc_data_structures::fx::FxHashSet;
+use rustc_driver::{Callbacks, Compilation};
+use rustc_hir::def_id::{DefId, LocalDefId};
+use rustc_middle::mir::TerminatorKind;
+use rustc_middle::ty::{self, TyCtxt, TypingEnv};
+
+/// One revision's measurement, as V2 §8 asks for it.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+struct Record {
+    fixture: String,
+    edit: String,
+    path: String,
+    iteration: usize,
+    /// Wall time of the whole compiler session, in this process.
+    session_ms: f64,
+    /// Up to and including macro expansion.
+    expand_ms: f64,
+    /// Resolution, type check, trait selection, borrow check.
+    analysis_ms: f64,
+    /// Forcing `optimized_mir` for the hot root: the MIR a backend consumes.
+    hot_mir_ms: f64,
+    /// Path D: walking what the hot root reaches.
+    hot_closure_ms: f64,
+    /// Path C: `collect_and_partition_mono_items` over the whole crate.
+    whole_crate_mono_ms: f64,
+    /// ABI and layout facts for the hot root (§7).
+    abi_layout_ms: f64,
+    /// Everything a replacement needs, excluding process startup.
+    total_required_frontend_ms: f64,
+    mono_items_examined: usize,
+    whole_crate_mono_items: usize,
+    hot_root_found: bool,
+    /// Non-empty when the session failed; the record is kept either way.
+    error: Option<String>,
+}
+
+/// Which measurements a run performs. C and D are both inside one session:
+/// running them in separate sessions would compare two different compilations
+/// rather than two algorithms.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Mode {
+    /// Force the hot root's MIR only.
+    Root,
+    /// ... and walk the hot root's reachable closure.
+    HotClosure,
+    /// ... and collect the whole crate's mono items.
+    WholeCrate,
+    /// Both, so the two can be compared within one compilation.
+    Both,
+}
+
+impl Mode {
+    fn parse(text: &str) -> Mode {
+        match text {
+            "root" => Mode::Root,
+            "hot" | "D" | "d" => Mode::HotClosure,
+            "whole" | "C" | "c" => Mode::WholeCrate,
+            _ => Mode::Both,
+        }
+    }
+
+    fn wants_closure(self) -> bool {
+        matches!(self, Mode::HotClosure | Mode::Both)
+    }
+
+    fn wants_whole_crate(self) -> bool {
+        matches!(self, Mode::WholeCrate | Mode::Both)
+    }
+}
+
+struct Measure {
+    hot: String,
+    mode: Mode,
+    started: Instant,
+    expansion_done: Option<Instant>,
+    record: Record,
+}
+
+impl Callbacks for Measure {
+    fn after_expansion(&mut self, _compiler: &rustc_interface::interface::Compiler, _tcx: TyCtxt<'_>) -> Compilation {
+        self.expansion_done = Some(Instant::now());
+        self.record.expand_ms = self.started.elapsed().as_secs_f64() * 1e3;
+        Compilation::Continue
+    }
+
+    fn after_analysis(&mut self, _compiler: &rustc_interface::interface::Compiler, tcx: TyCtxt<'_>) -> Compilation {
+        let analysis_done = Instant::now();
+        let since_expansion = self
+            .expansion_done
+            .map(|at| analysis_done.duration_since(at).as_secs_f64() * 1e3)
+            .unwrap_or_default();
+        self.record.analysis_ms = since_expansion;
+
+        let Some(root) = find_hot_root(tcx, &self.hot) else {
+            self.record.error = Some(format!("no function named {} in the crate", self.hot));
+            return Compilation::Stop;
+        };
+        self.record.hot_root_found = true;
+
+        // The MIR a backend would consume, not the MIR the borrow checker
+        // produced. Forcing the query is the measurement: it is a no-op if
+        // analysis already demanded it and the real cost if it did not.
+        let at = Instant::now();
+        let body = tcx.optimized_mir(root.to_def_id());
+        std::hint::black_box(body.basic_blocks.len());
+        self.record.hot_mir_ms = at.elapsed().as_secs_f64() * 1e3;
+
+        if self.mode.wants_closure() {
+            let at = Instant::now();
+            let examined = hot_root_closure(tcx, root.to_def_id());
+            self.record.hot_closure_ms = at.elapsed().as_secs_f64() * 1e3;
+            self.record.mono_items_examined = examined;
+        }
+
+        let at = Instant::now();
+        let facts = abi_and_layout(tcx, root.to_def_id());
+        self.record.abi_layout_ms = at.elapsed().as_secs_f64() * 1e3;
+        std::hint::black_box(facts);
+
+        if self.mode.wants_whole_crate() {
+            let at = Instant::now();
+            let partitions = tcx.collect_and_partition_mono_items(());
+            let total: usize = partitions
+                .codegen_units
+                .iter()
+                .map(|unit| unit.items().len())
+                .sum();
+            self.record.whole_crate_mono_ms = at.elapsed().as_secs_f64() * 1e3;
+            self.record.whole_crate_mono_items = total;
+            // A library crate has no monomorphization roots, so collection
+            // over one finds nothing in no time and Path C silently becomes a
+            // comparison against an empty set. The first run of this spike
+            // reported 0 items for a 300-function crate; refusing the result
+            // is cheaper than reading past it again.
+            if total == 0 {
+                self.record.error = Some(
+                    "whole-crate collection found no mono items — is the fixture a library?"
+                        .into(),
+                );
+            }
+        }
+
+        // Everything a replacement needs. Whole-crate collection is excluded
+        // deliberately: it is the control being measured against, not a cost
+        // the product would pay.
+        self.record.total_required_frontend_ms = self.record.expand_ms
+            + self.record.analysis_ms
+            + self.record.hot_mir_ms
+            + self.record.hot_closure_ms
+            + self.record.abi_layout_ms;
+
+        // Continue, even though everything this spike measures is already
+        // recorded above.
+        //
+        // Returning `Stop` here is the obvious thing and it silently destroys
+        // the experiment. rustc writes its dependency graph when a session
+        // *completes*; a session that stops after analysis leaves its
+        // incremental directory as `s-…-working` and finalizes nothing. Every
+        // run then starts cold, and the first version of this reported a flat
+        // 200 ms of analysis across four consecutive iterations of the same
+        // edit — a number that looked like a result and was an artefact of
+        // the harness. The phases above are timed before this returns, so
+        // letting compilation finish costs wall time and no accuracy.
+        Compilation::Continue
+    }
+}
+
+/// The hot root, by the last segment of its path.
+///
+/// By name rather than by `DefId`: a `DefId` is index-shaped and meaningless
+/// across compiler sessions, which is the same reason the linker cannot key a
+/// contribution on an `ObjectId`.
+fn find_hot_root(tcx: TyCtxt<'_>, name: &str) -> Option<LocalDefId> {
+    let wanted = name.rsplit("::").next().unwrap_or(name);
+    tcx.hir_free_items().find_map(|item| {
+        let def_id = item.owner_id.def_id;
+        match tcx.def_kind(def_id) {
+            rustc_hir::def::DefKind::Fn if tcx.item_name(def_id.to_def_id()).as_str() == wanted => {
+                Some(def_id)
+            }
+            _ => None,
+        }
+    })
+}
+
+/// Walk what the hot root reaches, and only that.
+///
+/// This is the smallest algorithm that answers "what changed with it": start
+/// at the concrete instance, read its codegen MIR, resolve every call it
+/// makes, and repeat. It is deliberately not rustc's collector — the point of
+/// the measurement is that the collector starts from every root in the crate
+/// and this starts from one.
+///
+/// Returns the number of distinct instances examined, which is the number the
+/// whole-crate figure has to be compared against.
+fn hot_root_closure(tcx: TyCtxt<'_>, root: DefId) -> usize {
+    let typing_env = TypingEnv::fully_monomorphized();
+    let Ok(Some(root)) = ty::Instance::try_resolve(
+        tcx,
+        typing_env,
+        root,
+        ty::GenericArgs::identity_for_item(tcx, root),
+    ) else {
+        return 0;
+    };
+
+    let mut seen: FxHashSet<ty::Instance<'_>> = FxHashSet::default();
+    let mut worklist = vec![root];
+    while let Some(instance) = worklist.pop() {
+        if !seen.insert(instance) {
+            continue;
+        }
+        // Only what this crate can see. An instance defined elsewhere and
+        // already compiled into the base image needs no new code, which is
+        // exactly the property that makes this closure small.
+        if !tcx.is_mir_available(instance.def_id()) {
+            continue;
+        }
+        let body = tcx.instance_mir(instance.def);
+        for block in body.basic_blocks.iter() {
+            let Some(terminator) = &block.terminator else {
+                continue;
+            };
+            let TerminatorKind::Call { func, .. } = &terminator.kind else {
+                continue;
+            };
+            let callee = func.ty(&body.local_decls, tcx);
+            let callee = instance.instantiate_mir_and_normalize_erasing_regions(
+                tcx,
+                typing_env,
+                ty::EarlyBinder::bind(tcx, callee),
+            );
+            let ty::FnDef(def_id, args) = *callee.kind() else {
+                continue;
+            };
+            // `FnDef` carries its arguments inside a `Binder`. The instance
+            // was instantiated and normalized just above, so there is nothing
+            // left bound — the same assertion rustc's own collector makes.
+            let Some(args) = args.no_bound_vars() else {
+                continue;
+            };
+            if let Ok(Some(resolved)) = ty::Instance::try_resolve(tcx, typing_env, def_id, args) {
+                worklist.push(resolved);
+            }
+        }
+    }
+    seen.len()
+}
+
+/// The facts §7 requires before a function may be replaced in place.
+///
+/// Returned as a tuple rather than hashed: S0 measures what it costs to
+/// *establish* them, and a persistent hash format is a design decision for
+/// the milestone that keeps them.
+fn abi_and_layout(tcx: TyCtxt<'_>, root: DefId) -> (usize, usize) {
+    let typing_env = TypingEnv::fully_monomorphized();
+    let signature = tcx.fn_sig(root).instantiate_identity().skip_normalization();
+    let signature = tcx.instantiate_bound_regions_with_erased(signature);
+
+    let mut sized = 0usize;
+    let mut bytes = 0usize;
+    for ty in signature.inputs().iter().copied().chain([signature.output()]) {
+        if let Ok(layout) = tcx.layout_of(typing_env.as_query_input(ty)) {
+            sized += 1;
+            bytes += layout.size.bytes() as usize;
+        }
+    }
+    (sized, bytes)
+}
+
+fn sysroot() -> String {
+    let out = std::process::Command::new("rustc")
+        .arg("--print=sysroot")
+        .output()
+        .expect("rustc runs");
+    String::from_utf8(out.stdout).expect("utf8").trim().to_string()
+}
+
+/// What a fixture is: a crate, the file an edit lands in, and the function
+/// standing in for a hot root.
+///
+/// Read from `fixture.json` rather than hardcoded, because `medium` and
+/// `large` are real crates whose rustc invocation comes from cargo and cannot
+/// be guessed. `args` is that invocation when one was captured; when it is
+/// empty the driver builds a self-contained one, which only works for a crate
+/// with no dependencies.
+#[derive(Debug, Clone, serde::Deserialize)]
+struct Fixture {
+    name: String,
+    #[serde(rename = "crate")]
+    crate_path: String,
+    file: String,
+    hot: String,
+    #[serde(default = "default_crate_name")]
+    crate_name: String,
+    #[serde(default = "default_crate_type")]
+    crate_type: String,
+    #[serde(default)]
+    args: Vec<String>,
+}
+
+fn default_crate_name() -> String {
+    "fixture".into()
+}
+
+fn default_crate_type() -> String {
+    "bin".into()
+}
+
+/// One compiler session over `file`, stopping after analysis.
+fn run_session(
+    fixture: &Fixture,
+    file: &Path,
+    incremental: &Path,
+    hot: &str,
+    mode: Mode,
+) -> Record {
+    let mut args: Vec<String> = if fixture.args.is_empty() {
+        vec![
+            "rustc".into(),
+            file.display().to_string(),
+            "--edition=2021".into(),
+            format!("--crate-type={}", fixture.crate_type),
+            format!("--crate-name={}", fixture.crate_name),
+            "-Copt-level=0".into(),
+            "-Cdebuginfo=0".into(),
+            "--emit=metadata".into(),
+            format!("--out-dir={}", incremental.display()),
+        ]
+    } else {
+        fixture.args.clone()
+    };
+    args.push(format!("--sysroot={}", sysroot()));
+    args.push(format!("-Cincremental={}", incremental.display()));
+    // Deny nothing and render nothing: a diagnostic that is printed is a
+    // diagnostic that is timed, and lint output is not what this measures.
+    args.push("--cap-lints=allow".into());
+
+    let mut measure = Measure {
+        hot: hot.to_string(),
+        mode,
+        started: Instant::now(),
+        expansion_done: None,
+        record: Record::default(),
+    };
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rustc_driver::run_compiler(&args, &mut measure);
+    }));
+    measure.record.session_ms = measure.started.elapsed().as_secs_f64() * 1e3;
+    if outcome.is_err() && measure.record.error.is_none() {
+        measure.record.error = Some("the compiler session failed".into());
+    }
+    measure.record
+}
+
+struct Options {
+    fixture: Fixture,
+    variants: PathBuf,
+    target_file: PathBuf,
+    incremental: PathBuf,
+    hot: String,
+    edits: Vec<String>,
+    iterations: usize,
+    warmup: usize,
+    mode: Mode,
+    path: String,
+    out: Option<PathBuf>,
+    once: bool,
+}
+
+fn parse_options() -> Options {
+    let mut args = std::env::args().skip(1);
+    let mut fixture = PathBuf::from("fixtures/small");
+    let mut hot: Option<String> = None;
+    let mut edits: Vec<String> = Vec::new();
+    let mut iterations = 30;
+    let mut warmup = 3;
+    let mut mode = Mode::Both;
+    let mut path = "B".to_string();
+    let mut out = None;
+    let mut once = false;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--fixture" => fixture = PathBuf::from(args.next().expect("--fixture takes a path")),
+            "--hot" => hot = Some(args.next().expect("--hot takes a name")),
+            "--edit" => edits.push(args.next().expect("--edit takes a name")),
+            "--iterations" => iterations = args.next().expect("count").parse().expect("number"),
+            "--warmup" => warmup = args.next().expect("count").parse().expect("number"),
+            "--mode" => mode = Mode::parse(&args.next().expect("--mode takes a mode")),
+            "--path" => path = args.next().expect("--path takes a label"),
+            "--out" => out = Some(PathBuf::from(args.next().expect("--out takes a path"))),
+            // Path A: one session, then exit, so the caller times the process.
+            "--once" => once = true,
+            // Start and exit. The difference between this and `--once` is the
+            // compiler work; this on its own is execve plus loading 150 MB of
+            // rustc dylibs, which is a cost a resident process pays once and
+            // an ordinary one pays per edit.
+            "--noop" => {
+                println!("[]");
+                std::process::exit(0);
+            }
+            other => panic!("unknown argument {other}"),
+        }
+    }
+    if edits.is_empty() {
+        edits = vec!["body_arith".into()];
+    }
+    let described = std::fs::read_to_string(fixture.join("fixture.json"))
+        .unwrap_or_else(|_| panic!("no fixture.json under {}", fixture.display()));
+    let described: Fixture = serde_json::from_str(&described).expect("fixture.json parses");
+    let root = PathBuf::from(&described.crate_path);
+    Options {
+        variants: root.join("variants"),
+        target_file: root.join(&described.file),
+        incremental: root.join("target/spike-incremental"),
+        hot: hot.unwrap_or_else(|| described.hot.clone()),
+        fixture: described,
+        edits,
+        iterations,
+        warmup,
+        mode,
+        path,
+        out,
+        once,
+    }
+}
+
+fn main() {
+    let options = parse_options();
+    std::fs::create_dir_all(&options.incremental).expect("incremental directory");
+    rustc_driver::install_ice_hook("https://github.com/blasrodri/blinker", |_| ());
+
+    let mut records: Vec<Record> = Vec::new();
+    for edit in &options.edits {
+        // Every revision is written from the pristine text, never from what
+        // the last one left: an edit applied on top of an edit measures a
+        // program nobody wrote.
+        let pristine = std::fs::read_to_string(options.variants.join("pristine.rs"))
+            .expect("the pristine variant exists");
+        let edited = std::fs::read_to_string(options.variants.join(format!("{edit}.rs")))
+            .unwrap_or_else(|_| panic!("no variant named {edit}"));
+
+        let total = if options.once {
+            1
+        } else {
+            options.warmup + options.iterations
+        };
+        for iteration in 0..total {
+            // Alternate, so every timed iteration is a real edit against a
+            // warm incremental directory rather than a recompile of text the
+            // compiler has already seen this run. Timing only the edited half.
+            //
+            // Skipped for Path A, where the caller is timing the whole
+            // process: running two compilations there and calling the result
+            // "process startup" would charge a compile to `execve`.
+            if !options.once {
+                std::fs::write(&options.target_file, &pristine).expect("write pristine");
+                let warm = run_session(
+                    &options.fixture,
+                    &options.target_file,
+                    &options.incremental,
+                    &options.hot,
+                    Mode::Root,
+                );
+                std::hint::black_box(warm);
+            }
+
+            std::fs::write(&options.target_file, &edited).expect("write edited");
+            let mut record = run_session(
+                &options.fixture,
+                &options.target_file,
+                &options.incremental,
+                &options.hot,
+                options.mode,
+            );
+            record.fixture = options.fixture.name.clone();
+            record.edit = edit.clone();
+            record.path = options.path.clone();
+            record.iteration = iteration;
+            if iteration >= options.warmup || options.once {
+                records.push(record);
+            }
+        }
+        std::fs::write(&options.target_file, &pristine).expect("restore pristine");
+    }
+
+    let json = serde_json::to_string_pretty(&records).expect("serialize");
+    match &options.out {
+        Some(path) => std::fs::write(path, json).expect("write results"),
+        None => println!("{json}"),
+    }
+}

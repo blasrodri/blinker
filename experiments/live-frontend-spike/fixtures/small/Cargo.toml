@@ -1,0 +1,10 @@
+[package]
+name = "spike-small"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "spike_small"
+path = "src/main.rs"
+
+[workspace]

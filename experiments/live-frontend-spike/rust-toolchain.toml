@@ -1,0 +1,5 @@
+# Pinned, and recorded in every result record: a frontend latency number is
+# meaningless without the compiler it was measured on.
+[toolchain]
+channel = "nightly-2026-07-27"
+components = ["rustc-dev", "rust-src", "llvm-tools"]

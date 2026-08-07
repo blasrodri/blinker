@@ -3,3 +3,9 @@
 /fuzz/target
 /fuzz/corpus
 /fuzz/artifacts
+
+# S0 spike: build output and captured fixtures. RESULTS.md and results/*.json
+# are the deliverable and are committed; 138 MB of incremental sessions are not.
+experiments/live-frontend-spike/target/
+experiments/live-frontend-spike/fixtures/*/target/
+experiments/live-frontend-spike/Cargo.lock

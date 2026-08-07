@@ -1,0 +1,23 @@
+# Its own workspace on purpose: `[workspace]` with no members makes this crate
+# a root rather than a member of the linker's workspace above it. The spike
+# uses a pinned nightly and `rustc_private`, and V2 §3 requires that a failure
+# to build it cannot affect the linker. It is also meant to be deletable with
+# `rm -rf`, which a workspace member is not.
+[workspace]
+
+[package]
+name = "live-frontend-spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bin]]
+name = "spike"
+path = "src/main.rs"
+
+[profile.release]
+debug = 1
