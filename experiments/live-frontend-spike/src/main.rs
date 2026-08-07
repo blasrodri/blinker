@@ -50,7 +50,11 @@ use std::time::Instant;
 
 use rustc_data_structures::fx::FxHashSet;
 use rustc_driver::{Callbacks, Compilation};
-use rustc_hir::def_id::{DefId, LocalDefId};
+use rustc_hir::attrs::Linkage;
+use rustc_hir::def_id::{DefId, DefIdSet, LocalDefId};
+use rustc_middle::mono::{
+    CodegenUnit, MonoItem, MonoItemData, MonoItemPartitions, Visibility,
+};
 use rustc_middle::mir::TerminatorKind;
 use rustc_middle::ty::{self, TyCtxt, TypingEnv};
 
@@ -143,6 +147,8 @@ impl Mode {
 struct Measure {
     hot: String,
     mode: Mode,
+    /// Replace the crate's codegen universe with Path D's closure (§27).
+    closure_only: bool,
     /// Whether an empty whole-crate collection is a bug or the truth.
     expects_mono_roots: bool,
     /// Set by Path D: whether every instance it reached resolved in this crate.
@@ -154,7 +160,107 @@ struct Measure {
     record: Record,
 }
 
+/// The hot root's name, for the query override.
+///
+/// A query provider is a bare `fn` and cannot capture, so the one thing the
+/// override needs from the caller is passed beside it. Sessions in this harness
+/// are sequential, and a mutex rather than a `static mut` says so honestly.
+static PATCH_ROOT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The discriminating control for the closure-only measurement.
+///
+/// The residual this harness calls `codegen` is *everything after analysis* —
+/// lowering, Cranelift, writing the object, finalizing the incremental session,
+/// and dropping the arena. Shrinking the universe from a whole crate to four
+/// functions and watching the residual fall does not say how much of the
+/// remainder is the four functions and how much is fixed cost that no amount
+/// of narrowing will remove.
+///
+/// So a third mode compiles *nothing at all* and still emits an object. The
+/// difference between it and closure-only is the closure's real backend cost;
+/// what is left underneath it is what the compiler charges for finishing a
+/// session, and is not a codegen number.
+static EMPTY_UNIVERSE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Path D's closure, as the crate's entire codegen universe.
+///
+/// This is the answer to the last loose number in §22–26. `cg_clif` is a rustc
+/// *backend*: it compiles whatever `collect_and_partition_mono_items` hands it,
+/// which is ordinarily every monomorphized item in the crate. That is why the
+/// end-to-end codegen column was 14–59 ms for an edit whose patch closure is
+/// four to six functions.
+///
+/// The backend does not need to be forked to fix that. The universe is a
+/// *query*, and `Config::override_queries` replaces it. So the compiler runs
+/// its ordinary frontend — the developer's validation, which is real work that
+/// has to happen — and then codegens exactly the instances Path D found, in one
+/// codegen unit, and nothing else.
+///
+/// Two consequences worth naming, because they are the point:
+///
+/// - The object now contains *exactly* the patch closure. Under whole-crate
+///   codegen, a Path D member that Path D had failed to find would still have
+///   been in the object and would still have linked, and the harness would not
+///   have noticed. Now a missing member is an unresolvable relocation. The
+///   closure-only path therefore checks Path D's completeness as a side effect
+///   of being faster.
+/// - Everything is given external linkage. Ordinary partitioning would make
+///   most of these internal, and an internal symbol is not in the object's
+///   symbol table, which is where the closure is lifted from.
+fn patch_universe<'tcx>(tcx: TyCtxt<'tcx>, (): ()) -> MonoItemPartitions<'tcx> {
+    let name = PATCH_ROOT.lock().expect("not poisoned").clone().unwrap_or_default();
+    let mut instances = Vec::new();
+    let mut defined = DefIdSet::default();
+    let empty = EMPTY_UNIVERSE.load(std::sync::atomic::Ordering::Relaxed);
+    if let Some(root) = find_hot_root(tcx, &name).filter(|_| !empty) {
+        // Recomputed rather than carried over from `after_analysis`, because an
+        // `Instance<'tcx>` cannot outlive the `TyCtxt` it names and so cannot be
+        // parked in a static. S0 measured this walk at 0.05 ms and the queries
+        // underneath it are already cached by now, so the duplicate lands in
+        // the codegen column and is smaller than the column's own noise.
+        let mut statics = std::collections::BTreeSet::new();
+        let mut symbols = Vec::new();
+        hot_root_closure(
+            tcx,
+            root.to_def_id(),
+            &mut statics,
+            &mut symbols,
+            Some(&mut instances),
+        );
+    }
+
+    let mut unit = CodegenUnit::new(rustc_span::Symbol::intern("live_patch"));
+    for instance in instances {
+        defined.insert(instance.def_id());
+        unit.items_mut().insert(
+            MonoItem::Fn(instance),
+            MonoItemData {
+                inlined: false,
+                linkage: Linkage::External,
+                visibility: Visibility::Default,
+                size_estimate: 0,
+            },
+        );
+    }
+    unit.compute_size_estimate();
+
+    MonoItemPartitions {
+        codegen_units: tcx.arena.alloc_from_iter([unit]),
+        all_mono_items: tcx.arena.alloc(defined),
+    }
+}
+
 impl Callbacks for Measure {
+    fn config(&mut self, config: &mut rustc_interface::interface::Config) {
+        if self.closure_only {
+            *PATCH_ROOT.lock().expect("not poisoned") = Some(self.hot.clone());
+            config.override_queries = Some(|_session, providers| {
+                providers.queries.collect_and_partition_mono_items = patch_universe;
+            });
+        }
+    }
+
     fn after_expansion(&mut self, _compiler: &rustc_interface::interface::Compiler, _tcx: TyCtxt<'_>) -> Compilation {
         self.expansion_done = Some(Instant::now());
         self.record.expand_ms = self.started.elapsed().as_secs_f64() * 1e3;
@@ -188,7 +294,7 @@ impl Callbacks for Measure {
             let mut statics = std::collections::BTreeSet::new();
             let mut symbols = Vec::new();
             let (examined, local) =
-                hot_root_closure(tcx, root.to_def_id(), &mut statics, &mut symbols);
+                hot_root_closure(tcx, root.to_def_id(), &mut statics, &mut symbols, None);
             self.statics = statics;
             self.record.closure_symbols = symbols;
             self.record.hot_closure_ms = at.elapsed().as_secs_f64() * 1e3;
@@ -312,8 +418,8 @@ fn find_hot_root(tcx: TyCtxt<'_>, name: &str) -> Option<LocalDefId> {
 ///
 /// Returns the number of distinct instances examined, which is the number the
 /// whole-crate figure has to be compared against.
-fn hot_root_closure(
-    tcx: TyCtxt<'_>,
+fn hot_root_closure<'tcx>(
+    tcx: TyCtxt<'tcx>,
     root: DefId,
     statics: &mut std::collections::BTreeSet<String>,
     // The closure's members, by the symbol the backend will give them. This is
@@ -321,6 +427,11 @@ fn hot_root_closure(
     // patch cluster means finding *these* functions in the generated code, and
     // a count cannot be looked up.
     symbols: &mut Vec<String>,
+    // The same members as instances, when the caller is `patch_universe` and is
+    // about to hand them to the backend as the crate's codegen universe. Only
+    // instances this crate can generate code for are collected; the rest are
+    // already in the base image and are resolved at publication.
+    mut instances: Option<&mut Vec<ty::Instance<'tcx>>>,
 ) -> (usize, bool) {
     let typing_env = TypingEnv::fully_monomorphized();
     let Ok(Some(root)) = ty::Instance::try_resolve(
@@ -358,6 +469,13 @@ fn hot_root_closure(
             }
             local = false;
             continue;
+        }
+        // Past the check above, so: MIR is available here and the backend can
+        // generate this one. That is the same predicate the closure's own
+        // locality test uses, which is deliberate — the set the backend is told
+        // to compile and the set the classifier reasoned about are the same set.
+        if let Some(instances) = instances.as_deref_mut() {
+            instances.push(instance);
         }
         let body = tcx.instance_mir(instance.def);
         // Statics the body reads. They are not in the call graph — a static
@@ -571,7 +689,7 @@ fn run_session(
     hot: &str,
     mode: Mode,
 ) -> Record {
-    run_session_with(fixture, file, incremental, hot, mode, &[])
+    run_session_with(fixture, file, incremental, hot, mode, &[], false)
 }
 
 /// The same session, with extra rustc arguments.
@@ -587,6 +705,7 @@ fn run_session_with(
     hot: &str,
     mode: Mode,
     extra: &[String],
+    closure_only: bool,
 ) -> Record {
     let mut args: Vec<String> = if fixture.args.is_empty() {
         vec![
@@ -622,6 +741,7 @@ fn run_session_with(
     let mut measure = Measure {
         hot: hot.to_string(),
         mode,
+        closure_only,
         expects_mono_roots: fixture.crate_type == "bin",
         closure_is_local: true,
         statics: std::collections::BTreeSet::new(),
@@ -654,6 +774,7 @@ struct Options {
     out: Option<PathBuf>,
     once: bool,
     end_to_end: bool,
+    closure_only: bool,
 }
 
 fn parse_options() -> Options {
@@ -668,6 +789,7 @@ fn parse_options() -> Options {
     let mut out = None;
     let mut once = false;
     let mut end_to_end = false;
+    let mut closure_only = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--fixture" => fixture = PathBuf::from(args.next().expect("--fixture takes a path")),
@@ -687,6 +809,16 @@ fn parse_options() -> Options {
             // The end-to-end path: edit, validate, classify, generate,
             // publish, call.
             "--live" => end_to_end = true,
+            // Codegen exactly Path D's closure rather than the whole crate.
+            // A flag rather than the only behaviour, because the difference
+            // between the two is the measurement.
+            "--closure-only" => closure_only = true,
+            // The control: an empty codegen universe, still emitting an
+            // object. Everything it costs after analysis is fixed cost.
+            "--empty-universe" => {
+                closure_only = true;
+                EMPTY_UNIVERSE.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             "--noop" => {
                 println!("[]");
                 std::process::exit(0);
@@ -715,6 +847,7 @@ fn parse_options() -> Options {
         out,
         once,
         end_to_end,
+        closure_only,
     }
 }
 
@@ -805,6 +938,16 @@ fn live_main(options: &Options) {
     let arena = arena::Arena::reserve(256 * 1024 * 1024).expect("arena");
     let runtime = generation::Runtime::new(8);
     let object = options.incremental.join("live.o");
+    // Whole-crate codegen leaves one object per codegen unit and closure-only
+    // leaves one; switching modes in the same directory would otherwise leave
+    // the other mode's objects behind for the newest-file rule to trip over.
+    if let Ok(entries) = std::fs::read_dir(&options.incremental) {
+        for path in entries.flatten().map(|e| e.path()) {
+            if path.extension().is_some_and(|e| e == "o") {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
 
     let pristine = std::fs::read_to_string(options.variants.join("pristine.rs"))
         .expect("the pristine variant exists");
@@ -830,6 +973,7 @@ fn live_main(options: &Options) {
                     "--emit=obj".into(),
                     format!("--out-dir={}", object.parent().unwrap_or(&object).display()),
                 ],
+                options.closure_only,
             );
             let mut record = live::revision(
                 &arena,
@@ -841,6 +985,7 @@ fn live_main(options: &Options) {
                 &edited,
                 base.contract.as_ref(),
                 &object,
+                options.closure_only,
             );
             record.edit = edit.clone();
             // The proof, not a demonstration: with `value = 3, scale = 5` the
@@ -879,31 +1024,37 @@ fn live_main(options: &Options) {
     for record in records.iter().filter(|r| r.error.is_some()) {
         println!("    {} FAILED: {}", record.edit, record.error.clone().unwrap_or_default());
     }
-    if !good.is_empty() {
-        println!(
-            "\n  {:<20} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}  {:<22} {}",
-            "edit", "validate", "classify", "closure", "codegen", "extract", "publish",
-            "verdict", "returned"
-        );
-        for edit in &options.edits {
-            let rows: Vec<&&live::LiveRecord> =
-                good.iter().filter(|r| r.edit == *edit).collect();
-            if rows.is_empty() {
-                continue;
-            }
-            println!(
-                "  {:<20} {:>9.2} {:>9.3} {:>9.3} {:>9.2} {:>9.3} {:>9.4}  {:<22} {:?}",
-                edit,
-                median(rows.iter().map(|r| r.validate_ms).collect()),
-                median(rows.iter().map(|r| r.classify_ms).collect()),
-                median(rows.iter().map(|r| r.closure_ms).collect()),
-                median(rows.iter().map(|r| r.codegen_ms).collect()),
-                median(rows.iter().map(|r| r.extract_ms).collect()),
-                median(rows.iter().map(|r| r.publish_ms).collect()),
-                rows[0].verdict,
-                rows[0].returned,
-            );
+    // Timings come from every record, not only the ones that published. The
+    // empty-universe control deliberately produces no callable code, and its
+    // whole purpose is the timing of a session that codegens nothing; reporting
+    // only successful revisions would discard exactly the control. Whether a
+    // revision published is the `returned` column and the FAILED lines above.
+    println!(
+        "\n  {:<20} {:>7} {:>9} {:>8} {:>9} {:>9} {:>9} {:>9} {:>9}  {}",
+        "edit", "expand", "analysis", "hot mir", "classify", "closure", "codegen", "extract",
+        "publish", "returned"
+    );
+    for edit in &options.edits {
+        let rows: Vec<&live::LiveRecord> =
+            records.iter().filter(|r| r.edit == *edit).collect();
+        if rows.is_empty() {
+            continue;
         }
+        println!(
+            "  {:<20} {:>7.2} {:>9.2} {:>8.2} {:>9.3} {:>9.3} {:>9.2} {:>9.3} {:>9.4}  {:?}",
+            edit,
+            median(rows.iter().map(|r| r.expand_ms).collect()),
+            median(rows.iter().map(|r| r.analysis_ms).collect()),
+            median(rows.iter().map(|r| r.hot_mir_ms).collect()),
+            median(rows.iter().map(|r| r.classify_ms).collect()),
+            median(rows.iter().map(|r| r.closure_ms).collect()),
+            median(rows.iter().map(|r| r.codegen_ms).collect()),
+            median(rows.iter().map(|r| r.extract_ms).collect()),
+            median(rows.iter().map(|r| r.publish_ms).collect()),
+            rows[0].returned,
+        );
+    }
+    if !good.is_empty() {
         println!(
             "\n  end to end, p50: {:.2} ms   (min {:.2}, max {:.2})",
             median(good.iter().map(|r| r.total_ms).collect()),

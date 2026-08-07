@@ -47,6 +47,11 @@ pub struct LiveRecord {
     pub edit: String,
     /// rustc: expansion, analysis, and the hot root's codegen MIR.
     pub validate_ms: f64,
+    /// The three parts of `validate_ms`, kept apart because the closure-only
+    /// experiment moved this column and a single number could not say why.
+    pub expand_ms: f64,
+    pub analysis_ms: f64,
+    pub hot_mir_ms: f64,
     /// S0c.
     pub classify_ms: f64,
     /// S0's Path D.
@@ -267,6 +272,7 @@ pub fn revision(
     edited: &str,
     before: Option<&crate::classify::Contract>,
     object: &PathBuf,
+    closure_only: bool,
 ) -> LiveRecord {
     let mut record = LiveRecord {
         fixture: fixture.name.clone(),
@@ -290,7 +296,11 @@ pub fn revision(
             "--emit=obj".into(),
             format!("--out-dir={}", object.parent().unwrap_or(object).display()),
         ],
+        closure_only,
     );
+    record.expand_ms = session.expand_ms;
+    record.analysis_ms = session.analysis_ms;
+    record.hot_mir_ms = session.hot_mir_ms;
     record.validate_ms = session.expand_ms + session.analysis_ms + session.hot_mir_ms;
     record.closure_ms = session.hot_closure_ms;
     record.classify_ms = session.classify_ms;
@@ -327,20 +337,21 @@ pub fn revision(
     }
 
     let at = Instant::now();
-    // rustc names the object itself (`<crate>-<hash>.o`), so the path is
-    // discovered rather than dictated.
-    let produced = std::fs::read_dir(object.parent().unwrap_or(object))
-        .ok()
-        .and_then(|entries| {
-            entries
-                .flatten()
-                .map(|e| e.path())
-                .find(|p| p.extension().is_some_and(|e| e == "o"))
-        });
-    let Some(produced) = produced else {
-        record.error = Some("the compiler produced no object".into());
-        return record;
-    };
+    // rustc names its objects itself, and there may be more than one of them:
+    // a binary crate gets a separate codegen unit for the allocator shim, and
+    // whole-crate codegen of a large crate gets several. So the object is
+    // chosen by *what it defines*, not by name, order, or timestamp — the same
+    // rule the linker learned in findings 230 and 241, where a name and a
+    // position both turned out not to be identities. Selecting the newest file
+    // picked the allocator shim for the `small` fixture and reported the hot
+    // root missing from a compilation that had in fact produced it.
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(object.parent().unwrap_or(object))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "o"))
+        .collect();
     // The whole closure, not just the root. `u64::wrapping_add` is a generic
     // instance compiled into *this* crate's object, not a symbol the process
     // exports, so lifting only the root left a call to it unresolvable — which
@@ -350,17 +361,31 @@ pub fn revision(
     } else {
         session.closure_symbols.clone()
     };
-    let lifted = match lift(&produced, &wanted) {
-        Ok(lifted) if !lifted.is_empty() => lifted,
-        Ok(_) => {
-            record.error = Some(format!("{hot} is not defined in the object"));
-            return record;
+    let mut lifted = Vec::new();
+    let mut last: Option<String> = None;
+    for candidate in &candidates {
+        match lift(candidate, &wanted) {
+            // The root is `wanted[0]`, and an object that does not define it is
+            // some other codegen unit rather than the one being patched.
+            Ok(found) if found.iter().any(|f| symbol_matches(&f.name, &wanted[0])) => {
+                lifted = found;
+                break;
+            }
+            Ok(_) => {}
+            Err(error) => last = Some(error),
         }
-        Err(error) => {
-            record.error = Some(error);
-            return record;
-        }
-    };
+    }
+    if lifted.is_empty() {
+        record.error = Some(match last {
+            Some(error) => error,
+            None if candidates.is_empty() => "the compiler produced no object".into(),
+            None => format!(
+                "{hot} is defined in none of the {} objects produced",
+                candidates.len()
+            ),
+        });
+        return record;
+    }
     record.extract_ms = at.elapsed().as_secs_f64() * 1e3;
 
     match publish_and_call(arena, runtime, &lifted, 3) {

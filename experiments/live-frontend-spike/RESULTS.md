@@ -591,3 +591,116 @@ non-const, non-async, `#[inline(never)]`. Codegen is whole-crate. Two
 fixtures. And the runtime differential that V2 §12.2 asks for — running the
 live program against a clean rebuild across a mutation suite — does not exist
 yet; §22 checks one value on one edit, which is a start and not that.
+
+## 27. Closure-only codegen — §24 closed
+
+§24 named cg_clif's whole-crate codegen as the last loose number and said the
+product would lower only Path D's closure. It now does, and the fix was not to
+fork the backend.
+
+A rustc backend compiles whatever `collect_and_partition_mono_items` hands it.
+That is a **query**, and `Config::override_queries` replaces it. So the
+compiler runs its ordinary frontend — the validation the developer was paying
+for anyway — and then codegens exactly the instances Path D found, in one
+codegen unit, and nothing else. Forty lines, in `patch_universe`.
+
+It works: the object for `blinker-lib` goes from **922 defined symbols to 5**,
+and from 15.7 KB to 3.1 KB for `rg-lib`.
+
+### The result, `body_arith`, p50 over 12 iterations after 4 warm-ups
+
+All milliseconds. `expand`/`analysis`/`hot mir` are the old `validate` column,
+split — see §28 for why.
+
+| fixture | mode | expand | analysis | hot mir | classify | closure | **codegen** | extract | **publish** | **total** |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| small | whole-crate | 8.28 | 4.17 | 0.06 | 0.137 | 0.033 | 7.31 | 0.90 | **0.0015** | 20.89 |
+| small | **closure-only** | 7.60 | 3.96 | 0.05 | 0.122 | 0.029 | **3.54** | 0.59 | **0.0015** | **16.40** |
+| rg-lib | whole-crate | 9.79 | 6.53 | 0.07 | 0.098 | 0.029 | 9.22 | 0.15 | **0.0016** | 26.37 |
+| rg-lib | **closure-only** | 9.29 | 6.27 | 0.07 | 0.097 | 0.028 | **6.99** | 0.13 | **0.0015** | **23.05** |
+| blinker-lib | whole-crate | 14.58 | 7.04 | 0.08 | 0.119 | 0.035 | 42.03 | 0.50 | **0.0015** | 64.59 |
+| blinker-lib | **closure-only** | 14.76 | 6.69 | 0.08 | 0.112 | 0.030 | **7.13** | 0.10 | **0.0015** | **29.00** |
+
+| fixture | cargo debug | whole-crate | **closure-only** |
+|---|---:|---:|---:|
+| blinker-lib | 434 ms | 64.6 ms (6.7×) | **29.0 ms (15.0×)** |
+| rg-lib | 762 ms | 26.4 ms (28.9×) | **23.1 ms (33.1×)** |
+
+72 revisions across three fixtures and both modes, every one returning the
+exact value §22 requires: 106 pristine, 167 edited.
+
+### The control, which is where the actual answer is
+
+`codegen` in that table is not lowering. It is *everything after analysis* —
+lowering, Cranelift, writing the object, finalizing the incremental session,
+dropping the arena. Watching it fall from 42 ms to 7 ms says the universe got
+smaller; it does not say how much of the remaining 7 ms is the four functions
+and how much is fixed cost that no narrowing will ever remove.
+
+So there is a third mode that codegens **nothing at all** and still emits an
+object. The difference is the closure's real backend cost:
+
+| fixture | whole-crate | closure-only | empty universe | **the closure itself** |
+|---|---:|---:|---:|---:|
+| small | 7.31 | 3.54 | 2.86 | **0.68 ms** |
+| rg-lib | 9.22 | 6.99 | 6.35 | **0.64 ms** |
+| blinker-lib | 42.03 | 7.13 | 6.79 | **0.33 ms** |
+
+**Lowering and compiling a real four-instance Rust patch closure through
+cg_clif costs 0.33–0.68 ms.** That is real MIR lowering — trait resolution,
+layout, ABI adaptation — not R1's hand-built CLIF, and it lands in the same
+order of magnitude as R1's 0.12 ms. It is inside the band this was called
+exceptional at, by a factor of three.
+
+The corollary is the useful part: **the backend is now the smallest measured
+component of the pipeline except publication.** Optimizing it further would
+buy nothing.
+
+### Where the time actually goes now
+
+For `blinker-lib`, of 29.0 ms:
+
+```
+expand      14.8   parse and macro-expand the crate
+analysis     6.7   resolve, type check, trait select, borrow check
+session      6.8   write the object, finalize incremental, drop the arena
+closure      0.33  lower and compile the patch closure          <- the backend
+extract      0.10  lift four functions out of the object
+classify     0.11  the DIRECT proof obligation
+Path D       0.03  find the closure
+publish      0.0015 reserve, copy, relocate, i-cache, swap
+```
+
+Two things dominate and neither is compilation of the edit. `expand` is
+whole-crate parsing that a resident compiler would not repeat; the 6.8 ms
+`session` cost is a batch compiler finishing a batch — writing an object file
+that the eventual design does not want and serializing a dependency graph.
+R1 already showed the artifact going straight from `Context::compile` to the
+arena in 0.13 ms with no object file involved.
+
+Neither is claimed as recoverable here. They are named because they are what
+is left, and because they are both *frontend and harness* costs — which is
+exactly what S0b predicted the answer would be.
+
+## 28. Two things the control caught
+
+**An apparent regression that was not one.** The first closure-only run showed
+`validate` rising from 23.7 ms to 34.2 ms on `blinker-lib` and 17.3 to 23.3 on
+`rg-lib` — consistently, on both fixtures, in the wrong direction for a change
+that only removes work. It was noise: eight iterations, interleaved with other
+heavy runs. Splitting the column into expand/analysis/hot-mir and running
+twelve iterations showed the three parts matching across modes to within
+0.3 ms. Recorded because the temptation was to explain it, and a plausible
+mechanism for a measurement artefact is worse than no explanation.
+
+**The object was chosen by timestamp.** With one codegen unit that is
+harmless. A *binary* crate gets a second unit for the allocator shim, and
+whole-crate codegen of a large crate gets several — so "the newest `.o`"
+picked the allocator shim for the `small` fixture and reported the hot root
+missing from a compilation that had just produced it. The object is now chosen
+by **what it defines**: the one containing the root symbol. This is findings
+230 and 241 again, in a third setting — a name and a position are both
+incidental, and identity is what the thing *is*.
+
+That fix is what made `small` work end to end, which is why §27 has three
+fixtures and one of them is a `bin`.
