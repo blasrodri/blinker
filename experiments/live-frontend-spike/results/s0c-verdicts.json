@@ -1,0 +1,142 @@
+[
+  {
+    "case": "ordinary_arith",
+    "hot": "ordinary",
+    "expected": "DIRECT",
+    "expected_reason": null,
+    "got": "DIRECT",
+    "got_reason": "-",
+    "classify_ms": 0.043375,
+    "closure": 4
+  },
+  {
+    "case": "ordinary_existing_call",
+    "hot": "ordinary",
+    "expected": "DIRECT",
+    "expected_reason": null,
+    "got": "DIRECT",
+    "got_reason": "-",
+    "classify_ms": 0.044833000000000005,
+    "closure": 5
+  },
+  {
+    "case": "ordinary_new_local_fn",
+    "hot": "ordinary",
+    "expected": "DIRECT",
+    "expected_reason": null,
+    "got": "DIRECT",
+    "got_reason": "-",
+    "classify_ms": 0.038042,
+    "closure": 5
+  },
+  {
+    "case": "ordinary_reads_existing_static",
+    "hot": "ordinary",
+    "expected": "DIRECT",
+    "expected_reason": null,
+    "got": "DIRECT",
+    "got_reason": "-",
+    "classify_ms": 0.05,
+    "closure": 4
+  },
+  {
+    "case": "inline_hint",
+    "hot": "inline_hinted",
+    "expected": "FALLBACK",
+    "expected_reason": "cross_crate_inlinable",
+    "got": "FALLBACK",
+    "got_reason": "cross_crate_inlinable",
+    "classify_ms": 0.041833999999999996,
+    "closure": 3
+  },
+  {
+    "case": "generic",
+    "hot": "generic_fn",
+    "expected": "FALLBACK",
+    "expected_reason": "requires_monomorphization",
+    "got": "FALLBACK",
+    "got_reason": "requires_monomorphization",
+    "classify_ms": 3.461125,
+    "closure": 2
+  },
+  {
+    "case": "const_fn",
+    "hot": "const_fn",
+    "expected": "FALLBACK",
+    "expected_reason": "const_evaluable",
+    "got": "FALLBACK",
+    "got_reason": "const_evaluable",
+    "classify_ms": 0.042125,
+    "closure": 2
+  },
+  {
+    "case": "async_fn",
+    "hot": "async_fn",
+    "expected": "FALLBACK",
+    "expected_reason": null,
+    "got": "FALLBACK",
+    "got_reason": "opaque_in_signature",
+    "classify_ms": 0.041792,
+    "closure": 1
+  },
+  {
+    "case": "rpit",
+    "hot": "rpit_fn",
+    "expected": "FALLBACK",
+    "expected_reason": "opaque_in_signature",
+    "got": "FALLBACK",
+    "got_reason": "opaque_in_signature",
+    "classify_ms": 0.041333,
+    "closure": 2
+  },
+  {
+    "case": "trait_method",
+    "hot": "compute",
+    "expected": "FALLBACK",
+    "expected_reason": "associated_fn",
+    "got": "FALLBACK",
+    "got_reason": "associated_fn",
+    "classify_ms": 0.046375,
+    "closure": 2
+  },
+  {
+    "case": "sneaky_signature",
+    "hot": "ordinary",
+    "expected": "FALLBACK",
+    "expected_reason": "contract_changed",
+    "got": "FALLBACK",
+    "got_reason": "contract_changed",
+    "classify_ms": 0.040458,
+    "closure": 4
+  },
+  {
+    "case": "target_feature",
+    "hot": "feature_fn",
+    "expected": "FALLBACK",
+    "expected_reason": "contract_changed",
+    "got": "FALLBACK",
+    "got_reason": "contract_changed",
+    "classify_ms": 0.046,
+    "closure": 2
+  },
+  {
+    "case": "new_static",
+    "hot": "ordinary",
+    "expected": "FALLBACK",
+    "expected_reason": null,
+    "got": "FALLBACK",
+    "got_reason": "new_static_required",
+    "classify_ms": 0.036625000000000005,
+    "closure": 4
+  },
+  {
+    "case": "new_generic_instantiation",
+    "hot": "ordinary",
+    "expected": "DIRECT",
+    "expected_reason": null,
+    "got": "DIRECT",
+    "got_reason": "-",
+    "classify_ms": 0.040125,
+    "closure": 6
+  }
+]

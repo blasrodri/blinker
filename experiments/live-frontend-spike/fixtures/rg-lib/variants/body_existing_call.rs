@@ -1423,6 +1423,17 @@ pub fn spike_hot_root(reading: SpikeReading) -> u64 {
     spike_helper(reading.total()).wrapping_add(3)
 }
 
+/// The same function with `#[inline]`, which rustc encodes into this crate's
+/// metadata so a downstream crate may compile its own copy. The oracle's
+/// control: editing *this* body must change a dependent's machine code, and
+/// if it does not, the oracle cannot detect a downstream change at all and
+/// nothing it says about the hot root means anything.
+#[allow(missing_docs, dead_code)]
+#[inline]
+pub fn spike_inline_twin(reading: SpikeReading) -> u64 {
+    reading.total().wrapping_mul(3).wrapping_add(1)
+}
+
 /// Reachable from the crate's roots, so whole-crate collection sees it.
 #[allow(missing_docs, dead_code)]
 #[unsafe(no_mangle)]

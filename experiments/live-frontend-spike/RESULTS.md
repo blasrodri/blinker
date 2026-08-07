@@ -1,5 +1,7 @@
 # Spike S0 — Rust frontend lower bound
 
+**S0c is complete and DIRECT holds on this corpus** (§16–§19).
+
 **Recommendation: A for an edit to a library crate, B for an edit to a large
 binary crate** — the envelope must be stated over the crate containing the hot
 function, not over the project. S0 alone recommended B; S0b (§12) measured the
@@ -325,3 +327,165 @@ same spike: compute an exported-interface fingerprint before and after each of
 the five edit classes, and check that classes 1–3 compare equal and classes 4–5
 compare different. That is a day of work against a harness that already exists,
 and it converts the product's headline number from contingent to earned.
+
+
+---
+
+# S0c — the classifier
+
+S0b left the 22–52× contingent on a component that did not exist: something
+that can *prove* an edit is invisible downstream. This is that component,
+its adversarial suite, and the differential evidence that it is right.
+
+## 16. What DIRECT means, and why it is defensible
+
+The rule is not "the public interface is unchanged". Enumerating a Rust
+crate's public API from scratch means guessing what rustc considers
+downstream-visible, and every item guessed wrong is a silently wrong program.
+
+Instead the classifier asks rustc the question rustc already asks itself.
+`rustc_metadata::rmeta::encoder::should_encode_mir` decides whether a body is
+serialized into crate metadata, and therefore whether any downstream crate can
+inline it, monomorphize it, or const-evaluate it:
+
+```rust
+DefKind::AnonConst | AssocConst | Const  => (true, false)    // CTFE MIR
+DefKind::Closure if is_coroutine         => (false, true)    // layout
+DefKind::AssocFn | Fn | Closure          => {
+    opt = always_encode_mir
+       || (should_codegen() && reachable(def_id)
+           && (generics.requires_monomorphization() || cross_crate_inlinable(def_id)))
+    opt = opt && !constness(def_id).is_always_const()
+    (is_const_fn(def_id), opt)
+}
+```
+
+`classify.rs::mir_is_downstream_observable` is that function reimplemented
+against the same queries, with the original quoted beside it so that drift is
+visible. **DIRECT requires that rustc would not encode this body.** Everything
+else — signature, `type_of`, generics, predicates, codegen attributes, `FnAbi`,
+symbol name — is a contract comparison across two revisions, because the rmeta
+rule answers "can another crate see this body?" and not "does replacing it
+keep the program's meaning?".
+
+## 17. The adversarial suite — 14 cases, all passing
+
+A classifier that says DIRECT to everything passes S0's five edit classes and
+is worthless. A case passes here only when the verdict **and the reason**
+match: a FALLBACK for the wrong reason means the predicate that should have
+refused it is untested.
+
+| case | verdict | classify |
+|---|---|---:|
+| ordinary_arith | DIRECT | 0.08 ms |
+| ordinary_existing_call | DIRECT | 0.09 ms |
+| ordinary_new_local_fn | DIRECT | 0.12 ms |
+| ordinary_reads_existing_static | DIRECT | 0.09 ms |
+| new_generic_instantiation | DIRECT (closure 6) | 0.06 ms |
+| inline_hint | FALLBACK(cross_crate_inlinable) | 0.06 ms |
+| generic | FALLBACK(requires_monomorphization) | 5.8 ms |
+| const_fn | FALLBACK(const_evaluable) | 0.13 ms |
+| async_fn | FALLBACK(opaque_in_signature) | 0.14 ms |
+| rpit | FALLBACK(opaque_in_signature) | 0.07 ms |
+| trait_method | FALLBACK(associated_fn) | 0.13 ms |
+| sneaky_signature | FALLBACK(contract_changed) | 0.08 ms |
+| target_feature | FALLBACK(contract_changed) | 0.11 ms |
+| new_static | FALLBACK(new_static_required) | 0.04 ms |
+
+**The classifier costs 0.04–0.14 ms**, against 15–20 ms of frontend. It is
+free, as S0 predicted from the 0.002 ms ABI/layout measurement.
+
+`new_generic_instantiation` is DIRECT with a closure of 6 rather than 4: the
+artifact must carry `convert::<u32>` as well as the root. That case is the one
+that shows **DIRECT means "replace this closure", not "replace this
+function"** — V2 §9.4's patch cluster, arrived at from the measurement rather
+than assumed.
+
+## 18. Two soundness holes the suite found
+
+Both were in the classifier, and both would have shipped wrong programs.
+
+**A body that introduces a new `static` was called DIRECT.** Path D walks
+`TerminatorKind::Call`, and a static does not reach a body through the call
+graph — it arrives as a constant holding a pointer into its allocation. The
+fix mirrors the collector's `collect_alloc`, through a MIR visitor over every
+constant. `body.required_consts()` is *not* enough: it holds only constants
+whose evaluation the body's validity depends on, and a plain static read is
+not one, so scanning it found no statics at all.
+
+The first version of that fix then refused **reading an existing static**,
+because it asked "did this function start reading a new static" instead of
+"does the body need storage the base image does not have". The comparison is
+against the crate's defined statics, not the function's previous reads.
+
+**Unevaluated constants are not a hazard, and treating them as one broke every
+integer cast.** Debug MIR wraps `as` casts in `u32::MIN`/`u32::MAX` checks,
+which are associated consts in `core`. A const is a value the backend
+materialises; unlike a static it has no address in the base image that must
+already exist. Statics are the hazard; only statics are collected.
+
+## 19. The oracle — and what it took to make it mean anything
+
+The classifier's claim is checkable offline: apply a DIRECT edit to a library,
+rebuild every dependent anyway, and compare each dependent's `__TEXT,__text`.
+
+| fixture | control `#[inline]` twin | DIRECT `#[inline(never)]` root |
+|---|---|---|
+| blinker-lib (50 dependents) | **2 changed** | **0 changed** |
+| rg-lib (32 dependents) | **1 changed** | **0 changed** |
+
+The control and the DIRECT case are the *same function* differing only in the
+inline attribute, both called from the same injected downstream caller. So the
+table shows two things at once: the oracle can detect a downstream change, and
+the classifier's `cross_crate_inlinable` refusal is load-bearing rather than
+decorative.
+
+Getting there took three corrections, each of which had produced a confident
+wrong answer:
+
+1. **`otool -s` prints the object's path as its first line**, and the objects
+   are extracted to a fresh temporary directory each call — so every rlib
+   differed from itself on every run. The oracle reported 50/50 dependents
+   changed. The tell was `libahash` in the list, a crate that does not depend
+   on the edited one. Now only the hex dump is hashed, and the oracle hashes
+   the same build twice and refuses to continue if the two disagree.
+2. **Incremental compilation repartitions codegen units** when a dependency
+   changes, moving functions between objects without changing what the program
+   means. With `CARGO_INCREMENTAL=0` the difference vanished entirely.
+3. **No dependent called the injected function**, so "all dependents
+   identical" was trivially true and proved nothing. This was caught by the
+   control assertion rather than by inspection: a signature change *also* left
+   every dependent identical, which is impossible for a real control. The
+   fixture now injects a caller into a downstream crate.
+
+Only the third of those was found by reading. The first two were found by
+guards that make the harness prove it can measure before it is allowed to
+report — which is the same discipline that caught the `Compilation::Stop`
+error in §9.
+
+## 20. What the oracle does not prove
+
+It shows that on this corpus, a DIRECT verdict changed no dependent's code. It
+cannot show that no such edit exists. The adversarial suite probes the cases
+that were thought of; the oracle checks the ones that were not; neither is a
+proof. Two fixtures and 14 cases is a starting safety case, not a finished one.
+
+Also still true, and unchanged by S0c: **cg_clif codegen and publication remain
+unmeasured**, and the DIRECT class deliberately excludes trait and inherent
+methods, generics, `const fn`, `async fn`, and RPIT.
+
+## 21. Next
+
+R1, as the plan says. The budget for a library-crate edit now reads:
+
+| component | measured |
+|---|---:|
+| rustc validation | 15–20 ms |
+| Path D closure | 0.25 ms |
+| classifier | 0.04–0.14 ms |
+| cg_clif codegen | **unmeasured** |
+| publication | **unmeasured** |
+| known subtotal | **~15–20 ms** |
+
+against a 434–762 ms cargo debug baseline. Codegen and publication have
+roughly 20–50 ms of room before the product stops being compelling.

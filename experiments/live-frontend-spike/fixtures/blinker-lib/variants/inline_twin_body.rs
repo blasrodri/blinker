@@ -926,7 +926,6 @@ pub fn relink_seam(value: u64) -> u64 {
 #[derive(Clone, Copy)]
 pub struct SpikeReading {
     pub value: u64,
-    pub tag: u64,
     pub scale: u32,
 }
 
@@ -966,13 +965,13 @@ pub fn spike_hot_root(reading: SpikeReading) -> u64 {
 #[allow(missing_docs, dead_code)]
 #[inline]
 pub fn spike_inline_twin(reading: SpikeReading) -> u64 {
-    reading.total().wrapping_mul(3).wrapping_add(1)
+    reading.total().wrapping_mul(23).wrapping_add(9)
 }
 
 /// Reachable from the crate's roots, so whole-crate collection sees it.
 #[allow(missing_docs, dead_code)]
 #[unsafe(no_mangle)]
 pub extern "C" fn spike_entry(value: u64) -> u64 {
-    let reading = SpikeReading { value, tag: 0, scale: 3 };
+    let reading = SpikeReading { value, scale: 3 };
     spike_hot_root(reading).wrapping_add(spike_helper(value)).wrapping_add(spike_convert(value))
 }

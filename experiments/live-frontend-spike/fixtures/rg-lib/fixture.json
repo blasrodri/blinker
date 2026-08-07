@@ -43,6 +43,7 @@
     "body_arith",
     "body_existing_call",
     "body_new_generic",
+    "inline_twin_body",
     "pristine",
     "signature",
     "type_layout"

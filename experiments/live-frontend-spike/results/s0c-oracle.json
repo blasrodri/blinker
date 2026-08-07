@@ -1,0 +1,49 @@
+[
+  {
+    "fixture": "blinker-lib",
+    "edit": "inline_twin_body",
+    "kind": "control",
+    "changed": [
+      "libblinker_cli-d9c6d7d4dc20c928.rlib",
+      "libblinker_cli.rlib"
+    ],
+    "total": 50
+  },
+  {
+    "fixture": "blinker-lib",
+    "edit": "body_arith",
+    "kind": "direct",
+    "changed": [],
+    "total": 50
+  },
+  {
+    "fixture": "blinker-lib",
+    "edit": "body_existing_call",
+    "kind": "direct",
+    "changed": [],
+    "total": 50
+  },
+  {
+    "fixture": "rg-lib",
+    "edit": "inline_twin_body",
+    "kind": "control",
+    "changed": [
+      "libgrep_printer-a86c32918a0fb720.rlib"
+    ],
+    "total": 32
+  },
+  {
+    "fixture": "rg-lib",
+    "edit": "body_arith",
+    "kind": "direct",
+    "changed": [],
+    "total": 32
+  },
+  {
+    "fixture": "rg-lib",
+    "edit": "body_existing_call",
+    "kind": "direct",
+    "changed": [],
+    "total": 32
+  }
+]

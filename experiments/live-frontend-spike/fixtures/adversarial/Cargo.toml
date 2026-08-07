@@ -1,0 +1,10 @@
+[package]
+name = "spike-adversarial"
+version = "0.0.0"
+edition = "2021"
+
+[[bin]]
+name = "spike_adversarial"
+path = "src/main.rs"
+
+[workspace]

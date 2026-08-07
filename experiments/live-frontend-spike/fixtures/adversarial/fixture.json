@@ -1,0 +1,97 @@
+{
+  "name": "adversarial",
+  "crate": "/Users/blas/projects/blinker/experiments/live-frontend-spike/fixtures/adversarial",
+  "file": "src/main.rs",
+  "crate_name": "spike_adversarial",
+  "crate_type": "bin",
+  "hot": "ordinary",
+  "variants": [
+    "async_fn",
+    "const_fn",
+    "generic",
+    "inline_hint",
+    "new_generic_instantiation",
+    "new_static",
+    "ordinary_arith",
+    "ordinary_existing_call",
+    "ordinary_new_local_fn",
+    "ordinary_reads_existing_static",
+    "pristine",
+    "rpit",
+    "sneaky_signature",
+    "target_feature",
+    "trait_method"
+  ],
+  "expectations": {
+    "ordinary_arith": {
+      "hot": "ordinary",
+      "verdict": "DIRECT",
+      "reason": null
+    },
+    "ordinary_existing_call": {
+      "hot": "ordinary",
+      "verdict": "DIRECT",
+      "reason": null
+    },
+    "ordinary_new_local_fn": {
+      "hot": "ordinary",
+      "verdict": "DIRECT",
+      "reason": null
+    },
+    "ordinary_reads_existing_static": {
+      "hot": "ordinary",
+      "verdict": "DIRECT",
+      "reason": null
+    },
+    "inline_hint": {
+      "hot": "inline_hinted",
+      "verdict": "FALLBACK",
+      "reason": "cross_crate_inlinable"
+    },
+    "generic": {
+      "hot": "generic_fn",
+      "verdict": "FALLBACK",
+      "reason": "requires_monomorphization"
+    },
+    "const_fn": {
+      "hot": "const_fn",
+      "verdict": "FALLBACK",
+      "reason": "const_evaluable"
+    },
+    "async_fn": {
+      "hot": "async_fn",
+      "verdict": "FALLBACK",
+      "reason": null
+    },
+    "rpit": {
+      "hot": "rpit_fn",
+      "verdict": "FALLBACK",
+      "reason": "opaque_in_signature"
+    },
+    "trait_method": {
+      "hot": "compute",
+      "verdict": "FALLBACK",
+      "reason": "associated_fn"
+    },
+    "sneaky_signature": {
+      "hot": "ordinary",
+      "verdict": "FALLBACK",
+      "reason": "contract_changed"
+    },
+    "target_feature": {
+      "hot": "feature_fn",
+      "verdict": "FALLBACK",
+      "reason": "contract_changed"
+    },
+    "new_static": {
+      "hot": "ordinary",
+      "verdict": "FALLBACK",
+      "reason": null
+    },
+    "new_generic_instantiation": {
+      "hot": "ordinary",
+      "verdict": "DIRECT",
+      "reason": null
+    }
+  }
+}

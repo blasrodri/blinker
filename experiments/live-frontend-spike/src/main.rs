@@ -54,6 +54,9 @@ use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_middle::mir::TerminatorKind;
 use rustc_middle::ty::{self, TyCtxt, TypingEnv};
 
+mod classify;
+use classify::{classify, contract_of, Contract, Verdict};
+
 /// One revision's measurement, as V2 §8 asks for it.
 #[derive(Debug, Default, Clone, serde::Serialize)]
 struct Record {
@@ -75,11 +78,19 @@ struct Record {
     whole_crate_mono_ms: f64,
     /// ABI and layout facts for the hot root (§7).
     abi_layout_ms: f64,
+    /// Building the downstream contract (S0c).
+    classify_ms: f64,
     /// Everything a replacement needs, excluding process startup.
     total_required_frontend_ms: f64,
     mono_items_examined: usize,
     whole_crate_mono_items: usize,
     hot_root_found: bool,
+    /// What this revision promises downstream (S0c). `None` when the session
+    /// failed or the hot root was not found.
+    contract: Option<Contract>,
+    /// The comparison against the previous revision, filled in by the caller
+    /// once both contracts exist.
+    verdict: Option<Verdict>,
     /// Non-empty when the session failed; the record is kept either way.
     error: Option<String>,
 }
@@ -123,6 +134,10 @@ struct Measure {
     mode: Mode,
     /// Whether an empty whole-crate collection is a bug or the truth.
     expects_mono_roots: bool,
+    /// Set by Path D: whether every instance it reached resolved in this crate.
+    closure_is_local: bool,
+    /// Statics the closure reads, by symbol path.
+    statics: std::collections::BTreeSet<String>,
     started: Instant,
     expansion_done: Option<Instant>,
     record: Record,
@@ -159,15 +174,43 @@ impl Callbacks for Measure {
 
         if self.mode.wants_closure() {
             let at = Instant::now();
-            let examined = hot_root_closure(tcx, root.to_def_id());
+            let mut statics = std::collections::BTreeSet::new();
+            let (examined, local) = hot_root_closure(tcx, root.to_def_id(), &mut statics);
+            self.statics = statics;
             self.record.hot_closure_ms = at.elapsed().as_secs_f64() * 1e3;
             self.record.mono_items_examined = examined;
+            self.closure_is_local = local;
         }
 
         let at = Instant::now();
         let facts = abi_and_layout(tcx, root.to_def_id());
         self.record.abi_layout_ms = at.elapsed().as_secs_f64() * 1e3;
         std::hint::black_box(facts);
+
+        // The contract, timed separately: S0 measured gathering the ABI and
+        // layout facts at 0.002 ms, and the classifier is those queries plus
+        // the rest of the downstream-visible surface.
+        let at = Instant::now();
+        let (size, local) = (self.record.mono_items_examined, self.closure_is_local);
+        // Every static the crate defines, not only those this body reads. The
+        // question a replacement has to answer is whether the storage exists
+        // in the base image, not whether this function previously used it —
+        // asking the narrower question made reading an existing static look
+        // like introducing one.
+        let defined: std::collections::BTreeSet<String> = tcx
+            .hir_crate_items(())
+            .definitions()
+            .filter(|def_id| {
+                matches!(
+                    tcx.def_kind(*def_id),
+                    rustc_hir::def::DefKind::Static { .. }
+                )
+            })
+            .map(|def_id| tcx.def_path_str(def_id.to_def_id()))
+            .collect();
+        self.record.contract =
+            Some(contract_of(tcx, root, size, local, &self.statics, &defined));
+        self.record.classify_ms = at.elapsed().as_secs_f64() * 1e3;
 
         if self.mode.wants_whole_crate() {
             let at = Instant::now();
@@ -225,15 +268,24 @@ impl Callbacks for Measure {
 /// contribution on an `ObjectId`.
 fn find_hot_root(tcx: TyCtxt<'_>, name: &str) -> Option<LocalDefId> {
     let wanted = name.rsplit("::").next().unwrap_or(name);
-    tcx.hir_free_items().find_map(|item| {
-        let def_id = item.owner_id.def_id;
-        match tcx.def_kind(def_id) {
-            rustc_hir::def::DefKind::Fn if tcx.item_name(def_id.to_def_id()).as_str() == wanted => {
-                Some(def_id)
-            }
-            _ => None,
-        }
-    })
+    // Every definition in the crate, not just the free ones. A trait or
+    // inherent method is an `AssocFn` owned by an impl and never appears in
+    // `hir_free_items`, so searching only those made the classifier's
+    // `AssociatedFn` guard untestable — the adversarial case reported "no
+    // function named compute in the crate" rather than exercising it.
+    tcx.hir_crate_items(())
+        .definitions()
+        .find(|def_id| {
+            matches!(
+                tcx.def_kind(*def_id),
+                rustc_hir::def::DefKind::Fn | rustc_hir::def::DefKind::AssocFn
+            ) && tcx.item_name(def_id.to_def_id()).as_str() == wanted
+                // A trait declares `compute` and an impl defines it. Both are
+                // `AssocFn` with the same name and only the definition has a
+                // body, so picking the declaration aborts the session in
+                // `optimized_mir`.
+                && tcx.is_mir_available(def_id.to_def_id())
+        })
 }
 
 /// Walk what the hot root reaches, and only that.
@@ -246,7 +298,11 @@ fn find_hot_root(tcx: TyCtxt<'_>, name: &str) -> Option<LocalDefId> {
 ///
 /// Returns the number of distinct instances examined, which is the number the
 /// whole-crate figure has to be compared against.
-fn hot_root_closure(tcx: TyCtxt<'_>, root: DefId) -> usize {
+fn hot_root_closure(
+    tcx: TyCtxt<'_>,
+    root: DefId,
+    statics: &mut std::collections::BTreeSet<String>,
+) -> (usize, bool) {
     let typing_env = TypingEnv::fully_monomorphized();
     let Ok(Some(root)) = ty::Instance::try_resolve(
         tcx,
@@ -254,10 +310,15 @@ fn hot_root_closure(tcx: TyCtxt<'_>, root: DefId) -> usize {
         root,
         ty::GenericArgs::identity_for_item(tcx, root),
     ) else {
-        return 0;
+        return (0, false);
     };
 
     let mut seen: FxHashSet<ty::Instance<'_>> = FxHashSet::default();
+    // Whether every instance reached is one this crate can generate code for.
+    // An instance whose MIR lives in another crate is one a direct
+    // replacement cannot produce, so the closure is not local and the edit
+    // cannot be published.
+    let mut local = true;
     let mut worklist = vec![root];
     while let Some(instance) = worklist.pop() {
         if !seen.insert(instance) {
@@ -267,9 +328,32 @@ fn hot_root_closure(tcx: TyCtxt<'_>, root: DefId) -> usize {
         // already compiled into the base image needs no new code, which is
         // exactly the property that makes this closure small.
         if !tcx.is_mir_available(instance.def_id()) {
+            // Defined elsewhere and already compiled into the base image:
+            // nothing new is needed for it, which is exactly the property
+            // that keeps this closure small.
+            if !instance.def_id().is_local() {
+                continue;
+            }
+            local = false;
             continue;
         }
         let body = tcx.instance_mir(instance.def);
+        // Statics the body reads. They are not in the call graph — a static
+        // reaches MIR as a constant holding a pointer into its allocation —
+        // so a walk that follows only `Call` terminators cannot see one. That
+        // is not a cosmetic gap: a body that introduces a new static needs
+        // storage that the base image does not have, and the classifier
+        // called such an edit DIRECT until this was added.
+        // Every constant in the body, through the visitor rustc provides.
+        // `required_consts()` holds only those whose evaluation the body's
+        // validity depends on, and a plain `static` read is not one of them —
+        // it appears as an ordinary operand. Scanning the required set alone
+        // therefore found no statics at all, and the classifier went on
+        // calling a new-static edit DIRECT.
+        {
+            use rustc_middle::mir::visit::Visitor;
+            StaticScan { tcx, out: statics }.visit_body(body);
+        }
         for block in body.basic_blocks.iter() {
             let Some(terminator) = &block.terminator else {
                 continue;
@@ -297,7 +381,74 @@ fn hot_root_closure(tcx: TyCtxt<'_>, root: DefId) -> usize {
             }
         }
     }
-    seen.len()
+    (seen.len(), local)
+}
+
+/// Visits every constant in a body, looking for statics.
+struct StaticScan<'a, 'tcx> {
+    tcx: TyCtxt<'tcx>,
+    out: &'a mut std::collections::BTreeSet<String>,
+}
+
+impl<'tcx> rustc_middle::mir::visit::Visitor<'tcx> for StaticScan<'_, 'tcx> {
+    fn visit_const_operand(
+        &mut self,
+        constant: &rustc_middle::mir::ConstOperand<'tcx>,
+        _: rustc_middle::mir::Location,
+    ) {
+        match constant.const_ {
+            rustc_middle::mir::Const::Val(value, _) => {
+                collect_statics(self.tcx, value, self.out)
+            }
+            // An unevaluated constant is *not* a hazard, and treating it as
+            // one made every integer cast fall back: debug MIR inserts
+            // `u32::MIN`/`u32::MAX` checks around `as` casts, and those are
+            // associated consts in `core`. A const is a value the backend
+            // materialises into the code or into read-only data it emits with
+            // the function; unlike a static it has no address in the base
+            // image that must already exist. Statics are the hazard, and only
+            // statics are collected here.
+            _ => {}
+        }
+    }
+}
+
+/// Statics reachable from a constant, mirroring the collector's `collect_alloc`.
+///
+/// Recursive through `GlobalAlloc::Memory` because a constant may be a
+/// reference to an allocation that itself holds pointers to statics; a
+/// one-level check would miss `&&SOME_STATIC`.
+fn collect_statics(
+    tcx: TyCtxt<'_>,
+    value: rustc_middle::mir::ConstValue,
+    out: &mut std::collections::BTreeSet<String>,
+) {
+    use rustc_middle::mir::interpret::{GlobalAlloc, Scalar};
+    let mut allocs = match value {
+        rustc_middle::mir::ConstValue::Scalar(Scalar::Ptr(pointer, _)) => {
+            vec![pointer.provenance.alloc_id()]
+        }
+        rustc_middle::mir::ConstValue::Indirect { alloc_id, .. } => vec![alloc_id],
+        rustc_middle::mir::ConstValue::Slice { alloc_id, .. } => vec![alloc_id],
+        _ => Vec::new(),
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(alloc_id) = allocs.pop() {
+        if !seen.insert(alloc_id) {
+            continue;
+        }
+        match tcx.global_alloc(alloc_id) {
+            GlobalAlloc::Static(def_id) => {
+                out.insert(tcx.def_path_str(def_id));
+            }
+            GlobalAlloc::Memory(alloc) => {
+                for provenance in alloc.inner().provenance().ptrs().values() {
+                    allocs.push(provenance.alloc_id());
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The facts §7 requires before a function may be replaced in place.
@@ -393,6 +544,8 @@ fn run_session(
         hot: hot.to_string(),
         mode,
         expects_mono_roots: fixture.crate_type == "bin",
+        closure_is_local: true,
+        statics: std::collections::BTreeSet::new(),
         started: Instant::now(),
         expansion_done: None,
         record: Record::default(),
@@ -508,6 +661,12 @@ fn main() {
             // Skipped for Path A, where the caller is timing the whole
             // process: running two compilations there and calling the result
             // "process startup" would charge a compile to `execve`.
+            // The pristine revision is compiled first for two reasons: it
+            // leaves the incremental directory warm, so the timed session
+            // measures a real edit rather than a cold crate, and it supplies
+            // the *before* contract. A verdict is a relation between two
+            // revisions and cannot be computed inside one compilation.
+            let mut before = None;
             if !options.once {
                 std::fs::write(&options.target_file, &pristine).expect("write pristine");
                 let warm = run_session(
@@ -515,9 +674,9 @@ fn main() {
                     &options.target_file,
                     &options.incremental,
                     &options.hot,
-                    Mode::Root,
+                    Mode::HotClosure,
                 );
-                std::hint::black_box(warm);
+                before = warm.contract;
             }
 
             std::fs::write(&options.target_file, &edited).expect("write edited");
@@ -528,6 +687,12 @@ fn main() {
                 &options.hot,
                 options.mode,
             );
+            record.verdict = match (&before, &record.contract) {
+                (Some(before), Some(after)) => Some(classify(before, after)),
+                // No `before` means no comparison is possible, and a verdict
+                // that guessed would be worse than none.
+                _ => None,
+            };
             record.fixture = options.fixture.name.clone();
             record.edit = edit.clone();
             record.path = options.path.clone();

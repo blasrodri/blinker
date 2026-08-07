@@ -86,6 +86,17 @@ pub fn spike_hot_root(reading: SpikeReading) -> u64 {
     reading.total().wrapping_mul(7).wrapping_add(1)
 }
 
+/// The same function with `#[inline]`, which rustc encodes into this crate's
+/// metadata so a downstream crate may compile its own copy. The oracle's
+/// control: editing *this* body must change a dependent's machine code, and
+/// if it does not, the oracle cannot detect a downstream change at all and
+/// nothing it says about the hot root means anything.
+#[allow(missing_docs, dead_code)]
+#[inline]
+pub fn spike_inline_twin(reading: SpikeReading) -> u64 {
+    reading.total().wrapping_mul(3).wrapping_add(1)
+}
+
 /// Reachable from the crate's roots, so whole-crate collection sees it.
 #[allow(missing_docs, dead_code)]
 #[unsafe(no_mangle)]
@@ -96,6 +107,8 @@ pub extern "C" fn spike_entry(value: u64) -> u64 {
 """
 
 BASE_BODY = "reading.total().wrapping_mul(7).wrapping_add(1)"
+
+INLINE_BODY = "reading.total().wrapping_mul(3).wrapping_add(1)"
 
 EDITS = {
     "body_arith": "reading.total().wrapping_mul(11).wrapping_add(2)",
@@ -206,6 +219,11 @@ def variants(pristine: str) -> dict:
     out = {"pristine": pristine}
     for name, body in EDITS.items():
         out[name] = pristine.replace(BASE_BODY, body)
+    # The control: an edit to the `#[inline]` twin, which the classifier
+    # refuses and which must therefore be visible downstream.
+    out["inline_twin_body"] = pristine.replace(
+        INLINE_BODY, "reading.total().wrapping_mul(23).wrapping_add(9)"
+    )
     out["signature"] = (
         pristine.replace(
             "pub fn spike_hot_root(reading: SpikeReading) -> u64 {",
@@ -238,6 +256,13 @@ def main():
     # depends on it has been rebuilt, and that is the number a developer waits
     # for today.
     parser.add_argument("--downstream-package", default=None)
+    # The crate that must *call* the injected root. Without one, no dependent
+    # references the edited function, "all dependents identical" is trivially
+    # true, and the oracle proves nothing — which is exactly what the first
+    # run of it did.
+    parser.add_argument("--downstream-file", default=None)
+    parser.add_argument("--dep-crate", default=None,
+                        help="how the downstream crate names the dependency")
     options = parser.parse_args()
 
     work = Path(options.work) / options.name
@@ -249,6 +274,24 @@ def main():
     text = source.read_text()
     if "spike_hot_root" not in text:
         source.write_text(text + HOT_ROOT)
+
+    if options.downstream_file:
+        downstream = root / options.downstream_file
+        if not downstream.exists():
+            sys.exit(f"{downstream} does not exist in the copy")
+        text = downstream.read_text()
+        if "spike_downstream_caller" not in text:
+            dep = options.dep_crate or options.package.replace("-", "_")
+            downstream.write_text(text + f"""
+
+// ---- injected by capture.py: the oracle's downstream caller ----
+#[allow(missing_docs, dead_code)]
+#[unsafe(no_mangle)]
+pub extern "C" fn spike_downstream_caller(value: u64) -> u64 {{
+    let reading = {dep}::SpikeReading {{ value, scale: 5 }};
+    {dep}::spike_hot_root(reading).wrapping_add({dep}::spike_inline_twin(reading))
+}}
+""")
 
     argv = clean_invocation(
         capture_invocation(root, options.package, options.target, source, options.toolchain),
