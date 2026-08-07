@@ -944,3 +944,183 @@ cg_clif rather than a subtraction outside it.
 What remains, for `blinker-lib`'s 31 ms: `expand` 15.5, `analysis` 7.2,
 fixed session finalization 7.9. Everything unique to Blinker Live — classify,
 Path D, the backend, extraction, publication — is **0.5 ms of the 31**.
+
+## 34. Objectless codegen — the backend's own timers
+
+§33 established the closure's backend cost by subtracting an empty-universe run
+from a closure-only one, and on the largest fixture that produced −0.23 ms. A
+subtraction at its noise floor is not a measurement. The timers are now inside
+cg_clif, around the work they name.
+
+### The seam
+
+§27 narrowed the codegen *universe* without touching the backend, because the
+universe is a query and queries can be overridden from outside. The codegen
+*output* is not a query. `CodegenBackend` exposes `codegen_crate` and
+`join_codegen`, and the object file is written between them, inside cg_clif's
+AOT driver. There is no seam there reachable from a driver, so this one is a
+backend patch.
+
+It is narrow on purpose: **356 added lines, 300 of them one new file and its
+documentation.** The rest is four hooks in `driver/aot.rs`, `pub(crate)` on two
+existing fields, and one `mod` declaration. Nothing in codegen changes; with no
+callback installed the backend is an unmodified drop-in. The pristine source
+stays in the toolchain (`rustc-src` ships it) and only the diff is in this
+repository — `experiments/live-sink/`, with a `build.sh` that reproduces the
+dylib in about 40 seconds.
+
+```
+MonoInstance → MIR→CLIF → Context::compile → code bytes
+                                             relocations   → callback → arena
+                                             alignment
+                                                  ↓
+                                          object file (still written,
+                                          after the callback, timed)
+```
+
+### The numbers, with no subtraction
+
+Four-instance patch closure, ~130 bytes of code, measured inside the backend:
+
+| | small | rg-lib | blinker-lib |
+|---|---:|---:|---:|
+| MIR → CLIF | 0.036 | 0.103 | 0.044 |
+| Cranelift `Context::compile` | 0.091 | 0.161 | 0.148 |
+| extract code + relocations | 0.001 | 0.001 | 0.001 |
+| **backend total** | **0.13** | **0.27** | **0.19** |
+
+That is the number §27 and §33 were circling. It is under a third of a
+millisecond, it was taken around the work rather than derived from a
+difference, and it settles the question: **the backend is not what to optimize.**
+
+### And the object file costs 0.2 ms, not 7
+
+The object path still runs, after the callback, timed separately — because
+deleting it before measuring it would repeat S0's mistake of removing a step to
+save time and silently invalidating the measurement.
+
+| | small | rg-lib | blinker-lib |
+|---|---:|---:|---:|
+| object define | 0.051 | 0.067 | 0.143 |
+| object write | 0.095 | 0.133 | 0.132 |
+| **total** | **0.15** | **0.20** | **0.28** |
+
+I had assumed the ~7 ms of post-analysis residual §33 reported was largely
+object emission. It is not: **removing the object file entirely saves about
+0.2 ms.** The 7 ms is rustc finishing a session — dependency graph, incremental
+bookkeeping, teardown — and none of it is the object.
+
+That is a correction to the reading in §33, and it changes where the remaining
+work is.
+
+## 35. Successive revisions, no cold reset
+
+Every earlier end-to-end run applied one edit to a pristine crate and then
+started over. That cannot see anything which only goes wrong the *second* time.
+
+`--sequence` applies revisions back to back in one process, each classified
+against the revision before it rather than against pristine, with the exact
+value asserted at every step. With `value = 3, scale = 5` the hot root's
+`total()` is 15, so the four revisions must return 106, 167, 54 and 349.
+
+| fixture | | G0 → G1 | G1 → G2 | G2 → G3 |
+|---|---|---:|---:|---:|
+| small | **edit → active** | 17.2 | 16.4 | 14.2 |
+| | edit → committed | 24.3 | 19.7 | 17.2 |
+| rg-lib | **edit → active** | 20.4 | 21.9 | 22.7 |
+| | edit → committed | 24.2 | 26.0 | 26.7 |
+| blinker-lib | **edit → active** | 27.3 | 26.3 | 26.5 |
+| | edit → committed | 31.6 | 31.6 | 31.1 |
+
+**Every value exact, on all three fixtures, four generations retained.** The
+cost is flat across revisions: incremental state survived publication moving
+ahead of finalization, def-path-hash identities survived successive source
+shapes, body fingerprints advanced, Path D held no stale instance, and the
+generation table did not depend on being the first one.
+
+The two columns answer different questions. `edit → active` is what a developer
+waits for. `edit → committed` is when the compiler is ready for the next
+revision, and the gap — **3–7 ms** — is what moving publication ahead of
+finalization bought.
+
+### The harness was measuring its own extra session
+
+The first version of this ran a separate contract-only session between
+revisions, and it showed G1 and G2 at 54 and 50 ms against G0's 20. That was
+not the second edit being slower. The interposed session had no `--emit=obj`,
+so it left the codegen cache in a different state, and the next revision paid
+for it — and on the `small` fixture it also tried to *link* a binary whose
+`main` the closure-only universe had deliberately not codegened.
+
+The product would never run that session: a revision's contract comes from its
+own compilation. Taking it from there removed the second session, the artefact
+and the link error together.
+
+## 36. What the sink found, and one it could not have found any other way
+
+The runtime differential was pointed at the new artifact path, and all four
+modes pass: 7 of 8 DIRECT mutations agree with a clean rebuild, all three
+negative controls behave as required.
+
+**Slot 0 was the wrong function.** cg_clif delivers a codegen unit's items in
+deterministic order, which is by symbol name — not Path D's order, which puts
+the root first. For two fixtures the root's mangled name sorted first and
+everything worked. `diff_fixture`'s root is `#[no_mangle]`, so `_diff_root`
+sorted *after* `_RNv…blend`, and the published entry point was `blend`. It
+returned 7 for probe `(0, 0)`: a plausible number, from the wrong function. The
+consumer now finds the root by name instead of trusting a position.
+
+**The suite had been testing the wrong backend.** rustc loads a codegen backend
+once per process and caches it, so the first session decides for every session
+after it. The differential's warm session ran first without
+`-Zcodegen-backend`, which meant every later session used LLVM no matter what
+it asked for. The sink was never reached — and before the sink existed, the
+suite was validating LLVM's objects while believing they were cg_clif's.
+
+**A cached codegen unit is not a compilation.** When a crate's code has not
+changed rustc reuses its cached work product and codegens nothing. The sink
+notices, because it only ever sees code that was actually generated. The object
+path did not: it read a file off disk that a previous compilation had left
+there and published it. Here that file happened to hold the right code — right
+by luck, not by construction.
+
+**The artifact class is backend-sensitive.** `new_local_helper` calls
+`rotate_left`. Under LLVM that needs no constant data; under cg_clif it
+materialises through an anonymous data object, which §29's relocation rule
+refuses. So it is *refused* under the sink and *agrees* under the object path.
+A refusal is a safety-preserving outcome and a coverage gap, and the suite now
+counts the two separately — conflating them in either direction makes it
+useless, one by hiding breakage and the other by making an honest refusal look
+like some.
+
+The DIRECT semantic envelope is backend-independent. The *artifact* envelope is
+not, and that had not been written down before.
+
+## 37. Identity, permanently
+
+The sets §32 compares are keyed by `DefPathHash`, which rustc defines as stable
+across crate and compilation-session boundaries. Not a definition index, which
+§32 found is not an identity; not a rendered path, which is a string this code
+invents rather than the compiler's own answer, and which cost 3.7 ms flat when
+rendered the readable way (`def_path_str` walks the whole crate graph for the
+*visible* path). A readable path travels beside the hash so that a refusal can
+name the function rather than a hash.
+
+The invariant, as it now stands:
+
+```
+Δbody = bodies added, removed or changed, by DefPathHash
+C     = Path D's patch closure, by DefPathHash
+
+DIRECT iff
+  1.  Δbody ⊆ C                          — nothing changed outside the closure
+  2.  every member of C satisfies the downstream-interface contract
+  3.  no new base-image state is required — statics, TLS, exported data
+  4.  every relocation target ∈ C ∪ base-image symbols ∪ runtime allowlist
+  5.  emitted definitions = C ∪ allowlist  (equality, both directions)
+  otherwise FALLBACK
+```
+
+Subset in (1) and equality in (5), and the difference matters: a closure may
+legitimately contain unchanged functions, but an object may not contain a
+definition nobody predicted.

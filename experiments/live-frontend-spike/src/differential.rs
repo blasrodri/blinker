@@ -287,6 +287,17 @@ impl Sabotage {
 /// Run the whole suite.
 pub fn run(options: &crate::Options, sabotage: Sabotage) -> Vec<Trial> {
     let work = options.incremental.clone();
+    // Start cold, every run.
+    //
+    // Not a tidiness measure. rustc reuses a cached codegen unit when a
+    // crate's code has not changed, and the suite runs the same ten mutations
+    // once per sabotage mode — so from the second mode onward every revision
+    // was a cache hit and nothing was compiled at all. The sink noticed,
+    // because it only ever sees code that was actually generated. The object
+    // path did not: it read a file off disk that a *previous* compilation had
+    // left there and published it. That happened to be the right code here,
+    // and it is right by luck rather than by construction.
+    let _ = std::fs::remove_dir_all(&work);
     let _ = std::fs::create_dir_all(&work);
     let pristine = std::fs::read_to_string(options.variants.join("pristine.rs"))
         .expect("the pristine variant exists");
@@ -358,7 +369,22 @@ fn trial(
         &options.incremental,
         &options.hot,
         crate::Mode::HotClosure,
-        &["-Cmetadata=diff".into(), "-Cdebug-assertions=off".into()],
+        // The backend flag belongs here too, and its absence was not harmless.
+        // rustc loads the codegen backend once per *process* and caches it, so
+        // the first session decides for all of them. This one ran first with no
+        // flag, which meant every later session used LLVM no matter what it
+        // asked for — the sink was never reached, and before that the suite was
+        // quietly validating LLVM's objects while believing they were cg_clif's.
+        &{
+            let mut arguments = vec![
+                "-Cmetadata=diff".to_string(),
+                "-Cdebug-assertions=off".to_string(),
+            ];
+            if let Some(backend) = &options.backend {
+                arguments.push(format!("-Zcodegen-backend={}", backend.display()));
+            }
+            arguments
+        },
         false,
     );
 
@@ -366,6 +392,13 @@ fn trial(
     std::fs::write(&options.target_file, edited).expect("write edited");
     let arena = Arena::reserve(64 * 1024 * 1024).expect("arena");
     let runtime = Runtime::new(4);
+    if options.backend.is_some() {
+        crate::sink::set_sabotage(crate::live::PatchOptions {
+            omit_closure_member: sabotage == Sabotage::OmitClosureMember,
+            corrupt_relocation: sabotage == Sabotage::CorruptRelocation,
+            ignore_classifier: sabotage == Sabotage::IgnoreClassifier,
+        });
+    }
     let live = crate::live::patch(
         &arena,
         &runtime,
@@ -380,6 +413,7 @@ fn trial(
         // closure. That is what a base image is *for*, and passing `None` here
         // made `read_static` fail to resolve a static the program plainly had.
         Some(base.handle),
+        options.backend.as_deref(),
         crate::live::PatchOptions {
             omit_closure_member: sabotage == Sabotage::OmitClosureMember,
             corrupt_relocation: sabotage == Sabotage::CorruptRelocation,
@@ -433,14 +467,31 @@ pub fn report(trials: &[Trial], sabotage: Sabotage, out: Option<&PathBuf>) -> bo
         "mutation", "verdict", "closure", "agreed", "base", "note"
     );
     let mut ok = true;
+    let mut refused = 0usize;
+    let mut agreed = 0usize;
     for trial in trials {
+        if trial.agreed == Some(true) {
+            agreed += 1;
+        }
         // What "correct" means depends on which control is running, and the
         // whole value of the controls is that they expect *different* things.
         let expected_to_publish = trial.verdict == "DIRECT" && sabotage == Sabotage::None;
         let good = match sabotage {
             Sabotage::None => {
                 if expected_to_publish {
-                    trial.agreed == Some(true) && trial.base_intact
+                    // A DIRECT edit that could not be built into an artifact is
+                    // a *coverage* gap, not a safety failure: the program is
+                    // untouched and correct. Counted separately below, because
+                    // conflating "refused" with "wrong" in either direction
+                    // makes the suite useless — one hides real breakage, the
+                    // other makes an honest refusal look like one.
+                    match trial.agreed {
+                        Some(agreed) => agreed && trial.base_intact,
+                        None => {
+                            refused += 1;
+                            trial.base_intact
+                        }
+                    }
                 } else {
                     // A refusal is a correct outcome; the program must survive it.
                     trial.agreed.is_none() && trial.base_intact
@@ -458,7 +509,15 @@ pub fn report(trials: &[Trial], sabotage: Sabotage, out: Option<&PathBuf>) -> bo
             // control was miswritten, not the system.
             Sabotage::IgnoreClassifier => {
                 if trial.verdict == "DIRECT" {
-                    trial.agreed == Some(true) && trial.base_intact
+                    // Same allowance as the main mode: an artifact the class
+                    // cannot build is a refusal, not a disagreement.
+                    match trial.agreed {
+                        Some(agreed) => agreed && trial.base_intact,
+                        None => {
+                            refused += 1;
+                            trial.base_intact
+                        }
+                    }
                 } else {
                     // Something must catch it: either the artifact rules
                     // refuse to build it, or the behaviour comparison sees it.
@@ -472,10 +531,11 @@ pub fn report(trials: &[Trial], sabotage: Sabotage, out: Option<&PathBuf>) -> bo
             trial.mutation,
             if trial.verdict.is_empty() { "-" } else { &trial.verdict },
             trial.closure_size,
-            match trial.agreed {
-                Some(true) => "yes",
-                Some(false) => "NO",
-                None => "-",
+            match (trial.agreed, expected_to_publish) {
+                (Some(true), _) => "yes",
+                (Some(false), _) => "NO",
+                (None, true) => "refused",
+                (None, false) => "-",
             },
             if trial.base_intact { "intact" } else { "MOVED" },
             if good { "ok  " } else { "FAIL" },
@@ -486,10 +546,21 @@ pub fn report(trials: &[Trial], sabotage: Sabotage, out: Option<&PathBuf>) -> bo
                 .unwrap_or_default(),
         );
     }
+    // A suite in which nothing ever agrees would satisfy every rule above by
+    // refusing everything, so the count that would make it vacuous is stated.
+    if sabotage == Sabotage::None && agreed == 0 {
+        ok = false;
+        println!("\n  nothing agreed: the suite proved nothing");
+    }
     println!(
-        "\n  {}: {}",
+        "\n  {}: {}{}",
         sabotage.label(),
-        if ok { "as expected" } else { "NOT as expected" }
+        if ok { "as expected" } else { "NOT as expected" },
+        if refused > 0 {
+            format!("  ({agreed} agreed, {refused} refused as out of artifact class)")
+        } else {
+            String::new()
+        }
     );
     if let Some(path) = out {
         let json = serde_json::to_string_pretty(trials).expect("serialize");

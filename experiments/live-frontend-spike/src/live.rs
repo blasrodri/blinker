@@ -70,6 +70,22 @@ pub struct LiveRecord {
     pub object_defines: usize,
     pub code_bytes: usize,
     pub relocations: usize,
+    /// Edit → the code is live. Set only on the sink path, where publication
+    /// happens inside codegen rather than after the session.
+    pub active_ms: f64,
+    /// The backend's own timers, when the live sink supplied them (§34).
+    pub timings: Option<crate::sink::Timings>,
+    /// This revision's contract, which is the *next* revision's baseline.
+    ///
+    /// Carried out of the session rather than recomputed by a second one. The
+    /// first version of §35 ran an extra contract-only session between
+    /// revisions, and it cost more than it looked: without `--emit=obj` it left
+    /// the codegen cache in a different state, so G1 and G2 measured 54 and 50
+    /// ms against G0's 20 — an artefact of the harness, not of the second edit.
+    /// It also tried to *link* a binary fixture whose `main` the closure-only
+    /// universe had not codegened.
+    #[serde(skip)]
+    pub contract: Option<crate::classify::Contract>,
     /// What the published function returned. The point of the exercise.
     pub returned: Option<i64>,
     pub error: Option<String>,
@@ -88,12 +104,12 @@ pub struct LiveRecord {
 /// for rather than absorbed.
 const RUNTIME_SUPPORT: &[&str] = &[];
 
-/// A function lifted out of a cg_clif object.
-struct Lifted {
-    name: String,
-    code: Vec<u8>,
+/// A function lifted out of a cg_clif object, or delivered by its live sink.
+pub struct Lifted {
+    pub name: String,
+    pub code: Vec<u8>,
     /// `(offset within this function, symbol name, kind, pc_relative, addend)`
-    relocations: Vec<(u64, String, blinker_macho::Arm64RelocationKind, bool, i64)>,
+    pub relocations: Vec<(u64, String, blinker_macho::Arm64RelocationKind, bool, i64)>,
 }
 
 /// Pull the named functions out of an object's `__TEXT,__text`.
@@ -244,7 +260,7 @@ fn check_universe(defined: &[String], expected: &[String]) -> Result<(), String>
 }
 
 /// Mach-O prefixes every symbol with an underscore, and Rust mangles.
-fn symbol_matches(symbol: &str, wanted: &str) -> bool {
+pub fn symbol_matches(symbol: &str, wanted: &str) -> bool {
     let bare = symbol.strip_prefix('_').unwrap_or(symbol);
     bare == wanted || bare.contains(wanted)
 }
@@ -256,7 +272,7 @@ fn symbol_matches(symbol: &str, wanted: &str) -> bool {
 /// resolved fails the publication rather than being patched with a guess, and
 /// the failure happens before anything is made executable — the arena's
 /// `publish` is the last step, not the first.
-fn publish(
+pub fn publish(
     arena: &Arena,
     runtime: &Runtime,
     lifted: &[Lifted],
@@ -506,9 +522,15 @@ pub fn patch(
     before: Option<&crate::classify::Contract>,
     out_dir: &Path,
     image: Option<*mut libc::c_void>,
+    backend: Option<&Path>,
     options: PatchOptions,
 ) -> Patch {
     let mut patch = Patch::default();
+    // The sink path publishes from inside codegen, so the arena and runtime
+    // have to be reachable from the callback before the session starts.
+    if backend.is_some() {
+        crate::sink::begin(arena, runtime, image, Instant::now(), hot);
+    }
     let session = crate::run_session_with(
         fixture,
         target_file,
@@ -516,7 +538,10 @@ pub fn patch(
         hot,
         crate::Mode::HotClosure,
         &[
-            "-Zcodegen-backend=cranelift".into(),
+            match backend {
+                Some(path) => format!("-Zcodegen-backend={}", path.display()),
+                None => "-Zcodegen-backend=cranelift".into(),
+            },
             "--emit=obj".into(),
             format!("--out-dir={}", out_dir.display()),
             "-Cmetadata=diff".into(),
@@ -534,6 +559,33 @@ pub fn patch(
         true,
     );
     patch.closure_size = session.mono_items_examined;
+    // The sink path is finished here: the artifact was published from inside
+    // codegen, so there is nothing left to lift.
+    if backend.is_some() {
+        let outcome = crate::sink::finish();
+        if let Some(error) = session.error {
+            patch.error = Some(error);
+            return patch;
+        }
+        let (Some(after), Some(before)) = (session.contract.as_ref(), before) else {
+            patch.error = Some("no contract to compare".into());
+            return patch;
+        };
+        let verdict = crate::classify::classify(before, after);
+        patch.verdict = verdict.label();
+        if !verdict.is_direct() && !options.ignore_classifier {
+            patch.error = Some(format!("the classifier refused: {verdict:?}"));
+            return patch;
+        }
+        match outcome {
+            Some(outcome) if outcome.error.is_some() => patch.error = outcome.error,
+            Some(outcome) if outcome.entry != 0 => {
+                patch.entry = Some(outcome.entry as *const u8)
+            }
+            _ => patch.error = Some("the sink delivered nothing".into()),
+        }
+        return patch;
+    }
     if let Some(error) = session.error {
         patch.error = Some(error);
         return patch;
@@ -786,5 +838,122 @@ pub fn revision(
         Err(error) => record.error = Some(error),
     }
     record.total_ms = whole.elapsed().as_secs_f64() * 1e3;
+    record
+}
+
+/// One revision through cg_clif's live sink: no object file in the path.
+///
+/// The difference from `revision` is where publication happens. There, the
+/// compiler session ran to completion, an object was found on disk, the
+/// closure was lifted out of it and only then published. Here the artifact is
+/// delivered from inside codegen and published on the spot, so the edit is
+/// active while rustc is still writing its object and finalizing its
+/// incremental session.
+///
+/// That is why this returns two times rather than one, and they answer
+/// different questions: `active_ms` is what a developer waits for; `total_ms`
+/// is when the compiler is ready for the next revision.
+#[allow(clippy::too_many_arguments)]
+pub fn sink_revision(
+    arena: &Arena,
+    runtime: &Runtime,
+    fixture: &crate::Fixture,
+    target_file: &Path,
+    incremental: &Path,
+    hot: &str,
+    edited: &str,
+    before: Option<&crate::classify::Contract>,
+    out_dir: &Path,
+    image: Option<*mut libc::c_void>,
+    extra: &[String],
+) -> LiveRecord {
+    let mut record = LiveRecord {
+        fixture: fixture.name.clone(),
+        ..Default::default()
+    };
+    let whole = Instant::now();
+    std::fs::write(target_file, edited).expect("write the edit");
+
+    // The clock starts at the edit, and the sink stops it from inside codegen.
+    crate::sink::begin(arena, runtime, image, whole, hot);
+    let mut arguments = vec![
+        "--emit=obj".to_string(),
+        format!("--out-dir={}", out_dir.display()),
+    ];
+    arguments.extend(extra.iter().cloned());
+    let session = crate::run_session_with(
+        fixture,
+        target_file,
+        incremental,
+        hot,
+        crate::Mode::HotClosure,
+        &arguments,
+        true,
+    );
+    let outcome = crate::sink::finish();
+
+    record.expand_ms = session.expand_ms;
+    record.analysis_ms = session.analysis_ms;
+    record.hot_mir_ms = session.hot_mir_ms;
+    record.validate_ms = session.expand_ms + session.analysis_ms + session.hot_mir_ms;
+    record.classify_ms = session.classify_ms;
+    record.closure_ms = session.hot_closure_ms;
+    record.closure_size = session.mono_items_examined;
+    record.codegen_ms =
+        (session.session_ms - record.validate_ms - record.closure_ms - record.classify_ms)
+            .max(0.0);
+    record.total_ms = whole.elapsed().as_secs_f64() * 1e3;
+    record.contract = session.contract.clone();
+
+    if let Some(error) = session.error {
+        record.error = Some(error);
+        return record;
+    }
+    // The verdict is still computed, and still decides. The sink publishes
+    // whatever cg_clif compiled, so a FALLBACK has to be turned into a
+    // rollback rather than prevented — which is why this runs before the
+    // artifact is reported and why a refused revision is rolled back below.
+    let verdict = match (session.contract.as_ref(), before) {
+        (Some(after), Some(before)) => crate::classify::classify(before, after),
+        _ => {
+            record.error = Some("no contract to compare".into());
+            return record;
+        }
+    };
+    record.verdict = verdict.label();
+
+    let Some(outcome) = outcome else {
+        if verdict.is_direct() {
+            record.error = Some("the sink delivered nothing".into());
+        }
+        return record;
+    };
+    record.publish_ms = outcome.publish_ms;
+    record.code_bytes = outcome.code_bytes;
+    record.relocations = outcome.relocations;
+    record.active_ms = outcome.active_ms;
+    record.timings = Some(outcome.timings);
+    record.object_defines = outcome.timings.functions as usize;
+    if let Some(error) = outcome.error {
+        record.error = Some(error);
+        return record;
+    }
+    if !verdict.is_direct() {
+        // Published, then refused. The generation table's rollback is what
+        // makes this recoverable rather than a hole: the classifier's answer
+        // still governs what the program runs.
+        // Back to the generation this revision superseded. `parent` is on the
+        // generation itself, which is what makes a rollback a fact about the
+        // published history rather than a count the caller has to keep.
+        let parent = scope(runtime, |generation| generation.parent);
+        runtime.rollback_code(parent);
+        return record;
+    }
+    if outcome.entry != 0 {
+        // SAFETY: an address in the arena, of the fixture's declared signature.
+        let f: extern "C" fn(u64, u32) -> u64 =
+            unsafe { std::mem::transmute(outcome.entry as *const u8) };
+        record.returned = Some(f(3, 5) as i64);
+    }
     record
 }

@@ -88,10 +88,11 @@ pub struct Contract {
     /// Path D's closure: how many instances the changed body reaches, and
     /// whether every one of them resolved inside this crate.
     pub closure_size: usize,
-    /// The closure's members, by def path. The set a live patch replaces.
+    /// The closure's members, by `DefPathHash`. The set a live patch replaces.
     pub closure_paths: std::collections::BTreeSet<String>,
-    /// Every function the crate defines, and a fingerprint of its body (§32).
-    pub bodies: std::collections::BTreeMap<String, String>,
+    /// Every function the crate defines, keyed by `DefPathHash`, holding a
+    /// fingerprint of its body and a readable path (§32).
+    pub bodies: std::collections::BTreeMap<String, (String, String)>,
     pub closure_is_local: bool,
     /// Statics the closure reads. A body that introduces a new one needs
     /// storage the base image does not have, and no signature or ABI
@@ -242,7 +243,7 @@ pub fn contract_of(
     statics: &std::collections::BTreeSet<String>,
     crate_statics: &std::collections::BTreeSet<String>,
     closure_paths: &std::collections::BTreeSet<String>,
-    bodies: std::collections::BTreeMap<String, String>,
+    bodies: std::collections::BTreeMap<String, (String, String)>,
 ) -> Contract {
     let global = def_id.to_def_id();
     let def_kind = tcx.def_kind(def_id);
@@ -517,23 +518,24 @@ pub fn classify(before: &Contract, after: &Contract) -> Verdict {
     // The runtime differential caught it returning 7 where a clean rebuild
     // returned 8, which is the first thing that suite found that nothing else
     // could have.
-    if after.bodies.is_empty() || after.bodies.values().any(String::is_empty) {
+    if after.bodies.is_empty() || after.bodies.values().any(|(hash, _)| hash.is_empty()) {
         // Fail closed. An unavailable fingerprint compares equal to another
         // unavailable fingerprint, so a missing one would make this check pass
         // by being unable to run.
         return fallback(Reason::BodiesUnavailable);
     }
     let mut outside: Vec<String> = Vec::new();
-    for (path, hash) in &after.bodies {
-        if before.bodies.get(path) != Some(hash) && !after.closure_paths.contains(path) {
-            outside.push(path.clone());
+    for (id, (hash, name)) in &after.bodies {
+        let unchanged = before.bodies.get(id).map(|(hash, _)| hash) == Some(hash);
+        if !unchanged && !after.closure_paths.contains(id) {
+            outside.push(name.clone());
         }
     }
     // A function that existed and no longer does is also a change outside the
     // closure — the base image still contains it, and still calls it.
-    for path in before.bodies.keys() {
-        if !after.bodies.contains_key(path) && !after.closure_paths.contains(path) {
-            outside.push(path.clone());
+    for (id, (_, name)) in &before.bodies {
+        if !after.bodies.contains_key(id) && !after.closure_paths.contains(id) {
+            outside.push(name.clone());
         }
     }
     if !outside.is_empty() {

@@ -1,0 +1,437 @@
+diff -ruN --exclude=target --exclude=Cargo.lock pristine/src/base.rs build/src/base.rs
+--- pristine/src/base.rs	2026-08-07 17:47:41
++++ build/src/base.rs	2026-08-07 17:34:22
+@@ -23,9 +23,9 @@
+ use crate::{codegen_f16_f128, enable_verifier};
+ 
+ pub(crate) struct CodegenedFunction {
+-    symbol_name: String,
++    pub(crate) symbol_name: String,
+     func_id: FuncId,
+-    func: Function,
++    pub(crate) func: Function,
+     clif_comments: CommentWriter,
+     func_debug_cx: Option<FunctionDebugContext>,
+     inline_asm: String,
+diff -ruN --exclude=target --exclude=Cargo.lock pristine/src/driver/aot.rs build/src/driver/aot.rs
+--- pristine/src/driver/aot.rs	2026-08-07 17:47:41
++++ build/src/driver/aot.rs	2026-08-07 17:38:08
+@@ -39,6 +39,9 @@
+     debug_context: Option<DebugContext>,
+     codegened_functions: Vec<CodegenedFunction>,
+     global_asm: String,
++    /// MIR → CLIF for this unit, measured where it happens rather than
++    /// inferred from the outside.
++    mir_to_clif_ns: u64,
+ }
+ 
+ fn make_module(tcx: TyCtxt<'_>, cgu_name: &str) -> AotModule {
+@@ -77,6 +80,7 @@
+         debug_context,
+         codegened_functions,
+         global_asm,
++        mir_to_clif_ns: 0,
+     }
+ }
+ 
+@@ -173,6 +177,7 @@
+                     );
+                     continue;
+                 }
++                let lowering_started = Instant::now();
+                 let codegened_function = crate::base::codegen_fn(
+                     tcx,
+                     cgu.name(),
+@@ -182,6 +187,7 @@
+                     &mut module.module,
+                     instance,
+                 );
++                module.mir_to_clif_ns += lowering_started.elapsed().as_nanos() as u64;
+                 module.codegened_functions.push(codegened_function);
+             }
+             MonoItem::Static(def_id) => {
+@@ -212,12 +218,51 @@
+     cgu_name: String,
+     kind: ModuleKind,
+ ) -> Result<CompiledModule, String> {
++    let mut delivered = false;
+     prof.generic_activity_with_arg("compile functions", &*cgu_name).run(|| {
+         cranelift_codegen::timing::set_thread_profiler(Box::new(super::MeasuremeProfiler(
+             prof.clone(),
+         )));
+ 
+         let mut cached_context = Context::new();
++        // The live sink, when one is installed. Everything in this block runs
++        // before the object path below it, and the callback at the end of it
++        // is where the product's latency clock stops.
++        if crate::live_sink::enabled() {
++            let mut artifacts = crate::live_sink::Artifacts::default();
++            artifacts.timings.mir_to_clif_ns = aot_module.mir_to_clif_ns;
++            for codegened_func in &aot_module.codegened_functions {
++                cached_context.clear();
++                let cloning = Instant::now();
++                cached_context.func = codegened_func.func.clone();
++                artifacts.timings.clif_clone_ns += cloning.elapsed().as_nanos() as u64;
++                let started = Instant::now();
++                let outcome = cached_context
++                    .compile(aot_module.module.isa(), &mut Default::default());
++                artifacts.timings.cranelift_ns += started.elapsed().as_nanos() as u64;
++                if outcome.is_err() {
++                    // Not fatal here: the object path below runs the same
++                    // compile and reports the error properly. Refusing to
++                    // deliver an artifact is the correct outcome.
++                    continue;
++                }
++                let started = Instant::now();
++                artifacts.add(
++                    &aot_module.module,
++                    &cached_context,
++                    &codegened_func.symbol_name,
++                );
++                artifacts.timings.extract_ns += started.elapsed().as_nanos() as u64;
++            }
++            // Only the unit that actually delivered a patch reports what the
++            // object path costs afterwards. Otherwise an empty allocator unit
++            // would overwrite the real unit's numbers with its own.
++            delivered = artifacts.deliver();
++            if delivered {
++                crate::live_sink::record_object_start();
++            }
++        }
++
+         for codegened_func in aot_module.codegened_functions {
+             crate::base::compile_fn(
+                 &prof,
+@@ -231,6 +276,9 @@
+                 codegened_func,
+             );
+         }
++        if delivered {
++            crate::live_sink::record_object_define();
++        }
+     });
+ 
+     let global_asm_object_file =
+@@ -250,6 +298,7 @@
+         })?;
+ 
+     prof.generic_activity_with_arg("write object file", &*cgu_name).run(|| {
++        let _writing = crate::live_sink::ObjectWriteTimer::start(delivered);
+         emit_module(
+             output_filenames,
+             prof,
+diff -ruN --exclude=target --exclude=Cargo.lock pristine/src/lib.rs build/src/lib.rs
+--- pristine/src/lib.rs	2026-08-07 17:47:41
++++ build/src/lib.rs	2026-08-07 17:33:26
+@@ -67,6 +67,7 @@
+ mod inline_asm;
+ mod intrinsics;
+ mod linkage;
++pub mod live_sink;
+ mod main_shim;
+ mod num;
+ mod optimize;
+diff -ruN --exclude=target --exclude=Cargo.lock pristine/src/live_sink.rs build/src/live_sink.rs
+--- pristine/src/live_sink.rs	1970-01-01 01:00:00
++++ build/src/live_sink.rs	2026-08-07 17:37:55
+@@ -0,0 +1,300 @@
++//! A second output sink for compiled functions: machine code straight out,
++//! with no object file.
++//!
++//! cg_clif's AOT driver lowers MIR to CLIF, asks Cranelift to compile it, and
++//! hands the result to an `ObjectModule` which writes a Mach-O/ELF file for a
++//! linker to consume. Blinker Live wants the step before that one — the code
++//! bytes, their alignment, and their relocations with symbol names — and then
++//! puts them in a `MAP_JIT` arena itself.
++//!
++//! This is deliberately an *output sink* and not a codegen change. Everything
++//! above it, from `TyCtxt` to `Context::compile`, is untouched cg_clif. The
++//! whole of the diff is: compile through `Context::compile` directly, hand the
++//! result to a callback, and then carry on into the object path exactly as
++//! before.
++//!
++//! Why the object path still runs
++//! ------------------------------
++//!
++//! Because deleting it before measuring it would repeat a mistake this project
++//! has already made once. S0 stopped the compiler after analysis to save time
++//! and silently made every measurement cold. So the object is still written,
++//! *after* the callback has fired, and it is timed separately. The cost of
++//! removing it is then a number that was observed rather than projected.
++//!
++//! The redundancy is real and is stated: in live mode a function is compiled
++//! twice, once for the artifact and once for the object. The second compile is
++//! entirely inside the post-publication window.
++
++use std::sync::Mutex;
++
++use cranelift_codegen::ir::{ExternalName, Function};
++use cranelift_codegen::{binemit::Reloc, Context, FinalizedRelocTarget};
++use cranelift_module::{FuncId, Module};
++
++/// A relocation, flattened for the C boundary.
++#[repr(C)]
++pub struct LiveReloc {
++    pub offset: u32,
++    /// See `reloc_kind`.
++    pub kind: u32,
++    pub addend: i64,
++    pub name: *const u8,
++    pub name_len: usize,
++}
++
++/// One compiled function.
++#[repr(C)]
++pub struct LiveFunction {
++    pub name: *const u8,
++    pub name_len: usize,
++    pub code: *const u8,
++    pub code_len: usize,
++    pub align: u32,
++    pub relocs: *const LiveReloc,
++    pub reloc_count: usize,
++}
++
++/// Timers, in nanoseconds, taken *inside* the backend.
++///
++/// The point of these is that the consumer no longer has to subtract one
++/// external measurement from another. The last attempt to establish the
++/// closure's backend cost that way produced a negative number, which is what a
++/// subtraction looks like when it reaches its noise floor.
++#[repr(C)]
++#[derive(Default, Clone, Copy)]
++pub struct LiveTimings {
++    /// MIR → CLIF, for every function in the unit.
++    pub mir_to_clif_ns: u64,
++    /// `Context::compile` — Cranelift proper.
++    pub cranelift_ns: u64,
++    /// Flattening code and relocations for the sink.
++    pub extract_ns: u64,
++    /// Everything after the callback: the object path, which exists to keep
++    /// rustc's pipeline whole and which the eventual design does not have.
++    pub object_define_ns: u64,
++    pub object_write_ns: u64,
++    pub functions: u32,
++    pub code_bytes: u32,
++    /// Cloning the CLIF so the object path can still consume it afterwards.
++    /// Harness-only: the eventual design has no object path and so no clone.
++    /// Reported rather than omitted, because unaccounted work is how a number
++    /// flatters itself.
++    pub clif_clone_ns: u64,
++}
++
++type Callback = extern "C" fn(*const LiveFunction, usize, *const LiveTimings);
++
++/// Set by the consumer before the session. A `None` here means ordinary cg_clif
++/// with nothing added — the backend is usable as a drop-in either way.
++static CALLBACK: Mutex<Option<Callback>> = Mutex::new(None);
++
++/// Install the sink. Passing null removes it.
++///
++/// # Safety
++/// `callback` must be a valid function pointer of the declared type, and must
++/// not outlive the process.
++#[unsafe(no_mangle)]
++pub extern "C" fn blinker_live_set_sink(callback: Option<Callback>) {
++    *CALLBACK.lock().expect("not poisoned") = callback;
++}
++
++pub(crate) fn enabled() -> bool {
++    CALLBACK.lock().expect("not poisoned").is_some()
++}
++
++/// What the object path costs, recorded after the callback has already fired.
++///
++/// Separate from `LiveTimings` because it is separate in meaning: this is the
++/// work that happens *after* the developer's edit is live, and the whole
++/// argument for an objectless design is that it is exactly this much.
++static OBJECT: Mutex<(Option<std::time::Instant>, u64, u64)> = Mutex::new((None, 0, 0));
++
++pub(crate) fn record_object_start() {
++    let mut object = OBJECT.lock().expect("not poisoned");
++    *object = (Some(std::time::Instant::now()), 0, 0);
++}
++
++pub(crate) fn record_object_define() {
++    let mut object = OBJECT.lock().expect("not poisoned");
++    if let Some(started) = object.0 {
++        object.1 = started.elapsed().as_nanos() as u64;
++    }
++}
++
++/// Times `emit_module`, including on the paths that return early.
++pub(crate) struct ObjectWriteTimer(std::time::Instant, bool);
++
++impl ObjectWriteTimer {
++    pub(crate) fn start(record: bool) -> ObjectWriteTimer {
++        ObjectWriteTimer(std::time::Instant::now(), record)
++    }
++}
++
++impl Drop for ObjectWriteTimer {
++    fn drop(&mut self) {
++        if !self.1 {
++            return;
++        }
++        let mut object = OBJECT.lock().expect("not poisoned");
++        object.2 = self.0.elapsed().as_nanos() as u64;
++    }
++}
++
++/// Read back what the object path cost. Zero when no live sink was installed.
++///
++/// # Safety
++/// Both pointers must be valid for one `u64` write.
++#[unsafe(no_mangle)]
++pub unsafe extern "C" fn blinker_live_object_cost(define_ns: *mut u64, write_ns: *mut u64) {
++    let object = OBJECT.lock().expect("not poisoned");
++    unsafe {
++        *define_ns = object.1;
++        *write_ns = object.2;
++    }
++}
++
++/// A relocation kind, as a number both sides agree on.
++///
++/// A closed mapping rather than a passthrough of Cranelift's enum: an
++/// unrecognised kind must reach the consumer *as* unrecognised so that it can
++/// refuse the patch. Passing an opaque discriminant through would let a kind
++/// nobody has considered be silently treated as one that was.
++fn reloc_kind(reloc: Reloc) -> u32 {
++    match reloc {
++        Reloc::Abs8 => 1,
++        Reloc::Arm64Call => 2,
++        Reloc::Aarch64AdrGotPage21 => 3,
++        Reloc::Aarch64Ld64GotLo12Nc => 4,
++        Reloc::Aarch64AdrPrelPgHi21 => 5,
++        Reloc::Aarch64AddAbsLo12Nc => 6,
++        _ => 0,
++    }
++}
++
++/// The symbol a relocation names.
++fn symbol_of(module: &dyn Module, func: &Function, name: &ExternalName) -> Option<String> {
++    match name {
++        ExternalName::User(reference) => {
++            let user = &func.params.user_named_funcs()[*reference];
++            let declarations = module.declarations();
++            match user.namespace {
++                // cranelift-module's convention: namespace 0 is a function and
++                // namespace 1 is a data object.
++                0 => {
++                    let id = FuncId::from_u32(user.index);
++                    Some(declarations.get_function_decl(id).linkage_name(id).into_owned())
++                }
++                1 => {
++                    let id = cranelift_module::DataId::from_u32(user.index);
++                    Some(declarations.get_data_decl(id).linkage_name(id).into_owned())
++                }
++                _ => None,
++            }
++        }
++        ExternalName::TestCase(_) | ExternalName::LibCall(_) | ExternalName::KnownSymbol(_) => {
++            // Deliberately unnamed rather than guessed. The consumer's
++            // relocation invariant refuses anything it cannot explain, and an
++            // invented name would be an explanation it should not accept.
++            None
++        }
++    }
++}
++
++/// One function's artifact, owned so the pointers handed across the boundary
++/// stay valid until the callback returns.
++#[derive(Default)]
++pub(crate) struct Artifacts {
++    names: Vec<String>,
++    code: Vec<Vec<u8>>,
++    aligns: Vec<u32>,
++    reloc_names: Vec<String>,
++    relocs: Vec<Vec<(u32, u32, i64, usize)>>,
++    pub(crate) timings: LiveTimings,
++}
++
++impl Artifacts {
++    /// Take everything Cranelift produced for one function.
++    ///
++    /// Called after `Context::compile`, so nothing is recompiled here.
++    pub(crate) fn add(&mut self, module: &dyn Module, context: &Context, symbol: &str) {
++        let compiled = context.compiled_code().expect("compiled");
++        let buffer = &compiled.buffer;
++        let mut relocs = Vec::new();
++        for reloc in buffer.relocs() {
++            let target = match &reloc.target {
++                FinalizedRelocTarget::ExternalName(name) => {
++                    symbol_of(module, &context.func, name)
++                }
++                // A relocation against a fixed offset inside this same
++                // function needs no symbol.
++                FinalizedRelocTarget::Func(_) => None,
++            };
++            let index = match target {
++                Some(name) => {
++                    self.reloc_names.push(name);
++                    self.reloc_names.len() - 1
++                }
++                // usize::MAX means "this relocation has no name the backend
++                // could give it", which the consumer must treat as a refusal.
++                None => usize::MAX,
++            };
++            relocs.push((reloc.offset, reloc_kind(reloc.kind), reloc.addend, index));
++        }
++        self.names.push(symbol.to_owned());
++        self.code.push(buffer.data().to_vec());
++        self.aligns.push(buffer.alignment);
++        self.relocs.push(relocs);
++        self.timings.functions += 1;
++        self.timings.code_bytes += buffer.data().len() as u32;
++    }
++
++    /// Hand everything to the consumer, which publishes it.
++    ///
++    /// This is the moment the product's latency clock stops. Everything after
++    /// it — the object file, rustc's incremental bookkeeping, the rest of the
++    /// session — is work the developer is not waiting on.
++    pub(crate) fn deliver(&self) -> bool {
++        let Some(callback) = *CALLBACK.lock().expect("not poisoned") else {
++            return false;
++        };
++        // A crate has more than one codegen unit — a binary gets a separate one
++        // for the allocator shim — and only one of them holds the patch. An
++        // empty delivery is not a patch, and publishing it produced a
++        // generation with no slot 0.
++        if self.names.is_empty() {
++            return false;
++        }
++        let mut flat_relocs: Vec<Vec<LiveReloc>> = Vec::with_capacity(self.relocs.len());
++        for relocs in &self.relocs {
++            flat_relocs.push(
++                relocs
++                    .iter()
++                    .map(|(offset, kind, addend, index)| LiveReloc {
++                        offset: *offset,
++                        kind: *kind,
++                        addend: *addend,
++                        name: match self.reloc_names.get(*index) {
++                            Some(name) => name.as_ptr(),
++                            None => std::ptr::null(),
++                        },
++                        name_len: self.reloc_names.get(*index).map_or(0, |n| n.len()),
++                    })
++                    .collect(),
++            );
++        }
++        let functions: Vec<LiveFunction> = (0..self.names.len())
++            .map(|index| LiveFunction {
++                name: self.names[index].as_ptr(),
++                name_len: self.names[index].len(),
++                code: self.code[index].as_ptr(),
++                code_len: self.code[index].len(),
++                align: self.aligns[index],
++                relocs: flat_relocs[index].as_ptr(),
++                reloc_count: flat_relocs[index].len(),
++            })
++            .collect();
++        callback(functions.as_ptr(), functions.len(), &self.timings);
++        true
++    }
++}

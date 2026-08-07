@@ -61,6 +61,7 @@ use rustc_middle::ty::{self, TyCtxt, TypingEnv};
 mod classify;
 mod differential;
 mod live;
+mod sink;
 
 // R1's runtime, included by path rather than copied: one source of truth for
 // the arena and the generation table, and the end-to-end path must exercise
@@ -446,7 +447,9 @@ fn find_hot_root(tcx: TyCtxt<'_>, name: &str) -> Option<LocalDefId> {
 /// bodies, for its own incremental machinery, so this reads a number that has
 /// been computed rather than computing one — which is why §32 measures the
 /// check at a fraction of a millisecond on crates with hundreds of functions.
-fn body_fingerprints(tcx: TyCtxt<'_>) -> std::collections::BTreeMap<String, String> {
+fn body_fingerprints(
+    tcx: TyCtxt<'_>,
+) -> std::collections::BTreeMap<String, (String, String)> {
     use rustc_hir::def::DefKind;
     tcx.hir_crate_items(())
         .definitions()
@@ -457,21 +460,29 @@ fn body_fingerprints(tcx: TyCtxt<'_>) -> std::collections::BTreeMap<String, Stri
         .map(|def_id| {
             let owner = rustc_hir::OwnerId { def_id };
             let hash = tcx.hir_owner_nodes(owner).opt_hash;
+            let display = tcx.def_path(def_id.to_def_id()).to_string_no_crate_verbose();
             (
-                // `def_path_str`, not `def_path`, cost 3.7 ms — flat across a
-                // 40-function crate and a 900-function one, which is the shape
-                // of one crate-wide query rather than of per-item work. It
-                // renders the *visible* path, which needs `visible_parent_map`
-                // over the whole crate graph. The identity wanted here is the
-                // definition path, and that is local data.
-                tcx.def_path(def_id.to_def_id()).to_string_no_crate_verbose(),
+                // `DefPathHash`, which rustc defines as stable across crate and
+                // compilation-session boundaries — the identity it built for
+                // exactly this purpose. A definition *index* is not one, which
+                // §32 found the hard way; a rendered path is one, but it is a
+                // string this code invented rather than the compiler's own
+                // answer, and it is more expensive to produce.
+                //
+                // Not `def_path_str`: that renders the *visible* path, which
+                // needs `visible_parent_map` over the whole crate graph, and
+                // cost 3.7 ms flat across a 40-function crate and a
+                // 900-function one.
+                format!("{:?}", tcx.def_path_hash(def_id.to_def_id())),
                 // `None` is recorded as such rather than as a constant. Two
                 // revisions that both fail to produce a fingerprint would
                 // otherwise compare equal, and the check would pass by being
                 // unable to run — `classify` refuses instead.
                 match hash {
-                    Some(hash) => format!("{hash:?}"),
-                    None => String::new(),
+                    // The display path travels beside the fingerprint so a
+                    // refusal can name the function rather than a hash.
+                    Some(hash) => (format!("{hash:?}"), display),
+                    None => (String::new(), display),
                 },
             )
         })
@@ -591,8 +602,7 @@ fn hot_root_closure<'tcx>(
             // closure and every edit was refused — and because the summary had
             // no verdict column, that read as a silent `None` rather than as a
             // refusal. Both are fixed here.
-            out.paths
-                .insert(tcx.def_path(local.to_def_id()).to_string_no_crate_verbose());
+            out.paths.insert(format!("{:?}", tcx.def_path_hash(local.to_def_id())));
         }
         let body = tcx.instance_mir(instance.def);
         // Statics the body reads. They are not in the call graph — a static
@@ -902,6 +912,11 @@ struct Options {
     closure_only: bool,
     /// The runtime differential (§30), and which defect it injects.
     differential: Option<differential::Sabotage>,
+    /// A patched cg_clif with the live output sink (§34). When absent the
+    /// stock backend is used and the object file is lifted from disk.
+    backend: Option<PathBuf>,
+    /// Successive revisions in one process (§35).
+    sequence: bool,
 }
 
 fn parse_options() -> Options {
@@ -918,6 +933,8 @@ fn parse_options() -> Options {
     let mut end_to_end = false;
     let mut closure_only = false;
     let mut differential = None;
+    let mut backend = None;
+    let mut sequence = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--fixture" => fixture = PathBuf::from(args.next().expect("--fixture takes a path")),
@@ -941,6 +958,8 @@ fn parse_options() -> Options {
             // A flag rather than the only behaviour, because the difference
             // between the two is the measurement.
             "--closure-only" => closure_only = true,
+            "--sequence" => sequence = true,
+            "--backend" => backend = Some(PathBuf::from(args.next().expect("--backend takes a path"))),
             // The runtime differential. The argument names the defect to
             // inject: `none` is the suite proper, the rest are its controls.
             "--differential" => {
@@ -986,6 +1005,8 @@ fn parse_options() -> Options {
         end_to_end,
         closure_only,
         differential,
+        backend,
+        sequence,
     }
 }
 
@@ -994,6 +1015,17 @@ fn main() {
     std::fs::create_dir_all(&options.incremental).expect("incremental directory");
     rustc_driver::install_ice_hook("https://github.com/blasrodri/blinker", |_| ());
 
+    if let Some(backend) = &options.backend {
+        // Installed once, before any session: the callback has to be in place
+        // before rustc loads the backend and starts codegen.
+        if let Err(error) = sink::install(backend) {
+            eprintln!("  the live sink is unavailable: {error}");
+            std::process::exit(2);
+        }
+    }
+    if options.sequence {
+        return sequence_main(&options);
+    }
     if let Some(sabotage) = options.differential {
         let trials = differential::run(&options, sabotage);
         let ok = differential::report(&trials, sabotage, options.out.as_ref());
@@ -1112,24 +1144,42 @@ fn live_main(options: &Options) {
                 &options.hot,
                 Mode::HotClosure,
                 &[
-                    "-Zcodegen-backend=cranelift".into(),
+                    match &options.backend {
+                        Some(backend) => format!("-Zcodegen-backend={}", backend.display()),
+                        None => "-Zcodegen-backend=cranelift".into(),
+                    },
                     "--emit=obj".into(),
                     format!("--out-dir={}", object.parent().unwrap_or(&object).display()),
                 ],
                 options.closure_only,
             );
-            let mut record = live::revision(
-                &arena,
-                &runtime,
-                &options.fixture,
-                &options.target_file,
-                &options.incremental,
-                &options.hot,
-                &edited,
-                base.contract.as_ref(),
-                &object,
-                options.closure_only,
-            );
+            let mut record = match &options.backend {
+                Some(backend) => live::sink_revision(
+                    &arena,
+                    &runtime,
+                    &options.fixture,
+                    &options.target_file,
+                    &options.incremental,
+                    &options.hot,
+                    &edited,
+                    base.contract.as_ref(),
+                    object.parent().unwrap_or(&object),
+                    None,
+                    &[format!("-Zcodegen-backend={}", backend.display())],
+                ),
+                None => live::revision(
+                    &arena,
+                    &runtime,
+                    &options.fixture,
+                    &options.target_file,
+                    &options.incremental,
+                    &options.hot,
+                    &edited,
+                    base.contract.as_ref(),
+                    &object,
+                    options.closure_only,
+                ),
+            };
             record.edit = edit.clone();
             // The proof, not a demonstration: with `value = 3, scale = 5` the
             // hot root's total is 15, so the pristine body returns
@@ -1209,5 +1259,161 @@ fn live_main(options: &Options) {
     match &options.out {
         Some(path) => std::fs::write(path, json).expect("write"),
         None => {}
+    }
+}
+
+/// G0 → G1 → G2 → G3 in one process, with no cold reset between them.
+///
+/// Every earlier end-to-end run measured a single revision applied to a
+/// pristine crate, and then started over. That cannot see anything that only
+/// goes wrong the *second* time: incremental state that did not survive moving
+/// publication ahead of finalization, a def path that was stable across one
+/// edit but not two, body fingerprints that failed to advance, Path D holding
+/// an instance from a previous session, a generation table that quietly
+/// depends on being the first one.
+///
+/// So this applies successive edits back to back, each classified against the
+/// revision before it rather than against pristine, and asserts the exact value
+/// at every step. With `value = 3, scale = 5` the hot root's `total()` is 15,
+/// so the four revisions must return 106, 167, 54 and 349.
+fn sequence_main(options: &Options) {
+    let arena = arena::Arena::reserve(256 * 1024 * 1024).expect("arena");
+    let runtime = generation::Runtime::new(8);
+    let out_dir = options.incremental.clone();
+    let backend = options
+        .backend
+        .as_ref()
+        .map(|path| format!("-Zcodegen-backend={}", path.display()))
+        .unwrap_or_else(|| "-Zcodegen-backend=cranelift".into());
+
+    // G0 establishes the baseline: the crate as it was, compiled, with its
+    // contract kept for the next revision to be compared against.
+    let pristine = std::fs::read_to_string(options.variants.join("pristine.rs"))
+        .expect("the pristine variant exists");
+    std::fs::write(&options.target_file, &pristine).expect("write pristine");
+    let mut previous = run_session_with(
+        &options.fixture,
+        &options.target_file,
+        &options.incremental,
+        &options.hot,
+        Mode::HotClosure,
+        &[
+            backend.clone(),
+            "--emit=obj".into(),
+            format!("--out-dir={}", out_dir.display()),
+        ],
+        true,
+    )
+    .contract;
+
+    let expected: std::collections::BTreeMap<&str, i64> = [
+        ("pristine", 106),
+        ("body_arith", 167),
+        ("body_arith2", 54),
+        ("body_arith3", 349),
+    ]
+    .into_iter()
+    .collect();
+
+    println!(
+        "\n  {:<14} {:<10} {:>8} {:>9} {:>9} {:>9}  {}",
+        "revision", "verdict", "closure", "active", "total", "after", "value"
+    );
+    let mut records = Vec::new();
+    let mut failures = Vec::new();
+    for (generation_index, edit) in options.edits.iter().enumerate() {
+        let edited = std::fs::read_to_string(options.variants.join(format!("{edit}.rs")))
+            .unwrap_or_else(|_| panic!("no variant named {edit}"));
+        let mut record = live::sink_revision(
+            &arena,
+            &runtime,
+            &options.fixture,
+            &options.target_file,
+            &options.incremental,
+            &options.hot,
+            &edited,
+            previous.as_ref(),
+            &out_dir,
+            None,
+            &[backend.clone()],
+        );
+        record.edit = edit.clone();
+        // Each revision is compared against the one before it, not against
+        // pristine, and its contract comes from its *own* session. A separate
+        // session to re-derive the baseline is not just wasteful — it is the
+        // second compilation of a revision that has already been compiled, and
+        // the product would never run one.
+        previous = record.contract.clone();
+
+        let want = expected.get(edit.as_str()).copied();
+        let timings = record.timings.unwrap_or_default();
+        println!(
+            "  G{generation_index} {:<12} {:<10} {:>8} {:>8.2} {:>9.2} {:>9.2}  {:?}{}",
+            edit,
+            if record.verdict.is_empty() { "-" } else { &record.verdict },
+            record.closure_size,
+            record.active_ms,
+            record.total_ms,
+            (timings.object_define_ns + timings.object_write_ns) as f64 / 1e6,
+            record.returned,
+            match (want, record.returned) {
+                (Some(want), Some(got)) if want != got => format!("  WRONG, expected {want}"),
+                (Some(_), None) => "  nothing published".to_string(),
+                _ => String::new(),
+            }
+        );
+        if let Some(error) = &record.error {
+            println!("      {error}");
+            failures.push(format!("{edit}: {error}"));
+        }
+        match (want, record.returned) {
+            (Some(want), Some(got)) if want != got => {
+                failures.push(format!("{edit}: returned {got}, expected {want}"))
+            }
+            (Some(_), None) => failures.push(format!("{edit}: nothing published")),
+            _ => {}
+        }
+        records.push(record);
+    }
+    std::fs::write(&options.target_file, &pristine).expect("restore pristine");
+
+    // The backend's own timers. No subtraction: every number below was taken
+    // around the work it names, inside cg_clif.
+    if let Some(timings) = records.iter().filter_map(|r| r.timings).last() {
+        let ms = |ns: u64| ns as f64 / 1e6;
+        println!(
+            "\n  inside the backend, last revision ({} functions, {} bytes):",
+            timings.functions, timings.code_bytes
+        );
+        println!(
+            "    MIR->CLIF {:.3}   cranelift {:.3}   extract {:.3}   | after publication: \
+             object define {:.3}   object write {:.3}   (clif clone {:.3}, harness only)",
+            ms(timings.mir_to_clif_ns),
+            ms(timings.cranelift_ns),
+            ms(timings.extract_ns),
+            ms(timings.object_define_ns),
+            ms(timings.object_write_ns),
+            ms(timings.clif_clone_ns),
+        );
+    }
+    println!(
+        "\n  {} generations retained, {} revisions, {}",
+        runtime.generations(),
+        records.len(),
+        if failures.is_empty() {
+            "every value exact".to_string()
+        } else {
+            format!("{} FAILED", failures.len())
+        }
+    );
+    for failure in &failures {
+        println!("    {failure}");
+    }
+    if let Some(path) = &options.out {
+        let json = serde_json::to_string_pretty(&records).expect("serialize");
+        std::fs::write(path, json).expect("write");
+    }
+    if !failures.is_empty() {
+        std::process::exit(1);
     }
 }
