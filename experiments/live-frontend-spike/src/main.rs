@@ -121,6 +121,8 @@ impl Mode {
 struct Measure {
     hot: String,
     mode: Mode,
+    /// Whether an empty whole-crate collection is a bug or the truth.
+    expects_mono_roots: bool,
     started: Instant,
     expansion_done: Option<Instant>,
     record: Record,
@@ -177,15 +179,16 @@ impl Callbacks for Measure {
                 .sum();
             self.record.whole_crate_mono_ms = at.elapsed().as_secs_f64() * 1e3;
             self.record.whole_crate_mono_items = total;
-            // A library crate has no monomorphization roots, so collection
-            // over one finds nothing in no time and Path C silently becomes a
-            // comparison against an empty set. The first run of this spike
-            // reported 0 items for a 300-function crate; refusing the result
-            // is cheaper than reading past it again.
-            if total == 0 {
+            // A library crate has no monomorphization roots — its generics are
+            // instantiated by whoever uses it — so collection over one finds
+            // nothing in no time, and Path C is not a measurement there. For a
+            // binary an empty result means the run is wrong: the first version
+            // of this spike reported 0 items for a 300-function crate and the
+            // number was read past. Which of the two it is comes from the
+            // fixture, so the check knows what it is looking at.
+            if total == 0 && self.expects_mono_roots {
                 self.record.error = Some(
-                    "whole-crate collection found no mono items — is the fixture a library?"
-                        .into(),
+                    "whole-crate collection found no mono items in a binary crate".into(),
                 );
             }
         }
@@ -389,6 +392,7 @@ fn run_session(
     let mut measure = Measure {
         hot: hot.to_string(),
         mode,
+        expects_mono_roots: fixture.crate_type == "bin",
         started: Instant::now(),
         expansion_done: None,
         record: Record::default(),

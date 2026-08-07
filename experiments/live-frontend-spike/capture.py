@@ -43,25 +43,36 @@ HERE = Path(__file__).resolve().parent
 HOT_ROOT = """
 
 // ---- injected by capture.py for the S0 frontend spike ----
+//
+// Every item carries `#[allow(missing_docs)]`: a real crate may `deny` lints
+// that an injected fixture knows nothing about, and `grep-matcher` denies
+// exactly this one. A fixture that cannot be injected into a strict crate can
+// only ever measure lax ones.
 
 /// A type whose layout the hot root depends on, so edit class 5 has something
 /// to change.
+#[allow(missing_docs, dead_code)]
 #[derive(Clone, Copy)]
 pub struct SpikeReading {
     pub value: u64,
     pub scale: u32,
 }
 
+#[allow(missing_docs, dead_code)]
 impl SpikeReading {
     pub fn total(&self) -> u64 {
         self.value.wrapping_mul(self.scale as u64)
     }
 }
 
+/// Generic, instantiated at `u64` below; edit class 3 asks for a second one.
+#[allow(missing_docs, dead_code)]
 pub fn spike_convert<T: Into<u64> + Copy>(x: T) -> u64 {
     x.into().wrapping_add(1)
 }
 
+/// An existing callee, for edit class 2.
+#[allow(missing_docs, dead_code)]
 #[inline(never)]
 pub fn spike_helper(x: u64) -> u64 {
     x.wrapping_mul(31).wrapping_add(7)
@@ -69,12 +80,14 @@ pub fn spike_helper(x: u64) -> u64 {
 
 /// The hot root. `#[inline(never)]` because a replaceable boundary the
 /// optimizer may erase is not one (V2 §10.3).
+#[allow(missing_docs, dead_code)]
 #[inline(never)]
 pub fn spike_hot_root(reading: SpikeReading) -> u64 {
     reading.total().wrapping_mul(7).wrapping_add(1)
 }
 
 /// Reachable from the crate's roots, so whole-crate collection sees it.
+#[allow(missing_docs, dead_code)]
 #[unsafe(no_mangle)]
 pub extern "C" fn spike_entry(value: u64) -> u64 {
     let reading = SpikeReading { value, scale: 3 };
@@ -219,6 +232,12 @@ def main():
     parser.add_argument("--file", required=True, help="source file, relative to the project")
     parser.add_argument("--work", default="/tmp/spike-fixtures")
     parser.add_argument("--toolchain", default="nightly-2026-07-27")
+    parser.add_argument("--crate-type", default="bin", choices=("bin", "lib"))
+    # For S0b: the binary at the top of the graph, so the cargo baseline can
+    # be timed. An edit to a library is only finished when everything that
+    # depends on it has been rebuilt, and that is the number a developer waits
+    # for today.
+    parser.add_argument("--downstream-package", default=None)
     options = parser.parse_args()
 
     work = Path(options.work) / options.name
@@ -256,11 +275,14 @@ def main():
         "file": str(source),
         "hot": "spike_hot_root",
         "crate_name": options.target,
-        "crate_type": "bin",
+        "crate_type": options.crate_type,
         "args": argv,
         "project": str(root),
         "variants": sorted(made),
         "toolchain": options.toolchain,
+        "package": options.package,
+        "downstream_package": options.downstream_package,
+        "source_relative": options.file,
     }
     (fixture_dir / "fixture.json").write_text(json.dumps(manifest, indent=2) + "\n")
     externs = sum(1 for a in argv if a == "--extern")

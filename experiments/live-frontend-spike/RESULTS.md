@@ -1,7 +1,9 @@
 # Spike S0 — Rust frontend lower bound
 
-**Recommendation: B**, with one large caveat that S0 did not measure and that
-should be measured before R1 begins (§8).
+**Recommendation: A for an edit to a library crate, B for an edit to a large
+binary crate** — the envelope must be stated over the crate containing the hot
+function, not over the project. S0 alone recommended B; S0b (§12) measured the
+case S0 had flagged as its largest gap and moved the common topology into A.
 
 ---
 
@@ -155,7 +157,7 @@ Reviewing V1, I claimed the spec's illustrative `frontend_ms: 12.4` was
 one. The figure was accurate for the first case and about 5× optimistic for the
 second. rustc's incremental frontend is considerably faster than I asserted.
 
-## 8. Known limitations — one of them matters a great deal
+## 8. Known limitations as of S0 — the first one is answered in §12
 
 **S0 measured a single-crate edit.** In every fixture the edited file belongs to
 the crate being compiled, so the measurement covers one compilation. A real edit
@@ -166,9 +168,9 @@ bound for the easiest topology, not the expected case**, and the expected case
 could be several times larger.
 
 This is the single most important thing S0 did not answer, and it should be
-answered before R1 is begun rather than after. It needs no new machinery — the
-harness already replays a captured cargo invocation, and what it needs is to
-replay the *sequence* of invocations cargo issues for a downstream edit.
+answered before R1 is begun rather than after.
+
+**Answered in §12, and the prediction above is wrong.**
 
 Other limitations, none of which changes the recommendation:
 
@@ -222,3 +224,104 @@ cd experiments/live-frontend-spike
 
 Raw per-iteration records are in `results/*.json`; `results/machine.json` holds
 the host metadata.
+
+
+---
+
+# S0b — the blast radius
+
+S0's §8 named one gap as decisive: every fixture edited the crate being
+compiled, which is the easiest topology. This measures the common one — an edit
+to a library crate that other crates depend on.
+
+## 12. What an edit to a library costs
+
+Two real leaf libraries, injected with the same hot root, edited through the
+same five classes.
+
+| | crate edited | crates cargo rebuilds |
+|---|---|---:|
+| `blinker-lib` | `blinker_diagnostics` | 2 (`blinker-diagnostics`, `blinker-cli`) |
+| `rg-lib` | `grep_matcher` | 6 (`grep-matcher` → `grep-searcher` → `grep-regex` → `grep-printer` → `grep` → `ripgrep`) |
+
+### Validating only the edited crate (the Live lower bound)
+
+| fixture | edit | p50 ms | p95 ms | instances |
+|---|---|---:|---:|---:|
+| blinker-lib | body_arith | **19.5** | 20.8 | 4 |
+| blinker-lib | body_existing_call | 20.4 | 23.1 | 5 |
+| blinker-lib | body_new_generic | 21.1 | 25.2 | 6 |
+| blinker-lib | signature | 20.8 | 23.0 | 4 |
+| blinker-lib | type_layout | 24.0 | 24.9 | 4 |
+| rg-lib | body_arith | **14.7** | 16.0 | 4 |
+| rg-lib | body_existing_call | 14.2 | 15.4 | 5 |
+| rg-lib | body_new_generic | 15.1 | 16.3 | 6 |
+| rg-lib | signature | 15.1 | 17.2 | 4 |
+| rg-lib | type_layout | 17.9 | 20.2 | 4 |
+
+### What a developer pays today
+
+`cargo build` of the binary at the top of the graph, alternating real edits:
+
+| fixture | debug | release |
+|---|---:|---:|
+| blinker-lib | **434 ms** | 9 855 ms |
+| rg-lib | **762 ms** | 3 038 ms |
+
+Debug is the honest baseline: nobody runs an edit–test loop in release. The
+first version of this measured only release and reported a 512× ratio, which is
+a fact about optimization levels and not about this product.
+
+## 13. What S0b says
+
+**1. My §8 prediction was wrong, in the favourable direction.** I wrote that 62
+ms was "a lower bound for the easiest topology" and that the expected case
+"could be several times larger". It is *smaller*: 14.7–19.5 ms, against 62 ms
+for the large binary crate. The reason is S0's finding 2 restated — the cost is
+set by the size of the crate you edit, and leaf libraries are small crates. The
+blast radius is expensive for **cargo**, which must rebuild every dependent
+because an rlib changed; it is not expensive for **validation**, because
+nothing downstream changed semantically.
+
+**2. The product's value on this edit class is 22–52×, measured.** 434 ms
+against 19.5, and 762 against 14.7. V2 §10.5 struck the 10× claim until a
+baseline existed; this is that baseline, and it supports considerably more than
+10× — *provided* the two exclusions below are honoured.
+
+**3. The whole gap is contingent on a component that does not exist.** The
+19.5 ms number is only reachable if the runtime can *prove* the crate's
+exported interface is unchanged, and therefore that no dependent needs
+revalidating. The `signature` and `type_layout` rows above are measured at the
+same cost as the others, but they are edits that **must** fall back to the full
+rebuild — and the classifier that tells them apart was costed by S0 at 0.002 ms
+and never implemented. **The critical path to the product is the classifier,
+not the JIT.**
+
+**4. Two things are excluded from the Live figure and must be added before any
+end-to-end claim**: cg_clif codegen of the changed function, and publication.
+S0 measured neither. A realistic live total is the 15–20 ms here plus both.
+
+## 14. Revised recommendation
+
+| topology | p50 | p95 | band |
+|---|---:|---:|---|
+| edit to a library crate — `blinker-lib`, `rg-lib` | 14.7–19.5 | 16–21 | **A** |
+| edit to a small binary crate — `medium` | 10.5 | 11–21 | **A** |
+| edit to a large binary crate — `large` (`rg`) | 61–69 | 71–110 | **B** |
+
+Proceed on the basis of **A**, with the L1 envelope defined over the crate
+containing the hot function and reported per crate rather than asserted for the
+project. The `large` row is not an outlier to be explained away: a hot function
+in a big crate costs 62 ms of frontend before anything is generated, and the
+product should measure and say so rather than discover it.
+
+## 15. Proposed next step, revised
+
+Not R1, and not the blast radius — that is now answered. **The interface
+classifier.** It is the component the 22–52× depends on, it is the one piece
+whose correctness is a safety property rather than a latency one, and S0 showed
+that computing the facts it needs is free. Build it as an extension of this
+same spike: compute an exported-interface fingerprint before and after each of
+the five edit classes, and check that classes 1–3 compare equal and classes 4–5
+compare different. That is a day of work against a harness that already exists,
+and it converts the product's headline number from contingent to earned.
