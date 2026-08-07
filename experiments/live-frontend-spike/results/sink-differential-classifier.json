@@ -5,7 +5,7 @@
     "agreed": true,
     "difference": null,
     "base_intact": true,
-    "closure_size": 5,
+    "closure_size": 6,
     "error": null
   },
   {
@@ -14,7 +14,7 @@
     "agreed": true,
     "difference": null,
     "base_intact": true,
-    "closure_size": 5,
+    "closure_size": 6,
     "error": null
   },
   {
@@ -23,7 +23,7 @@
     "agreed": null,
     "difference": null,
     "base_intact": true,
-    "closure_size": 12,
+    "closure_size": 13,
     "error": "cannot resolve .Ldata0 for the GOT"
   },
   {
@@ -32,7 +32,7 @@
     "agreed": true,
     "difference": null,
     "base_intact": true,
-    "closure_size": 7,
+    "closure_size": 8,
     "error": null
   },
   {
@@ -41,7 +41,7 @@
     "agreed": true,
     "difference": null,
     "base_intact": true,
-    "closure_size": 5,
+    "closure_size": 6,
     "error": null
   },
   {
@@ -50,7 +50,7 @@
     "agreed": true,
     "difference": null,
     "base_intact": true,
-    "closure_size": 5,
+    "closure_size": 6,
     "error": null
   },
   {
@@ -59,11 +59,20 @@
     "agreed": true,
     "difference": null,
     "base_intact": true,
-    "closure_size": 5,
+    "closure_size": 6,
     "error": null
   },
   {
     "mutation": "loop_edit",
+    "verdict": "DIRECT",
+    "agreed": true,
+    "difference": null,
+    "base_intact": true,
+    "closure_size": 7,
+    "error": null
+  },
+  {
+    "mutation": "two_gates",
     "verdict": "DIRECT",
     "agreed": true,
     "difference": null,
@@ -75,9 +84,9 @@
     "mutation": "edit_outside_closure",
     "verdict": "FALLBACK(changed_outside_closure)",
     "agreed": false,
-    "difference": "probe 0 (0, 0): live returned 7 wrote 43693, clean returned 8 wrote 43693",
+    "difference": "probe 0 (0, 0): live returned 8 wrote 43682, clean returned 9 wrote 43682",
     "base_intact": true,
-    "closure_size": 5,
+    "closure_size": 6,
     "error": null
   },
   {
@@ -86,7 +95,7 @@
     "agreed": null,
     "difference": null,
     "base_intact": true,
-    "closure_size": 5,
+    "closure_size": 6,
     "error": "cannot resolve _RNvCsfCWnWJ9PaRW_12diff_fixture10DIFF_FRESH for the GOT"
   }
 ]

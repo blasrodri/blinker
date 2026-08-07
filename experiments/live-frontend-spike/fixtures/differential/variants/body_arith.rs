@@ -40,9 +40,24 @@ impl Reading {
     }
 }
 
+/// A second patchable function, reachable from the hot root and so inside its
+/// closure. `extern "C"` and `#[no_mangle]` so that both a probe and a clean
+/// rebuild can call it by name.
+///
+/// The concurrency scenarios need more than one gate. A scope that captures a
+/// generation and then calls a single function through it proves very little:
+/// the pointer was read once and could not have changed. Two functions, read
+/// from the captured generation on either side of a barrier, is what makes
+/// "the scope holds its generation" a claim with something to fail.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn diff_second(x: u64) -> u64 {
+    x.wrapping_mul(3).wrapping_add(1)
+}
+
 #[inline(never)]
 fn blend(x: u64) -> u64 {
-    x.wrapping_add(7)
+    diff_second(x).wrapping_add(7)
 }
 
 /// The hot root. `extern "C"` so that both paths call it through one signature

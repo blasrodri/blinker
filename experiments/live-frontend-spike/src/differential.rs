@@ -114,6 +114,11 @@ pub struct Image {
     handle: *mut libc::c_void,
     entry: extern "C" fn(u64, u32, *mut u64) -> u64,
     gate: *mut Option<extern "C" fn(u64, u32, *mut u64) -> u64>,
+    /// The two patchable functions, called directly for §40's generation
+    /// scenarios. Those compare a *generation's* implementations against a
+    /// clean rebuild's, so they bypass the gate rather than installing into it.
+    root: extern "C" fn(u64, u32, *mut u64) -> u64,
+    second: extern "C" fn(u64) -> u64,
 }
 
 impl Image {
@@ -175,8 +180,16 @@ impl Image {
             .ok_or_else(|| format!("{} has no diff_entry", path.display()))?;
         let gate = symbol(handle, "DIFF_GATE")
             .ok_or_else(|| format!("{} has no DIFF_GATE", path.display()))?;
+        let root = symbol(handle, "diff_root")
+            .ok_or_else(|| format!("{} has no diff_root", path.display()))?;
+        let second = symbol(handle, "diff_second")
+            .ok_or_else(|| format!("{} has no diff_second", path.display()))?;
         Ok(Image {
             handle,
+            // SAFETY: both are declared `#[no_mangle] extern "C"` in the
+            // fixture with these signatures.
+            root: unsafe { std::mem::transmute(root) },
+            second: unsafe { std::mem::transmute(second) },
             // SAFETY: the fixture declares `diff_entry` with this signature and
             // `#[no_mangle] extern "C"`, so the type is read off the source
             // rather than assumed — §25.
@@ -429,7 +442,13 @@ fn trial(
     trial.verdict = live.verdict.clone();
     trial.closure_size = live.closure_size;
 
-    let published = match live.entry {
+    let published = match live.staged.map(|staged| {
+        let entry = staged.entry();
+        // The commit. A trial that got this far has a DIRECT verdict and an
+        // artifact that passed every rule, which is exactly the precondition.
+        staged.commit(&runtime);
+        entry as *const u8
+    }) {
         Some(pointer) => pointer,
         None => {
             trial.error = live.error.clone();
@@ -464,6 +483,391 @@ fn trial(
     trial.difference = observed.difference(&expected);
     trial.agreed = Some(trial.difference.is_none());
     trial
+}
+
+/// What a probe observes when it runs the patched code through a generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+struct Reading {
+    returned: u64,
+    written: u64,
+    second: u64,
+}
+
+/// Call a generation's closure. `root` and `second` are gate indices.
+///
+/// # Safety
+/// The generation's slots must hold relocated functions of these signatures.
+unsafe fn read(generation: &crate::generation::Generation, root: usize, second: usize) -> Reading {
+    let mut written = 0u64;
+    let f: extern "C" fn(u64, u32, *mut u64) -> u64 =
+        unsafe { std::mem::transmute(generation.implementation(root).expect("root")) };
+    let g: extern "C" fn(u64) -> u64 =
+        unsafe { std::mem::transmute(generation.implementation(second).expect("second")) };
+    let returned = f(3, 5, &mut written);
+    Reading { returned, written, second: g(11) }
+}
+
+/// The same reading from a cleanly rebuilt image, as the reference.
+fn read_clean(image: &Image) -> Reading {
+    let mut written = 0u64;
+    let returned = (image.root)(3, 5, &mut written);
+    Reading { returned, written, second: (image.second)(11) }
+}
+
+/// Where the closure's two `extern "C"` members sit in a candidate's gates.
+fn gates(staged: &crate::live::Staged) -> Option<(usize, usize)> {
+    let find = |wanted: &str| {
+        staged
+            .entries
+            .iter()
+            .position(|(name, _)| crate::live::symbol_matches(name, wanted))
+    };
+    Some((find("diff_root")?, find("diff_second")?))
+}
+
+/// Build one revision's candidate without committing it.
+fn candidate(
+    options: &crate::Options,
+    arena: &Arena,
+    runtime: &Runtime,
+    source: &str,
+    before: Option<&crate::classify::Contract>,
+    image: &Image,
+    work: &Path,
+) -> Result<(crate::live::Staged, crate::classify::Contract), String> {
+    std::fs::write(&options.target_file, source).expect("write");
+    let mut arguments = vec![
+        "-Cmetadata=diff".to_string(),
+        "-Cdebug-assertions=off".to_string(),
+    ];
+    arguments.push(match &options.backend {
+        Some(backend) => format!("-Zcodegen-backend={}", backend.display()),
+        None => "-Zcodegen-backend=cranelift".into(),
+    });
+    let warm = crate::run_session_with(
+        &options.fixture,
+        &options.target_file,
+        &options.incremental,
+        &options.hot,
+        crate::Mode::HotClosure,
+        &arguments,
+        false,
+    );
+    let _ = warm;
+    let patch = crate::live::patch(
+        arena,
+        runtime,
+        &options.fixture,
+        &options.target_file,
+        &options.incremental,
+        &options.hot,
+        before,
+        work,
+        Some(image.handle),
+        options.backend.as_deref(),
+        crate::live::PatchOptions::default(),
+    );
+    match (patch.staged, patch.error) {
+        (Some(staged), _) => {
+            let contract = patch.contract.ok_or("no contract")?;
+            Ok((staged, contract))
+        }
+        (None, Some(error)) => Err(error),
+        (None, None) => Err("no candidate and no reason".into()),
+    }
+}
+
+/// Generation consistency under concurrency, and rollback (§40).
+///
+/// Barriers rather than sleeps. A sleep makes a race *likely*; a barrier makes
+/// the interleaving the test claims to exercise the only one that can happen.
+pub fn generations(options: &crate::Options) -> bool {
+    use std::sync::Barrier;
+
+    let work = options.incremental.clone();
+    let _ = std::fs::remove_dir_all(&work);
+    let _ = std::fs::create_dir_all(&work);
+    let arena = Arena::reserve(64 * 1024 * 1024).expect("arena");
+    let runtime = Runtime::new(8);
+
+    let read_source = |name: &str| {
+        std::fs::read_to_string(options.variants.join(format!("{name}.rs")))
+            .unwrap_or_else(|_| panic!("no variant named {name}"))
+    };
+    let g0 = read_source("pristine");
+    let g1 = read_source("body_arith");
+    let g2 = read_source("two_gates");
+
+    // Three clean rebuilds, by ordinary rustc and LLVM in a subprocess, loaded
+    // by the dynamic loader. Every assertion below is against one of these.
+    std::fs::write(&options.target_file, &g0).expect("write");
+    let base = match Image::build(&options.target_file, &work.join("g0.dylib")) {
+        Ok(image) => image,
+        Err(error) => {
+            println!("  cannot build the base image: {error}");
+            return false;
+        }
+    };
+    let mut clean = Vec::new();
+    for (index, source) in [&g1, &g2].iter().enumerate() {
+        std::fs::write(&options.target_file, source).expect("write");
+        match Image::build(&options.target_file, &work.join(format!("clean{index}.dylib"))) {
+            Ok(image) => clean.push(image),
+            Err(error) => {
+                println!("  cannot build a clean reference: {error}");
+                return false;
+            }
+        }
+    }
+    let (clean_g1, clean_g2) = (read_clean(&clean[0]), read_clean(&clean[1]));
+    // Every field has to discriminate, not just one. A probe that reads two
+    // gates from a captured generation proves nothing about the second gate if
+    // the two revisions happen to agree on it.
+    if clean_g1.returned == clean_g2.returned
+        || clean_g1.written == clean_g2.written
+        || clean_g1.second == clean_g2.second
+    {
+        println!(
+            "  the two revisions agree on something the probe reads \
+             ({clean_g1:?} vs {clean_g2:?}); part of this test could not fail"
+        );
+        return false;
+    }
+
+    // G0 → G1, committed.
+    std::fs::write(&options.target_file, &g0).expect("write");
+    let zero = crate::run_session_with(
+        &options.fixture,
+        &options.target_file,
+        &options.incremental,
+        &options.hot,
+        crate::Mode::HotClosure,
+        &[
+            "-Cmetadata=diff".to_string(),
+            "-Cdebug-assertions=off".to_string(),
+            match &options.backend {
+                Some(backend) => format!("-Zcodegen-backend={}", backend.display()),
+                None => "-Zcodegen-backend=cranelift".into(),
+            },
+        ],
+        false,
+    );
+    let (first, contract_g1) =
+        match candidate(options, &arena, &runtime, &g1, zero.contract.as_ref(), &base, &work) {
+            Ok(pair) => pair,
+            Err(error) => {
+                println!("  G1 produced no candidate: {error}");
+                return false;
+            }
+        };
+    let Some((root, second)) = gates(&first) else {
+        println!("  the candidate does not contain both probe functions");
+        return false;
+    };
+    first.commit(&runtime);
+
+    let mut failures: Vec<String> = Vec::new();
+    let mut checks = 0usize;
+
+    // Scenario 1: a scope holds the generation it entered, across a commit.
+    {
+        let (start, resume) = (Barrier::new(2), Barrier::new(2));
+        let (second_candidate, _produced) =
+            match candidate(options, &arena, &runtime, &g2, Some(&contract_g1), &base, &work) {
+                Ok(pair) => pair,
+                Err(error) => {
+                    println!("  G2 produced no candidate: {error}");
+                    return false;
+                }
+            };
+        std::thread::scope(|threads| {
+            let holder = threads.spawn(|| {
+                crate::generation::scope(&runtime, |generation| {
+                    // SAFETY: a committed generation of this fixture.
+                    let before = unsafe { read(generation, root, second) };
+                    start.wait();
+                    resume.wait();
+                    // The same generation, read again *after* another thread
+                    // has committed a newer one. Two functions, not one: a
+                    // single pointer read on entry could not have changed.
+                    let after = unsafe { read(generation, root, second) };
+                    (before, after)
+                })
+            });
+            start.wait();
+            second_candidate.commit(&runtime);
+            let fresh = crate::generation::scope(&runtime, |generation| {
+                // SAFETY: the generation just committed.
+                unsafe { read(generation, root, second) }
+            });
+            resume.wait();
+            let (before, after) = holder.join().expect("thread");
+            checks += 3;
+            if before != clean_g1 {
+                failures.push(format!("a scope on G1 read {before:?}, clean G1 is {clean_g1:?}"));
+            }
+            if after != clean_g1 {
+                failures.push(format!(
+                    "after a concurrent commit the same scope read {after:?}, clean G1 is \
+                     {clean_g1:?} — the scope did not hold its generation"
+                ));
+            }
+            if fresh != clean_g2 {
+                failures.push(format!("a scope entered on G2 read {fresh:?}, clean G2 is {clean_g2:?}"));
+            }
+        });
+    }
+
+    // Scenario 2: a refused candidate is never observable — not eventually,
+    // never. It is built while a scope is open and discarded without ever
+    // being committed, so there is no interleaving in which it could run.
+    {
+        let refused = read_source("edit_outside_closure");
+        let (start, resume) = (Barrier::new(2), Barrier::new(2));
+        std::thread::scope(|threads| {
+            let holder = threads.spawn(|| {
+                crate::generation::scope(&runtime, |generation| {
+                    start.wait();
+                    resume.wait();
+                    // SAFETY: a committed generation of this fixture.
+                    unsafe { read(generation, root, second) }
+                })
+            });
+            start.wait();
+            let outcome =
+                candidate(options, &arena, &runtime, &refused, Some(&contract_g1), &base, &work);
+            let refused_correctly = match outcome {
+                // The classifier refuses before a candidate is returned.
+                Err(_) => true,
+                // A candidate that was built is simply dropped. Nothing ever
+                // pointed at it.
+                Ok((staged, _)) => {
+                    drop(staged);
+                    true
+                }
+            };
+            let during = crate::generation::scope(&runtime, |generation| {
+                // SAFETY: a committed generation of this fixture.
+                unsafe { read(generation, root, second) }
+            });
+            resume.wait();
+            let held = holder.join().expect("thread");
+            checks += 2;
+            let _ = refused_correctly;
+            if held != clean_g2 || during != clean_g2 {
+                failures.push(format!(
+                    "a refused revision was observable: held {held:?}, concurrent {during:?}, \
+                     clean G2 is {clean_g2:?}"
+                ));
+            }
+        });
+    }
+
+    // Scenario 3: rollback obeys the same rules as publication.
+    {
+        let (start, resume) = (Barrier::new(2), Barrier::new(2));
+        std::thread::scope(|threads| {
+            let holder = threads.spawn(|| {
+                crate::generation::scope(&runtime, |generation| {
+                    let before = unsafe { read(generation, root, second) };
+                    start.wait();
+                    resume.wait();
+                    let after = unsafe { read(generation, root, second) };
+                    (before, after)
+                })
+            });
+            start.wait();
+            // Back to G1. Code only: whatever G2 wrote to globals, files or
+            // sockets is still written, which is why it is called a code
+            // rollback and not a transaction.
+            let rolled = runtime.rollback_code(1);
+            let after_rollback = crate::generation::scope(&runtime, |generation| unsafe {
+                read(generation, root, second)
+            });
+            resume.wait();
+            let (before, after) = holder.join().expect("thread");
+            checks += 3;
+            if !rolled {
+                failures.push("the rollback found no such generation".into());
+            }
+            if before != clean_g2 || after != clean_g2 {
+                failures.push(format!(
+                    "a scope on G2 read {before:?} then {after:?} across a rollback, clean G2 \
+                     is {clean_g2:?}"
+                ));
+            }
+            if after_rollback != clean_g1 {
+                failures.push(format!(
+                    "after rolling back to G1 a new scope read {after_rollback:?}, clean G1 is \
+                     {clean_g1:?}"
+                ));
+            }
+        });
+    }
+
+    // The control, last, because it commits. Scenario 1 asserts that a *captured* generation still reads
+    // G1 after a concurrent commit — but that assertion is only worth
+    // something if reading the wrong thing would have been noticed. So the
+    // same interleaving is run again with the probe deliberately re-entering
+    // the runtime after the barrier instead of using the generation it holds.
+    // It runs after the rollback, so the current generation is G1 and the
+    // commit is a G2 candidate: the held scope must still read G1 and the
+    // re-entering one must read G2. If the second does not, the commit was
+    // never visible and scenario 1 passed because nothing was happening.
+    {
+        let (start, resume) = (Barrier::new(2), Barrier::new(2));
+        let (third, _) =
+            match candidate(options, &arena, &runtime, &g2, Some(&contract_g1), &base, &work) {
+                Ok(pair) => pair,
+                Err(error) => {
+                    println!("  the control produced no candidate: {error}");
+                    return false;
+                }
+            };
+        std::thread::scope(|threads| {
+            let holder = threads.spawn(|| {
+                let held = crate::generation::scope(&runtime, |generation| {
+                    start.wait();
+                    resume.wait();
+                    // SAFETY: a committed generation of this fixture.
+                    unsafe { read(generation, root, second) }
+                });
+                // Deliberately wrong: a fresh scope, so the newest generation.
+                let reloaded = crate::generation::scope(&runtime, |generation| unsafe {
+                    read(generation, root, second)
+                });
+                (held, reloaded)
+            });
+            start.wait();
+            third.commit(&runtime);
+            resume.wait();
+            let (held, reloaded) = holder.join().expect("thread");
+            checks += 2;
+            if held != clean_g1 {
+                failures.push(format!("the control's held scope read {held:?}, expected G1"));
+            }
+            if reloaded != clean_g2 {
+                failures.push(format!(
+                    "re-entering the runtime after the commit read {reloaded:?} rather than the \
+                     newly committed revision — the commit was not visible, so scenario 1 \
+                     proved nothing"
+                ));
+            }
+        });
+    }
+
+
+    println!("\n  generation semantics, against independently rebuilt references");
+    println!("    clean G1 {clean_g1:?}");
+    println!("    clean G2 {clean_g2:?}");
+    println!(
+        "    {checks} observations across 3 scenarios and a control: {}",
+        if failures.is_empty() { "all exact" } else { "FAILED" }
+    );
+    for failure in &failures {
+        println!("      {failure}");
+    }
+    failures.is_empty()
 }
 
 /// Print the suite's outcome, and say what it proves.

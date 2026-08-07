@@ -5,7 +5,7 @@
     "agreed": null,
     "difference": null,
     "base_intact": true,
-    "closure_size": 5,
+    "closure_size": 6,
     "error": "cannot resolve _RNvMCsfCWnWJ9PaRW_12diff_fixtureNtB2_7Reading5total"
   },
   {
@@ -14,7 +14,7 @@
     "agreed": null,
     "difference": null,
     "base_intact": true,
-    "closure_size": 5,
+    "closure_size": 6,
     "error": "cannot resolve _RNvMCsfCWnWJ9PaRW_12diff_fixtureNtB2_7Reading5total"
   },
   {
@@ -23,7 +23,7 @@
     "agreed": null,
     "difference": null,
     "base_intact": true,
-    "closure_size": 12,
+    "closure_size": 13,
     "error": "cannot resolve .Ldata0 for the GOT"
   },
   {
@@ -32,7 +32,7 @@
     "agreed": null,
     "difference": null,
     "base_intact": true,
-    "closure_size": 7,
+    "closure_size": 8,
     "error": "cannot resolve _RNvCsfCWnWJ9PaRW_12diff_fixture5blend"
   },
   {
@@ -41,7 +41,7 @@
     "agreed": null,
     "difference": null,
     "base_intact": true,
-    "closure_size": 5,
+    "closure_size": 6,
     "error": "cannot resolve _RNvMCsfCWnWJ9PaRW_12diff_fixtureNtB2_7Reading5total"
   },
   {
@@ -50,7 +50,7 @@
     "agreed": null,
     "difference": null,
     "base_intact": true,
-    "closure_size": 5,
+    "closure_size": 6,
     "error": "cannot resolve _RNvMCsfCWnWJ9PaRW_12diff_fixtureNtB2_7Reading5total"
   },
   {
@@ -59,11 +59,20 @@
     "agreed": null,
     "difference": null,
     "base_intact": true,
-    "closure_size": 5,
+    "closure_size": 6,
     "error": "cannot resolve _RNvMCsfCWnWJ9PaRW_12diff_fixtureNtB2_7Reading5total"
   },
   {
     "mutation": "loop_edit",
+    "verdict": "DIRECT",
+    "agreed": null,
+    "difference": null,
+    "base_intact": true,
+    "closure_size": 7,
+    "error": "cannot resolve _RNvMCsfCWnWJ9PaRW_12diff_fixtureNtB2_7Reading5total"
+  },
+  {
+    "mutation": "two_gates",
     "verdict": "DIRECT",
     "agreed": null,
     "difference": null,
@@ -77,7 +86,7 @@
     "agreed": null,
     "difference": null,
     "base_intact": true,
-    "closure_size": 5,
+    "closure_size": 6,
     "error": "the classifier refused: Fallback { reason: ChangedOutsideClosure { functions: [\"::diff_entry\"] } }"
   },
   {
@@ -86,7 +95,7 @@
     "agreed": null,
     "difference": null,
     "base_intact": true,
-    "closure_size": 5,
+    "closure_size": 6,
     "error": "the classifier refused: Fallback { reason: NewStaticRequired { statics: [\"DIFF_FRESH\"] } }"
   }
 ]

@@ -5,7 +5,7 @@
     "agreed": true,
     "difference": null,
     "base_intact": true,
-    "closure_size": 5,
+    "closure_size": 6,
     "error": null
   },
   {
@@ -14,7 +14,7 @@
     "agreed": true,
     "difference": null,
     "base_intact": true,
-    "closure_size": 5,
+    "closure_size": 6,
     "error": null
   },
   {
@@ -23,7 +23,7 @@
     "agreed": null,
     "difference": null,
     "base_intact": true,
-    "closure_size": 12,
+    "closure_size": 13,
     "error": "cannot resolve .Ldata0 for the GOT"
   },
   {
@@ -32,7 +32,7 @@
     "agreed": true,
     "difference": null,
     "base_intact": true,
-    "closure_size": 7,
+    "closure_size": 8,
     "error": null
   },
   {
@@ -41,7 +41,7 @@
     "agreed": true,
     "difference": null,
     "base_intact": true,
-    "closure_size": 5,
+    "closure_size": 6,
     "error": null
   },
   {
@@ -50,7 +50,7 @@
     "agreed": true,
     "difference": null,
     "base_intact": true,
-    "closure_size": 5,
+    "closure_size": 6,
     "error": null
   },
   {
@@ -59,11 +59,20 @@
     "agreed": true,
     "difference": null,
     "base_intact": true,
-    "closure_size": 5,
+    "closure_size": 6,
     "error": null
   },
   {
     "mutation": "loop_edit",
+    "verdict": "DIRECT",
+    "agreed": true,
+    "difference": null,
+    "base_intact": true,
+    "closure_size": 7,
+    "error": null
+  },
+  {
+    "mutation": "two_gates",
     "verdict": "DIRECT",
     "agreed": true,
     "difference": null,
@@ -77,7 +86,7 @@
     "agreed": null,
     "difference": null,
     "base_intact": true,
-    "closure_size": 5,
+    "closure_size": 6,
     "error": "the classifier refused: Fallback { reason: ChangedOutsideClosure { functions: [\"::diff_entry\"] } }"
   },
   {
@@ -86,7 +95,7 @@
     "agreed": null,
     "difference": null,
     "base_intact": true,
-    "closure_size": 5,
+    "closure_size": 6,
     "error": "the classifier refused: Fallback { reason: NewStaticRequired { statics: [\"DIFF_FRESH\"] } }"
   }
 ]

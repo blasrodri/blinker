@@ -1236,3 +1236,140 @@ coordinator answers a FALLBACK with an ordinary rebuild, which re-establishes
 the baseline; this harness has none to rebuild, so it models the conservative
 path and checks that the program stays on its last good generation throughout.
 Across 300 revisions it did.
+
+## 40. Candidate and commit
+
+§39 found the sink publishing a revision that nothing had classified, and the
+fix at the time was to roll it back on every non-accepting path. That is the
+wrong fix. It is only safe because the soak is sequential: the sequence
+
+```
+build artifact → publish → classify → FALLBACK → roll back
+```
+
+has a window in which a generation nothing accepted is globally reachable, and
+a request arriving inside it runs code that was refused.
+
+The architecture now forbids it. cg_clif's sink may only build a **candidate**:
+its code is in the arena, fully relocated, i-cache flushed, slot table built —
+and `Runtime::current` has never heard of it.
+
+```
+rustc / cg_clif
+      ↓
+  Candidate            code bytes · relocations · gates
+      │                NOT reachable
+      ↓
+  classifier  →  artifact rules  →  DIRECT?
+      ├── no  → discard
+      └── yes → Staged::commit()      one atomic store
+```
+
+`Staged::commit` is the only thing on the forward path that changes the current
+generation, and `Patch` hands the caller a candidate rather than a fait
+accompli. A refused candidate is *discarded*, not rolled back: its arena slab
+stays allocated until reclamation exists, but nothing ever pointed at it, so
+there is no interleaving in which it could have run.
+
+The soak shows the change directly: **52 generations retained across 100
+revisions**, one per DIRECT commit. It was 101 before — one per revision,
+because every refusal published and then retreated.
+
+## 41. Generation semantics, against independent rebuilds
+
+Three scenarios and a control, with barriers rather than sleeps — a sleep makes
+an interleaving *likely*, a barrier makes it the only one that can happen.
+Every assertion is against a clean LLVM rebuild loaded by the dynamic loader.
+
+The fixture gained a second `#[no_mangle] extern "C"` function inside the patch
+closure, and the revisions compared change *both*. A probe that captures a
+generation and calls one function through it proves very little: the pointer
+was read once and could not have changed. Two gates, read on either side of a
+barrier, is a claim with something to fail. The harness refuses to run if the
+two references agree on any field the probe reads.
+
+```
+clean G1   returned 585    wrote 43235   second 34
+clean G2   returned 7624   wrote 46946   second 325
+```
+
+| scenario | what it forces | result |
+|---|---|---|
+| 1 | a scope enters on G1; another thread commits G2 while it is blocked; it then re-reads **both** gates from the generation it holds | reads G1, both gates, both times |
+| | a scope entered after the commit | reads G2 |
+| 2 | a refused revision is built while a scope is open, and discarded | **no observation of it from either thread** |
+| 3 | a scope holds G2; the runtime rolls back to G1; a new scope starts | holder still reads G2, new scope reads G1 |
+| control | the same interleaving, with the probe deliberately re-entering the runtime after the barrier | reads the newly committed generation |
+
+**10 observations, all exact.**
+
+The control is the part that makes the rest mean anything. Scenario 1 asserts
+that a captured generation still reads G1 after a concurrent commit — which a
+runtime where the commit never happened would also satisfy. So the same
+interleaving runs again with the probe reading `current` instead of what it
+holds, and that one must see the new generation. It does.
+
+Building the control found its own bug: the control commits, and it was
+originally placed before scenarios 2 and 3, which then measured a state they
+had not established. It runs last now, after the rollback, which also makes it
+a second check that rollback left the runtime in a state a later commit can
+still move.
+
+Rollback is still called *code* rollback. It restores implementations. Whatever
+the retired generation wrote to globals, files or sockets is still written.
+
+## 42. `needs_rebase`, named
+
+A refusal makes two notions of "the previous revision" diverge: the **compiler**
+predecessor, which is whatever was last compiled, and the **committed**
+predecessor, which is the generation the program is actually running.
+
+This compares against the compiler predecessor, and that is why recovery from
+an inlinability refusal takes two revisions rather than one. `fallback_inline`
+leaves a body rustc encodes into the crate's rmeta, so a downstream crate may
+hold a copy; `classify` refuses on `before.mir_observable` as well as
+`after.mir_observable`; and the revision after it — clean `#[inline(never)]`
+body of its own — is refused because its *predecessor* is still observable
+downstream and replacing one copy does not reach the others.
+
+Comparing against the *committed* predecessor instead would permit
+DIRECT → FALLBACK → DIRECT, on the argument that no downstream crate ever
+received the refused revision. That is probably sound. It is not what this
+does, because it makes source history and runtime history diverge and each
+divergence needs its own oracle.
+
+The rule, stated rather than emergent:
+
+> **A FALLBACK puts the Live session into `needs_rebase`. Revisions stay
+> non-DIRECT until a rebase re-establishes the baseline.**
+
+The soak checks the *policy*, and the classifier independently arrives at the
+same verdict from `before.mir_observable`. Two derivations of one conclusion,
+rather than one asserted twice. Over 300 revisions they never disagreed.
+
+## 43. Where this stands
+
+| property | status |
+|---|---|
+| Rust semantic validation | real compiler sessions, every revision |
+| exact changed closure | Path D, 4–12 instances, set-equality checked |
+| DIRECT safety classifier | 14 adversarial cases, closed-world invariant |
+| downstream rebuild skipping | oracle, 50 and 32 dependents, discriminating control |
+| MIR → Cranelift patch codegen | **0.13–0.27 ms**, timed inside the backend |
+| publication | **~2 µs** |
+| runtime vs independent LLVM rebuild | 9 mutations, 3 negative controls |
+| 100-revision residency | flat: drift 0.93×, 1.03×, 1.01× |
+| memory | +5.7 to +14.4 MB over 75 revisions |
+| concurrent generation consistency | 3 scenarios + control, 10 observations |
+| rollback consistency | scenario 3, against clean rebuilds |
+
+Steady-state `edit → active`, p50: **small 15 ms, rg-lib 23 ms, blinker-lib
+29 ms**, against cargo debug rebuilds of 434 and 762 ms.
+
+The defensible claim:
+
+> Blinker Live activates eligible Rust body edits in roughly 15–30 ms on the
+> measured workloads, 14–30× faster than Cargo. The changed Rust code compiles
+> in well under a millisecond and publishes in about 2 µs; the remaining
+> latency is rustc's own semantic validation, of which expansion is the largest
+> part and is a compiler-persistence problem rather than a Blinker Live one.

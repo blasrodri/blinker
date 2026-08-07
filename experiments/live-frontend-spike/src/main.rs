@@ -958,6 +958,8 @@ struct Options {
     sequence: bool,
     /// The resident-coordinator soak (§38).
     soak: bool,
+    /// Concurrency and rollback against clean rebuilds (§40).
+    generations: bool,
 }
 
 fn parse_options() -> Options {
@@ -977,6 +979,7 @@ fn parse_options() -> Options {
     let mut backend = None;
     let mut sequence = false;
     let mut soak = false;
+    let mut generations = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--fixture" => fixture = PathBuf::from(args.next().expect("--fixture takes a path")),
@@ -1002,6 +1005,7 @@ fn parse_options() -> Options {
             "--closure-only" => closure_only = true,
             "--sequence" => sequence = true,
             "--soak" => soak = true,
+            "--generations" => generations = true,
             "--backend" => backend = Some(PathBuf::from(args.next().expect("--backend takes a path"))),
             // The runtime differential. The argument names the defect to
             // inject: `none` is the suite proper, the rest are its controls.
@@ -1051,6 +1055,7 @@ fn parse_options() -> Options {
         backend,
         sequence,
         soak,
+        generations,
     }
 }
 
@@ -1072,6 +1077,9 @@ fn main() {
     }
     if options.sequence {
         return sequence_main(&options);
+    }
+    if options.generations {
+        std::process::exit(if differential::generations(&options) { 0 } else { 1 });
     }
     if let Some(sabotage) = options.differential {
         let trials = differential::run(&options, sabotage);
@@ -1583,23 +1591,37 @@ fn soak_main(options: &Options) {
     // exactly as it was.
     let mut live_value: i64 = 106;
 
-    // Whether the revision before this one was refused, which decides what
-    // this one may be.
+    // `needs_rebase`, as a stated policy rather than an emergent property.
     //
-    // Recovery from an inlinability refusal takes two revisions, not one, and
-    // that is the classifier being right rather than slow: `fallback_inline`
-    // leaves a body that rustc encodes into this crate's rmeta, so a
-    // downstream crate may hold a copy of it. The revision after it has a
-    // clean `#[inline(never)]` body of its own, but its *predecessor* is still
-    // observable downstream, and replacing one copy does not reach the others.
-    // A real coordinator answers a FALLBACK with an ordinary rebuild, which
-    // re-establishes the baseline; this harness has no downstream to rebuild,
-    // so it models the conservative path and checks that the program stays on
-    // its last good generation throughout.
-    let mut recovering = false;
+    // There are two notions of "the previous revision" once a refusal happens:
+    // the *compiler* predecessor, which is whatever was last compiled, and the
+    // *committed* predecessor, which is the last generation the program is
+    // actually running. After a FALLBACK they diverge.
+    //
+    // Comparing against the compiler predecessor is what this does, and it is
+    // why recovery takes two revisions: `fallback_inline` leaves a body rustc
+    // encodes into the crate's rmeta, so a downstream crate may hold a copy,
+    // and `classify` refuses on `before.mir_observable` as well as
+    // `after.mir_observable`. The revision after it has a clean
+    // `#[inline(never)]` body of its own, but its predecessor is still
+    // observable downstream and replacing one copy does not reach the others.
+    //
+    // Comparing against the *committed* predecessor instead would permit
+    // DIRECT → FALLBACK → DIRECT, on the argument that no downstream crate
+    // ever received the refused revision. That is probably sound and it is not
+    // what this does, because it makes source history and runtime history
+    // diverge and each divergence needs its own oracle.
+    //
+    // So the MVP rule is: a refusal puts the session into `needs_rebase`, and
+    // revisions stay non-DIRECT until a rebase re-establishes the baseline.
+    // Here the rebase is the next compilation. The check below is against the
+    // *policy*, and the classifier independently reaching the same answer is
+    // the point — two derivations of the same conclusion rather than one
+    // asserted twice.
+    let mut needs_rebase = false;
     for revision in 0..options.iterations {
         let (edit, expected, source) = &sources[revision % sources.len()];
-        let must_be_direct = expected.is_some() && !recovering;
+        let must_be_direct = expected.is_some() && !needs_rebase;
         let mut record = live::sink_revision(
             &arena,
             &runtime,
@@ -1649,10 +1671,10 @@ fn soak_main(options: &Options) {
                 record.verdict
             ));
         }
-        // Set by the *inline* revision, not by any refusal. A revision refused
-        // because its predecessor was observable does not itself leave an
-        // observable body behind, so recovery lasts exactly one revision.
-        recovering = expected.is_none();
+        // Set by the revision that is genuinely ineligible, and cleared by the
+        // rebase that follows it. A revision refused only *because* it was
+        // rebasing does not itself leave an observable body behind.
+        needs_rebase = expected.is_none();
         if direct && record.timings.is_none() {
             failures.push(format!(
                 "revision {revision} ({edit}): nothing was generated — a cached codegen unit \

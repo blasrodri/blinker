@@ -27,7 +27,7 @@ PRISTINE_BODY = """    let reading = Reading { value, scale };
 
 PRISTINE_BLEND = """#[inline(never)]
 fn blend(x: u64) -> u64 {
-    x.wrapping_add(7)
+    diff_second(x).wrapping_add(7)
 }"""
 
 # (name, what it exercises, [(anchor, replacement), ...])
@@ -90,7 +90,7 @@ fn fold<T: Copy + core::ops::BitXor<Output = T>>(a: T, b: T) -> T {
         [
             (PRISTINE_BLEND, """#[inline(never)]
 fn blend(x: u64) -> u64 {
-    x.wrapping_mul(31).wrapping_add(9)
+    diff_second(x).wrapping_mul(31).wrapping_add(9)
 }"""),
             (PRISTINE_BODY, """    let reading = Reading { value, scale };
     let total = reading.total();
@@ -122,6 +122,27 @@ fn blend(x: u64) -> u64 {
         i = i.wrapping_add(1);
     }
     let mixed = blend(acc);""")],
+    ),
+    # Both patchable functions changed, for §40's generation scenarios. A
+    # concurrent probe reads two gates from the generation it captured; if the
+    # revision it is compared against changes only one of them, the second gate
+    # returns the same number under either generation and proves nothing.
+    (
+        "two_gates",
+        "both `extern \"C\"` members of the closure changed",
+        [
+            (
+                """pub extern "C" fn diff_second(x: u64) -> u64 {
+    x.wrapping_mul(3).wrapping_add(1)
+}""",
+                """pub extern "C" fn diff_second(x: u64) -> u64 {
+    x.wrapping_mul(29).wrapping_add(6)
+}""",
+            ),
+            (PRISTINE_BODY, """    let reading = Reading { value, scale };
+    let total = reading.total();
+    let mixed = blend(total).wrapping_mul(17).wrapping_add(8);"""),
+        ],
     ),
     # The edit the classifier cannot see. `diff_entry` is not the hot root and
     # is not in its closure, so nothing S0c examines changes — yet a clean

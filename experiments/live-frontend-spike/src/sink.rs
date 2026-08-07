@@ -76,10 +76,10 @@ pub struct Timings {
 /// What one delivery produced.
 #[derive(Default)]
 pub struct Outcome {
-    /// The published root, as an address. A `*const u8` would make `Outcome`
-    /// non-`Send` and so unable to live in the static the callback writes to;
-    /// the pointer is reconstructed by the one caller that dereferences it,
-    /// under the same lifetime argument as everything else in the arena.
+    /// The candidate, built and relocated and not reachable. Whoever takes it
+    /// out of here is the one deciding whether it becomes the running program.
+    pub staged: Option<crate::live::Staged>,
+    /// The candidate root's address. Meaningful only once committed.
     pub entry: usize,
     /// Edit → the published code is callable. The product's latency.
     pub active_ms: f64,
@@ -344,18 +344,26 @@ extern "C" fn deliver(functions: *const LiveFunction, count: usize, timings: *co
         }
     }
 
-    match crate::live::publish(arena, runtime, &lifted, image) {
-        Ok((entry, publish_ms, bytes, relocations)) => {
-            outcome.entry = entry as usize;
-            outcome.publish_ms = publish_ms;
-            outcome.code_bytes = bytes;
-            outcome.relocations = relocations;
+    // Staged, not published. The backend's job ends with a candidate; making
+    // it reachable is the classifier's decision and happens elsewhere.
+    match crate::live::stage(arena, runtime, &lifted, image) {
+        Ok(staged) => {
+            outcome.entry = staged.entry();
+            outcome.publish_ms = staged.publish_ms;
+            outcome.code_bytes = staged.code_bytes;
+            outcome.relocations = staged.relocations;
+            outcome.staged = Some(staged);
         }
         Err(error) => outcome.error = Some(error),
     }
     // The clock stops here, and only here. Everything the compiler does after
     // this — the object file, the incremental session, the rest of codegen —
     // is work the developer is no longer waiting on.
+    //
+    // The commit itself is outside this window and is measured by R1 at ~1 µs:
+    // one atomic store. Attributing it here or there changes nothing that
+    // rounds to a microsecond, and putting it here would be claiming the
+    // classifier's time as the backend's.
     if let Some(started) = *STARTED.lock().expect("not poisoned") {
         outcome.active_ms = started.elapsed().as_secs_f64() * 1e3;
     }

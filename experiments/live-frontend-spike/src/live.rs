@@ -265,19 +265,54 @@ pub fn symbol_matches(symbol: &str, wanted: &str) -> bool {
     bare == wanted || bare.contains(wanted)
 }
 
-/// Publish the lifted functions and return the closure's root.
+/// A generation that exists but is not reachable.
+///
+/// The arena holds its code, it is fully relocated, its i-cache is flushed and
+/// its slot table is built — and `Runtime::current` has never heard of it. That
+/// separation is the point. cg_clif delivers an artifact from inside codegen,
+/// before anything has classified the revision, so an artifact that publishes
+/// on arrival is globally visible for the whole window in which it is being
+/// decided about. Under the sequential soak that window was harmless; a request
+/// arriving inside it would execute code nothing had accepted.
+///
+/// So the backend may only build one of these. Exactly one function makes a
+/// generation reachable on the forward path — `Runtime::publish` — and it is
+/// called after the classifier and the artifact rules have both said yes.
+pub struct Staged {
+    generation: Box<crate::generation::Generation>,
+    /// Every closure member's arena address, by symbol, so a caller can find a
+    /// gate other than the root. Addresses rather than pointers because this
+    /// crosses a thread boundary.
+    pub entries: Vec<(String, usize)>,
+    pub publish_ms: f64,
+    pub code_bytes: usize,
+    pub relocations: usize,
+}
+
+impl Staged {
+    pub fn entry(&self) -> usize {
+        self.entries.first().map(|(_, address)| *address).unwrap_or(0)
+    }
+
+    /// The one call that makes a candidate reachable.
+    pub fn commit(self, runtime: &Runtime) -> u64 {
+        runtime.publish(self.generation)
+    }
+}
+
+/// Build a candidate from the lifted functions. Nothing becomes visible.
 ///
 /// Relocations to symbols outside the closure are resolved against the base
 /// image, or failing that the running process. A target that cannot be
 /// resolved fails the publication rather than being patched with a guess, and
 /// the failure happens before anything is made executable — the arena's
 /// `publish` is the last step, not the first.
-pub fn publish(
+pub fn stage(
     arena: &Arena,
     runtime: &Runtime,
     lifted: &[Lifted],
     image: Option<*mut libc::c_void>,
-) -> Result<(*const u8, f64, usize, usize), String> {
+) -> Result<Staged, String> {
     use blinker_macho::Arm64RelocationKind as Kind;
     let at = Instant::now();
 
@@ -433,12 +468,21 @@ pub fn publish(
         .iter()
         .map(|o| unsafe { slab.ptr.add(*o) } as *const u8)
         .collect();
-    let candidate = runtime.candidate(slots, vec![slab]);
-    runtime.publish(candidate);
+    let entries = lifted
+        .iter()
+        .zip(&slots)
+        .map(|(function, slot)| (function.name.clone(), *slot as usize))
+        .collect();
+    let generation = runtime.candidate(slots, vec![slab]);
     let publish_ms = at.elapsed().as_secs_f64() * 1e3;
 
-    let entry = scope(runtime, |generation| generation.implementation(0).expect("slot 0"));
-    Ok((entry, publish_ms, total, applied))
+    Ok(Staged {
+        generation,
+        entries,
+        publish_ms,
+        code_bytes: total,
+        relocations: applied,
+    })
 }
 
 /// Publish, then call the closure's root.
@@ -455,10 +499,14 @@ fn publish_and_call(
     lifted: &[Lifted],
     argument: i64,
 ) -> Result<(i64, f64, usize, usize), String> {
-    let (entry, publish_ms, total, applied) = publish(arena, runtime, lifted, None)?;
+    let staged = stage(arena, runtime, lifted, None)?;
+    let (publish_ms, bytes, relocations) =
+        (staged.publish_ms, staged.code_bytes, staged.relocations);
+    let entry = staged.entry();
+    staged.commit(runtime);
     // SAFETY: the fixture is generated, so the signature is known.
-    let f: extern "C" fn(u64, u32) -> u64 = unsafe { std::mem::transmute(entry) };
-    Ok((f(argument as u64, 5) as i64, publish_ms, total, applied))
+    let f: extern "C" fn(u64, u32) -> u64 = unsafe { std::mem::transmute(entry as *const u8) };
+    Ok((f(argument as u64, 5) as i64, publish_ms, bytes, relocations))
 }
 
 /// A symbol in the base image, or failing that in the running process.
@@ -496,13 +544,18 @@ pub struct PatchOptions {
     pub ignore_classifier: bool,
 }
 
-/// A published patch, or the reason there is not one.
-#[derive(Debug, Default)]
+/// A candidate patch, or the reason there is not one.
+#[derive(Default)]
 pub struct Patch {
     pub verdict: String,
     pub closure_size: usize,
-    /// The patch closure's root, live in the arena.
-    pub entry: Option<*const u8>,
+    /// This revision's contract, for the next revision to be compared against.
+    pub contract: Option<crate::classify::Contract>,
+    /// The candidate, built and not reachable. `patch` never commits: the
+    /// caller does, once it has decided. That is the whole architecture in one
+    /// field — there is no path from "the backend produced code" to "the
+    /// program runs it" that does not go through a caller saying so.
+    pub staged: Option<Staged>,
     pub error: Option<String>,
 }
 
@@ -559,6 +612,7 @@ pub fn patch(
         true,
     );
     patch.closure_size = session.mono_items_examined;
+    patch.contract = session.contract.clone();
     // The sink path is finished here: the artifact was published from inside
     // codegen, so there is nothing left to lift.
     if backend.is_some() {
@@ -579,10 +633,11 @@ pub fn patch(
         }
         match outcome {
             Some(outcome) if outcome.error.is_some() => patch.error = outcome.error,
-            Some(outcome) if outcome.entry != 0 => {
-                patch.entry = Some(outcome.entry as *const u8)
-            }
-            _ => patch.error = Some("the sink delivered nothing".into()),
+            Some(outcome) => match outcome.staged {
+                Some(staged) => patch.staged = Some(staged),
+                None => patch.error = Some("the sink staged nothing".into()),
+            },
+            None => patch.error = Some("the sink delivered nothing".into()),
         }
         return patch;
     }
@@ -666,8 +721,8 @@ pub fn patch(
         }
     }
 
-    match publish(arena, runtime, &lifted, image) {
-        Ok((entry, _, _, _)) => patch.entry = Some(entry),
+    match stage(arena, runtime, &lifted, image) {
+        Ok(staged) => patch.staged = Some(staged),
         Err(error) => patch.error = Some(error),
     }
     patch
@@ -922,9 +977,9 @@ pub fn sink_revision(
         record.timings = Some(outcome.timings);
         record.object_defines = outcome.timings.functions as usize;
     }
-    let published = outcome
+    let staged = outcome
         .as_ref()
-        .is_some_and(|outcome| outcome.entry != 0 && outcome.error.is_none());
+        .is_some_and(|outcome| outcome.staged.is_some() && outcome.error.is_none());
 
     let accept = (|| {
         if let Some(error) = session.error {
@@ -941,7 +996,7 @@ pub fn sink_revision(
         }
         match outcome.as_ref().and_then(|outcome| outcome.error.clone()) {
             Some(error) => Err(error),
-            None if !published => Err("the sink delivered nothing".into()),
+            None if !staged => Err("the sink staged nothing".into()),
             None => Ok(true),
         }
     })();
@@ -953,22 +1008,19 @@ pub fn sink_revision(
             false
         }
     };
-    if !accepted {
-        if published {
-            // Back to the generation this revision superseded. `parent` is on
-            // the generation itself, which makes a rollback a fact about the
-            // published history rather than a count the caller has to keep.
-            let parent = scope(runtime, |generation| generation.parent);
-            runtime.rollback_code(parent);
-        }
+    // A refused candidate is *discarded*, not rolled back. Its arena slab stays
+    // allocated until reclamation exists — R1 deferred that — but nothing ever
+    // pointed at it, so there is no window in which it could have run.
+    let Some(outcome) = outcome.filter(|_| accepted) else {
         return record;
-    }
-
-    if let Some(outcome) = outcome {
-        // SAFETY: an address in the arena, of the fixture's declared signature.
-        let f: extern "C" fn(u64, u32) -> u64 =
-            unsafe { std::mem::transmute(outcome.entry as *const u8) };
-        record.returned = Some(f(3, 5) as i64);
-    }
+    };
+    let Some(staged) = outcome.staged else {
+        return record;
+    };
+    let entry = staged.entry();
+    staged.commit(runtime);
+    // SAFETY: an address in the arena, of the fixture's declared signature.
+    let f: extern "C" fn(u64, u32) -> u64 = unsafe { std::mem::transmute(entry as *const u8) };
+    record.returned = Some(f(3, 5) as i64);
     record
 }
