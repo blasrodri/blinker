@@ -1,0 +1,92 @@
+[
+  {
+    "mutation": "body_arith",
+    "verdict": "DIRECT",
+    "agreed": null,
+    "difference": null,
+    "base_intact": true,
+    "closure_size": 5,
+    "error": "cannot resolve __RNvCsfCWnWJ9PaRW_12diff_fixture5blend"
+  },
+  {
+    "mutation": "call_existing",
+    "verdict": "DIRECT",
+    "agreed": null,
+    "difference": null,
+    "base_intact": true,
+    "closure_size": 5,
+    "error": "cannot resolve __RNvCsfCWnWJ9PaRW_12diff_fixture5blend"
+  },
+  {
+    "mutation": "new_local_helper",
+    "verdict": "DIRECT",
+    "agreed": null,
+    "difference": null,
+    "base_intact": true,
+    "closure_size": 12,
+    "error": "cannot resolve __RNvCsfCWnWJ9PaRW_12diff_fixture4skew"
+  },
+  {
+    "mutation": "new_generic",
+    "verdict": "DIRECT",
+    "agreed": null,
+    "difference": null,
+    "base_intact": true,
+    "closure_size": 7,
+    "error": "cannot resolve __RNvCsfCWnWJ9PaRW_12diff_fixture5blend"
+  },
+  {
+    "mutation": "read_static",
+    "verdict": "DIRECT",
+    "agreed": null,
+    "difference": null,
+    "base_intact": true,
+    "closure_size": 5,
+    "error": "cannot resolve __RNvCsfCWnWJ9PaRW_12diff_fixture5blend"
+  },
+  {
+    "mutation": "multi_function",
+    "verdict": "DIRECT",
+    "agreed": null,
+    "difference": null,
+    "base_intact": true,
+    "closure_size": 5,
+    "error": "cannot resolve __RNvCsfCWnWJ9PaRW_12diff_fixture5blend"
+  },
+  {
+    "mutation": "branch_cold",
+    "verdict": "DIRECT",
+    "agreed": null,
+    "difference": null,
+    "base_intact": true,
+    "closure_size": 5,
+    "error": "cannot resolve __RNvCsfCWnWJ9PaRW_12diff_fixture5blend"
+  },
+  {
+    "mutation": "loop_edit",
+    "verdict": "DIRECT",
+    "agreed": null,
+    "difference": null,
+    "base_intact": true,
+    "closure_size": 6,
+    "error": "cannot resolve __RNvCsfCWnWJ9PaRW_12diff_fixture5blend"
+  },
+  {
+    "mutation": "edit_outside_closure",
+    "verdict": "FALLBACK(changed_outside_closure)",
+    "agreed": null,
+    "difference": null,
+    "base_intact": true,
+    "closure_size": 5,
+    "error": "the classifier refused: Fallback { reason: ChangedOutsideClosure { functions: [\"::diff_entry\"] } }"
+  },
+  {
+    "mutation": "new_static",
+    "verdict": "FALLBACK(new_static_required)",
+    "agreed": null,
+    "difference": null,
+    "base_intact": true,
+    "closure_size": 5,
+    "error": "the classifier refused: Fallback { reason: NewStaticRequired { statics: [\"DIFF_FRESH\"] } }"
+  }
+]

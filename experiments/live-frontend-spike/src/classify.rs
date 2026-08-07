@@ -88,6 +88,10 @@ pub struct Contract {
     /// Path D's closure: how many instances the changed body reaches, and
     /// whether every one of them resolved inside this crate.
     pub closure_size: usize,
+    /// The closure's members, by def path. The set a live patch replaces.
+    pub closure_paths: std::collections::BTreeSet<String>,
+    /// Every function the crate defines, and a fingerprint of its body (§32).
+    pub bodies: std::collections::BTreeMap<String, String>,
     pub closure_is_local: bool,
     /// Statics the closure reads. A body that introduces a new one needs
     /// storage the base image does not have, and no signature or ABI
@@ -105,6 +109,12 @@ pub struct Contract {
 pub enum Reason {
     /// The function vanished, or was never there.
     HotRootMissing,
+    /// A function outside the patch closure changed in the same revision, so
+    /// the base image would keep its old compiled code (§32).
+    ChangedOutsideClosure { functions: Vec<String> },
+    /// The crate's body fingerprints could not be read, so the check above
+    /// cannot be performed and the edit is refused rather than assumed safe.
+    BodiesUnavailable,
     /// Not an ordinary free function.
     NotAnOrdinaryFn { def_kind: String },
     /// A trait or inherent method. Excluded from the first DIRECT class
@@ -231,6 +241,8 @@ pub fn contract_of(
     closure_is_local: bool,
     statics: &std::collections::BTreeSet<String>,
     crate_statics: &std::collections::BTreeSet<String>,
+    closure_paths: &std::collections::BTreeSet<String>,
+    bodies: std::collections::BTreeMap<String, String>,
 ) -> Contract {
     let global = def_id.to_def_id();
     let def_kind = tcx.def_kind(def_id);
@@ -279,13 +291,13 @@ pub fn contract_of(
     let attrs = tcx.codegen_fn_attrs(def_id);
     Contract {
         def_kind: format!("{def_kind:?}"),
-        fn_sig: format!(
+        fn_sig: stable(&format!(
             "{:?}",
             tcx.fn_sig(global).instantiate_identity().skip_normalization()
-        ),
-        type_of: format!("{:?}", tcx.type_of(global).instantiate_identity()),
-        generics: format!("{:?}", tcx.generics_of(global).own_params),
-        predicates: format!("{:?}", tcx.predicates_of(global).predicates),
+        )),
+        type_of: stable(&format!("{:?}", tcx.type_of(global).instantiate_identity())),
+        generics: stable(&format!("{:?}", tcx.generics_of(global).own_params)),
+        predicates: stable(&format!("{:?}", tcx.predicates_of(global).predicates)),
         // Every codegen-relevant attribute in one string: `#[target_feature]`,
         // `#[no_mangle]`, `#[export_name]`, `#[linkage]`, `#[cold]`, the
         // inline hint, and the flag set. A target-feature change alters the
@@ -307,7 +319,7 @@ pub fn contract_of(
             attrs.instruction_set,
             attrs.sanitizers,
         ),
-        fn_abi,
+        fn_abi: stable(&fn_abi),
         symbol_name,
         mir_observable: ctfe || optimized,
         requires_monomorphization: tcx.generics_of(global).requires_monomorphization(tcx),
@@ -324,6 +336,8 @@ pub fn contract_of(
             && mentions_opaque(tcx, global),
         is_associated: matches!(def_kind, DefKind::AssocFn),
         closure_size,
+        closure_paths: closure_paths.clone(),
+        bodies,
         closure_is_local,
         statics: statics.iter().cloned().collect(),
         crate_statics: crate_statics.iter().cloned().collect(),
@@ -335,6 +349,85 @@ pub fn contract_of(
 /// Ordered so that the *categorical* refusals come before the comparative
 /// ones: "this kind of function can never be replaced" is a better
 /// explanation than "its ABI string differs", even when both are true.
+/// Render a compiler Debug string without the parts that are positions rather
+/// than identities.
+///
+/// `{:?}` on a type prints `DefId(0:7 ~ diff_fixture[b607]::diff_root)`. The
+/// `0:7` is a *definition index*, assigned by the order items appear in the
+/// crate, so adding any function above `diff_root` renumbers it — and the
+/// contract then reports that `diff_root`'s type changed when nothing about it
+/// changed at all. The runtime differential found this: `new_local_helper` and
+/// `new_generic` were both refused with `field: "type_of"`, quoting two
+/// spellings of the same function.
+///
+/// This is the linker's finding 230 and finding 241 for a third time. A local's
+/// name was not an identity; an archive member's name was not an identity; a
+/// definition's index is not an identity either. The path is, so the path is
+/// what the contract compares.
+///
+/// The crate's disambiguator hash goes too — it tracks compilation flags, not
+/// source — but the crate *name* stays, because two crates with the same item
+/// path are genuinely different items.
+fn stable(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("DefId(") {
+        out.push_str(&rest[..at]);
+        out.push_str("DefId(");
+        let inner = &rest[at + "DefId(".len()..];
+        let Some(close) = inner.find(')') else {
+            out.push_str(inner);
+            return out;
+        };
+        let body = &inner[..close];
+        // Everything after the `~` is the path; everything before it is the
+        // index. When there is no `~` the whole body is kept rather than
+        // guessed at.
+        let path = body.split_once(" ~ ").map(|(_, path)| path).unwrap_or(body);
+        let mut scrubbed = String::with_capacity(path.len());
+        let mut depth = 0usize;
+        for ch in path.chars() {
+            match ch {
+                '[' => depth += 1,
+                ']' if depth > 0 => depth -= 1,
+                _ if depth == 0 => scrubbed.push(ch),
+                _ => {}
+            }
+        }
+        out.push_str(&scrubbed);
+        out.push(')');
+        rest = &inner[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+#[cfg(test)]
+mod stable_tests {
+    use super::stable;
+
+    #[test]
+    fn an_index_is_not_an_identity() {
+        let before = "FnDef(DefId(0:7 ~ diff_fixture[b607]::diff_root), Binder)";
+        let after = "FnDef(DefId(0:9 ~ diff_fixture[b607]::diff_root), Binder)";
+        assert_eq!(stable(before), stable(after));
+        assert_eq!(stable(before), "FnDef(DefId(diff_fixture::diff_root), Binder)");
+    }
+
+    #[test]
+    fn a_different_item_is_still_different() {
+        assert_ne!(
+            stable("DefId(0:7 ~ c[a]::one)"),
+            stable("DefId(0:7 ~ c[a]::two)")
+        );
+    }
+
+    #[test]
+    fn text_without_a_def_id_survives_unchanged() {
+        assert_eq!(stable("conv=Rust args=[Size(8)/Direct]"), "conv=Rust args=[Size(8)/Direct]");
+    }
+}
+
 pub fn classify(before: &Contract, after: &Contract) -> Verdict {
     let fallback = |reason| Verdict::Fallback { reason };
 
@@ -411,6 +504,42 @@ pub fn classify(before: &Contract, after: &Contract) -> Verdict {
         .collect();
     if !fresh.is_empty() {
         return fallback(Reason::NewStaticRequired { statics: fresh });
+    }
+
+    // A live patch replaces the closure. Anything outside it that changed in
+    // the same revision keeps its old compiled code in the base image, and the
+    // program then behaves like neither revision.
+    //
+    // Every check above this one is about the hot root, and that is exactly
+    // why none of them could see it: `edit_outside_closure` changes a function
+    // the root never mentions, so the signature, ABI, symbol name, attributes
+    // and MIR observability are all bit-identical across the two revisions.
+    // The runtime differential caught it returning 7 where a clean rebuild
+    // returned 8, which is the first thing that suite found that nothing else
+    // could have.
+    if after.bodies.is_empty() || after.bodies.values().any(String::is_empty) {
+        // Fail closed. An unavailable fingerprint compares equal to another
+        // unavailable fingerprint, so a missing one would make this check pass
+        // by being unable to run.
+        return fallback(Reason::BodiesUnavailable);
+    }
+    let mut outside: Vec<String> = Vec::new();
+    for (path, hash) in &after.bodies {
+        if before.bodies.get(path) != Some(hash) && !after.closure_paths.contains(path) {
+            outside.push(path.clone());
+        }
+    }
+    // A function that existed and no longer does is also a change outside the
+    // closure — the base image still contains it, and still calls it.
+    for path in before.bodies.keys() {
+        if !after.bodies.contains_key(path) && !after.closure_paths.contains(path) {
+            outside.push(path.clone());
+        }
+    }
+    if !outside.is_empty() {
+        outside.sort();
+        outside.dedup();
+        return fallback(Reason::ChangedOutsideClosure { functions: outside });
     }
     Verdict::Direct
 }

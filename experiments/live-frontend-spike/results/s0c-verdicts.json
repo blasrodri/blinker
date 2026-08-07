@@ -6,7 +6,7 @@
     "expected_reason": null,
     "got": "DIRECT",
     "got_reason": "-",
-    "classify_ms": 0.043375,
+    "classify_ms": 0.048,
     "closure": 4
   },
   {
@@ -16,7 +16,7 @@
     "expected_reason": null,
     "got": "DIRECT",
     "got_reason": "-",
-    "classify_ms": 0.044833000000000005,
+    "classify_ms": 0.048374999999999994,
     "closure": 5
   },
   {
@@ -26,7 +26,7 @@
     "expected_reason": null,
     "got": "DIRECT",
     "got_reason": "-",
-    "classify_ms": 0.038042,
+    "classify_ms": 0.04629200000000001,
     "closure": 5
   },
   {
@@ -36,7 +36,7 @@
     "expected_reason": null,
     "got": "DIRECT",
     "got_reason": "-",
-    "classify_ms": 0.05,
+    "classify_ms": 0.049292,
     "closure": 4
   },
   {
@@ -46,7 +46,7 @@
     "expected_reason": "cross_crate_inlinable",
     "got": "FALLBACK",
     "got_reason": "cross_crate_inlinable",
-    "classify_ms": 0.041833999999999996,
+    "classify_ms": 0.045709,
     "closure": 3
   },
   {
@@ -56,7 +56,7 @@
     "expected_reason": "requires_monomorphization",
     "got": "FALLBACK",
     "got_reason": "requires_monomorphization",
-    "classify_ms": 3.461125,
+    "classify_ms": 3.610375,
     "closure": 2
   },
   {
@@ -66,7 +66,7 @@
     "expected_reason": "const_evaluable",
     "got": "FALLBACK",
     "got_reason": "const_evaluable",
-    "classify_ms": 0.042125,
+    "classify_ms": 0.048792,
     "closure": 2
   },
   {
@@ -76,7 +76,7 @@
     "expected_reason": null,
     "got": "FALLBACK",
     "got_reason": "opaque_in_signature",
-    "classify_ms": 0.041792,
+    "classify_ms": 0.05175,
     "closure": 1
   },
   {
@@ -86,7 +86,7 @@
     "expected_reason": "opaque_in_signature",
     "got": "FALLBACK",
     "got_reason": "opaque_in_signature",
-    "classify_ms": 0.041333,
+    "classify_ms": 0.051292000000000004,
     "closure": 2
   },
   {
@@ -96,7 +96,7 @@
     "expected_reason": "associated_fn",
     "got": "FALLBACK",
     "got_reason": "associated_fn",
-    "classify_ms": 0.046375,
+    "classify_ms": 0.053083,
     "closure": 2
   },
   {
@@ -106,7 +106,7 @@
     "expected_reason": "contract_changed",
     "got": "FALLBACK",
     "got_reason": "contract_changed",
-    "classify_ms": 0.040458,
+    "classify_ms": 0.048917,
     "closure": 4
   },
   {
@@ -116,7 +116,7 @@
     "expected_reason": "contract_changed",
     "got": "FALLBACK",
     "got_reason": "contract_changed",
-    "classify_ms": 0.046,
+    "classify_ms": 0.043792,
     "closure": 2
   },
   {
@@ -126,7 +126,7 @@
     "expected_reason": null,
     "got": "FALLBACK",
     "got_reason": "new_static_required",
-    "classify_ms": 0.036625000000000005,
+    "classify_ms": 0.042082999999999995,
     "closure": 4
   },
   {
@@ -136,7 +136,7 @@
     "expected_reason": null,
     "got": "DIRECT",
     "got_reason": "-",
-    "classify_ms": 0.040125,
+    "classify_ms": 0.058375,
     "closure": 6
   }
 ]

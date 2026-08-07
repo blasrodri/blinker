@@ -704,3 +704,243 @@ incidental, and identity is what the thing *is*.
 
 That fix is what made `small` work end to end, which is why §27 has three
 fixtures and one of them is a `bin`.
+
+## 29. Two invariants, so that the narrow universe is a check and not a hope
+
+Closure-only codegen made the patch object's contents *predictable*. A
+prediction nobody compares against the outcome is a comment, so both are now
+asserted on every patch.
+
+**Set equality on definitions.** The object's external definitions must equal
+the set the codegen universe was told to emit, plus an explicit
+`RUNTIME_SUPPORT` allowlist that is currently empty and exists so the first
+entry has to be argued for. Containment would not do: "every closure member is
+present" passes on the 922-symbol whole-crate object exactly as happily as on
+the 5-symbol one. Both directions have teeth — an unexpected definition means
+the backend emitted something Path D did not account for; a missing one means
+the patch is incomplete. Measured on all three latency fixtures: **4 defined,
+4 expected, 0 unexpected, 0 missing.**
+
+**Every relocation explained.** A target must be inside the closure, a symbol
+the base image defines, or an allowlisted runtime helper. Anything else
+rejects the patch.
+
+Writing that down found a defect in code that had been passing its tests.
+Section-relative relocations — a constant pool, a jump table, a string literal
+— were `return None` inside a `filter_map`, which does not refuse them. It
+**drops** them: the patch was published with that field unpatched and the code
+read whatever cg_clif had left there. Refusing to lift a function is a rejected
+patch. Silently skipping one of its relocations is a wrong answer at full
+speed. A relocation against a symbol that could not be named was being dropped
+the same way. Both now reject.
+
+The one capability added is a GOT. Reading a static compiles to an
+`adrp`/`ldr` pair through a Global Offset Table, so the arena now carries an
+eight-byte slot per externally-referenced symbol and relocates `Page21`,
+`PageOff12`, `GotLoadPage21` and `GotLoadPageOff12` into it. That is case two
+of the invariant — an existing base-image symbol — rather than a widening of
+the semantic class.
+
+## 30. The runtime differential
+
+§22 checked one value on one edit. That is a start and it is not a safety case.
+
+```
+                   same starting revision
+                            │
+               ┌────────────┴────────────┐
+           LIVE PATH                 CLEAN PATH
+               │                         │
+    validate / classify           apply the same edit
+      Path D closure                     │
+       cg_clif patch            rustc, LLVM, real linker
+         publish                         │
+               │                         │
+          run probes                run probes
+               └────────────┬────────────┘
+                            ↓
+                    compare observations
+```
+
+The two sides share **no code below the source text**. The clean path is
+ordinary rustc with the default LLVM backend, producing a `cdylib` that the
+dynamic loader loads. Nothing in the live path's lifting, relocation or
+publication logic runs on the clean side, so a bug there cannot cancel out.
+
+### It has a base image, and that is the whole design
+
+Every error the classifier exists to prevent is an error about code that was
+*not* patched — a caller holding an inlined copy of an old body, a constant
+folded into a neighbour, a layout some other function still assumes. A
+differential that only ever calls the patched function cannot see any of them,
+and would be green for exactly the reasons it should be red.
+
+So the live path loads the previous revision as a real base image and drives
+its probes through `diff_entry`, which lives in that image and reaches the
+patch through a gate. Everything the entry point touches other than the patch
+closure is old compiled code. That is the situation a live patch actually
+creates, and it is what makes §32 findable.
+
+Nine probe inputs, chosen so that `branch_cold`'s cold path is taken by some
+and not others and `loop_edit`'s trip count varies across its clamp. Return
+values and the memory the callee writes are both compared.
+
+### The suite
+
+| mutation | exercises | verdict | agrees with a clean rebuild |
+|---|---|---|---|
+| `body_arith` | arithmetic in the root | DIRECT | **yes** |
+| `call_existing` | a second call to a member the closure had | DIRECT | **yes** |
+| `new_local_helper` | a function that did not exist before | DIRECT | **yes** |
+| `new_generic` | a generic instantiated at a new type | DIRECT | **yes** |
+| `read_static` | reading a static the base image holds | DIRECT | **yes** |
+| `multi_function` | two members of one closure changed | DIRECT | **yes** |
+| `branch_cold` | a branch most probes never take | DIRECT | **yes** |
+| `loop_edit` | a loop whose trip count is an input | DIRECT | **yes** |
+| `edit_outside_closure` | a function outside the closure changed | FALLBACK(changed_outside_closure) | refused |
+| `new_static` | a static introduced | FALLBACK(new_static_required) | refused |
+
+Every variant is generated from `pristine.rs` by a stated substitution rather
+than written by hand, because "the same starting revision, edited two ways" is
+the premise, and a hand-written variant that had drifted in some second,
+unnoticed respect would make a passing comparison mean less than it looks like.
+
+### What is not observed, and why
+
+`stdout`, `stderr`, panics and callbacks are fields on `Observation` and are
+empty for every mutation. The reason is one reason: all four need the patch to
+reference constant data — a format string, a `&Location`, a vtable — which
+arrives as a section-relative relocation, which §29 refuses outright. A patch
+that can panic is outside this DIRECT class today. The fixture is compiled with
+`-Cdebug-assertions=off` for the same reason and not for convenience: at
+`-Copt-level=0` an ordinary `+` emits an overflow check that calls
+`core::panicking::panic_const_add_overflow(&Location)`.
+
+## 31. Three negative controls
+
+A suite that has never failed is a suite nobody has shown *can* fail.
+
+| control | injected defect | required outcome | result |
+|---|---|---|---|
+| 1 | omit one member of the patch closure | caught while building the artifact, never as a wrong answer | **8/8 rejected**, base image intact |
+| 2 | point a relocation at a symbol that does not exist | candidate rejected, current generation unchanged | **8/8 rejected**, base image intact |
+| 3 | publish an edit the classifier refused | the suite must catch what the classifier would have | **2/2 caught** |
+
+Control 3 is the one that decides whether a green run means anything, and it
+demonstrates *both* detection mechanisms:
+
+- `new_static` forced through is caught by §29's relocation rule — the patch
+  references storage the base image does not have.
+- `edit_outside_closure` forced through **publishes cleanly and is caught by
+  the behaviour comparison**: `probe 0 (0, 0): live returned 7 wrote 43693,
+  clean returned 8 wrote 43693`.
+
+The transactional property is checked on every trial and not only the failing
+ones, because an *accepted* patch that corrupted the previous generation would
+otherwise go unnoticed. Across all four modes and every mutation, the base
+image answers exactly as it did before the attempt.
+
+Control 1 was wrong the first time and said so. It dropped Path D's *last*
+symbol, which for two mutations nothing referred to — so the patch published,
+agreed with the clean rebuild, and the control reported a failure to fail. An
+omission that changes no observable behaviour is not an incomplete closure; it
+is a closure that was larger than it needed to be. The victim is now a member
+that another member calls, and if no such member exists the control reports
+that it does not apply rather than passing.
+
+## 32. What the differential found: the classifier was reasoning about the wrong thing
+
+`edit_outside_closure` changes `diff_entry` — a function that is not the hot
+root and is not in its closure. Every field S0c compared was bit-identical
+across the two revisions, because every field S0c compared is *about the hot
+root*: signature, ABI, symbol name, attributes, generics, predicates, MIR
+observability. All unchanged, correctly, because the root did not change.
+
+The patch published. The base image kept its old `diff_entry`. The program
+returned **7 where a clean rebuild returned 8**.
+
+Nothing in the compile-time oracle could have found this either — no
+dependent's code changes, because the edit is inside one crate. It needed a
+behavioural comparison against a clean rebuild, which is precisely the argument
+for having one.
+
+The missing premise is not about the root at all:
+
+> **A live patch replaces the closure, so nothing outside the closure may have
+> changed.**
+
+The contract now carries a fingerprint of every function the crate defines, and
+`classify` refuses when any body outside the closure changed — or was removed.
+The fingerprints are rustc's own: it already hashes each HIR owner including
+bodies for its incremental machinery, so this reads numbers that have been
+computed rather than computing them. Added-then-deleted functions are covered
+in both directions. It fails closed: an unavailable fingerprint refuses rather
+than comparing equal to another unavailable fingerprint.
+
+`edit_outside_closure` is now `FALLBACK(changed_outside_closure)`, naming
+`::diff_entry`. All eight DIRECT mutations still agree, all 14 S0c adversarial
+cases still pass, and the downstream oracle still passes.
+
+**A DefId is not an identity, either.** Fixing that hole surfaced a second one
+underneath it. The contract rendered types with `{:?}`, which prints
+`DefId(0:7 ~ diff_fixture[b607]::diff_root)`. The `0:7` is a *definition
+index*, assigned by the order items appear in the crate — so adding any
+function above `diff_root` renumbered it, and the contract reported that
+`diff_root`'s type had changed when nothing about it had. `new_local_helper`
+and `new_generic` were both refused with `field: "type_of"`, quoting two
+spellings of the same function.
+
+That is the linker's finding 230 and finding 241 for a third time. A local's
+name was not an identity; an archive member's name was not an identity; a
+definition's index is not one either. The contract now compares def *paths*.
+A consequence worth stating: this bug was making the classifier *look* safer
+than it was, by refusing edits for a reason that had nothing to do with safety.
+
+**Two smaller ones, both found the same way.** Path D walked into intrinsics
+and asked for their MIR, which is an ICE rather than an error — a mutation
+calling `rotate_left` took the compiler down. But skipping all intrinsics is
+wrong in the more dangerous direction: one that is not `must_be_overridden` has
+a fallback body, and cg_clif emits an ordinary call to it, so the object was
+left calling a function nobody had generated. rustc's own collector resolves
+such an intrinsic to its fallback `Item`, and now so does this.
+
+And `def_path_str` cost **3.7 ms** — flat across a 40-function crate and a
+900-function one, which is the shape of one crate-wide query and not of
+per-item work. It renders the *visible* path, which needs `visible_parent_map`
+over the whole crate graph. `def_path` is local data and costs 0.15 ms. When
+the two renderings disagreed, every changed body looked like it lay outside the
+closure, every edit was refused, and — because the summary table had no verdict
+column — that read as a silent `None` rather than as a refusal. The column is
+back.
+
+## 33. Where the numbers stand
+
+`body_arith`, closure-only, p50 over 12 iterations after 4 warm-ups, with §32's
+check in place:
+
+| fixture | expand | analysis | hot mir | classify | closure | codegen | extract | **publish** | **total** | cargo debug |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| small (bin) | 8.61 | 4.08 | 0.05 | 0.228 | 0.033 | 3.76 | 0.795 | **0.0020** | **17.5** | — |
+| rg-lib | 9.75 | 6.65 | 0.07 | 0.165 | 0.031 | 7.11 | 0.103 | **0.0018** | **25.0** | 762 ms → **30.5×** |
+| blinker-lib | 15.51 | 7.20 | 0.09 | 0.145 | 0.032 | 7.65 | 0.111 | **0.0019** | **31.2** | 434 ms → **13.9×** |
+
+72 revisions, no errors, every one DIRECT and returning 106 / 167.
+
+**A correction to §27.** That section put the closure's own backend cost at
+0.33–0.68 ms. Repeating the empty-universe subtraction on a quiet machine gives
+0.53, 0.25 and **−0.23** ms. A negative figure is not a faster-than-nothing
+compile; it is the subtraction reaching its noise floor against a ~7 ms fixed
+session cost. The defensible statement across both runs and all three fixtures
+is:
+
+> Lowering and compiling a real four-instance Rust patch closure through
+> cg_clif costs **under 1 ms**, and on the largest fixture it is not
+> distinguishable from zero by this method.
+
+The conclusion §27 drew is unchanged and slightly strengthened: the backend is
+not the thing to optimize. Resolving it further would need a timer inside
+cg_clif rather than a subtraction outside it.
+
+What remains, for `blinker-lib`'s 31 ms: `expand` 15.5, `analysis` 7.2,
+fixed session finalization 7.9. Everything unique to Blinker Live — classify,
+Path D, the backend, extraction, publication — is **0.5 ms of the 31**.

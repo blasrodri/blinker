@@ -65,12 +65,28 @@ pub struct LiveRecord {
     pub total_ms: f64,
     pub verdict: String,
     pub closure_size: usize,
+    /// External definitions in the patch object, which must equal the codegen
+    /// universe exactly (§29).
+    pub object_defines: usize,
     pub code_bytes: usize,
     pub relocations: usize,
     /// What the published function returned. The point of the exercise.
     pub returned: Option<i64>,
     pub error: Option<String>,
 }
+
+/// Symbols a patch object may define beyond Path D's closure.
+///
+/// Deliberately tiny, and deliberately explicit. Closure-only codegen made the
+/// object contain exactly what was asked for — 5 external definitions for
+/// `blinker-lib` where whole-crate codegen produced 922 — and the value of
+/// that is only realised if it is *asserted*. An object with an unexpected
+/// definition is an object whose contents nobody predicted, which is the same
+/// condition as an unexplained relocation and gets the same answer: refuse.
+///
+/// Nothing is in it today. It exists so that the first entry has to be argued
+/// for rather than absorbed.
+const RUNTIME_SUPPORT: &[&str] = &[];
 
 /// A function lifted out of a cg_clif object.
 struct Lifted {
@@ -86,7 +102,7 @@ struct Lifted {
 /// because Mach-O does not record function sizes. Sorting is therefore not a
 /// convenience: without it a function's bytes run to whichever symbol happened
 /// to come next in the table.
-fn lift(object: &Path, wanted: &[String]) -> Result<Vec<Lifted>, String> {
+fn lift(object: &Path, wanted: &[String]) -> Result<(Vec<Lifted>, Vec<String>), String> {
     let parsed = blinker_macho::parse_object_file(object, blinker_macho::ObjectId(0))
         .map_err(|e| format!("cannot parse {}: {e}", object.display()))?;
     let bytes = std::fs::read(object).map_err(|e| e.to_string())?;
@@ -104,6 +120,18 @@ fn lift(object: &Path, wanted: &[String]) -> Result<Vec<Lifted>, String> {
         .filter(|s| s.section == Some(text.id) && s.strength.is_definition())
         .collect();
     defined.sort_by_key(|s| s.value);
+
+    // What the object actually defines, for the caller's set-equality check.
+    // Local symbols are excluded because they are not definitions in the sense
+    // that matters here: `ltmp0`, `Ldata1` and their kin are assembler
+    // bookkeeping that nothing outside the object can refer to. The predicate
+    // is the linker's own `can_satisfy_reference`, so the two products agree on
+    // what counts as a definition.
+    let external: Vec<String> = defined
+        .iter()
+        .filter(|s| s.can_satisfy_reference())
+        .map(|s| s.name.trim_start_matches('_').to_string())
+        .collect();
 
     let mut out = Vec::new();
     for name in wanted {
@@ -128,25 +156,91 @@ fn lift(object: &Path, wanted: &[String]) -> Result<Vec<Lifted>, String> {
             .relocations
             .iter()
             .filter(|r| r.section == text.id && r.offset >= start && r.offset < end)
-            .filter_map(|r| {
+            .map(|r| {
                 let target = match r.target {
-                    blinker_macho::RelocationTarget::Symbol(id) => {
-                        parsed.symbol(id).map(|s| s.name.clone())?
+                    blinker_macho::RelocationTarget::Symbol(id) => match parsed.symbol(id) {
+                        Some(symbol) => symbol.name.clone(),
+                        // Same rule: a relocation whose target cannot even be
+                        // named is not one to drop on the floor.
+                        None => {
+                            return Err(format!(
+                                "{name} has a relocation at +{:#x} against an \
+                                 unknown symbol",
+                                r.offset - start
+                            ))
+                        }
+                    },
+                    // Section-relative: a constant pool, a jump table, or a
+                    // string literal. Not in the first DIRECT class.
+                    //
+                    // This used to `return None`, which *dropped* the
+                    // relocation: the patch was published with that field
+                    // unpatched and the code read whatever cg_clif had left
+                    // there. Refusing to lift a function is a rejected patch;
+                    // silently skipping one of its relocations is a wrong
+                    // answer at full speed. An unexplainable relocation must
+                    // reject the patch, never be omitted from it.
+                    blinker_macho::RelocationTarget::Section(_) => {
+                        return Err(format!(
+                            "{name} has a section-relative relocation at +{:#x}, \
+                             which this DIRECT class does not support",
+                            r.offset - start
+                        ))
                     }
-                    // Section-relative: a constant pool or jump table. Not in
-                    // the first DIRECT class, and refused rather than guessed.
-                    blinker_macho::RelocationTarget::Section(_) => return None,
                 };
-                Some((r.offset - start, target, r.kind, r.pc_relative, r.addend))
+                Ok((r.offset - start, target, r.kind, r.pc_relative, r.addend))
             })
-            .collect();
+            .collect::<Result<Vec<_>, String>>()?;
         out.push(Lifted {
             name: symbol.name.clone(),
             code,
             relocations,
         });
     }
-    Ok(out)
+    Ok((out, external))
+}
+
+/// The object must define Path D's closure and nothing else.
+///
+/// Set equality, not containment. Checking only that every closure member is
+/// present would pass on the 922-symbol whole-crate object just as happily as
+/// on the 5-symbol one, and the whole point of overriding the codegen universe
+/// is that the object's contents are now *predicted*. A prediction that is
+/// never compared against the outcome is a comment.
+///
+/// Both directions have teeth. An unexpected definition means the backend
+/// emitted something Path D did not account for, so the closure is not what
+/// the classifier reasoned about. A missing definition means the backend
+/// declined to emit something Path D promised, so the patch is incomplete.
+fn check_universe(defined: &[String], expected: &[String]) -> Result<(), String> {
+    use std::collections::BTreeSet;
+    // Both sides lose the Mach-O underscore first. `tcx.symbol_name` returns
+    // the *linkage* name, which on this target already carries the prefix, and
+    // the object's symbol table carries it too — but the two are not guaranteed
+    // to agree on it and comparing raw strings made every symbol simultaneously
+    // unexpected and missing. Normalizing where the sets are built, rather than
+    // where they are produced, keeps the rule in one place.
+    let bare = |s: &str| s.trim_start_matches('_').to_string();
+    let defined: BTreeSet<String> = defined.iter().map(|s| bare(s)).collect();
+    let expected: BTreeSet<String> = expected
+        .iter()
+        .map(|s| bare(s))
+        .chain(RUNTIME_SUPPORT.iter().map(|s| bare(s)))
+        .collect();
+
+    let unexpected: Vec<&String> = defined.difference(&expected).collect();
+    let missing: Vec<&String> = expected.difference(&defined).collect();
+    if unexpected.is_empty() && missing.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "the patch object defines {} symbols against {} expected: \
+         {} unexpected {unexpected:?}, {} missing {missing:?}",
+        defined.len(),
+        expected.len(),
+        unexpected.len(),
+        missing.len(),
+    ))
 }
 
 /// Mach-O prefixes every symbol with an underscore, and Rust mangles.
@@ -155,22 +249,41 @@ fn symbol_matches(symbol: &str, wanted: &str) -> bool {
     bare == wanted || bare.contains(wanted)
 }
 
-/// Publish the lifted functions and call the first one.
+/// Publish the lifted functions and return the closure's root.
 ///
-/// Relocations to symbols outside the closure are resolved against the
-/// *running process* by `dlsym`, which is what a real base image would supply
-/// from its own symbol table. A target that cannot be resolved fails the
-/// publication rather than being patched with a guess.
-fn publish_and_call(
+/// Relocations to symbols outside the closure are resolved against the base
+/// image, or failing that the running process. A target that cannot be
+/// resolved fails the publication rather than being patched with a guess, and
+/// the failure happens before anything is made executable — the arena's
+/// `publish` is the last step, not the first.
+fn publish(
     arena: &Arena,
     runtime: &Runtime,
     lifted: &[Lifted],
-    argument: i64,
-) -> Result<(i64, f64, usize, usize), String> {
+    image: Option<*mut libc::c_void>,
+) -> Result<(*const u8, f64, usize, usize), String> {
     use blinker_macho::Arm64RelocationKind as Kind;
     let at = Instant::now();
 
-    let total: usize = lifted.iter().map(|f| f.code.len().next_multiple_of(16)).sum();
+    let code: usize = lifted.iter().map(|f| f.code.len().next_multiple_of(16)).sum();
+    // Every distinct symbol the closure reaches through the GOT needs an
+    // eight-byte slot holding its address. Sized up front so the slab does not
+    // have to grow while it is being relocated.
+    let got_targets: Vec<String> = {
+        let mut names: Vec<String> = lifted
+            .iter()
+            .flat_map(|f| &f.relocations)
+            .filter(|(_, _, kind, _, _)| {
+                matches!(kind, Kind::GotLoadPage21 | Kind::GotLoadPageOff12 | Kind::PointerToGot)
+            })
+            .map(|(_, target, _, _, _)| target.clone())
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    };
+    let got_base = code.next_multiple_of(8);
+    let total = got_base + got_targets.len() * 8;
     let slab = arena.slab(total).map_err(|e| e.to_string())?;
 
     let mut offsets = Vec::with_capacity(lifted.len());
@@ -183,16 +296,48 @@ fn publish_and_call(
         cursor += function.code.len();
     }
 
+    // Fill the GOT before any instruction referring to it is patched.
+    for (index, target) in got_targets.iter().enumerate() {
+        let address = match lifted.iter().position(|f| f.name == *target) {
+            // SAFETY: an offset inside the slab.
+            Some(member) => (unsafe { slab.ptr.add(offsets[member]) }) as u64,
+            None => resolve(target, image)
+                .ok_or_else(|| format!("cannot resolve {target} for the GOT"))?,
+        };
+        // SAFETY: a slot this function just reserved.
+        unsafe { arena.write(&slab, got_base + index * 8, &address.to_le_bytes()) };
+    }
+    let got_slot = |target: &str| -> Option<usize> {
+        got_targets
+            .iter()
+            .position(|t| t == target)
+            .map(|index| got_base + index * 8)
+    };
+
     let mut applied = 0usize;
     for (index, function) in lifted.iter().enumerate() {
         for (offset, target, kind, pc_relative, addend) in &function.relocations {
             let site = offsets[index] + *offset as usize;
-            // Inside the closure first, then the process.
-            let address = match lifted.iter().position(|f| f.name == *target) {
-                // SAFETY: an offset inside the slab.
-                Some(member) => (unsafe { slab.ptr.add(offsets[member]) }) as u64,
-                None => resolve(target)
-                    .ok_or_else(|| format!("cannot resolve {target}"))?,
+            // GOT-mediated references point at the slot, not at the symbol:
+            // that is the whole purpose of a GOT, and rewriting the `adrp` to
+            // reach the symbol directly would silently change what the `ldr`
+            // beside it loads.
+            let through_got = matches!(
+                kind,
+                Kind::GotLoadPage21 | Kind::GotLoadPageOff12 | Kind::PointerToGot
+            );
+            // Inside the closure first, then the base image, then the process.
+            let address = if through_got {
+                let slot = got_slot(target).ok_or_else(|| format!("no GOT slot for {target}"))?;
+                // SAFETY: a slot inside the slab.
+                (unsafe { slab.ptr.add(slot) }) as u64
+            } else {
+                match lifted.iter().position(|f| f.name == *target) {
+                    // SAFETY: an offset inside the slab.
+                    Some(member) => (unsafe { slab.ptr.add(offsets[member]) }) as u64,
+                    None => resolve(target, image)
+                        .ok_or_else(|| format!("cannot resolve {target}"))?,
+                }
             };
             let value = (address as i64).wrapping_add(*addend);
             match (kind, pc_relative) {
@@ -215,6 +360,50 @@ fn publish_and_call(
                 (Kind::Unsigned, false) => {
                     unsafe { arena.write(&slab, site, &(value as u64).to_le_bytes()) };
                 }
+                // `adrp Xd, page` — the target's 4 KiB page relative to the
+                // instruction's own page. The immediate is split across two
+                // fields, `immlo` at bits 30:29 and `immhi` at 23:5, which is
+                // why this cannot be written as one mask.
+                (Kind::Page21 | Kind::GotLoadPage21, true) => {
+                    // SAFETY: the site holds an instruction cg_clif wrote.
+                    let here = (unsafe { slab.ptr.add(site) }) as i64;
+                    let pages = (value >> 12) - (here >> 12);
+                    if !(-(1 << 20)..(1 << 20)).contains(&pages) {
+                        return Err(format!("{target} is {pages} pages away, out of adrp range"));
+                    }
+                    let word =
+                        unsafe { std::ptr::read_unaligned(slab.ptr.add(site).cast::<u32>()) };
+                    let pages = pages as u32;
+                    let patched = (word & !0x60ff_ffe0)
+                        | ((pages & 0x3) << 29)
+                        | (((pages >> 2) & 0x7_ffff) << 5);
+                    unsafe { arena.write(&slab, site, &patched.to_le_bytes()) };
+                }
+                // The `add`/`ldr` beside it. The 12-bit immediate is *scaled*
+                // by the access size for a load, and unscaled for an `add`;
+                // getting that wrong reads the right page at the wrong offset,
+                // which is a wrong answer rather than a crash. The size comes
+                // from bits 31:30 of the instruction itself.
+                (Kind::PageOff12 | Kind::GotLoadPageOff12, false) => {
+                    let word =
+                        unsafe { std::ptr::read_unaligned(slab.ptr.add(site).cast::<u32>()) };
+                    let within = (value as u64) & 0xfff;
+                    let is_load_store = (word & 0x3b00_0000) == 0x3900_0000;
+                    let immediate = if is_load_store {
+                        let scale = word >> 30;
+                        if within & ((1 << scale) - 1) != 0 {
+                            return Err(format!(
+                                "{target} is not {}-byte aligned for its load",
+                                1u32 << scale
+                            ));
+                        }
+                        (within as u32) >> scale
+                    } else {
+                        within as u32
+                    };
+                    let patched = (word & !0x003f_fc00) | ((immediate & 0xfff) << 10);
+                    unsafe { arena.write(&slab, site, &patched.to_le_bytes()) };
+                }
                 other => return Err(format!("unhandled relocation {other:?}")),
             }
             applied += 1;
@@ -232,32 +421,215 @@ fn publish_and_call(
     runtime.publish(candidate);
     let publish_ms = at.elapsed().as_secs_f64() * 1e3;
 
-    let returned = scope(runtime, |generation| {
-        let pointer = generation.implementation(0).expect("slot 0");
-        // `spike_hot_root(reading: SpikeReading) -> u64`, where `SpikeReading`
-        // is `{ value: u64, scale: u32 }`. A 16-byte aggregate goes in two
-        // registers under AAPCS, so the C signature is `(u64, u32) -> u64`.
-        //
-        // Calling it as `fn(i64) -> i64` — which the first version did —
-        // leaves `scale` as whatever was in `x1`, and the "result" changes
-        // from run to run. It looked like a working demo and was reading
-        // uninitialised register state.
-        //
-        // SAFETY: the fixture is generated, so the signature is known rather
-        // than assumed.
-        let f: extern "C" fn(u64, u32) -> u64 = unsafe { std::mem::transmute(pointer) };
-        f(argument as u64, 5) as i64
-    });
-    Ok((returned, publish_ms, total, applied))
+    let entry = scope(runtime, |generation| generation.implementation(0).expect("slot 0"));
+    Ok((entry, publish_ms, total, applied))
 }
 
-/// A symbol in the running process, which stands in for the base image.
-fn resolve(name: &str) -> Option<u64> {
+/// Publish, then call the closure's root.
+///
+/// The signature is written down rather than assumed. `spike_hot_root` takes
+/// `SpikeReading { value: u64, scale: u32 }` — a 16-byte aggregate, two
+/// registers under AAPCS — and the first version of this called it as
+/// `fn(i64) -> i64`. It returned 105866, then 72866: `scale` was whatever `x1`
+/// happened to hold. It looked like a working demonstration and was reading
+/// uninitialised register state.
+fn publish_and_call(
+    arena: &Arena,
+    runtime: &Runtime,
+    lifted: &[Lifted],
+    argument: i64,
+) -> Result<(i64, f64, usize, usize), String> {
+    let (entry, publish_ms, total, applied) = publish(arena, runtime, lifted, None)?;
+    // SAFETY: the fixture is generated, so the signature is known.
+    let f: extern "C" fn(u64, u32) -> u64 = unsafe { std::mem::transmute(entry) };
+    Ok((f(argument as u64, 5) as i64, publish_ms, total, applied))
+}
+
+/// A symbol in the base image, or failing that in the running process.
+///
+/// `image` is asked first and it matters that it is: the differential loads
+/// each revision's base image with `RTLD_LOCAL`, so its symbols are reachable
+/// through its own handle and not through `RTLD_DEFAULT`. Asking the process
+/// first would also mean that when several revisions are loaded at once, the
+/// oldest one answers for all of them.
+fn resolve(name: &str, image: Option<*mut libc::c_void>) -> Option<u64> {
     let bare = name.strip_prefix('_').unwrap_or(name);
     let c = std::ffi::CString::new(bare).ok()?;
-    // SAFETY: a null-terminated name; `dlsym` returns null when it fails.
-    let address = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c.as_ptr()) };
-    (!address.is_null()).then(|| address as u64)
+    for handle in image.into_iter().chain([libc::RTLD_DEFAULT]) {
+        // SAFETY: an open handle and a null-terminated name; `dlsym` returns
+        // null when it fails.
+        let address = unsafe { libc::dlsym(handle, c.as_ptr()) };
+        if !address.is_null() {
+            return Some(address as u64);
+        }
+    }
+    None
+}
+
+/// Deliberate defects, for the negative controls (§31).
+///
+/// A suite that has never failed is a suite nobody has shown *can* fail. These
+/// exist so that each safety property is demonstrated by breaking it.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PatchOptions {
+    /// Drop a member of the patch closure, as an incomplete Path D would.
+    pub omit_closure_member: bool,
+    /// Point a relocation at a symbol that does not exist.
+    pub corrupt_relocation: bool,
+    /// Publish an edit the classifier refused.
+    pub ignore_classifier: bool,
+}
+
+/// A published patch, or the reason there is not one.
+#[derive(Debug, Default)]
+pub struct Patch {
+    pub verdict: String,
+    pub closure_size: usize,
+    /// The patch closure's root, live in the arena.
+    pub entry: Option<*const u8>,
+    pub error: Option<String>,
+}
+
+/// Build and publish a patch, without calling it.
+///
+/// `revision` measures latency and calls the result; this one is for the
+/// differential, which installs the result into a base image and drives probes
+/// through it. They share every stage below.
+#[allow(clippy::too_many_arguments)]
+pub fn patch(
+    arena: &Arena,
+    runtime: &Runtime,
+    fixture: &crate::Fixture,
+    target_file: &Path,
+    incremental: &Path,
+    hot: &str,
+    before: Option<&crate::classify::Contract>,
+    out_dir: &Path,
+    image: Option<*mut libc::c_void>,
+    options: PatchOptions,
+) -> Patch {
+    let mut patch = Patch::default();
+    let session = crate::run_session_with(
+        fixture,
+        target_file,
+        incremental,
+        hot,
+        crate::Mode::HotClosure,
+        &[
+            "-Zcodegen-backend=cranelift".into(),
+            "--emit=obj".into(),
+            format!("--out-dir={}", out_dir.display()),
+            "-Cmetadata=diff".into(),
+            // Debug assertions off, and this is a limitation being stated
+            // rather than a convenience. At `-Copt-level=0` they are on, and
+            // they make every raw-pointer write emit a null and an alignment
+            // check that call `core::panicking::…(&Location)`. A `&Location`
+            // is constant data, reached by a relocation against an anonymous
+            // symbol in `__const`, and lifting constant data into the arena is
+            // not something this DIRECT class does. So a patch that can panic
+            // is out of class today — which is also why §30's observations
+            // cover no panic, no stdout, and no callback.
+            "-Cdebug-assertions=off".into(),
+        ],
+        true,
+    );
+    patch.closure_size = session.mono_items_examined;
+    if let Some(error) = session.error {
+        patch.error = Some(error);
+        return patch;
+    }
+    let (Some(after), Some(before)) = (session.contract.as_ref(), before) else {
+        patch.error = Some("no contract to compare".into());
+        return patch;
+    };
+    let verdict = crate::classify::classify(before, after);
+    patch.verdict = verdict.label();
+    if !verdict.is_direct() && !options.ignore_classifier {
+        patch.error = Some(format!("the classifier refused: {verdict:?}"));
+        return patch;
+    }
+
+    let wanted = session.closure_symbols.clone();
+    let mut lifted = Vec::new();
+    let mut defines = Vec::new();
+    let mut last = None;
+    for candidate in objects(out_dir) {
+        match lift(&candidate, &wanted) {
+            Ok((found, external))
+                if found.iter().any(|f| symbol_matches(&f.name, &wanted[0])) =>
+            {
+                lifted = found;
+                defines = external;
+                break;
+            }
+            Ok(_) => {}
+            Err(error) => last = Some(error),
+        }
+    }
+    if lifted.is_empty() {
+        patch.error = Some(last.unwrap_or_else(|| format!("{hot} is in no object produced")));
+        return patch;
+    }
+    if options.omit_closure_member {
+        // The victim has to be a member some *other* member calls, or the
+        // control proves nothing. The first version dropped Path D's last
+        // symbol, and for two of the mutations nothing referred to it — so the
+        // patch published, agreed with the clean rebuild, and the control
+        // reported a failure to fail. An omission that changes no observable
+        // behaviour is not an incomplete closure; it is a closure that was
+        // larger than it needed to be.
+        let victim = lifted
+            .iter()
+            .skip(1)
+            .map(|f| f.name.clone())
+            .find(|name| {
+                lifted
+                    .iter()
+                    .any(|other| other.name != *name && other.relocations.iter().any(|r| r.1 == *name))
+            });
+        match victim {
+            Some(victim) => lifted.retain(|f| f.name != victim),
+            None => {
+                patch.error =
+                    Some("control not applicable: no member is called by another".into());
+                return patch;
+            }
+        }
+    }
+    // Skipped when a member was deliberately omitted: the check would catch the
+    // sabotage here, and the property under test is that an *incomplete
+    // closure* is caught even by a system that got as far as relocating it.
+    if !options.omit_closure_member && !session.universe_symbols.is_empty() {
+        if let Err(error) = check_universe(&defines, &session.universe_symbols) {
+            patch.error = Some(error);
+            return patch;
+        }
+    }
+    if options.corrupt_relocation {
+        for function in &mut lifted {
+            if let Some(relocation) = function.relocations.first_mut() {
+                relocation.1 = "_a_symbol_that_does_not_exist".into();
+                break;
+            }
+        }
+    }
+
+    match publish(arena, runtime, &lifted, image) {
+        Ok((entry, _, _, _)) => patch.entry = Some(entry),
+        Err(error) => patch.error = Some(error),
+    }
+    patch
+}
+
+/// Every object in a directory.
+fn objects(directory: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|e| e == "o"))
+        .collect()
 }
 
 /// One complete revision: edit, validate, classify, generate, publish, call.
@@ -345,7 +717,7 @@ pub fn revision(
     // position both turned out not to be identities. Selecting the newest file
     // picked the allocator shim for the `small` fixture and reported the hot
     // root missing from a compilation that had in fact produced it.
-    let mut candidates: Vec<PathBuf> = std::fs::read_dir(object.parent().unwrap_or(object))
+    let candidates: Vec<PathBuf> = std::fs::read_dir(object.parent().unwrap_or(object))
         .into_iter()
         .flatten()
         .flatten()
@@ -362,13 +734,17 @@ pub fn revision(
         session.closure_symbols.clone()
     };
     let mut lifted = Vec::new();
+    let mut defines: Vec<String> = Vec::new();
     let mut last: Option<String> = None;
     for candidate in &candidates {
         match lift(candidate, &wanted) {
             // The root is `wanted[0]`, and an object that does not define it is
             // some other codegen unit rather than the one being patched.
-            Ok(found) if found.iter().any(|f| symbol_matches(&f.name, &wanted[0])) => {
+            Ok((found, external))
+                if found.iter().any(|f| symbol_matches(&f.name, &wanted[0])) =>
+            {
                 lifted = found;
+                defines = external;
                 break;
             }
             Ok(_) => {}
@@ -386,6 +762,18 @@ pub fn revision(
         });
         return record;
     }
+    // Set equality against what the codegen universe was told to emit. Only
+    // meaningful when the universe was overridden — under whole-crate codegen
+    // the object legitimately holds the entire crate, and `universe_symbols` is
+    // empty because the override never ran.
+    if !session.universe_symbols.is_empty() {
+        if let Err(error) = check_universe(&defines, &session.universe_symbols) {
+            record.error = Some(error);
+            record.total_ms = whole.elapsed().as_secs_f64() * 1e3;
+            return record;
+        }
+    }
+    record.object_defines = defines.len();
     record.extract_ms = at.elapsed().as_secs_f64() * 1e3;
 
     match publish_and_call(arena, runtime, &lifted, 3) {

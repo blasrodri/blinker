@@ -1,0 +1,9 @@
+{
+  "name": "differential",
+  "crate": "/Users/blas/projects/blinker/experiments/live-frontend-spike/fixtures/differential",
+  "file": "src/lib.rs",
+  "crate_name": "diff_fixture",
+  "crate_type": "lib",
+  "hot": "diff_root",
+  "args": []
+}

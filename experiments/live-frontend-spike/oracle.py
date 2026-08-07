@@ -91,7 +91,15 @@ def main():
     parser.add_argument("--fixtures", nargs="+", default=["blinker-lib", "rg-lib"])
     parser.add_argument("--direct-edits", nargs="+",
                         default=["body_arith", "body_existing_call"])
-    parser.add_argument("--control-edits", nargs="+", default=["signature"])
+    # `inline_twin_body` first, and it is the one that carries the argument.
+    # `signature` cannot build by construction — changing the injected
+    # function's signature breaks the downstream caller that was injected to
+    # call it — so an oracle whose only control is `signature` reports "cannot
+    # discriminate" on every run and proves nothing. That is what it did, for
+    # as long as the default was not updated when the inline twin was added.
+    parser.add_argument(
+        "--control-edits", nargs="+", default=["inline_twin_body", "signature"]
+    )
     parser.add_argument("--out", default=str(HERE / "results" / "s0c-oracle.json"))
     options = parser.parse_args()
 
@@ -147,7 +155,7 @@ def main():
                          "changed": changed, "total": len(baseline)})
             if not changed:
                 failures.append(
-                    f"{name}/{edit}: a signature change left every dependent identical,"
+                    f"{name}/{edit}: a control edit left every dependent identical,"
                     " so this oracle cannot detect a downstream change at all"
                 )
 

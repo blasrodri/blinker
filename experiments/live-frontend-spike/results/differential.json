@@ -1,0 +1,92 @@
+[
+  {
+    "mutation": "body_arith",
+    "verdict": "DIRECT",
+    "agreed": true,
+    "difference": null,
+    "base_intact": true,
+    "closure_size": 5,
+    "error": null
+  },
+  {
+    "mutation": "call_existing",
+    "verdict": "DIRECT",
+    "agreed": true,
+    "difference": null,
+    "base_intact": true,
+    "closure_size": 5,
+    "error": null
+  },
+  {
+    "mutation": "new_local_helper",
+    "verdict": "DIRECT",
+    "agreed": true,
+    "difference": null,
+    "base_intact": true,
+    "closure_size": 12,
+    "error": null
+  },
+  {
+    "mutation": "new_generic",
+    "verdict": "DIRECT",
+    "agreed": true,
+    "difference": null,
+    "base_intact": true,
+    "closure_size": 7,
+    "error": null
+  },
+  {
+    "mutation": "read_static",
+    "verdict": "DIRECT",
+    "agreed": true,
+    "difference": null,
+    "base_intact": true,
+    "closure_size": 5,
+    "error": null
+  },
+  {
+    "mutation": "multi_function",
+    "verdict": "DIRECT",
+    "agreed": true,
+    "difference": null,
+    "base_intact": true,
+    "closure_size": 5,
+    "error": null
+  },
+  {
+    "mutation": "branch_cold",
+    "verdict": "DIRECT",
+    "agreed": true,
+    "difference": null,
+    "base_intact": true,
+    "closure_size": 5,
+    "error": null
+  },
+  {
+    "mutation": "loop_edit",
+    "verdict": "DIRECT",
+    "agreed": true,
+    "difference": null,
+    "base_intact": true,
+    "closure_size": 6,
+    "error": null
+  },
+  {
+    "mutation": "edit_outside_closure",
+    "verdict": "FALLBACK(changed_outside_closure)",
+    "agreed": null,
+    "difference": null,
+    "base_intact": true,
+    "closure_size": 5,
+    "error": "the classifier refused: Fallback { reason: ChangedOutsideClosure { functions: [\"diff_entry\"] } }"
+  },
+  {
+    "mutation": "new_static",
+    "verdict": "FALLBACK(new_static_required)",
+    "agreed": null,
+    "difference": null,
+    "base_intact": true,
+    "closure_size": 5,
+    "error": "the classifier refused: Fallback { reason: NewStaticRequired { statics: [\"DIFF_FRESH\"] } }"
+  }
+]

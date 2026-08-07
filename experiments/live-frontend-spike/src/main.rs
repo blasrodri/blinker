@@ -59,6 +59,7 @@ use rustc_middle::mir::TerminatorKind;
 use rustc_middle::ty::{self, TyCtxt, TypingEnv};
 
 mod classify;
+mod differential;
 mod live;
 
 // R1's runtime, included by path rather than copied: one source of truth for
@@ -100,6 +101,10 @@ struct Record {
     hot_root_found: bool,
     /// Path D's members, by backend symbol name, root first.
     closure_symbols: Vec<String>,
+    /// The subset of those the backend was told to emit — Path D's members
+    /// minus the ones that already exist in the base image. The object's
+    /// external definitions must equal this set exactly (§29).
+    universe_symbols: Vec<String>,
     /// What this revision promises downstream (S0c). `None` when the session
     /// failed or the hot root was not found.
     contract: Option<Contract>,
@@ -155,6 +160,8 @@ struct Measure {
     closure_is_local: bool,
     /// Statics the closure reads, by symbol path.
     statics: std::collections::BTreeSet<String>,
+    /// The closure's own members, by def path (§32).
+    closure_paths: std::collections::BTreeSet<String>,
     started: Instant,
     expansion_done: Option<Instant>,
     record: Record,
@@ -183,6 +190,15 @@ static PATCH_ROOT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None
 static EMPTY_UNIVERSE: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// The symbols the codegen universe was told to emit, as the backend will name
+/// them.
+///
+/// Not the same list as `Record::closure_symbols`, which also holds instances
+/// that resolve to the base image and are therefore *not* codegened here. This
+/// is the set the object is checked against for equality, so it has to be the
+/// set the backend was actually given.
+static UNIVERSE_SYMBOLS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
 /// Path D's closure, as the crate's entire codegen universe.
 ///
 /// This is the answer to the last loose number in §22–26. `cg_clif` is a rustc
@@ -210,7 +226,7 @@ static EMPTY_UNIVERSE: std::sync::atomic::AtomicBool =
 ///   symbol table, which is where the closure is lifted from.
 fn patch_universe<'tcx>(tcx: TyCtxt<'tcx>, (): ()) -> MonoItemPartitions<'tcx> {
     let name = PATCH_ROOT.lock().expect("not poisoned").clone().unwrap_or_default();
-    let mut instances = Vec::new();
+    let mut instances: Vec<ty::Instance<'tcx>> = Vec::new();
     let mut defined = DefIdSet::default();
     let empty = EMPTY_UNIVERSE.load(std::sync::atomic::Ordering::Relaxed);
     if let Some(root) = find_hot_root(tcx, &name).filter(|_| !empty) {
@@ -219,19 +235,15 @@ fn patch_universe<'tcx>(tcx: TyCtxt<'tcx>, (): ()) -> MonoItemPartitions<'tcx> {
         // parked in a static. S0 measured this walk at 0.05 ms and the queries
         // underneath it are already cached by now, so the duplicate lands in
         // the codegen column and is smaller than the column's own noise.
-        let mut statics = std::collections::BTreeSet::new();
-        let mut symbols = Vec::new();
-        hot_root_closure(
-            tcx,
-            root.to_def_id(),
-            &mut statics,
-            &mut symbols,
-            Some(&mut instances),
-        );
+        let mut walk = Closure::default();
+        hot_root_closure(tcx, root.to_def_id(), &mut walk);
+        instances = walk.instances;
     }
 
     let mut unit = CodegenUnit::new(rustc_span::Symbol::intern("live_patch"));
+    let mut emitted = Vec::with_capacity(instances.len());
     for instance in instances {
+        emitted.push(tcx.symbol_name(instance).name.to_string());
         defined.insert(instance.def_id());
         unit.items_mut().insert(
             MonoItem::Fn(instance),
@@ -244,6 +256,7 @@ fn patch_universe<'tcx>(tcx: TyCtxt<'tcx>, (): ()) -> MonoItemPartitions<'tcx> {
         );
     }
     unit.compute_size_estimate();
+    *UNIVERSE_SYMBOLS.lock().expect("not poisoned") = emitted;
 
     MonoItemPartitions {
         codegen_units: tcx.arena.alloc_from_iter([unit]),
@@ -291,12 +304,11 @@ impl Callbacks for Measure {
 
         if self.mode.wants_closure() {
             let at = Instant::now();
-            let mut statics = std::collections::BTreeSet::new();
-            let mut symbols = Vec::new();
-            let (examined, local) =
-                hot_root_closure(tcx, root.to_def_id(), &mut statics, &mut symbols, None);
-            self.statics = statics;
-            self.record.closure_symbols = symbols;
+            let mut walk = Closure::default();
+            let (examined, local) = hot_root_closure(tcx, root.to_def_id(), &mut walk);
+            self.statics = walk.statics;
+            self.closure_paths = walk.paths;
+            self.record.closure_symbols = walk.symbols;
             self.record.hot_closure_ms = at.elapsed().as_secs_f64() * 1e3;
             self.record.mono_items_examined = examined;
             self.closure_is_local = local;
@@ -328,8 +340,16 @@ impl Callbacks for Measure {
             })
             .map(|def_id| tcx.def_path_str(def_id.to_def_id()))
             .collect();
-        self.record.contract =
-            Some(contract_of(tcx, root, size, local, &self.statics, &defined));
+        self.record.contract = Some(contract_of(
+            tcx,
+            root,
+            size,
+            local,
+            &self.statics,
+            &defined,
+            &self.closure_paths,
+            body_fingerprints(tcx),
+        ));
         self.record.classify_ms = at.elapsed().as_secs_f64() * 1e3;
 
         if self.mode.wants_whole_crate() {
@@ -408,6 +428,76 @@ fn find_hot_root(tcx: TyCtxt<'_>, name: &str) -> Option<LocalDefId> {
         })
 }
 
+/// Every function this crate defines, and a fingerprint of its body.
+///
+/// The hole this closes was found by the runtime differential, and it was found
+/// the only way it could have been. `edit_outside_closure` changes `diff_entry`
+/// — a function that is not the hot root and not in its closure. Every field
+/// S0c compared was identical, because every field S0c compared is *about the
+/// hot root*. The patch published, the base image kept its old `diff_entry`,
+/// and the program returned 7 where a clean rebuild returned 8.
+///
+/// No amount of care about the root's signature, ABI, symbol or MIR
+/// observability can see that, because the root did not change. The missing
+/// premise is not about the root at all: **a live patch replaces the closure,
+/// so nothing outside the closure may have changed.**
+///
+/// The fingerprints are rustc's own. It already hashes each HIR owner including
+/// bodies, for its own incremental machinery, so this reads a number that has
+/// been computed rather than computing one — which is why §32 measures the
+/// check at a fraction of a millisecond on crates with hundreds of functions.
+fn body_fingerprints(tcx: TyCtxt<'_>) -> std::collections::BTreeMap<String, String> {
+    use rustc_hir::def::DefKind;
+    tcx.hir_crate_items(())
+        .definitions()
+        .filter(|def_id| {
+            matches!(tcx.def_kind(*def_id), DefKind::Fn | DefKind::AssocFn)
+                && tcx.is_mir_available(def_id.to_def_id())
+        })
+        .map(|def_id| {
+            let owner = rustc_hir::OwnerId { def_id };
+            let hash = tcx.hir_owner_nodes(owner).opt_hash;
+            (
+                // `def_path_str`, not `def_path`, cost 3.7 ms — flat across a
+                // 40-function crate and a 900-function one, which is the shape
+                // of one crate-wide query rather than of per-item work. It
+                // renders the *visible* path, which needs `visible_parent_map`
+                // over the whole crate graph. The identity wanted here is the
+                // definition path, and that is local data.
+                tcx.def_path(def_id.to_def_id()).to_string_no_crate_verbose(),
+                // `None` is recorded as such rather than as a constant. Two
+                // revisions that both fail to produce a fingerprint would
+                // otherwise compare equal, and the check would pass by being
+                // unable to run — `classify` refuses instead.
+                match hash {
+                    Some(hash) => format!("{hash:?}"),
+                    None => String::new(),
+                },
+            )
+        })
+        .collect()
+}
+
+/// What a Path D walk produces.
+///
+/// Five out-parameters had accumulated, and the fifth — the closure's def
+/// paths, which §32 needs — was the one that made it worth naming.
+#[derive(Default)]
+struct Closure<'tcx> {
+    /// The members, by the symbol the backend will give them, root first. This
+    /// is what makes Path D actionable rather than merely countable: publishing
+    /// a patch cluster means finding *these* functions in the generated code.
+    symbols: Vec<String>,
+    /// The members that are defined in this crate, by def path. The unit in
+    /// which "this edit changed only what the patch replaces" is decided.
+    paths: std::collections::BTreeSet<String>,
+    /// Statics the closure reads, by symbol path.
+    statics: std::collections::BTreeSet<String>,
+    /// The members as instances, when the caller is `patch_universe` and is
+    /// about to hand them to the backend as the codegen universe.
+    instances: Vec<ty::Instance<'tcx>>,
+}
+
 /// Walk what the hot root reaches, and only that.
 ///
 /// This is the smallest algorithm that answers "what changed with it": start
@@ -421,17 +511,7 @@ fn find_hot_root(tcx: TyCtxt<'_>, name: &str) -> Option<LocalDefId> {
 fn hot_root_closure<'tcx>(
     tcx: TyCtxt<'tcx>,
     root: DefId,
-    statics: &mut std::collections::BTreeSet<String>,
-    // The closure's members, by the symbol the backend will give them. This is
-    // what makes Path D actionable rather than merely countable: publishing a
-    // patch cluster means finding *these* functions in the generated code, and
-    // a count cannot be looked up.
-    symbols: &mut Vec<String>,
-    // The same members as instances, when the caller is `patch_universe` and is
-    // about to hand them to the backend as the crate's codegen universe. Only
-    // instances this crate can generate code for are collected; the rest are
-    // already in the base image and are resolved at publication.
-    mut instances: Option<&mut Vec<ty::Instance<'tcx>>>,
+    out: &mut Closure<'tcx>,
 ) -> (usize, bool) {
     let typing_env = TypingEnv::fully_monomorphized();
     let Ok(Some(root)) = ty::Instance::try_resolve(
@@ -451,12 +531,42 @@ fn hot_root_closure<'tcx>(
     let mut local = true;
     let mut worklist = vec![root];
     while let Some(instance) = worklist.pop() {
+        // An intrinsic is not an ordinary function, and there are two kinds.
+        //
+        // Asking for `instance_mir` on either is an ICE rather than an error —
+        // "intrinsics have no instance MIR" — which the differential suite hit
+        // on its first run with a mutation that called `rotate_left`. But
+        // skipping both is also wrong, and wrong in the more dangerous
+        // direction: an intrinsic that is *not* `must_be_overridden` has a
+        // fallback body, and a backend that does not implement it directly
+        // emits an ordinary call. cg_clif does exactly that for
+        // `rotate_left`, so skipping it left the object with a call to a
+        // function nobody had generated.
+        //
+        // rustc's own collector resolves such an intrinsic to its fallback
+        // `Item`, and so does this. The other kind — `must_be_overridden` —
+        // has no body by construction and every backend expands it in place.
+        // `Virtual` is skipped for a related reason: a `dyn` call names a
+        // vtable slot rather than a body.
+        let instance = match instance.def {
+            ty::InstanceKind::Intrinsic(def_id) => {
+                match tcx.intrinsic(def_id) {
+                    Some(intrinsic) if !intrinsic.must_be_overridden => ty::Instance {
+                        def: ty::InstanceKind::Item(def_id),
+                        args: instance.args,
+                    },
+                    _ => continue,
+                }
+            }
+            ty::InstanceKind::Virtual(_, _) => continue,
+            _ => instance,
+        };
         if !seen.insert(instance) {
             continue;
         }
         // The root first, then everything it reaches: the caller publishes
         // slot 0 as the entry point.
-        symbols.push(tcx.symbol_name(instance).name.to_string());
+        out.symbols.push(tcx.symbol_name(instance).name.to_string());
         // Only what this crate can see. An instance defined elsewhere and
         // already compiled into the base image needs no new code, which is
         // exactly the property that makes this closure small.
@@ -474,8 +584,15 @@ fn hot_root_closure<'tcx>(
         // generate this one. That is the same predicate the closure's own
         // locality test uses, which is deliberate — the set the backend is told
         // to compile and the set the classifier reasoned about are the same set.
-        if let Some(instances) = instances.as_deref_mut() {
-            instances.push(instance);
+        out.instances.push(instance);
+        if let Some(local) = instance.def_id().as_local() {
+            // The same rendering `body_fingerprints` uses. When these two
+            // disagreed, every changed body looked like it lay outside the
+            // closure and every edit was refused — and because the summary had
+            // no verdict column, that read as a silent `None` rather than as a
+            // refusal. Both are fixed here.
+            out.paths
+                .insert(tcx.def_path(local.to_def_id()).to_string_no_crate_verbose());
         }
         let body = tcx.instance_mir(instance.def);
         // Statics the body reads. They are not in the call graph — a static
@@ -492,7 +609,7 @@ fn hot_root_closure<'tcx>(
         // calling a new-static edit DIRECT.
         {
             use rustc_middle::mir::visit::Visitor;
-            StaticScan { tcx, out: statics }.visit_body(body);
+            StaticScan { tcx, out: &mut out.statics }.visit_body(body);
         }
         for block in body.basic_blocks.iter() {
             let Some(terminator) = &block.terminator else {
@@ -738,6 +855,12 @@ fn run_session_with(
     }
     args.extend(extra.iter().cloned());
 
+    // Cleared, not merely overwritten: if the override never runs — the session
+    // failed, or the mode is whole-crate — a stale list from the previous
+    // session would be checked against this session's object, and the two would
+    // agree often enough to be worse than no check.
+    UNIVERSE_SYMBOLS.lock().expect("not poisoned").clear();
+
     let mut measure = Measure {
         hot: hot.to_string(),
         mode,
@@ -745,6 +868,7 @@ fn run_session_with(
         expects_mono_roots: fixture.crate_type == "bin",
         closure_is_local: true,
         statics: std::collections::BTreeSet::new(),
+        closure_paths: std::collections::BTreeSet::new(),
         started: Instant::now(),
         expansion_done: None,
         record: Record::default(),
@@ -754,6 +878,7 @@ fn run_session_with(
         rustc_driver::run_compiler(&args, &mut measure);
     }));
     measure.record.session_ms = measure.started.elapsed().as_secs_f64() * 1e3;
+    measure.record.universe_symbols = UNIVERSE_SYMBOLS.lock().expect("not poisoned").clone();
     if outcome.is_err() && measure.record.error.is_none() {
         measure.record.error = Some("the compiler session failed".into());
     }
@@ -775,6 +900,8 @@ struct Options {
     once: bool,
     end_to_end: bool,
     closure_only: bool,
+    /// The runtime differential (§30), and which defect it injects.
+    differential: Option<differential::Sabotage>,
 }
 
 fn parse_options() -> Options {
@@ -790,6 +917,7 @@ fn parse_options() -> Options {
     let mut once = false;
     let mut end_to_end = false;
     let mut closure_only = false;
+    let mut differential = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--fixture" => fixture = PathBuf::from(args.next().expect("--fixture takes a path")),
@@ -813,6 +941,15 @@ fn parse_options() -> Options {
             // A flag rather than the only behaviour, because the difference
             // between the two is the measurement.
             "--closure-only" => closure_only = true,
+            // The runtime differential. The argument names the defect to
+            // inject: `none` is the suite proper, the rest are its controls.
+            "--differential" => {
+                let which = args.next().unwrap_or_else(|| "none".into());
+                differential = Some(
+                    differential::Sabotage::parse(&which)
+                        .unwrap_or_else(|| panic!("unknown sabotage {which}")),
+                );
+            }
             // The control: an empty codegen universe, still emitting an
             // object. Everything it costs after analysis is fixed cost.
             "--empty-universe" => {
@@ -848,6 +985,7 @@ fn parse_options() -> Options {
         once,
         end_to_end,
         closure_only,
+        differential,
     }
 }
 
@@ -856,6 +994,11 @@ fn main() {
     std::fs::create_dir_all(&options.incremental).expect("incremental directory");
     rustc_driver::install_ice_hook("https://github.com/blasrodri/blinker", |_| ());
 
+    if let Some(sabotage) = options.differential {
+        let trials = differential::run(&options, sabotage);
+        let ok = differential::report(&trials, sabotage, options.out.as_ref());
+        std::process::exit(if ok { 0 } else { 1 });
+    }
     if options.end_to_end {
         return live_main(&options);
     }
@@ -1032,7 +1175,7 @@ fn live_main(options: &Options) {
     println!(
         "\n  {:<20} {:>7} {:>9} {:>8} {:>9} {:>9} {:>9} {:>9} {:>9}  {}",
         "edit", "expand", "analysis", "hot mir", "classify", "closure", "codegen", "extract",
-        "publish", "returned"
+        "publish", "verdict / returned"
     );
     for edit in &options.edits {
         let rows: Vec<&live::LiveRecord> =
@@ -1041,7 +1184,7 @@ fn live_main(options: &Options) {
             continue;
         }
         println!(
-            "  {:<20} {:>7.2} {:>9.2} {:>8.2} {:>9.3} {:>9.3} {:>9.2} {:>9.3} {:>9.4}  {:?}",
+            "  {:<20} {:>7.2} {:>9.2} {:>8.2} {:>9.3} {:>9.3} {:>9.2} {:>9.3} {:>9.4}  {}",
             edit,
             median(rows.iter().map(|r| r.expand_ms).collect()),
             median(rows.iter().map(|r| r.analysis_ms).collect()),
@@ -1051,7 +1194,7 @@ fn live_main(options: &Options) {
             median(rows.iter().map(|r| r.codegen_ms).collect()),
             median(rows.iter().map(|r| r.extract_ms).collect()),
             median(rows.iter().map(|r| r.publish_ms).collect()),
-            rows[0].returned,
+            format!("{} {:?}", rows[0].verdict, rows[0].returned),
         );
     }
     if !good.is_empty() {
