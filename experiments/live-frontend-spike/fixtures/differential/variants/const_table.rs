@@ -60,6 +60,12 @@ fn blend(x: u64) -> u64 {
     diff_second(x).wrapping_add(7)
 }
 
+/// A constant the patched body reads. cg_clif materialises it as an anonymous
+/// rodata blob, so a patch that replaces the body has to carry the bytes with
+/// it — and the answer below depends on them, so carrying the *wrong* bytes is
+/// visible rather than merely wasteful.
+const SKEW: [u64; 8] = [3, 5, 7, 11, 13, 17, 19, 23];
+
 /// The hot root. `extern "C"` so that both paths call it through one signature
 /// that is written down rather than assumed — §25's lesson.
 #[no_mangle]
@@ -67,7 +73,7 @@ fn blend(x: u64) -> u64 {
 pub extern "C" fn diff_root(value: u64, scale: u32, out: *mut u64) -> u64 {
     let reading = Reading { value, scale };
     let total = reading.total();
-    let mixed = blend(total);
+    let mixed = blend(total).wrapping_mul(SKEW[(total & 7) as usize]);
     // The memory output: a differential that compared return values alone
     // would miss a patch that got the write wrong.
     unsafe { *out = mixed ^ 0xAAAA };

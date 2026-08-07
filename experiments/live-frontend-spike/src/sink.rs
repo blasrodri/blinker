@@ -59,6 +59,22 @@ struct LiveFunction {
     reloc_count: usize,
 }
 
+/// Mirrors `live_sink::LiveData` (§46).
+#[repr(C)]
+struct LiveData {
+    name: *const u8,
+    name_len: usize,
+    bytes: *const u8,
+    bytes_len: usize,
+    align: u32,
+    local: u32,
+    writable: u32,
+    tls: u32,
+    relocs: *const LiveReloc,
+    reloc_count: usize,
+    function_relocs: usize,
+}
+
 /// Mirrors `live_sink::LiveTimings`. Nanoseconds.
 #[repr(C)]
 #[derive(Default, Clone, Copy, Debug, serde::Serialize)]
@@ -88,6 +104,13 @@ pub struct Outcome {
     pub code_bytes: usize,
     pub relocations: usize,
     pub timings: Timings,
+    /// What the artifact actually defines, after any control has damaged it.
+    ///
+    /// Carried out so the caller can hold it against the codegen universe.
+    /// Recorded *after* the sabotage rather than before, because a check that
+    /// examined the undamaged list would be checking something that was never
+    /// staged.
+    pub defined: Vec<String>,
     pub error: Option<String>,
 }
 
@@ -115,6 +138,8 @@ static SABOTAGE: Mutex<crate::live::PatchOptions> = Mutex::new(crate::live::Patc
     omit_closure_member: false,
     corrupt_relocation: false,
     ignore_classifier: false,
+    corrupt_constant: false,
+    omit_constant: false,
 });
 
 pub fn set_sabotage(options: crate::live::PatchOptions) {
@@ -144,18 +169,34 @@ pub fn install(backend: &std::path::Path) -> Result<(), String> {
         if handle.is_null() {
             return Err(format!("cannot load the backend at {}", backend.display()));
         }
-        let name = std::ffi::CString::new("blinker_live_set_sink").expect("literal");
+        // Versioned, and the version is not decoration. §46 added two
+        // parameters to the callback; an older backend dylib calling a
+        // three-argument callback that expects five would read two registers
+        // of whatever happened to be there and hand them to the arena. A
+        // renamed symbol turns that into a clean "not the patched one".
+        let name = std::ffi::CString::new("blinker_live_set_sink_v2").expect("literal");
         // SAFETY: an open handle and a null-terminated name.
         let symbol = unsafe { libc::dlsym(handle, name.as_ptr()) };
         if symbol.is_null() {
             return Err(
-                "the backend has no blinker_live_set_sink — it is not the patched one".into(),
+                "the backend has no blinker_live_set_sink_v2 — it is not the patched one, \
+                 or it predates the constant-data sink"
+                    .into(),
             );
         }
         // SAFETY: the backend declares this signature in `live_sink.rs`, and
         // the two declarations are kept beside each other deliberately.
-        let set: extern "C" fn(Option<extern "C" fn(*const LiveFunction, usize, *const Timings)>) =
-            unsafe { std::mem::transmute(symbol) };
+        let set: extern "C" fn(
+            Option<
+                extern "C" fn(
+                    *const LiveFunction,
+                    usize,
+                    *const LiveData,
+                    usize,
+                    *const Timings,
+                ),
+            >,
+        ) = unsafe { std::mem::transmute(symbol) };
         set(Some(deliver));
         Ok(())
     })();
@@ -178,6 +219,18 @@ pub fn begin(
     IMAGE.store(image.map_or(0, |i| i as usize), Ordering::Release);
     *STARTED.lock().expect("not poisoned") = Some(started);
     *OUTCOME.lock().expect("not poisoned") = None;
+    // Anonymous constants are named by position, so every session defines a
+    // `.Ldata0`. A record left behind by the previous revision would not fail
+    // to resolve — it would resolve to the wrong bytes, quietly, which is §36's
+    // stale codegen unit wearing different clothes.
+    let name = std::ffi::CString::new("blinker_live_forget").expect("literal");
+    // SAFETY: the backend is loaded by now; a null symbol is handled.
+    let symbol = unsafe { libc::dlsym(libc::RTLD_DEFAULT, name.as_ptr()) };
+    if !symbol.is_null() {
+        // SAFETY: the signature is declared beside the definition.
+        let forget: extern "C" fn() = unsafe { std::mem::transmute(symbol) };
+        forget();
+    }
 }
 
 /// End the bracket and take what the callback recorded.
@@ -224,7 +277,13 @@ fn relocation(kind: u32) -> Option<(blinker_macho::Arm64RelocationKind, bool)> {
 }
 
 /// The sink. Called from inside cg_clif, before it writes anything.
-extern "C" fn deliver(functions: *const LiveFunction, count: usize, timings: *const Timings) {
+extern "C" fn deliver(
+    functions: *const LiveFunction,
+    count: usize,
+    data: *const LiveData,
+    data_count: usize,
+    timings: *const Timings,
+) {
     let arena = ARENA.load(Ordering::Acquire);
     let runtime = RUNTIME.load(Ordering::Acquire);
     if arena == 0 || runtime == 0 {
@@ -242,6 +301,13 @@ extern "C" fn deliver(functions: *const LiveFunction, count: usize, timings: *co
     };
     // SAFETY: the backend passes a valid array of `count` entries.
     let functions = unsafe { std::slice::from_raw_parts(functions, count) };
+    // SAFETY: likewise, and an empty patch delivers a null pointer with zero
+    // length, which `from_raw_parts` will not accept.
+    let data: &[LiveData] = if data_count == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(data, data_count) }
+    };
     // SAFETY: the backend passes one `Timings`.
     let timings = unsafe { *timings };
 
@@ -300,6 +366,80 @@ extern "C" fn deliver(functions: *const LiveFunction, count: usize, timings: *co
         });
     }
 
+    // The constants the closure reaches. Whether any of them may be carried is
+    // decided in `stage`, beside the other artifact invariants; here they are
+    // only copied out of the backend's memory before it reclaims it.
+    let mut carried = Vec::with_capacity(data.len());
+    for constant in data {
+        // SAFETY: pointers and lengths from owned `String`/`Vec` in the backend
+        // that outlive this call.
+        let name = unsafe {
+            std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                constant.name,
+                constant.name_len,
+            ))
+        };
+        let bytes =
+            unsafe { std::slice::from_raw_parts(constant.bytes, constant.bytes_len) }.to_vec();
+        let relocations = if constant.reloc_count == 0 {
+            Vec::new()
+        } else {
+            unsafe { std::slice::from_raw_parts(constant.relocs, constant.reloc_count) }
+                .iter()
+                .map(|entry| {
+                    let target = unsafe {
+                        std::str::from_utf8_unchecked(std::slice::from_raw_parts(
+                            entry.name,
+                            entry.name_len,
+                        ))
+                    };
+                    (entry.offset as u64, target.to_string())
+                })
+                .collect()
+        };
+        carried.push(crate::live::Constant {
+            name: name.to_string(),
+            bytes,
+            align: constant.align,
+            relocations,
+            local: constant.local != 0,
+            writable: constant.writable != 0,
+            tls: constant.tls != 0,
+            function_relocs: constant.function_relocs,
+        });
+    }
+
+    let defects = *SABOTAGE.lock().expect("not poisoned");
+    if defects.corrupt_constant {
+        if carried.is_empty() {
+            outcome.error =
+                Some("control not applicable: this patch carries no constants".into());
+            *OUTCOME.lock().expect("not poisoned") = Some(outcome);
+            return;
+        }
+        // Every byte of every constant, not one byte of the first.
+        //
+        // The first version flipped a single byte and the control passed
+        // nothing: most carried constants are panic locations on a path the
+        // probes never take, so damaging them is genuinely unobservable, and
+        // the one constant whose bytes are *read* was not the one being hit.
+        // A control that can only fail by luck is not a control.
+        for constant in &mut carried {
+            for byte in &mut constant.bytes {
+                *byte ^= 0xFF;
+            }
+        }
+    }
+    if defects.omit_constant {
+        if carried.is_empty() {
+            outcome.error =
+                Some("control not applicable: this patch carries no constants".into());
+            *OUTCOME.lock().expect("not poisoned") = Some(outcome);
+            return;
+        }
+        carried.pop();
+    }
+
     // Slot 0 must be the hot root, and the sink does not deliver it first.
     // cg_clif emits a codegen unit's items in deterministic order — which is
     // by symbol name, not by Path D's order — so which function landed in slot
@@ -344,9 +484,11 @@ extern "C" fn deliver(functions: *const LiveFunction, count: usize, timings: *co
         }
     }
 
+    outcome.defined = lifted.iter().map(|f| f.name.clone()).collect();
+
     // Staged, not published. The backend's job ends with a candidate; making
     // it reachable is the classifier's decision and happens elsewhere.
-    match crate::live::stage(arena, runtime, &lifted, image) {
+    match crate::live::stage(arena, runtime, &lifted, &carried, image) {
         Ok(staged) => {
             outcome.entry = staged.entry();
             outcome.publish_ms = staged.publish_ms;

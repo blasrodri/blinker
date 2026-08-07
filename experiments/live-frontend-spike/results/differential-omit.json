@@ -5,8 +5,8 @@
     "agreed": null,
     "difference": null,
     "base_intact": true,
-    "closure_size": 5,
-    "error": "cannot resolve __RNvCsfCWnWJ9PaRW_12diff_fixture5blend"
+    "closure_size": 6,
+    "error": "_RNvMCsfCWnWJ9PaRW_12diff_fixtureNtB2_7Reading5total is -195147544 bytes away, out of range for a bl"
   },
   {
     "mutation": "call_existing",
@@ -14,8 +14,8 @@
     "agreed": null,
     "difference": null,
     "base_intact": true,
-    "closure_size": 5,
-    "error": "cannot resolve __RNvCsfCWnWJ9PaRW_12diff_fixture5blend"
+    "closure_size": 6,
+    "error": "the patch object defines 5 symbols against 6 expected: 0 unexpected [], 1 missing [\"RNvMCsfCWnWJ9PaRW_12diff_fixtureNtB2_7Reading5total\"]"
   },
   {
     "mutation": "new_local_helper",
@@ -23,8 +23,8 @@
     "agreed": null,
     "difference": null,
     "base_intact": true,
-    "closure_size": 12,
-    "error": "cannot resolve __RNvCsfCWnWJ9PaRW_12diff_fixture4skew"
+    "closure_size": 13,
+    "error": "cannot resolve _RINvNtCs9NVAEkDcDTP_4core10intrinsics14disjoint_bitoryECsfCWnWJ9PaRW_12diff_fixture"
   },
   {
     "mutation": "new_generic",
@@ -32,8 +32,8 @@
     "agreed": null,
     "difference": null,
     "base_intact": true,
-    "closure_size": 7,
-    "error": "cannot resolve __RNvCsfCWnWJ9PaRW_12diff_fixture5blend"
+    "closure_size": 8,
+    "error": "cannot resolve _RNvCsfCWnWJ9PaRW_12diff_fixture5blend"
   },
   {
     "mutation": "read_static",
@@ -41,8 +41,8 @@
     "agreed": null,
     "difference": null,
     "base_intact": true,
-    "closure_size": 5,
-    "error": "cannot resolve __RNvCsfCWnWJ9PaRW_12diff_fixture5blend"
+    "closure_size": 6,
+    "error": "the patch object defines 5 symbols against 6 expected: 0 unexpected [], 1 missing [\"RNvMCsfCWnWJ9PaRW_12diff_fixtureNtB2_7Reading5total\"]"
   },
   {
     "mutation": "multi_function",
@@ -50,8 +50,8 @@
     "agreed": null,
     "difference": null,
     "base_intact": true,
-    "closure_size": 5,
-    "error": "cannot resolve __RNvCsfCWnWJ9PaRW_12diff_fixture5blend"
+    "closure_size": 6,
+    "error": "the patch object defines 5 symbols against 6 expected: 0 unexpected [], 1 missing [\"RNvMCsfCWnWJ9PaRW_12diff_fixtureNtB2_7Reading5total\"]"
   },
   {
     "mutation": "branch_cold",
@@ -59,8 +59,8 @@
     "agreed": null,
     "difference": null,
     "base_intact": true,
-    "closure_size": 5,
-    "error": "cannot resolve __RNvCsfCWnWJ9PaRW_12diff_fixture5blend"
+    "closure_size": 6,
+    "error": "the patch object defines 5 symbols against 6 expected: 0 unexpected [], 1 missing [\"RNvMCsfCWnWJ9PaRW_12diff_fixtureNtB2_7Reading5total\"]"
   },
   {
     "mutation": "loop_edit",
@@ -68,8 +68,17 @@
     "agreed": null,
     "difference": null,
     "base_intact": true,
+    "closure_size": 7,
+    "error": "the patch object defines 6 symbols against 7 expected: 0 unexpected [], 1 missing [\"RNvMCsfCWnWJ9PaRW_12diff_fixtureNtB2_7Reading5total\"]"
+  },
+  {
+    "mutation": "two_gates",
+    "verdict": "DIRECT",
+    "agreed": null,
+    "difference": null,
+    "base_intact": true,
     "closure_size": 6,
-    "error": "cannot resolve __RNvCsfCWnWJ9PaRW_12diff_fixture5blend"
+    "error": "the patch object defines 5 symbols against 6 expected: 0 unexpected [], 1 missing [\"RNvMCsfCWnWJ9PaRW_12diff_fixtureNtB2_7Reading5total\"]"
   },
   {
     "mutation": "edit_outside_closure",
@@ -77,8 +86,26 @@
     "agreed": null,
     "difference": null,
     "base_intact": true,
-    "closure_size": 5,
+    "closure_size": 6,
     "error": "the classifier refused: Fallback { reason: ChangedOutsideClosure { functions: [\"::diff_entry\"] } }"
+  },
+  {
+    "mutation": "checked_div",
+    "verdict": "DIRECT",
+    "agreed": null,
+    "difference": null,
+    "base_intact": true,
+    "closure_size": 7,
+    "error": "the patch object defines 6 symbols against 7 expected: 0 unexpected [], 1 missing [\"RNvMCsfCWnWJ9PaRW_12diff_fixtureNtB2_7Reading5total\"]"
+  },
+  {
+    "mutation": "const_table",
+    "verdict": "DIRECT",
+    "agreed": null,
+    "difference": null,
+    "base_intact": true,
+    "closure_size": 6,
+    "error": "the patch object defines 5 symbols against 6 expected: 0 unexpected [], 1 missing [\"RNvMCsfCWnWJ9PaRW_12diff_fixtureNtB2_7Reading5total\"]"
   },
   {
     "mutation": "new_static",
@@ -86,7 +113,7 @@
     "agreed": null,
     "difference": null,
     "base_intact": true,
-    "closure_size": 5,
+    "closure_size": 6,
     "error": "the classifier refused: Fallback { reason: NewStaticRequired { statics: [\"DIFF_FRESH\"] } }"
   }
 ]

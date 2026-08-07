@@ -67,7 +67,7 @@ fn blend(x: u64) -> u64 {
 pub extern "C" fn diff_root(value: u64, scale: u32, out: *mut u64) -> u64 {
     let reading = Reading { value, scale };
     let total = reading.total();
-    let mixed = blend(total);
+    let mixed = blend(total).wrapping_div((scale as u64) | 1).wrapping_add(1);
     // The memory output: a differential that compared return values alone
     // would miss a patch that got the write wrong.
     unsafe { *out = mixed ^ 0xAAAA };

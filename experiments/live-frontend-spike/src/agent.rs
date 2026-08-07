@@ -199,7 +199,23 @@ impl BaseImage {
         let output = std::process::Command::new("rustc")
             .args([
                 "--edition=2021",
-                "--crate-type=cdylib",
+                                // A Rust `dylib`, not a `cdylib`.
+                //
+                // A `cdylib` exports only the C surface — everything else,
+                // including the parts of `core` linked into it, gets local
+                // visibility. So a patch carrying a panic path could not
+                // resolve `core::panicking::panic_const_div_by_zero`: the code
+                // was right there in the image, at a `t` symbol `dlsym` cannot
+                // see. `-Wl,-export_dynamic` does not help, because the hiding
+                // happens in codegen rather than at link time.
+                //
+                // A stand-in either way, and worth naming as one: in the
+                // product the base image is the developer's own binary and
+                // Blinker *is* its linker, so it holds the address of every
+                // symbol whether or not the dynamic table does. Choosing a
+                // crate type that keeps them visible is how a harness without
+                // a linker gets the same answer.
+                "--crate-type=dylib",
                 "-Copt-level=0",
                 "-Cdebuginfo=0",
                 "-Cdebug-assertions=off",

@@ -1,6 +1,6 @@
 diff -ruN --exclude=target --exclude=Cargo.lock pristine/src/base.rs build/src/base.rs
---- pristine/src/base.rs	2026-08-07 17:47:41
-+++ build/src/base.rs	2026-08-07 17:34:22
+--- pristine/src/base.rs	2026-08-07 20:56:13
++++ build/src/base.rs	2026-08-07 17:48:04
 @@ -23,9 +23,9 @@
  use crate::{codegen_f16_f128, enable_verifier};
  
@@ -14,8 +14,8 @@ diff -ruN --exclude=target --exclude=Cargo.lock pristine/src/base.rs build/src/b
      func_debug_cx: Option<FunctionDebugContext>,
      inline_asm: String,
 diff -ruN --exclude=target --exclude=Cargo.lock pristine/src/driver/aot.rs build/src/driver/aot.rs
---- pristine/src/driver/aot.rs	2026-08-07 17:47:41
-+++ build/src/driver/aot.rs	2026-08-07 17:38:08
+--- pristine/src/driver/aot.rs	2026-08-07 20:56:13
++++ build/src/driver/aot.rs	2026-08-07 17:48:04
 @@ -39,6 +39,9 @@
      debug_context: Option<DebugContext>,
      codegened_functions: Vec<CodegenedFunction>,
@@ -121,8 +121,8 @@ diff -ruN --exclude=target --exclude=Cargo.lock pristine/src/driver/aot.rs build
              output_filenames,
              prof,
 diff -ruN --exclude=target --exclude=Cargo.lock pristine/src/lib.rs build/src/lib.rs
---- pristine/src/lib.rs	2026-08-07 17:47:41
-+++ build/src/lib.rs	2026-08-07 17:33:26
+--- pristine/src/lib.rs	2026-08-07 20:56:13
++++ build/src/lib.rs	2026-08-07 17:48:04
 @@ -67,6 +67,7 @@
  mod inline_asm;
  mod intrinsics;
@@ -133,8 +133,8 @@ diff -ruN --exclude=target --exclude=Cargo.lock pristine/src/lib.rs build/src/li
  mod optimize;
 diff -ruN --exclude=target --exclude=Cargo.lock pristine/src/live_sink.rs build/src/live_sink.rs
 --- pristine/src/live_sink.rs	1970-01-01 01:00:00
-+++ build/src/live_sink.rs	2026-08-07 17:37:55
-@@ -0,0 +1,300 @@
++++ build/src/live_sink.rs	2026-08-07 20:47:08
+@@ -0,0 +1,496 @@
 +//! A second output sink for compiled functions: machine code straight out,
 +//! with no object file.
 +//!
@@ -167,7 +167,7 @@ diff -ruN --exclude=target --exclude=Cargo.lock pristine/src/live_sink.rs build/
 +
 +use cranelift_codegen::ir::{ExternalName, Function};
 +use cranelift_codegen::{binemit::Reloc, Context, FinalizedRelocTarget};
-+use cranelift_module::{FuncId, Module};
++use cranelift_module::{DataDescription, DataId, FuncId, Init, Module, ModuleRelocTarget};
 +
 +/// A relocation, flattened for the C boundary.
 +#[repr(C)]
@@ -220,7 +220,40 @@ diff -ruN --exclude=target --exclude=Cargo.lock pristine/src/live_sink.rs build/
 +    pub clif_clone_ns: u64,
 +}
 +
-+type Callback = extern "C" fn(*const LiveFunction, usize, *const LiveTimings);
++/// One constant the patch closure references, flattened for the C boundary.
++///
++/// The backend reports *facts* — linkage, mutability, whether anything in the
++/// bytes is a function address — and does not decide anything. Whether a
++/// constant may be carried into a live patch is an invariant, invariants live
++/// in the consumer beside the others, and a backend that made the call here
++/// would be a second place to look when one of them is wrong.
++#[repr(C)]
++pub struct LiveData {
++    pub name: *const u8,
++    pub name_len: usize,
++    pub bytes: *const u8,
++    pub bytes_len: usize,
++    pub align: u32,
++    /// `Linkage::Local`: nothing outside this object can name it.
++    pub local: u32,
++    pub writable: u32,
++    pub tls: u32,
++    /// Relocations that write the address of *another constant*.
++    pub relocs: *const LiveReloc,
++    pub reloc_count: usize,
++    /// Relocations that write the address of a *function*. A vtable or a
++    /// function-pointer table, counted separately because it is the one shape
++    /// whose duplication a live patch cannot justify.
++    pub function_relocs: usize,
++}
++
++type Callback = extern "C" fn(
++    *const LiveFunction,
++    usize,
++    *const LiveData,
++    usize,
++    *const LiveTimings,
++);
 +
 +/// Set by the consumer before the session. A `None` here means ordinary cg_clif
 +/// with nothing added — the backend is usable as a drop-in either way.
@@ -232,7 +265,7 @@ diff -ruN --exclude=target --exclude=Cargo.lock pristine/src/live_sink.rs build/
 +/// `callback` must be a valid function pointer of the declared type, and must
 +/// not outlive the process.
 +#[unsafe(no_mangle)]
-+pub extern "C" fn blinker_live_set_sink(callback: Option<Callback>) {
++pub extern "C" fn blinker_live_set_sink_v2(callback: Option<Callback>) {
 +    *CALLBACK.lock().expect("not poisoned") = callback;
 +}
 +
@@ -329,8 +362,20 @@ diff -ruN --exclude=target --exclude=Cargo.lock pristine/src/live_sink.rs build/
 +                _ => None,
 +            }
 +        }
-+        ExternalName::TestCase(_) | ExternalName::LibCall(_) | ExternalName::KnownSymbol(_) => {
-+            // Deliberately unnamed rather than guessed. The consumer's
++        // A compiler-runtime helper: `memcpy`, `memset`, a soft-float
++        // routine. Named by cranelift-module's own mapping rather than by a
++        // table written here, so the name is the one the object path would
++        // have emitted and not a second opinion about it.
++        //
++        // These are the entries §29's `RUNTIME_SUPPORT` was reserved for, and
++        // the argument for each is the same: it is a function that already
++        // exists in the process, the patch calls it rather than defining it,
++        // and there is exactly one of it. Reading a constant array at a
++        // computed index compiles to a `memcpy` at `-Copt-level=0`, which is
++        // how this stopped being hypothetical.
++        ExternalName::LibCall(libcall) => Some(cranelift_module::default_libcall_names()(*libcall)),
++        ExternalName::TestCase(_) | ExternalName::KnownSymbol(_) => {
++            // Still deliberately unnamed rather than guessed. The consumer's
 +            // relocation invariant refuses anything it cannot explain, and an
 +            // invented name would be an explanation it should not accept.
 +            None
@@ -420,6 +465,49 @@ diff -ruN --exclude=target --exclude=Cargo.lock pristine/src/live_sink.rs build/
 +                    .collect(),
 +            );
 +        }
++        // Every constant the delivered code names, and everything those
++        // constants name in turn.
++        let reached = reachable(&self.reloc_names);
++        let defined = DEFINED.lock().expect("not poisoned");
++        let mut data_relocs: Vec<Vec<LiveReloc>> = Vec::with_capacity(reached.len());
++        for index in &reached {
++            data_relocs.push(
++                defined[*index]
++                    .relocs
++                    .iter()
++                    .map(|(offset, target)| LiveReloc {
++                        offset: *offset,
++                        // Absolute pointer-sized, which is the only kind
++                        // `write_data_addr` produces.
++                        kind: 1,
++                        addend: 0,
++                        name: target.as_ptr(),
++                        name_len: target.len(),
++                    })
++                    .collect(),
++            );
++        }
++        let constants: Vec<LiveData> = reached
++            .iter()
++            .enumerate()
++            .map(|(slot, index)| {
++                let recorded = &defined[*index];
++                LiveData {
++                    name: recorded.name.as_ptr(),
++                    name_len: recorded.name.len(),
++                    bytes: recorded.bytes.as_ptr(),
++                    bytes_len: recorded.bytes.len(),
++                    align: recorded.align,
++                    local: recorded.local as u32,
++                    writable: recorded.writable as u32,
++                    tls: recorded.tls as u32,
++                    relocs: data_relocs[slot].as_ptr(),
++                    reloc_count: data_relocs[slot].len(),
++                    function_relocs: recorded.function_relocs,
++                }
++            })
++            .collect();
++
 +        let functions: Vec<LiveFunction> = (0..self.names.len())
 +            .map(|index| LiveFunction {
 +                name: self.names[index].as_ptr(),
@@ -431,7 +519,130 @@ diff -ruN --exclude=target --exclude=Cargo.lock pristine/src/live_sink.rs build/
 +                reloc_count: flat_relocs[index].len(),
 +            })
 +            .collect();
-+        callback(functions.as_ptr(), functions.len(), &self.timings);
++        callback(
++            functions.as_ptr(),
++            functions.len(),
++            constants.as_ptr(),
++            constants.len(),
++            &self.timings,
++        );
 +        true
 +    }
 +}
++
++/// Every constant this module defined, in definition order.
++///
++/// Recorded at `define_data` rather than read back out of the module, because
++/// a `DataDescription` is consumed by `define_data` and the `ObjectModule`
++/// keeps no accessible copy of the bytes.
++static DEFINED: Mutex<Vec<Recorded>> = Mutex::new(Vec::new());
++
++struct Recorded {
++    name: String,
++    bytes: Vec<u8>,
++    align: u32,
++    local: bool,
++    writable: bool,
++    tls: bool,
++    /// `(offset, target constant)`, pointer-sized absolute writes.
++    relocs: Vec<(u32, String)>,
++    function_relocs: usize,
++}
++
++/// Clear what a previous session recorded. The consumer calls this as it opens
++/// a revision.
++///
++/// Mandatory rather than tidy. Anonymous constants are named by position —
++/// every session has a `.Ldata0` — so a record left over from the last
++/// revision does not fail to resolve, it resolves to the *wrong bytes*. That is
++/// the same shape as §36's stale codegen unit and it would be just as quiet.
++#[unsafe(no_mangle)]
++pub extern "C" fn blinker_live_forget() {
++    DEFINED.lock().expect("not poisoned").clear();
++}
++
++/// Record one constant as the module defines it.
++pub(crate) fn record_data(module: &dyn Module, data_id: DataId, data: &DataDescription) {
++    if !enabled() {
++        return;
++    }
++    let declarations = module.declarations();
++    let declaration = declarations.get_data_decl(data_id);
++    let bytes = match &data.init {
++        Init::Bytes { contents } => contents.to_vec(),
++        Init::Zeros { size } => vec![0u8; *size],
++        // Nothing to copy, and nothing that could be copied correctly.
++        Init::Uninitialized => return,
++    };
++    let name_of = |target: &ModuleRelocTarget| match target {
++        ModuleRelocTarget::User { namespace: 1, index } => Some(
++            declarations
++                .get_data_decl(DataId::from_u32(*index))
++                .linkage_name(DataId::from_u32(*index))
++                .into_owned(),
++        ),
++        _ => None,
++    };
++    let mut relocs = Vec::with_capacity(data.data_relocs.len());
++    let mut unnameable = 0usize;
++    for (offset, global, _addend) in &data.data_relocs {
++        match name_of(&data.data_decls[*global]) {
++            Some(name) => relocs.push((*offset, name)),
++            // Counted as a function relocation rather than dropped: the
++            // consumer refuses on the count, and a target it cannot name is
++            // exactly as unexplainable as one pointing at code.
++            None => unnameable += 1,
++        }
++    }
++    DEFINED.lock().expect("not poisoned").push(Recorded {
++        name: declaration.linkage_name(data_id).into_owned(),
++        bytes,
++        align: data.align.unwrap_or(1) as u32,
++        local: declaration.linkage == cranelift_module::Linkage::Local,
++        writable: declaration.writable,
++        tls: declaration.tls,
++        relocs,
++        function_relocs: data.function_relocs.len() + unnameable,
++    });
++}
++
++/// The constants the delivered functions reach, transitively.
++///
++/// Not every constant the module defined. Two reasons, and the second is the
++/// one that matters: the patch should carry what it references and nothing
++/// else, and a crate compiles more than one codegen unit — so a global record
++/// holds constants belonging to units this patch has nothing to do with.
++/// Following the references from the delivered code reaches exactly the right
++/// set and cannot reach into another unit, because a function's relocations
++/// only name symbols its own module declared.
++fn reachable(wanted: &[String]) -> Vec<usize> {
++    let defined = DEFINED.lock().expect("not poisoned");
++    let mut order: Vec<usize> = Vec::new();
++    let mut queue: Vec<String> = wanted.to_vec();
++    while let Some(name) = queue.pop() {
++        let Some(index) = defined.iter().position(|d| d.name == name) else {
++            continue;
++        };
++        if order.contains(&index) {
++            continue;
++        }
++        order.push(index);
++        queue.extend(defined[index].relocs.iter().map(|(_, target)| target.clone()));
++    }
++    order
++}
+diff -ruN --exclude=target --exclude=Cargo.lock pristine/src/unwind_module.rs build/src/unwind_module.rs
+--- pristine/src/unwind_module.rs	2026-08-07 20:56:13
++++ build/src/unwind_module.rs	2026-08-07 20:37:31
+@@ -106,6 +106,11 @@
+     }
+ 
+     fn define_data(&mut self, data_id: DataId, data: &DataDescription) -> ModuleResult<()> {
++        // The live sink's one hook into constant data. Every constant a module
++        // defines goes through here — anonymous allocations, statics, the
++        // `_rust_extern_with_linkage_` shims — so recording here needs no
++        // knowledge of who is defining what or why.
++        crate::live_sink::record_data(&self.module, data_id, data);
+         self.module.define_data(data_id, data)
+     }
+ }

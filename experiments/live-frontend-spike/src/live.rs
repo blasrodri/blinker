@@ -124,6 +124,78 @@ pub struct Lifted {
     pub relocations: Vec<(u64, String, blinker_macho::Arm64RelocationKind, bool, i64)>,
 }
 
+/// A constant the patch closure references, delivered beside the code (§46).
+///
+/// The bytes behind `.Ldata0`: a `core::panic::Location`, a string literal, an
+/// array literal, a jump table. Until §46 a relocation naming one of these was
+/// unresolvable and the patch was refused, which is why §43 lists "constant
+/// data" as an artifact class and why the M1 fixture had to be written around
+/// `ptr::add`.
+pub struct Constant {
+    pub name: String,
+    pub bytes: Vec<u8>,
+    pub align: u32,
+    /// `(offset within these bytes, the constant it addresses)`. Absolute
+    /// pointer-sized writes; that is the only kind a data object produces.
+    pub relocations: Vec<(u64, String)>,
+    /// Facts from the backend, on which the rule below is decided.
+    pub local: bool,
+    pub writable: bool,
+    pub tls: bool,
+    /// Relocations writing the address of a *function*, or naming nothing the
+    /// backend could identify.
+    pub function_relocs: usize,
+}
+
+/// Whether a constant may be copied into a live patch.
+///
+/// A patch that carries a constant creates a **second copy** of it: the base
+/// image has its own, compiled in, and the unpatched functions there go on
+/// using it. For read-only bytes that nothing compares by address, two
+/// identical copies are indistinguishable from one — which is what makes this
+/// sound, and is also the whole of the argument, so the conditions are exactly
+/// the ones that argument needs.
+///
+/// - **`Linkage::Local`.** Nothing outside the object can name it, so no other
+///   translation unit holds a reference this patch would have to keep
+///   consistent. An exported constant is a `static`, and a `static` is state.
+/// - **Not writable.** Duplicating mutable storage is the one thing a live
+///   patch must never do: two copies of a counter is two counters. The
+///   classifier already refuses a body that reads a *new* static; this is the
+///   same rule enforced one layer down, where the bytes are.
+/// - **Not thread-local.** A second TLS key is a second variable.
+/// - **No function addresses in the bytes.** A vtable or a function-pointer
+///   table is precisely the case where address identity is observable —
+///   `ptr::eq` on two `dyn Trait` references compares vtable pointers, and two
+///   vtables for one type would make it answer no. This is also where a
+///   relocation the backend could not name is counted, because an unexplained
+///   target is exactly as unjustifiable as a known-bad one.
+///
+/// Returns the reason it is refused, or `None` if it may be carried.
+pub fn constant_is_carryable(constant: &Constant) -> Option<String> {
+    if !constant.local {
+        return Some(format!(
+            "{} is not Linkage::Local, so it is a static rather than a constant and \
+             copying it would duplicate state",
+            constant.name
+        ));
+    }
+    if constant.writable {
+        return Some(format!("{} is writable", constant.name));
+    }
+    if constant.tls {
+        return Some(format!("{} is thread-local", constant.name));
+    }
+    if constant.function_relocs > 0 {
+        return Some(format!(
+            "{} holds {} function address(es) — a vtable or function-pointer table, whose \
+             identity is observable through `ptr::eq`",
+            constant.name, constant.function_relocs
+        ));
+    }
+    None
+}
+
 /// Pull the named functions out of an object's `__TEXT,__text`.
 ///
 /// A symbol's extent is the distance to the next symbol in the same section,
@@ -323,10 +395,20 @@ pub fn stage(
     arena: &Arena,
     runtime: &Runtime,
     lifted: &[Lifted],
+    constants: &[Constant],
     image: Option<*mut libc::c_void>,
 ) -> Result<Staged, String> {
     use blinker_macho::Arm64RelocationKind as Kind;
     let at = Instant::now();
+
+    // Every constant the patch is about to carry has to earn its place first,
+    // and before anything is written rather than after. `stage` is the last
+    // point at which refusing costs nothing.
+    for constant in constants {
+        if let Some(why) = constant_is_carryable(constant) {
+            return Err(format!("this patch cannot carry constant data: {why}"));
+        }
+    }
 
     let code: usize = lifted.iter().map(|f| f.code.len().next_multiple_of(16)).sum();
     // Every distinct symbol the closure reaches through the GOT needs an
@@ -345,7 +427,22 @@ pub fn stage(
         names.dedup();
         names
     };
-    let got_base = code.next_multiple_of(8);
+    // Layout: code, then constants, then the GOT. Constants sit after the code
+    // rather than in a region of their own, so they are in the same `MAP_JIT`
+    // mapping and therefore executable. That is not a weakening — every byte in
+    // this arena already is — but it is not where they belong either, and a
+    // read-only region for them is the obvious next piece of hygiene.
+    let mut data_offsets = Vec::with_capacity(constants.len());
+    let mut data_cursor = code;
+    for constant in constants {
+        // Its own alignment, not a fixed one: a `[u64; N]` literal wants eight
+        // and a jump table can want more, and a misaligned constant is a
+        // correctness bug that only shows up on some targets.
+        data_cursor = data_cursor.next_multiple_of(constant.align.max(1) as usize);
+        data_offsets.push(data_cursor);
+        data_cursor += constant.bytes.len();
+    }
+    let got_base = data_cursor.next_multiple_of(8);
     let total = got_base + got_targets.len() * 8;
     let slab = arena.slab(total).map_err(|e| e.to_string())?;
 
@@ -358,6 +455,33 @@ pub fn stage(
         offsets.push(cursor);
         cursor += function.code.len();
     }
+    for (constant, offset) in constants.iter().zip(&data_offsets) {
+        // SAFETY: an offset this function reserved inside its own slab.
+        unsafe { arena.write(&slab, *offset, &constant.bytes) };
+    }
+    // A constant that addresses another constant — a `Location` holding a
+    // pointer to its file name — is patched before anything reads either.
+    for (constant, offset) in constants.iter().zip(&data_offsets) {
+        for (at, target) in &constant.relocations {
+            let Some(index) = constants.iter().position(|c| c.name == *target) else {
+                return Err(format!(
+                    "{} addresses {target}, which the backend did not deliver",
+                    constant.name
+                ));
+            };
+            // SAFETY: an offset inside the slab.
+            let address = (unsafe { slab.ptr.add(data_offsets[index]) }) as u64;
+            // SAFETY: eight bytes inside this constant, which was just written.
+            unsafe { arena.write(&slab, offset + *at as usize, &address.to_le_bytes()) };
+        }
+    }
+    let constant_address = |name: &str| -> Option<u64> {
+        constants
+            .iter()
+            .position(|c| c.name == name)
+            // SAFETY: an offset inside the slab.
+            .map(|index| (unsafe { slab.ptr.add(data_offsets[index]) }) as u64)
+    };
 
     // Fill the GOT before any instruction referring to it is patched.
     for (index, target) in got_targets.iter().enumerate() {
@@ -368,7 +492,7 @@ pub fn stage(
             // .Ldata0" is a fact about a symbol nobody wrote and the actionable
             // question is which body needed constant data. Working that out by
             // bisecting the fixture took longer than this line.
-            None => resolve(target, image).ok_or_else(|| {
+            None => constant_address(target).or_else(|| resolve(target, image)).ok_or_else(|| {
                 let wants: Vec<&str> = lifted
                     .iter()
                     .filter(|f| f.relocations.iter().any(|(_, t, _, _, _)| t == target))
@@ -408,7 +532,12 @@ pub fn stage(
                 match lifted.iter().position(|f| f.name == *target) {
                     // SAFETY: an offset inside the slab.
                     Some(member) => (unsafe { slab.ptr.add(offsets[member]) }) as u64,
-                    None => resolve(target, image)
+                    // Closure member, then carried constant, then base image,
+                    // then the process — §29's relocation invariant with one
+                    // new category, added explicitly rather than by widening
+                    // what "the base image" is taken to mean.
+                    None => constant_address(target)
+                        .or_else(|| resolve(target, image))
                         .ok_or_else(|| format!("cannot resolve {target}"))?,
                 }
             };
@@ -521,7 +650,11 @@ fn publish_and_call(
     lifted: &[Lifted],
     argument: i64,
 ) -> Result<(i64, f64, usize, usize), String> {
-    let staged = stage(arena, runtime, lifted, None)?;
+    // No constants: this is the object path, which lifts `__TEXT,__text` off
+    // disk and has never looked at `__DATA,__const`. §46 gave the *sink* path
+    // constant data, and leaving this one without it keeps it as the control
+    // rather than quietly making the two paths differ in two ways at once.
+    let staged = stage(arena, runtime, lifted, &[], None)?;
     let (publish_ms, bytes, relocations) =
         (staged.publish_ms, staged.code_bytes, staged.relocations);
     let entry = staged.entry();
@@ -539,14 +672,29 @@ fn publish_and_call(
 /// first would also mean that when several revisions are loaded at once, the
 /// oldest one answers for all of them.
 fn resolve(name: &str, image: Option<*mut libc::c_void>) -> Option<u64> {
-    let bare = name.strip_prefix('_').unwrap_or(name);
-    let c = std::ffi::CString::new(bare).ok()?;
-    for handle in image.into_iter().chain([libc::RTLD_DEFAULT]) {
-        // SAFETY: an open handle and a null-terminated name; `dlsym` returns
-        // null when it fails.
-        let address = unsafe { libc::dlsym(handle, c.as_ptr()) };
-        if !address.is_null() {
-            return Some(address as u64);
+    // Both spellings, and the order matters.
+    //
+    // `dlsym` wants the name without Mach-O's leading underscore, so a symbol
+    // lifted from an object file has to have it stripped. But a name delivered
+    // by the sink is cg_clif's *linkage* name, which carries no such prefix —
+    // and Rust's v0 mangling begins `_R`. Stripping unconditionally turned
+    // `_RNvNt…panic_const_div_by_zero` into `RNvNt…`, which resolves nowhere.
+    //
+    // Nothing caught it until §46 because until then every base-image reference
+    // a patch made was to a `#[no_mangle]` symbol, where the two spellings are
+    // the same string.
+    let stripped = name.strip_prefix('_');
+    for candidate in [Some(name), stripped].into_iter().flatten() {
+        let Ok(c) = std::ffi::CString::new(candidate) else {
+            continue;
+        };
+        for handle in image.into_iter().chain([libc::RTLD_DEFAULT]) {
+            // SAFETY: an open handle and a null-terminated name; `dlsym`
+            // returns null when it fails.
+            let address = unsafe { libc::dlsym(handle, c.as_ptr()) };
+            if !address.is_null() {
+                return Some(address as u64);
+            }
         }
     }
     None
@@ -564,6 +712,12 @@ pub struct PatchOptions {
     pub corrupt_relocation: bool,
     /// Publish an edit the classifier refused.
     pub ignore_classifier: bool,
+    /// Flip a byte in a carried constant (§46). The patch stays fully
+    /// resolvable, so nothing refuses it — the answer is simply wrong, which is
+    /// what makes this the control that proves the bytes are *read*.
+    pub corrupt_constant: bool,
+    /// Drop a carried constant, as an incomplete transitive walk would.
+    pub omit_constant: bool,
 }
 
 /// A candidate patch, or the reason there is not one.
@@ -620,15 +774,19 @@ pub fn patch(
             "--emit=obj".into(),
             format!("--out-dir={}", out_dir.display()),
             "-Cmetadata=diff".into(),
-            // Debug assertions off, and this is a limitation being stated
-            // rather than a convenience. At `-Copt-level=0` they are on, and
-            // they make every raw-pointer write emit a null and an alignment
-            // check that call `core::panicking::…(&Location)`. A `&Location`
-            // is constant data, reached by a relocation against an anonymous
-            // symbol in `__const`, and lifting constant data into the arena is
-            // not something this DIRECT class does. So a patch that can panic
-            // is out of class today — which is also why §30's observations
-            // cover no panic, no stdout, and no callback.
+            // Debug assertions off, and the reason has changed.
+            //
+            // It used to be a limitation: at `-Copt-level=0` they are on, every
+            // raw-pointer write emits checks that call
+            // `core::panicking::…(&Location)`, a `&Location` is constant data,
+            // and a patch could not carry constant data. §46 removed that —
+            // `checked_div` publishes a panic path and agrees with a clean
+            // rebuild.
+            //
+            // It stays off because **both sides must be compiled the same
+            // way**. The clean image is built with it off, and a differential
+            // whose two halves disagree about which checks exist is comparing
+            // two programs rather than two compilations of one.
             "-Cdebug-assertions=off".into(),
         ],
         true,
@@ -655,10 +813,31 @@ pub fn patch(
         }
         match outcome {
             Some(outcome) if outcome.error.is_some() => patch.error = outcome.error,
-            Some(outcome) => match outcome.staged {
-                Some(staged) => patch.staged = Some(staged),
-                None => patch.error = Some("the sink staged nothing".into()),
-            },
+            Some(outcome) => {
+                // §29's set equality, on the sink path.
+                //
+                // It was only ever enforced on the object path below, and the
+                // omitted-member control passed anyway — because a member the
+                // patch had dropped left a relocation nothing could resolve.
+                // §46 removed that accident when the base image became a Rust
+                // `dylib`: every symbol is exported now, so the missing member
+                // resolves *silently* against the base image's older copy.
+                //
+                // Which is the exact failure this invariant is for, and it was
+                // one crate-type flag away the whole time. It is checked here,
+                // deterministically, rather than left to a behavioural
+                // difference that only appears when the dropped member happens
+                // to be one this revision changed.
+                match check_universe(&outcome.defined, &session.universe_symbols) {
+                    Err(error) if !session.universe_symbols.is_empty() => {
+                        patch.error = Some(error)
+                    }
+                    _ => match outcome.staged {
+                        Some(staged) => patch.staged = Some(staged),
+                        None => patch.error = Some("the sink staged nothing".into()),
+                    },
+                }
+            }
             None => patch.error = Some("the sink delivered nothing".into()),
         }
         return patch;
@@ -743,7 +922,7 @@ pub fn patch(
         }
     }
 
-    match stage(arena, runtime, &lifted, image) {
+    match stage(arena, runtime, &lifted, &[], image) {
         Ok(staged) => patch.staged = Some(staged),
         Err(error) => patch.error = Some(error),
     }
@@ -1069,11 +1248,28 @@ pub fn sink_candidate(
             // Not an error: a refusal is the classifier working.
             return Ok(false);
         }
-        match outcome.as_ref().and_then(|outcome| outcome.error.clone()) {
-            Some(error) => Err(error),
-            None if !staged => Err("the sink staged nothing".into()),
-            None => Ok(true),
+        if let Some(error) = outcome.as_ref().and_then(|outcome| outcome.error.clone()) {
+            return Err(error);
         }
+        if !staged {
+            return Err("the sink staged nothing".into());
+        }
+        // §29's set equality, on the path that actually runs.
+        //
+        // It was only ever enforced on the object path. The sink path got away
+        // with it because an omitted closure member left an unresolvable
+        // relocation, so the control passed — for a reason it did not claim.
+        // §46 removed that accident: the base image became a Rust `dylib`, which
+        // exports every symbol, so a missing member now resolves *silently*
+        // against the base image's older copy of it. That is precisely the
+        // failure this invariant exists to prevent, and it was one crate-type
+        // flag away the whole time.
+        if let Some(outcome) = outcome.as_ref() {
+            if !session.universe_symbols.is_empty() {
+                check_universe(&outcome.defined, &session.universe_symbols)?;
+            }
+        }
+        Ok(true)
     })();
 
     let accepted = match accept {
@@ -1121,4 +1317,55 @@ pub fn index_session(
         at.elapsed().as_secs_f64() * 1e3,
         session.error,
     )
+}
+
+#[cfg(test)]
+mod constant_tests {
+    use super::*;
+
+    fn readonly_local() -> Constant {
+        Constant {
+            name: ".Ldata0".into(),
+            bytes: vec![1, 2, 3, 4],
+            align: 8,
+            relocations: Vec::new(),
+            local: true,
+            writable: false,
+            tls: false,
+            function_relocs: 0,
+        }
+    }
+
+    #[test]
+    fn a_private_read_only_constant_may_be_carried() {
+        assert_eq!(constant_is_carryable(&readonly_local()), None);
+    }
+
+    #[test]
+    fn an_exported_constant_is_a_static_and_is_refused() {
+        // The distinction the whole rule turns on: a `Linkage::Local` blob is
+        // private to one object and duplicating it is invisible; anything
+        // nameable from outside is state, and a second copy of state is two
+        // variables where the program has one.
+        let refused = constant_is_carryable(&Constant { local: false, ..readonly_local() });
+        assert!(refused.expect("refused").contains("static"));
+    }
+
+    #[test]
+    fn writable_and_thread_local_are_refused() {
+        assert!(constant_is_carryable(&Constant { writable: true, ..readonly_local() }).is_some());
+        assert!(constant_is_carryable(&Constant { tls: true, ..readonly_local() }).is_some());
+    }
+
+    #[test]
+    fn a_constant_holding_a_function_address_is_refused() {
+        // A vtable. `ptr::eq` on two `dyn Trait` references compares vtable
+        // pointers, so two vtables for one type is observable — the one case
+        // where duplicating read-only bytes is not equivalent to sharing them.
+        let refused = constant_is_carryable(&Constant {
+            function_relocs: 1,
+            ..readonly_local()
+        });
+        assert!(refused.expect("refused").contains("vtable"));
+    }
 }

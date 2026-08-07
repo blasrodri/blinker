@@ -2,83 +2,83 @@
   {
     "mutation": "body_arith",
     "verdict": "DIRECT",
-    "agreed": true,
+    "agreed": null,
     "difference": null,
     "base_intact": true,
     "closure_size": 6,
-    "error": null
+    "error": "control not applicable: this patch carries no constants"
   },
   {
     "mutation": "call_existing",
     "verdict": "DIRECT",
-    "agreed": true,
+    "agreed": null,
     "difference": null,
     "base_intact": true,
     "closure_size": 6,
-    "error": null
+    "error": "control not applicable: this patch carries no constants"
   },
   {
     "mutation": "new_local_helper",
     "verdict": "DIRECT",
-    "agreed": true,
+    "agreed": null,
     "difference": null,
     "base_intact": true,
     "closure_size": 13,
-    "error": null
+    "error": "cannot resolve .Ldata1 for the GOT, wanted by _RINvNtCs9NVAEkDcDTP_4core10intrinsics11rotate_leftyECsfCWnWJ9PaRW_12diff_fixture"
   },
   {
     "mutation": "new_generic",
     "verdict": "DIRECT",
-    "agreed": true,
+    "agreed": null,
     "difference": null,
     "base_intact": true,
     "closure_size": 8,
-    "error": null
+    "error": "control not applicable: this patch carries no constants"
   },
   {
     "mutation": "read_static",
     "verdict": "DIRECT",
-    "agreed": true,
+    "agreed": null,
     "difference": null,
     "base_intact": true,
     "closure_size": 6,
-    "error": null
+    "error": "control not applicable: this patch carries no constants"
   },
   {
     "mutation": "multi_function",
     "verdict": "DIRECT",
-    "agreed": true,
+    "agreed": null,
     "difference": null,
     "base_intact": true,
     "closure_size": 6,
-    "error": null
+    "error": "control not applicable: this patch carries no constants"
   },
   {
     "mutation": "branch_cold",
     "verdict": "DIRECT",
-    "agreed": true,
+    "agreed": null,
     "difference": null,
     "base_intact": true,
     "closure_size": 6,
-    "error": null
+    "error": "control not applicable: this patch carries no constants"
   },
   {
     "mutation": "loop_edit",
     "verdict": "DIRECT",
-    "agreed": true,
+    "agreed": null,
     "difference": null,
     "base_intact": true,
     "closure_size": 7,
-    "error": null
+    "error": "control not applicable: this patch carries no constants"
   },
   {
     "mutation": "two_gates",
     "verdict": "DIRECT",
-    "agreed": true,
+    "agreed": null,
     "difference": null,
     "base_intact": true,
     "closure_size": 6,
-    "error": null
+    "error": "control not applicable: this patch carries no constants"
   },
   {
     "mutation": "edit_outside_closure",
@@ -92,20 +92,20 @@
   {
     "mutation": "checked_div",
     "verdict": "DIRECT",
-    "agreed": true,
+    "agreed": null,
     "difference": null,
     "base_intact": true,
     "closure_size": 7,
-    "error": null
+    "error": ".Ldata0 addresses .Ldata1, which the backend did not deliver"
   },
   {
     "mutation": "const_table",
     "verdict": "DIRECT",
-    "agreed": true,
+    "agreed": null,
     "difference": null,
     "base_intact": true,
     "closure_size": 6,
-    "error": null
+    "error": "cannot resolve .Ldata0 for the GOT, wanted by diff_root"
   },
   {
     "mutation": "new_static",

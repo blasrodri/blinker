@@ -132,7 +132,23 @@ impl Image {
         let status = std::process::Command::new("rustc")
             .args([
                 "--edition=2021",
-                "--crate-type=cdylib",
+                                // A Rust `dylib`, not a `cdylib`.
+                //
+                // A `cdylib` exports only the C surface — everything else,
+                // including the parts of `core` linked into it, gets local
+                // visibility. So a patch carrying a panic path could not
+                // resolve `core::panicking::panic_const_div_by_zero`: the code
+                // was right there in the image, at a `t` symbol `dlsym` cannot
+                // see. `-Wl,-export_dynamic` does not help, because the hiding
+                // happens in codegen rather than at link time.
+                //
+                // A stand-in either way, and worth naming as one: in the
+                // product the base image is the developer's own binary and
+                // Blinker *is* its linker, so it holds the address of every
+                // symbol whether or not the dynamic table does. Choosing a
+                // crate type that keeps them visible is how a harness without
+                // a linker gets the same answer.
+                "--crate-type=dylib",
                 "--crate-name=diff_fixture",
                 "-Copt-level=0",
                 "-Cdebuginfo=0",
@@ -274,6 +290,15 @@ pub enum Sabotage {
     /// the classifier never says yes to anything dangerous — not that the
     /// differential could tell if it did.
     IgnoreClassifier,
+    /// Flip a byte in a constant the patch carries (§46). Nothing about the
+    /// artifact becomes unresolvable, so nothing refuses it — the program
+    /// simply computes a different answer, and the differential has to be the
+    /// thing that notices. Without this control, "the patch carries its
+    /// constants" is satisfied equally well by carrying bytes nobody reads.
+    CorruptConstant,
+    /// Drop a carried constant, as an incomplete transitive walk would. Must be
+    /// caught while the artifact is built, never as a wrong answer.
+    OmitConstant,
 }
 
 impl Sabotage {
@@ -283,6 +308,8 @@ impl Sabotage {
             "omit" => Sabotage::OmitClosureMember,
             "relocation" => Sabotage::CorruptRelocation,
             "classifier" => Sabotage::IgnoreClassifier,
+            "constant" => Sabotage::CorruptConstant,
+            "omit-constant" => Sabotage::OmitConstant,
             _ => return None,
         })
     }
@@ -293,6 +320,8 @@ impl Sabotage {
             Sabotage::OmitClosureMember => "omit a closure member",
             Sabotage::CorruptRelocation => "corrupt a relocation",
             Sabotage::IgnoreClassifier => "ignore the classifier",
+            Sabotage::CorruptConstant => "corrupt a carried constant",
+            Sabotage::OmitConstant => "omit a carried constant",
         }
     }
 }
@@ -416,6 +445,8 @@ fn trial(
             omit_closure_member: sabotage == Sabotage::OmitClosureMember,
             corrupt_relocation: sabotage == Sabotage::CorruptRelocation,
             ignore_classifier: sabotage == Sabotage::IgnoreClassifier,
+            corrupt_constant: sabotage == Sabotage::CorruptConstant,
+            omit_constant: sabotage == Sabotage::OmitConstant,
         });
     }
     let live = crate::live::patch(
@@ -437,6 +468,8 @@ fn trial(
             omit_closure_member: sabotage == Sabotage::OmitClosureMember,
             corrupt_relocation: sabotage == Sabotage::CorruptRelocation,
             ignore_classifier: sabotage == Sabotage::IgnoreClassifier,
+            corrupt_constant: sabotage == Sabotage::CorruptConstant,
+            omit_constant: sabotage == Sabotage::OmitConstant,
         },
     );
     trial.verdict = live.verdict.clone();
@@ -909,9 +942,26 @@ pub fn report(trials: &[Trial], sabotage: Sabotage, out: Option<&PathBuf>) -> bo
             }
             // Caught while building the artifact, never as a wrong answer, and
             // the running program untouched.
-            Sabotage::OmitClosureMember | Sabotage::CorruptRelocation => {
+            Sabotage::OmitClosureMember
+            | Sabotage::CorruptRelocation
+            | Sabotage::OmitConstant => {
                 trial.agreed.is_none() && trial.error.is_some() && trial.base_intact
             }
+            // The one control that must *not* be caught while building. A
+            // constant with its bytes flipped is a perfectly well-formed
+            // artifact: every relocation resolves, nothing is missing, the
+            // patch publishes. Only the behaviour comparison can see it.
+            //
+            // The requirement is therefore at the *suite* level rather than per
+            // mutation, and that is not a weakening — it is what this control
+            // is actually about. Most carried constants are panic locations on
+            // a path the probes never take, so corrupting them is genuinely
+            // unobservable and demanding that every mutation notice would be
+            // demanding the impossible. What has to be true is that the
+            // differential *can* detect a corrupted constant, and one mutation
+            // whose answer depends on carried bytes is enough to establish it.
+            // The check is below, after the loop.
+            Sabotage::CorruptConstant => trial.base_intact,
             // Only the mutations the classifier *would* have refused are under
             // test here. Forcing an edit that was DIRECT anyway changes
             // nothing, and demanding that those also break made the control
@@ -961,6 +1011,27 @@ pub fn report(trials: &[Trial], sabotage: Sabotage, out: Option<&PathBuf>) -> bo
     if sabotage == Sabotage::None && agreed == 0 {
         ok = false;
         println!("\n  nothing agreed: the suite proved nothing");
+    }
+    // The suite-level half of the corrupted-constant control (§46).
+    //
+    // Per-trial it only requires that the program survive, because most carried
+    // constants are panic locations on a path the probes never take and
+    // corrupting those is genuinely unobservable. What the control is *for* is
+    // the claim that the differential can detect a wrong constant at all, and
+    // that is a property of the suite: at least one mutation whose answer
+    // depends on carried bytes has to notice.
+    if sabotage == Sabotage::CorruptConstant {
+        let detected = trials.iter().filter(|trial| trial.agreed == Some(false)).count();
+        if detected == 0 {
+            ok = false;
+            println!(
+                "\n  no mutation disagreed: corrupting every carried constant changed nothing \
+                 the probes can see, so this run does not show that a wrong constant is \
+                 detectable"
+            );
+        } else {
+            println!("\n  {detected} mutation(s) disagreed, which is what this control requires");
+        }
     }
     println!(
         "\n  {}: {}{}",

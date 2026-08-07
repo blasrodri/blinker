@@ -83,7 +83,7 @@ SCAN_FIXED = """{
     let mut i: u64 = 0;
     while i < len {
         // SAFETY: the caller passes a pointer to at least `len` bytes.
-        let b = unsafe { byte_at(data, i) };
+        let b = unsafe { *data.add(i as usize) };
         let class = classify_byte(b);
         if class == CLASS_DIGIT {
             acc = accumulate(acc, b);
@@ -108,7 +108,7 @@ COUNT_FIXED = """{
     let mut i: u64 = 0;
     while i < len {
         // SAFETY: as above.
-        let b = unsafe { byte_at(data, i) };
+        let b = unsafe { *data.add(i as usize) };
         if classify_byte(b) == CLASS_DIGIT {
             in_number = 1;
         } else if in_number == 1 {

@@ -7,12 +7,16 @@ than written out by hand. That is not tidiness: the differential's premise is
 had drifted in some second, unnoticed respect would make a passing comparison
 mean less than it looks like it means.
 
-Everything is `wrapping_*` on purpose. `-Copt-level=0` leaves debug assertions
-on, so an ordinary `+` emits an overflow check that calls
-`core::panicking::panic_const_add_overflow` with a `&Location`, and a
-`&Location` is a section-relative relocation, which the current DIRECT class
-refuses. Arithmetic that can panic is outside the class today; §30 says so
-rather than hiding it behind a fixture that avoids the question by accident.
+Most of it is `wrapping_*` for a reason that used to be a hard limit and is now
+a control. `-Copt-level=0` leaves debug assertions on, so an ordinary `+` emits
+an overflow check calling `core::panicking::panic_const_add_overflow` with a
+`&Location` — constant data, which the artifact class refused until §46.
+
+The last two mutations are there *because* they need it. `checked_div` divides,
+whose zero check needs a `&Location`; `const_table` reads a constant array
+through a bounds check, so it carries both the table and a panic location, and
+its answer depends on the carried bytes — which is what makes a corrupted
+constant detectable rather than merely survivable.
 """
 
 import pathlib
@@ -159,6 +163,34 @@ fn blend(x: u64) -> u64 {
     # Not a DIRECT edit. Included so the suite exercises a refusal as well as
     # an acceptance: a run in which nothing is ever refused cannot distinguish
     # a working classifier from one that says yes to everything.
+    (
+        "checked_div",
+        "integer division, whose divide-by-zero check needs a panic location (§46)",
+        # Not `+` or `*`: the differential compiles both sides with
+        # `-Cdebug-assertions=off`, so overflow checks are not emitted and a
+        # mutation relying on them would quietly test nothing. A division's zero
+        # check is emitted regardless of that flag, because it is a language
+        # guarantee rather than a debug assertion.
+        [(PRISTINE_BODY, """    let reading = Reading { value, scale };
+    let total = reading.total();
+    let mixed = blend(total).wrapping_div((scale as u64) | 1).wrapping_add(1);""")],
+    ),
+    (
+        "const_table",
+        "a body that reads a constant table the patch has to carry (§46)",
+        [
+            (PRISTINE_BLEND, PRISTINE_BLEND + """
+
+/// A constant the patched body reads. cg_clif materialises it as an anonymous
+/// rodata blob, so a patch that replaces the body has to carry the bytes with
+/// it — and the answer below depends on them, so carrying the *wrong* bytes is
+/// visible rather than merely wasteful.
+const SKEW: [u64; 8] = [3, 5, 7, 11, 13, 17, 19, 23];"""),
+            (PRISTINE_BODY, """    let reading = Reading { value, scale };
+    let total = reading.total();
+    let mixed = blend(total).wrapping_mul(SKEW[(total & 7) as usize]);"""),
+        ],
+    ),
     (
         "new_static",
         "introducing a static, which S0c refuses — the base image has no "

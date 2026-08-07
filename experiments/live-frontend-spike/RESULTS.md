@@ -1613,3 +1613,165 @@ arithmetic overflow checks, array literals, bounds checks, `panic!`, and every
 string in the program. It is **the** limiting factor on what fraction of real
 Rust edits can go DIRECT, and M2's task set has to be built knowing that rather
 than around it.
+
+## 46. Constant data — the artifact class, widened
+
+§45 ended on a claim about scope: the constant-data refusal is not an exotic
+corner, it is `ptr::add`, overflow checks, array literals, bounds checks,
+`panic!`, and every string in the program. That makes it *the* limit on how much
+real Rust can go DIRECT, and it had to move before M2's task set could be built
+against a stable envelope.
+
+### What a patch could not carry
+
+A relocation naming `.Ldata0` had no answer. The bytes exist — cg_clif puts them
+in `__DATA,__const` — but the sink delivered only functions, so the patch
+referenced an address nobody had provided and `stage` refused. §43 called this
+"constant data" and left it.
+
+The backend now delivers the constants too. One hook, in
+`UnwindModule::define_data`, which every constant a module defines passes
+through: anonymous allocations, statics, the `_rust_extern_with_linkage_` shims.
+A `DataDescription` is consumed by `define_data` and the `ObjectModule` keeps no
+readable copy, so it has to be recorded there or not at all.
+
+Delivery carries what the code **reaches**, transitively, not everything the
+module defined. Two reasons, and the second is the one that matters: a patch
+should carry what it references and nothing else, and a crate compiles more than
+one codegen unit, so a global record holds constants belonging to units this
+patch has nothing to do with. Following references from the delivered code
+reaches exactly the right set and cannot cross into another unit, because a
+function's relocations only name symbols its own module declared.
+
+### Why copying a constant is sound, and exactly when
+
+A patch that carries a constant creates a **second copy**. The base image has
+its own, and the unpatched functions there go on using it. For read-only bytes
+that nothing compares by address, two identical copies are indistinguishable
+from one — and that sentence is the entire argument, so the conditions are
+exactly the ones it needs:
+
+| condition | why |
+|---|---|
+| `Linkage::Local` | nothing outside the object can name it, so no other translation unit holds a reference to keep consistent. An exported constant is a `static`, and a `static` is state |
+| not writable | duplicating mutable storage is the one thing a live patch must never do: two copies of a counter is two counters |
+| not thread-local | a second TLS key is a second variable |
+| no function addresses in the bytes | a vtable. `ptr::eq` on two `dyn Trait` references compares vtable pointers, so two vtables for one type is observable — the single case where duplicating read-only bytes is not equivalent to sharing them |
+
+The backend reports these as *facts* and decides nothing; the rule lives in the
+consumer beside the other artifact invariants, so there is one place to look
+when it is wrong. Four unit tests, one per condition.
+
+An unnameable relocation target is counted as a function relocation rather than
+dropped. A target that cannot be explained is exactly as unjustifiable as a
+known-bad one.
+
+### Three things that had to be fixed to get one mutation to pass
+
+**`resolve` was eating the Rust mangling prefix.** It stripped a leading `_`
+because Mach-O prefixes symbols with one — but a name delivered by the sink is
+cg_clif's *linkage* name, which has no such prefix, and Rust's v0 mangling
+begins `_R`. So `_RNvNt…panic_const_div_by_zero` became `RNvNt…` and resolved
+nowhere. Invisible until now because every base-image reference a patch made
+was to a `#[no_mangle]` symbol, where the two spellings are the same string.
+
+**A `cdylib` hides the code it contains.** `panic_const_div_by_zero` was linked
+into the base image at a `t` symbol `dlsym` cannot see; `-Wl,-export_dynamic`
+does not help, because the hiding happens in codegen. The image is now a Rust
+`dylib`. A stand-in, and named as one: in the product the base image is the
+developer's binary and Blinker *is* its linker, so it holds the address of every
+symbol whether or not the dynamic table does.
+
+**`LibCall` relocations were deliberately unnamed.** Reading a constant array at
+a computed index compiles to a `memcpy` at `-Copt-level=0`. These are the
+entries §29's empty `RUNTIME_SUPPORT` was reserved for, and the argument for
+each is the same: a function that already exists in the process, which the patch
+calls rather than defines, and of which there is exactly one. Named by
+cranelift-module's own mapping rather than by a table written here, so the name
+is the one the object path would have emitted and not a second opinion.
+
+### The hole the third fix opened
+
+Switching the base image to a `dylib` broke the omitted-closure-member control.
+Six mutations that had been caught now **agreed** with the clean rebuild.
+
+The control was passing for a reason it did not claim. Dropping a member left a
+relocation nothing could resolve, so the patch was refused — but once every
+symbol is exported, that member resolves *silently* against the base image's
+older copy of it. Which is precisely the failure §29's closed-world invariant
+exists to prevent, and it was one crate-type flag away the whole time.
+
+The cause: **set equality was only ever enforced on the object path.** Both sink
+paths — `patch`'s early return and `sink_candidate` — returned a staged
+candidate without ever comparing what the artifact defines against what the
+codegen universe was told to emit. Both check it now, and the control is caught
+deterministically by the invariant rather than by a behavioural difference that
+only appears when the dropped member happens to be one this revision changed.
+
+This is the second time in two sections that a green control turned out to be
+green for the wrong reason. Both were found by changing something else.
+
+### Where the differential stands
+
+Thirteen mutations, six modes.
+
+| | before §46 | after |
+|---|---:|---:|
+| agreed with a clean rebuild | 8 | **11** |
+| refused as out of artifact class | 1 | **0** |
+| refused by the classifier | 2 | 2 |
+
+`checked_div` (a divide-by-zero check, hence a `&Location`), `const_table` (a
+constant array read through a bounds check) and `new_local_helper` (`rotate_left`,
+whose fallback carries `panic_const_rem_by_zero`) all publish and agree.
+
+Two new controls:
+
+- **omit a carried constant** — caught while building. `.Ldata0 addresses
+  .Ldata1, which the backend did not deliver`.
+- **corrupt a carried constant** — *not* caught while building, and that is the
+  point. Every relocation still resolves, nothing is missing, the patch
+  publishes; only the behaviour comparison can see it. `const_table` disagrees
+  (`live returned 18446744073709551584, clean returned 24`) while `checked_div`
+  correctly does not, because its constants are panic locations on a path the
+  probes never take.
+
+  The first version of this control flipped one byte of the first constant and
+  passed while proving nothing — it was hitting a cold-path `Location` rather
+  than the table anyone reads. It now flips every byte of every constant, and
+  the requirement is at suite level: at least one mutation must notice. A
+  control that can only fail by luck is not a control.
+
+### What it cost
+
+Nothing measurable. Constants are copied into the same slab as the code, in one
+pass, before relocation. `small` sequence: MIR→CLIF 0.037 ms, Cranelift 0.126
+ms, extract 0.002 ms — unchanged. Three 100-revision soaks after the change:
+
+| fixture | drift | steady state | verdicts |
+|---|---:|---:|---|
+| small | 0.95× | 12.45 → 11.86 ms | 51 DIRECT, 49 refused, all exact |
+| rg-lib | 0.97× | 19.34 → 18.80 ms | 51 DIRECT, 49 refused, all exact |
+| blinker-lib | 0.98× | 23.79 → 23.29 ms | 51 DIRECT, 49 refused, all exact |
+
+Generations: 10 observations across 3 scenarios and a control, all exact.
+
+They also sit in the same `MAP_JIT` mapping as the code, and are therefore
+executable. That is not a weakening, because every byte in this arena already
+is, but it is not where they belong: a read-only region for constants is the
+obvious next piece of hygiene and is not done.
+
+### The fixture says what it means now
+
+`fixtures/agent/variants/pristine.rs` was written around the limit: an offset
+helper instead of `ptr::add`, `wrapping_sub` instead of `-`, bytes assembled
+into a `u64` instead of an array literal. Every one of those was a place where
+the fixture avoided the question rather than answering it.
+
+They are gone. The M1 gate is green on ordinary Rust — `*data.add(i as usize)`,
+`b - b'0'` — and that is the result: 21 calls, 3 compiler sessions, no cargo,
+against a crate nobody had to write carefully.
+
+What is still out of class: trait methods, generics as roots, `const fn`,
+`async fn`, RPIT, anything a vtable reaches, and any constant that is not
+private and read-only. Arena reclamation is still not done.

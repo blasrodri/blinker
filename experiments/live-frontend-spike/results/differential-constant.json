@@ -2,20 +2,20 @@
   {
     "mutation": "body_arith",
     "verdict": "DIRECT",
-    "agreed": true,
+    "agreed": null,
     "difference": null,
     "base_intact": true,
     "closure_size": 6,
-    "error": null
+    "error": "control not applicable: this patch carries no constants"
   },
   {
     "mutation": "call_existing",
     "verdict": "DIRECT",
-    "agreed": true,
+    "agreed": null,
     "difference": null,
     "base_intact": true,
     "closure_size": 6,
-    "error": null
+    "error": "control not applicable: this patch carries no constants"
   },
   {
     "mutation": "new_local_helper",
@@ -29,56 +29,56 @@
   {
     "mutation": "new_generic",
     "verdict": "DIRECT",
-    "agreed": true,
+    "agreed": null,
     "difference": null,
     "base_intact": true,
     "closure_size": 8,
-    "error": null
+    "error": "control not applicable: this patch carries no constants"
   },
   {
     "mutation": "read_static",
     "verdict": "DIRECT",
-    "agreed": true,
+    "agreed": null,
     "difference": null,
     "base_intact": true,
     "closure_size": 6,
-    "error": null
+    "error": "control not applicable: this patch carries no constants"
   },
   {
     "mutation": "multi_function",
     "verdict": "DIRECT",
-    "agreed": true,
+    "agreed": null,
     "difference": null,
     "base_intact": true,
     "closure_size": 6,
-    "error": null
+    "error": "control not applicable: this patch carries no constants"
   },
   {
     "mutation": "branch_cold",
     "verdict": "DIRECT",
-    "agreed": true,
+    "agreed": null,
     "difference": null,
     "base_intact": true,
     "closure_size": 6,
-    "error": null
+    "error": "control not applicable: this patch carries no constants"
   },
   {
     "mutation": "loop_edit",
     "verdict": "DIRECT",
-    "agreed": true,
+    "agreed": null,
     "difference": null,
     "base_intact": true,
     "closure_size": 7,
-    "error": null
+    "error": "control not applicable: this patch carries no constants"
   },
   {
     "mutation": "two_gates",
     "verdict": "DIRECT",
-    "agreed": true,
+    "agreed": null,
     "difference": null,
     "base_intact": true,
     "closure_size": 6,
-    "error": null
+    "error": "control not applicable: this patch carries no constants"
   },
   {
     "mutation": "edit_outside_closure",
@@ -101,8 +101,8 @@
   {
     "mutation": "const_table",
     "verdict": "DIRECT",
-    "agreed": true,
-    "difference": null,
+    "agreed": false,
+    "difference": "probe 0 (0, 0): live returned 18446744073709551584 wrote 18446744073709507914, clean returned 24 wrote 43698",
     "base_intact": true,
     "closure_size": 6,
     "error": null
