@@ -55,6 +55,15 @@ use rustc_middle::mir::TerminatorKind;
 use rustc_middle::ty::{self, TyCtxt, TypingEnv};
 
 mod classify;
+mod live;
+
+// R1's runtime, included by path rather than copied: one source of truth for
+// the arena and the generation table, and the end-to-end path must exercise
+// the same code R1 benchmarked or the two numbers are about different things.
+#[path = "../../live-r1/src/arena.rs"]
+mod arena;
+#[path = "../../live-r1/src/generation.rs"]
+mod generation;
 use classify::{classify, contract_of, Contract, Verdict};
 
 /// One revision's measurement, as V2 §8 asks for it.
@@ -85,6 +94,8 @@ struct Record {
     mono_items_examined: usize,
     whole_crate_mono_items: usize,
     hot_root_found: bool,
+    /// Path D's members, by backend symbol name, root first.
+    closure_symbols: Vec<String>,
     /// What this revision promises downstream (S0c). `None` when the session
     /// failed or the hot root was not found.
     contract: Option<Contract>,
@@ -175,8 +186,11 @@ impl Callbacks for Measure {
         if self.mode.wants_closure() {
             let at = Instant::now();
             let mut statics = std::collections::BTreeSet::new();
-            let (examined, local) = hot_root_closure(tcx, root.to_def_id(), &mut statics);
+            let mut symbols = Vec::new();
+            let (examined, local) =
+                hot_root_closure(tcx, root.to_def_id(), &mut statics, &mut symbols);
             self.statics = statics;
+            self.record.closure_symbols = symbols;
             self.record.hot_closure_ms = at.elapsed().as_secs_f64() * 1e3;
             self.record.mono_items_examined = examined;
             self.closure_is_local = local;
@@ -302,6 +316,11 @@ fn hot_root_closure(
     tcx: TyCtxt<'_>,
     root: DefId,
     statics: &mut std::collections::BTreeSet<String>,
+    // The closure's members, by the symbol the backend will give them. This is
+    // what makes Path D actionable rather than merely countable: publishing a
+    // patch cluster means finding *these* functions in the generated code, and
+    // a count cannot be looked up.
+    symbols: &mut Vec<String>,
 ) -> (usize, bool) {
     let typing_env = TypingEnv::fully_monomorphized();
     let Ok(Some(root)) = ty::Instance::try_resolve(
@@ -324,6 +343,9 @@ fn hot_root_closure(
         if !seen.insert(instance) {
             continue;
         }
+        // The root first, then everything it reaches: the caller publishes
+        // slot 0 as the entry point.
+        symbols.push(tcx.symbol_name(instance).name.to_string());
         // Only what this crate can see. An instance defined elsewhere and
         // already compiled into the base image needs no new code, which is
         // exactly the property that makes this closure small.
@@ -472,12 +494,42 @@ fn abi_and_layout(tcx: TyCtxt<'_>, root: DefId) -> (usize, usize) {
     (sized, bytes)
 }
 
-fn sysroot() -> String {
-    let out = std::process::Command::new("rustc")
-        .arg("--print=sysroot")
-        .output()
-        .expect("rustc runs");
-    String::from_utf8(out.stdout).expect("utf8").trim().to_string()
+/// Drop `name` and `name=value` and `name value` from an argument list.
+fn strip_pairs(args: &[String], names: &[&str]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut skip = false;
+    for arg in args {
+        if skip {
+            skip = false;
+            continue;
+        }
+        if names.contains(&arg.as_str()) {
+            skip = true;
+            continue;
+        }
+        if names.iter().any(|n| arg.starts_with(&format!("{n}="))) {
+            continue;
+        }
+        out.push(arg.clone());
+    }
+    out
+}
+
+/// The sysroot, asked for once.
+///
+/// This used to spawn `rustc --print=sysroot` on every session. It is harness
+/// overhead and not a cost the product would pay, and it was outside the
+/// session timer — so the end-to-end total came out 44 ms above the sum of its
+/// own stages. A total that exceeds its parts is the harness measuring itself.
+fn sysroot() -> &'static str {
+    static SYSROOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SYSROOT.get_or_init(|| {
+        let out = std::process::Command::new("rustc")
+            .arg("--print=sysroot")
+            .output()
+            .expect("rustc runs");
+        String::from_utf8(out.stdout).expect("utf8").trim().to_string()
+    })
 }
 
 /// What a fixture is: a crate, the file an edit lands in, and the function
@@ -519,6 +571,23 @@ fn run_session(
     hot: &str,
     mode: Mode,
 ) -> Record {
+    run_session_with(fixture, file, incremental, hot, mode, &[])
+}
+
+/// The same session, with extra rustc arguments.
+///
+/// The end-to-end path adds `-Zcodegen-backend=cranelift --emit=obj`, so that
+/// one compiler run produces the validation, the classification, the closure
+/// *and* the machine code — which is the point: a developer pays for one
+/// compilation, not two.
+fn run_session_with(
+    fixture: &Fixture,
+    file: &Path,
+    incremental: &Path,
+    hot: &str,
+    mode: Mode,
+    extra: &[String],
+) -> Record {
     let mut args: Vec<String> = if fixture.args.is_empty() {
         vec![
             "rustc".into(),
@@ -539,6 +608,16 @@ fn run_session(
     // Deny nothing and render nothing: a diagnostic that is printed is a
     // diagnostic that is timed, and lint output is not what this measures.
     args.push("--cap-lints=allow".into());
+    if !extra.is_empty() {
+        // `--emit`, `--out-dir` and `-o` are two-token flags in the captured
+        // cargo invocation, and adding a second `--emit` does not override the
+        // first — rustc simply writes what the earlier one asked for and the
+        // object never appears. Removing the flag alone leaves its *path* as a
+        // positional input, which rustc reports as "multiple input filenames".
+        // Both tokens go, or neither.
+        args = strip_pairs(&args, &["--emit", "--out-dir", "-o"]);
+    }
+    args.extend(extra.iter().cloned());
 
     let mut measure = Measure {
         hot: hot.to_string(),
@@ -574,6 +653,7 @@ struct Options {
     path: String,
     out: Option<PathBuf>,
     once: bool,
+    end_to_end: bool,
 }
 
 fn parse_options() -> Options {
@@ -587,6 +667,7 @@ fn parse_options() -> Options {
     let mut path = "B".to_string();
     let mut out = None;
     let mut once = false;
+    let mut end_to_end = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--fixture" => fixture = PathBuf::from(args.next().expect("--fixture takes a path")),
@@ -603,6 +684,9 @@ fn parse_options() -> Options {
             // compiler work; this on its own is execve plus loading 150 MB of
             // rustc dylibs, which is a cost a resident process pays once and
             // an ordinary one pays per edit.
+            // The end-to-end path: edit, validate, classify, generate,
+            // publish, call.
+            "--live" => end_to_end = true,
             "--noop" => {
                 println!("[]");
                 std::process::exit(0);
@@ -630,6 +714,7 @@ fn parse_options() -> Options {
         path,
         out,
         once,
+        end_to_end,
     }
 }
 
@@ -637,6 +722,10 @@ fn main() {
     let options = parse_options();
     std::fs::create_dir_all(&options.incremental).expect("incremental directory");
     rustc_driver::install_ice_hook("https://github.com/blasrodri/blinker", |_| ());
+
+    if options.end_to_end {
+        return live_main(&options);
+    }
 
     let mut records: Vec<Record> = Vec::new();
     for edit in &options.edits {
@@ -708,5 +797,123 @@ fn main() {
     match &options.out {
         Some(path) => std::fs::write(path, json).expect("write results"),
         None => println!("{json}"),
+    }
+}
+
+/// The end-to-end benchmark: a real edit becoming live code, repeatedly.
+fn live_main(options: &Options) {
+    let arena = arena::Arena::reserve(256 * 1024 * 1024).expect("arena");
+    let runtime = generation::Runtime::new(8);
+    let object = options.incremental.join("live.o");
+
+    let pristine = std::fs::read_to_string(options.variants.join("pristine.rs"))
+        .expect("the pristine variant exists");
+    let mut records: Vec<live::LiveRecord> = Vec::new();
+
+    for edit in &options.edits {
+        let edited = std::fs::read_to_string(options.variants.join(format!("{edit}.rs")))
+            .unwrap_or_else(|_| panic!("no variant named {edit}"));
+        for iteration in 0..(options.warmup + options.iterations) {
+            // The pristine revision first: it warms the incremental directory
+            // and supplies the *before* contract a verdict is a comparison
+            // against. Its cost is the developer's previous build, not this
+            // edit's, so it is not in the number.
+            std::fs::write(&options.target_file, &pristine).expect("write pristine");
+            let base = run_session_with(
+                &options.fixture,
+                &options.target_file,
+                &options.incremental,
+                &options.hot,
+                Mode::HotClosure,
+                &[
+                    "-Zcodegen-backend=cranelift".into(),
+                    "--emit=obj".into(),
+                    format!("--out-dir={}", object.parent().unwrap_or(&object).display()),
+                ],
+            );
+            let mut record = live::revision(
+                &arena,
+                &runtime,
+                &options.fixture,
+                &options.target_file,
+                &options.incremental,
+                &options.hot,
+                &edited,
+                base.contract.as_ref(),
+                &object,
+            );
+            record.edit = edit.clone();
+            // The proof, not a demonstration: with `value = 3, scale = 5` the
+            // hot root's total is 15, so the pristine body returns
+            // `15 * 7 + 1 = 106` and `body_arith` returns `15 * 11 + 2 = 167`.
+            // A published function that returns anything else has not
+            // replaced what the source says it replaced.
+            let expected: Option<i64> = match edit.as_str() {
+                "body_arith" => Some(167),
+                "pristine" => Some(106),
+                _ => None,
+            };
+            if let (Some(expected), Some(returned)) = (expected, record.returned) {
+                if expected != returned {
+                    record.error = Some(format!(
+                        "the published function returned {returned}, expected {expected}"
+                    ));
+                }
+            }
+            if iteration >= options.warmup {
+                records.push(record);
+            }
+        }
+        std::fs::write(&options.target_file, &pristine).expect("restore pristine");
+    }
+
+    let median = |mut values: Vec<f64>| -> f64 {
+        if values.is_empty() {
+            return 0.0;
+        }
+        values.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+        values[values.len() / 2]
+    };
+    let good: Vec<&live::LiveRecord> = records.iter().filter(|r| r.error.is_none()).collect();
+    println!("\n  {} of {} revisions completed", good.len(), records.len());
+    for record in records.iter().filter(|r| r.error.is_some()) {
+        println!("    {} FAILED: {}", record.edit, record.error.clone().unwrap_or_default());
+    }
+    if !good.is_empty() {
+        println!(
+            "\n  {:<20} {:>9} {:>9} {:>9} {:>9} {:>9} {:>9}  {:<22} {}",
+            "edit", "validate", "classify", "closure", "codegen", "extract", "publish",
+            "verdict", "returned"
+        );
+        for edit in &options.edits {
+            let rows: Vec<&&live::LiveRecord> =
+                good.iter().filter(|r| r.edit == *edit).collect();
+            if rows.is_empty() {
+                continue;
+            }
+            println!(
+                "  {:<20} {:>9.2} {:>9.3} {:>9.3} {:>9.2} {:>9.3} {:>9.4}  {:<22} {:?}",
+                edit,
+                median(rows.iter().map(|r| r.validate_ms).collect()),
+                median(rows.iter().map(|r| r.classify_ms).collect()),
+                median(rows.iter().map(|r| r.closure_ms).collect()),
+                median(rows.iter().map(|r| r.codegen_ms).collect()),
+                median(rows.iter().map(|r| r.extract_ms).collect()),
+                median(rows.iter().map(|r| r.publish_ms).collect()),
+                rows[0].verdict,
+                rows[0].returned,
+            );
+        }
+        println!(
+            "\n  end to end, p50: {:.2} ms   (min {:.2}, max {:.2})",
+            median(good.iter().map(|r| r.total_ms).collect()),
+            good.iter().map(|r| r.total_ms).fold(f64::MAX, f64::min),
+            good.iter().map(|r| r.total_ms).fold(0.0, f64::max),
+        );
+    }
+    let json = serde_json::to_string_pretty(&records).expect("serialize");
+    match &options.out {
+        Some(path) => std::fs::write(path, json).expect("write"),
+        None => {}
     }
 }

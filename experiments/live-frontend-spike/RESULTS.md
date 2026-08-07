@@ -1,6 +1,8 @@
 # Spike S0 — Rust frontend lower bound
 
 **S0c is complete and DIRECT holds on this corpus** (§16–§19).
+**The end-to-end pipeline runs: a real source edit becomes live machine code
+in 33–75 ms against a 434–762 ms cargo baseline** (§22–§25).
 
 **Recommendation: A for an edit to a library crate, B for an edit to a large
 binary crate** — the envelope must be stated over the crate containing the hot
@@ -489,3 +491,103 @@ R1, as the plan says. The budget for a library-crate edit now reads:
 
 against a 434–762 ms cargo debug baseline. Codegen and publication have
 roughly 20–50 ms of room before the product stops being compelling.
+
+
+---
+
+# E2E — a source edit becoming live code
+
+Every component was measured separately; this runs them in one process.
+
+```
+source edit
+  → rustc validation            a real compiler session
+  → DIRECT classifier            S0c
+  → Path D closure               S0, now returning symbol names
+  → cg_clif machine code         -Zcodegen-backend=cranelift
+  → MAP_JIT arena                R1's arena and generation table, by #[path]
+  → the next call returns the new value
+```
+
+## 22. The proof, before the numbers
+
+The fixture's hot root is
+`spike_hot_root(reading) = reading.total().wrapping_mul(7).wrapping_add(1)`,
+and `body_arith` changes it to `.wrapping_mul(11).wrapping_add(2)`. Called with
+`value = 3, scale = 5`, `total()` is 15, so:
+
+| revision | expected | **returned by the published code** |
+|---|---:|---:|
+| pristine | 15 × 7 + 1 = 106 | **106** |
+| body_arith | 15 × 11 + 2 = 167 | **167** |
+
+Both fixtures, every iteration. The harness asserts the exact value rather
+than reporting it, so a publication that ran the *old* body would fail rather
+than print a plausible number.
+
+## 23. End to end, p50 over 8 iterations after 3 warm-ups
+
+All milliseconds.
+
+| fixture | edit | validate | classify | closure | codegen | extract | **publish** | **total** |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| blinker-lib | pristine | 26.7 | 0.04 | 0.12 | 14.1 | 0.68 | **0.0020** | |
+| blinker-lib | body_arith | 32.1 | 0.20 | 0.05 | 59.2 | 0.64 | **0.0022** | **75.1** |
+| rg-lib | pristine | 13.9 | 0.03 | 0.06 | 7.2 | 0.18 | **0.0016** | |
+| rg-lib | body_arith | 25.5 | 0.16 | 0.04 | 14.5 | 0.20 | **0.0017** | **32.9** |
+
+Against the cargo debug baselines S0b measured on the same crates:
+
+| fixture | cargo debug | **live** | **speedup** |
+|---|---:|---:|---:|
+| blinker-lib | 434 ms | **75 ms** | **5.8×** |
+| rg-lib | 762 ms | **33 ms** | **23×** |
+
+Publication is 1.6–2.2 µs, consistent with R1's isolated measurement.
+
+## 24. Codegen is the whole crate, and that is the loose part
+
+`codegen` above is cg_clif compiling the **entire crate** and writing an
+object, because `rustc_codegen_cranelift` is a backend that exposes "compile
+this crate" and not "lower this `Instance`". The product would lower the
+4-instance closure Path D found, which R1 measured at **0.12 ms for six
+functions**.
+
+Removing whole-crate codegen from the totals gives ~16 ms and ~18 ms, which
+would be **27×** and **42×**. That is not claimed as a result — it is what the
+remaining engineering is *for*, and it is why §24 exists rather than a single
+optimistic number.
+
+The object file is not part of the eventual design.
+
+## 25. Two harness errors, both of which produced a working-looking demo
+
+**The end-to-end total exceeded the sum of its own stages by 44 ms.** The
+harness spawned `rustc --print=sysroot` on every session, outside the session
+timer. A total larger than its parts is the harness measuring itself; the
+sysroot is now asked for once.
+
+**The published function was called with the wrong ABI.** `spike_hot_root`
+takes `SpikeReading { value: u64, scale: u32 }` — a 16-byte aggregate, two
+registers under AAPCS — and the first version called it as `fn(i64) -> i64`.
+It returned 105866, then 72866, then something else: `scale` was whatever `x1`
+happened to hold. It looked like a working demonstration and was reading
+uninitialised register state. Only fixing the signature and asserting the
+exact expected value turned it into evidence.
+
+Neither was found by reading the code. The first was found because the
+arithmetic did not add up, the second because the "result" changed between
+runs of an identical input.
+
+## 26. What this does and does not establish
+
+**Does:** the whole path works, on two real library crates, with the value
+verified against what the source says. Publication is microseconds. The
+classifier runs inside the same compiler session the developer was already
+paying for.
+
+**Does not:** the DIRECT class is still one shape — free, non-generic,
+non-const, non-async, `#[inline(never)]`. Codegen is whole-crate. Two
+fixtures. And the runtime differential that V2 §12.2 asks for — running the
+live program against a clean rebuild across a mutation suite — does not exist
+yet; §22 checks one value on one edit, which is a start and not that.
