@@ -61,15 +61,13 @@ impl Reading {
 #[no_mangle]
 #[inline(never)]
 pub extern "C" fn diff_second(x: u64) -> u64 {
-    x.wrapping_mul(3).wrapping_add(1)
+    x.wrapping_mul(29).wrapping_add(6)
 }
 
 #[inline(never)]
 fn blend(x: u64) -> u64 {
     diff_second(x).wrapping_add(7)
 }
-
-static DIFF_FRESH: u64 = 77;
 
 /// The hot root. `extern "C"` so that both paths call it through one signature
 /// that is written down rather than assumed — §25's lesson.
@@ -78,7 +76,7 @@ static DIFF_FRESH: u64 = 77;
 pub extern "C" fn diff_root(value: u64, scale: u32, out: *mut u64) -> u64 {
     let reading = Reading { value, scale };
     let total = reading.total();
-    let mixed = blend(total).wrapping_add(DIFF_FRESH);
+    let mixed = blend(total).wrapping_mul(17).wrapping_add(8);
     // The memory output: a differential that compared return values alone
     // would miss a patch that got the write wrong.
     unsafe { *out = mixed ^ 0xAAAA };

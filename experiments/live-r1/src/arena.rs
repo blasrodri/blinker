@@ -25,6 +25,7 @@
 //! publication is sub-millisecond.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 unsafe extern "C" {
     fn pthread_jit_write_protect_np(enabled: libc::c_int);
@@ -54,11 +55,22 @@ impl std::fmt::Display for ArenaError {
 pub struct Arena {
     base: *mut u8,
     size: usize,
-    /// Bump pointer. Whole generations are retired together, so there is no
-    /// free list: R1 keeps every generation until the process exits, which is
-    /// the honest thing to do before reclamation is designed rather than a
-    /// reclamation scheme nobody measured.
+    /// Bump pointer, for slabs that cannot be satisfied from the free list.
     used: AtomicUsize,
+    /// Returned slabs, as `(offset, len)`, newest first.
+    ///
+    /// A free list rather than a compacting allocator, and the reason is the
+    /// same one that makes this whole design work: a slab's address is baked
+    /// into a published generation's slot table and into every relocation
+    /// inside it. Nothing can move once it is written, so the only reclamation
+    /// available is reuse in place.
+    ///
+    /// First fit, and no coalescing. Patch slabs are a few hundred bytes to a
+    /// few kilobytes and successive revisions of one program ask for nearly the
+    /// same size, so the list stays short and hits almost always. Coalescing is
+    /// what to add when a measurement says the list is growing, and §49 reports
+    /// that it is not.
+    free: Mutex<Vec<(usize, usize)>>,
 }
 
 // SAFETY: the arena hands out disjoint slabs and never aliases them. `base`
@@ -71,6 +83,8 @@ unsafe impl Sync for Arena {}
 pub struct Slab {
     pub ptr: *mut u8,
     pub len: usize,
+    /// Offset from the arena base, so it can be handed back.
+    pub(crate) offset: usize,
 }
 
 impl Arena {
@@ -95,6 +109,7 @@ impl Arena {
             base: base.cast(),
             size,
             used: AtomicUsize::new(0),
+            free: Mutex::new(Vec::new()),
         })
     }
 
@@ -102,6 +117,18 @@ impl Arena {
     /// and constant pool this emits is happy with.
     pub fn slab(&self, len: usize) -> Result<Slab, ArenaError> {
         let aligned = len.next_multiple_of(16);
+        // A returned slab first. Whole blocks only: splitting one would need
+        // the remainder tracked and eventually coalesced, and a patch closure's
+        // size barely moves between revisions, so an exact-or-larger block is
+        // almost always waiting.
+        {
+            let mut free = self.free.lock().expect("not poisoned");
+            if let Some(index) = free.iter().position(|(_, len)| *len >= aligned) {
+                let (offset, len) = free.swap_remove(index);
+                // SAFETY: an offset and length this arena handed out before.
+                return Ok(Slab { ptr: unsafe { self.base.add(offset) }, len, offset });
+            }
+        }
         let start = self.used.fetch_add(aligned, Ordering::Relaxed);
         if start + aligned > self.size {
             // Give the bump pointer back so a failed publication does not
@@ -117,7 +144,32 @@ impl Arena {
         Ok(Slab {
             ptr: unsafe { self.base.add(start) },
             len: aligned,
+            offset: start,
         })
+    }
+
+    /// Hand a slab back.
+    ///
+    /// # Safety
+    /// Nothing may execute or hold a pointer into `slab` after this returns.
+    /// That is the whole safety obligation of reclamation and it is not one the
+    /// arena can check: it does not know which generation owns a slab, which
+    /// scopes are live, or whether a rollback might want it again. The caller
+    /// that does know is [`crate::generation::Runtime`], and §49 is the
+    /// argument it makes.
+    pub unsafe fn release(&self, slab: Slab) {
+        self.free.lock().expect("not poisoned").push((slab.offset, slab.len));
+    }
+
+    /// Bytes sitting on the free list.
+    pub fn reclaimable(&self) -> usize {
+        self.free.lock().expect("not poisoned").iter().map(|(_, len)| len).sum()
+    }
+
+    /// How many blocks the free list holds. A number that keeps climbing is
+    /// fragmentation, and is the measurement that would justify coalescing.
+    pub fn free_blocks(&self) -> usize {
+        self.free.lock().expect("not poisoned").len()
     }
 
     /// Fill a slab, with the write protection flipped for exactly as long as

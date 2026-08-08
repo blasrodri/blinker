@@ -1359,7 +1359,7 @@ rather than one asserted twice. Over 300 revisions they never disagreed.
 | publication | **~2 µs** |
 | runtime vs independent LLVM rebuild | 9 mutations, 3 negative controls |
 | 100-revision residency | flat: drift 0.93×, 1.03×, 1.01× |
-| memory | +5.7 to +14.4 MB over 75 revisions |
+| memory | +5.7 to +14.4 MB over 75 revisions — **not the arena**, see §49 |
 | concurrent generation consistency | 3 scenarios + control, 10 observations |
 | rollback consistency | scenario 3, against clean rebuilds |
 
@@ -2022,3 +2022,91 @@ takes the rest, with the classifier deciding rather than the agent guessing.
 
 Every M0 suite re-run: 6 differential modes over 14 mutations, generations 10/10
 exact, 22 unit tests, the M1 gate, the linker gate.
+
+
+## 49. Reclamation, and what the leak was not
+
+§43 listed arena reclamation as a known gap and put a number beside it: "+5.7 to
++14.4 MB over 75 revisions". Those two facts shared a sentence, and the sentence
+implied the second was caused by the first.
+
+It was not. Fixing the leak proves it.
+
+### Two classes, two arguments
+
+**A discarded candidate** was never published. `Runtime::current` never pointed
+at it, no scope can be holding it, no rollback can reach it. Its slabs go back
+immediately and the argument is one sentence. This is the half that matters most
+on the agent path, where far more candidates are refused than committed — every
+`replace_body` that stages and is superseded, every rollback, every refused
+revision in the soak.
+
+**A retired generation** is harder, and the design pays for it twice.
+
+A scope that entered while it was current may still be running, so generations
+are reference-counted: `scope_in` registers on the generation it captured and
+the last one out reclaims. The count is safe to touch without hazard pointers
+because **the `Generation` struct is never freed** — only its slabs are. A slot
+table and two counters is hundreds of bytes against a slab's kilobytes, so a
+thread that loads a stale `current` pointer reads a live object, discovers it is
+stale, and lets go:
+
+```rust
+loop {
+    let pointer = current.load(Acquire);
+    let generation = &*pointer;          // never freed
+    generation.scopes.fetch_add(1, Acquire);
+    if current.load(Acquire) == pointer { return generation }
+    generation.scopes.fetch_sub(1, Release);
+}
+```
+
+And `rollback_code` can make *any* generation in history current again, so
+"retired" cannot be inferred — it has to be a **stated retention policy**.
+Generations outside the window are retired and reclaimed, and a rollback to one
+of them is **refused**, not attempted. That is where the policy has teeth: those
+slabs may already hold a later revision's code, so installing an old slot table
+would branch into whatever is there now.
+
+The arena's free list is first-fit, with no coalescing and no splitting, because
+a slab's address is baked into a published generation's slot table and into
+every relocation inside it. Nothing can move once written; reuse in place is the
+only reclamation available. Successive revisions of one program ask for nearly
+the same size, so the list stays at one block.
+
+Four tests, one per claim: a discarded candidate returns its memory; a retired
+generation is reclaimed *and* refuses rollback; a live scope keeps its
+generation alive across three publications landing on top of it; and a released
+slab is handed out again and runs the **new** code — which is what
+`Arena::publish`'s i-cache flush is for, and would be the first thing to break
+if reuse were added without it.
+
+### What it fixed
+
+| revisions | arena in use | reclaimed | RSS growth |
+|---:|---:|---:|---:|
+| 50 | 1 KB | 6 KB | +6.5 MB |
+| 100 | 1 KB | 14 KB | +3.2 MB |
+| 200 | 1 KB | 30 KB | +7.8 MB |
+
+The arena's high-water mark is **constant in the number of revisions** while
+reclaimed bytes grow linearly — the same kilobyte handed out and taken back. It
+was O(n) before and it is O(1) now.
+
+### What it did not fix, and what that means
+
+RSS growth is 6.5, 3.2 and 7.8 MB for 50, 100 and 200 revisions. **No trend.**
+Whatever that memory is, it is not per-revision, and it was never the arena: the
+arena would have leaked about 30 KB over 200 revisions, four orders of magnitude
+below the figure §43 sat beside it.
+
+So the leak was real, it is fixed, and it was never the thing the number
+measured. The megabytes belong to rustc's own per-session state — a `TyCtxt`,
+HIR arenas, an incremental session — which §38 already said is session-scoped
+and which residency deliberately does not try to keep. A one-off cost that does
+not compound is a different problem from a leak, and this document had the two
+confused in print for six sections.
+
+Every suite re-run after the change: 6 differential modes over 14 mutations,
+generations 10/10 exact, 26 unit tests, the M1 gate, three soaks with every
+value exact and every verdict as required, the linker gate.

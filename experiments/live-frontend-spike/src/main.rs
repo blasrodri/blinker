@@ -1701,7 +1701,10 @@ fn peak_rss_mb() -> f64 {
 /// leave for later.
 fn soak_main(options: &Options) {
     let arena = arena::Arena::reserve(256 * 1024 * 1024).expect("arena");
-    let runtime = generation::Runtime::new(8);
+    // Eight generations of rollback; everything older is retired and its arena
+    // memory reclaimed (§49). The soak is where the leak was visible — +5.7 to
+    // +14.4 MB over 75 revisions — so it is where the fix has to be shown.
+    let runtime = generation::Runtime::with_retention(8, 8);
     let out_dir = options.incremental.clone();
     let backend = options
         .backend
@@ -1953,6 +1956,13 @@ fn soak_main(options: &Options) {
     let rss_last = rows[rows.len() - 1].peak_rss_mb;
     println!(
         "\n  latency drift, last quarter vs first: {drift:.2}x  ({first:.2} → {last:.2} ms)"
+    );
+    println!(
+        "  arena: {} KB in use, {} KB on the free list in {} blocks, {} KB reclaimed",
+        arena.used() / 1024,
+        arena.reclaimable() / 1024,
+        arena.free_blocks(),
+        runtime.reclaimed_bytes() / 1024,
     );
     println!(
         "  peak RSS after the first quarter: {rss_first:.1} → {rss_last:.1} MB  \

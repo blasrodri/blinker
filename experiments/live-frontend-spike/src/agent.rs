@@ -318,7 +318,11 @@ impl Workspace {
             .unwrap_or_else(|| "-Zcodegen-backend=cranelift".into());
         Workspace {
             arena: Arena::reserve(256 * 1024 * 1024).expect("arena"),
-            runtime: Runtime::new(64),
+            // Sixteen generations of rollback, and everything older is
+            // reclaimed (§49). A number rather than "all", because retiring a
+            // *published* generation is only safe if the depth a rollback may
+            // reach is declared — and refused past it.
+            runtime: Runtime::with_retention(64, 16),
             fixture: options.fixture.clone(),
             target_file: options.target_file.clone(),
             incremental: options.incremental.clone(),
@@ -611,6 +615,12 @@ impl Workspace {
             entry.edges_fresh = false;
         }
 
+        // A candidate this one replaces was never published either, so it goes
+        // back the same way. Staging twice without committing is the ordinary
+        // shape of an agent trying hypotheses, and each one used to cost a slab.
+        if let Some(previous) = self.staged.take() {
+            previous.discard(&self.runtime, &self.arena);
+        }
         self.staged_entries = staged.entries.clone();
         self.staged = Some(staged);
         self.editing.insert(function.id.clone());
@@ -782,7 +792,7 @@ impl Workspace {
             return Observation::error("nothing is staged");
         };
         let entries = std::mem::take(&mut self.staged_entries);
-        let id = staged.commit(&self.runtime);
+        let id = staged.commit_in(&self.runtime, &self.arena);
         self.committed.push((id, entries));
         self.editing.clear();
         Observation {
@@ -804,8 +814,11 @@ impl Workspace {
         let at = Instant::now();
         // A staged candidate is discarded first: rolling back while one is held
         // would leave a probe answering from a candidate that belongs to a
-        // revision the caller has just abandoned.
-        self.staged = None;
+        // revision the caller has just abandoned. Its memory goes back with it
+        // (§49) — nothing was ever published, so there is nothing to wait for.
+        if let Some(staged) = self.staged.take() {
+            staged.discard(&self.runtime, &self.arena);
+        }
         self.staged_entries.clear();
         self.editing.clear();
         let parent = self.runtime.enter().parent;

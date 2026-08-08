@@ -382,6 +382,22 @@ impl Staged {
     pub fn commit(self, runtime: &Runtime) -> u64 {
         runtime.publish(self.generation)
     }
+
+    /// The same, then retire whatever the retention policy no longer protects
+    /// (§49).
+    pub fn commit_in(self, runtime: &Runtime, arena: &Arena) -> u64 {
+        runtime.publish_and_retire(self.generation, arena)
+    }
+
+    /// Throw the candidate away and give its memory back.
+    ///
+    /// Nothing ever pointed at it, so there is no quiescence to wait for. This
+    /// is the half of §49 that matters most on the agent path, where far more
+    /// candidates are refused than committed — every one of them used to cost a
+    /// slab for the life of the process.
+    pub fn discard(self, runtime: &Runtime, arena: &Arena) -> usize {
+        runtime.discard(self.generation, arena)
+    }
 }
 
 /// Build a candidate from the lifted functions. Nothing becomes visible.
@@ -1141,7 +1157,7 @@ pub fn sink_revision(
         return record;
     };
     let entry = staged.entry();
-    staged.commit(runtime);
+    staged.commit_in(runtime, arena);
     // SAFETY: an address in the arena, of the fixture's declared signature.
     let f: extern "C" fn(u64, u32) -> u64 = unsafe { std::mem::transmute(entry as *const u8) };
     record.returned = Some(f(3, 5) as i64);
@@ -1279,10 +1295,20 @@ pub fn sink_candidate(
             false
         }
     };
-    // A refused candidate is *discarded*, not rolled back. Its arena slab stays
-    // allocated until reclamation exists — R1 deferred that — but nothing ever
-    // pointed at it, so there is no window in which it could have run.
-    let staged = outcome.filter(|_| accepted).and_then(|outcome| outcome.staged);
+    // A refused candidate is *discarded*, not rolled back: nothing ever pointed
+    // at it, so there is no window in which it could have run — and since §49
+    // its arena slab goes straight back rather than being held for the life of
+    // the process.
+    let outcome = match outcome {
+        Some(outcome) if !accepted => {
+            if let Some(staged) = outcome.staged {
+                staged.discard(runtime, arena);
+            }
+            None
+        }
+        other => other,
+    };
+    let staged = outcome.and_then(|outcome| outcome.staged);
     if let Some(staged) = &staged {
         record.entries = staged.entries.clone();
     }
